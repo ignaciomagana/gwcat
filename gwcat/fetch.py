@@ -522,8 +522,8 @@ def _cli():
                     help="Use pinned record IDs instead of resolving latest.")
     ap.add_argument("--dry-run", action="store_true",
                     help="List files without downloading.")
-    ap.add_argument("--with-event-table", action="store_true",
-                    help="Fetch FAR/p_astro from GWOSC before building the store.")
+    ap.add_argument("--no-event-table", action="store_true",
+                    help="Skip auto-fetching FAR/p_astro from GWOSC during build.")
     ap.add_argument("--no-progress", action="store_true",
                     help="Disable progress bars.")
     ap.add_argument("--record-ids", type=int, nargs="+", default=None,
@@ -566,14 +566,9 @@ def _cli():
         if not pe_paths:
             print("No PE files to ingest (only injection files downloaded).")
             return
-        event_table = None
-        if args.with_event_table:
-            print("\nFetching FAR/p_astro from GWOSC ...")
-            try:
-                event_table = fetch_event_table_gwosc()
-                print(f"  got {len(event_table)} events")
-            except Exception as e:
-                warnings.warn(f"Could not fetch event table: {e}")
+        # event_table=None lets build_store auto-fetch from GWOSC;
+        # event_table={} skips the fetch.
+        event_table = {} if args.no_event_table else None
 
         from .ingest import build_store
         print(f"\n--- Building store from {len(pe_paths)} PE files ---")

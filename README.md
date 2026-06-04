@@ -20,7 +20,7 @@ For sky-area computation at ingest (optional): `pip install healpy`
 
 ```python
 from gwcat import GWCatalog, SelectionSet, build_store, validate_export
-from gwcat.fetch import fetch_catalog, fetch_event_table_gwosc
+from gwcat.fetch import fetch_catalog
 
 # ── 1. Download PE files from Zenodo ─────────────────────────
 paths_21 = fetch_catalog("GWTC-2.1")
@@ -33,15 +33,15 @@ inj_paths = fetch_catalog("injections-O1O2O3O4",
                           data_dir="./injections")
 
 # ── 3. Ingest PE files into the store ────────────────────────
-event_table = fetch_event_table_gwosc()
 all_pe = paths_21 + paths_3 + paths_41 + paths_5
-build_store(all_pe, "store.h5", event_table=event_table)
+build_store(all_pe, "store.h5")           # FAR/p_astro auto-fetched from GWOSC
 
 # ── 4. Explore the catalog ───────────────────────────────────
 cat = GWCatalog("store.h5")
 cat.summary()                             # compact event table
 bbh = cat.select(
     compact_type="BBH",
+    far_max=1.0,                          # match GWTC-5 populations paper
 )
 print("Selected " + str(bbh.n_events) + " events")
 
@@ -75,14 +75,14 @@ When a new catalog drops, append without re-ingesting the full set:
 from gwcat import merge_store
 
 new_paths = fetch_catalog("GWTC-5", data_dir="./GWTC")
-merge_store("store.h5", new_paths)   # duplicates are auto-skipped
+merge_store("store.h5", new_paths)   # duplicates auto-skipped, FAR auto-fetched
 ```
 
 ## Quick start (CLI)
 
 ```bash
-gwcat-fetch --out store.h5                            # download all PE + build
-gwcat-fetch --out store.h5 --with-event-table         # + FAR/p_astro from GWOSC
+gwcat-fetch --out store.h5                            # download all PE + build (FAR auto-fetched)
+gwcat-fetch --out store.h5 --no-event-table           # skip GWOSC FAR/p_astro fetch
 gwcat-fetch --catalog injections-O1O2O3O4             # download injection sets
 gwcat-fetch --catalog all                             # PE + injections
 gwcat-fetch --catalog GWTC-5 --dry-run                # preview files
@@ -242,8 +242,9 @@ O1–O4b in the modern `events/` format.
 
 ## Known limitations
 
-- **FAR / p_astro** are not in per-event PE files. Use `--with-event-table`
-  or pass `event_table` to `build_store`.
+- **FAR / p_astro** are not in per-event PE files.  `build_store` auto-fetches
+  them from GWOSC (requires network).  Pass `event_table={}` or `--no-event-table`
+  to skip.
 - **`mass_prior_kind`** is assumed `uniform_detector_frame`.
 - **Ingest requires `pesummary`** (`pip install gwcat[ingest]`).
 - **healpy** is optional; without it `sky_area_90` is NaN.

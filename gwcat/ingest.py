@@ -325,20 +325,45 @@ def _sky_area_90(ra_samples, dec_samples, nside=64):
     return n_pix_90 * pix_area_deg2
 
 
+def _resolve_event_table(event_table):
+    """Resolve the event_table argument for build_store / merge_store.
+
+    None (default) → auto-fetch FAR/p_astro from GWOSC.
+    {}             → skip (no network call).
+    dict           → use as-is.
+    """
+    if event_table is not None:
+        return event_table
+    try:
+        from .fetch import fetch_event_table_gwosc
+        print("Fetching FAR/p_astro from GWOSC ...")
+        table = fetch_event_table_gwosc()
+        print(f"  got {len(table)} events from GWOSC")
+        return table
+    except Exception as e:
+        warnings.warn(
+            f"Could not auto-fetch event table from GWOSC: {e}\n"
+            "  FAR/p_astro metadata will be NaN. Pass event_table={{}} to silence."
+        )
+        return {}
+
+
 def build_store(paths, out_path, params=None, extra_params=None,
                 cfg: Optional[IngestConfig] = None, event_table=None):
     """Ingest a list of cosmo-file paths into a single concatenated store.
 
     params       : column list to store (default DEFAULT_PARAMS).
     extra_params : appended to params (store anything extra without editing code).
-    event_table  : optional {event_name: {'far':..,'pastro':..}} for FAR/p_astro,
+    event_table  : {event_name: {'far':..,'pastro':..}} for FAR/p_astro,
                    which are NOT in per-event PE files.
+                   None (default) → auto-fetch from GWOSC.
+                   Pass {} to skip.
     """
     cfg = cfg or IngestConfig()
     params = list(params or DEFAULT_PARAMS)
     if extra_params:
         params += [p for p in extra_params if p not in params]
-    event_table = event_table or {}
+    event_table = _resolve_event_table(event_table)
 
     col_chunks = {p: [] for p in params}      # only filled for params present
     stored_params = None
@@ -473,7 +498,7 @@ def merge_store(existing_path: str, new_paths, out_path: str = None,
     out_path : str or None
         Output path.  None → overwrite existing_path (via a temp file for safety).
     cfg, event_table, extra_params :
-        Same as build_store.
+        Same as build_store.  event_table=None auto-fetches from GWOSC.
 
     Returns
     -------
@@ -482,7 +507,7 @@ def merge_store(existing_path: str, new_paths, out_path: str = None,
     import shutil, tempfile
 
     cfg = cfg or IngestConfig()
-    event_table = event_table or {}
+    event_table = _resolve_event_table(event_table)
     out_path = out_path or existing_path
 
     # Read existing store
@@ -615,6 +640,8 @@ def _cli():
     ap.add_argument("--glob", action="append", default=[],
                     help="glob of cosmo files (repeatable, one per catalog dir)")
     ap.add_argument("--out", default="store.h5")
+    ap.add_argument("--no-event-table", action="store_true",
+                    help="Skip auto-fetching FAR/p_astro from GWOSC.")
     a = ap.parse_args()
     if a.inspect:
         inspect(a.inspect)
@@ -624,7 +651,8 @@ def _cli():
         paths += sorted(glob.glob(g))
     if not paths:
         ap.error("no files matched; pass --glob or --inspect")
-    build_store(paths, a.out)
+    event_table = {} if a.no_event_table else None
+    build_store(paths, a.out, event_table=event_table)
 
 
 if __name__ == "__main__":
