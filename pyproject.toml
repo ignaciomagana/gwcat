@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gwcat"
+version = "0.1.0"
+description = "Fast preprocessing of GWTC-2.1/3/4/5 cosmo PE files for dark-siren cosmology"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+authors = [
+    {name = "gwcat contributors"},
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Astronomy",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Programming Language :: Python :: 3",
+]
+dependencies = [
+    "numpy>=1.22",
+    "h5py>=3.6",
+    "astropy>=5.0",
+]
+
+[project.optional-dependencies]
+ingest = [
+    "pesummary>=0.13",
+    "bilby>=1.1",
+]
+fetch = [
+    "requests>=2.28",
+    "tqdm>=4.64",
+]
+all = [
+    "gwcat[ingest,fetch]",
+]
+dev = [
+    "gwcat[all]",
+    "pytest>=7",
+]
+
+[project.scripts]
+gwcat-ingest = "gwcat.ingest:_cli"
+gwcat-fetch = "gwcat.fetch:_cli"
+
+[project.urls]
+Documentation = "https://github.com/ignaciomagana/gwcat"
+Repository = "https://github.com/ignaciomagana/gwcat"
+
+[tool.setuptools.packages.find]
+include = ["gwcat*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
