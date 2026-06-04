@@ -79,7 +79,7 @@ META_STR_FIELDS = [
 
 # Default waveform priority when no Mixed set exists (O4b/GWTC-5 events).
 O4_WAVEFORM_PRIORITY = [
-    "C00:SEOBNRv5PHM", "C00:IMRPhenomXPHM-SpinTaylor",
+    "C00:IMRPhenomXPHM-SpinTaylor", "C00:SEOBNRv5PHM",
     "C00:IMRPhenomXPNR", "C00:NRSur7dq4",
 ]
 O3_WAVEFORM_PRIORITY = ["C01:IMRPhenomXPHM", "C01:SEOBNRv4PHM"]
@@ -293,9 +293,9 @@ def inspect(path: str, cfg: Optional[IngestConfig] = None):
 def _classify(m1_src, m2_src, thr):
     if not np.isfinite(m1_src) or not np.isfinite(m2_src):
         return "unknown"
-    if m2_src >= thr:
+    if m1_src >= thr and m2_src >= thr:
         return "BBH"
-    if m1_src >= thr:
+    if m1_src >= thr and m2_src < thr:
         return "NSBH"
     return "BNS"
 

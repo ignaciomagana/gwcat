@@ -42,21 +42,20 @@ cat = GWCatalog("store.h5")
 cat.summary()                             # compact event table
 bbh = cat.select(
     compact_type="BBH",
-    pastro_min=0.9,
-    sky_area_max=1000,                    # deg², requires healpy at ingest
 )
+print("Selected " + str(bbh.n_events) + " events")
 
 # ── 5. Export PE samples for darksirens ──────────────────────
 bbh._to_darksirens_format(
     "gw_bbh.h5",
     nsamp=4096,
-    z_max=2.0,                            # per-sample redshift cut
+    z_max=10.0,                            # per-sample redshift cut
     cosmology=(67.74, 0.3089),
     seed=0,
 )
 
 # ── 6. Export selection function for darksirens ──────────────
-sel = SelectionSet("injections/mixture-real_o3_o4a_o4b-cartesian_spins_*.hdf")
+sel = SelectionSet("injections/injections-O1O2O3O4/mixture-real_o3_o4a_o4b-cartesian_spins_20260410130052UTC-clipped.hdf")
 sel.to_darksirens("selection_bbh.h5", far_threshold=1.0)
 
 # ── 7. Validate before running darksirens ────────────────────

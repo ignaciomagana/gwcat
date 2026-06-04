@@ -146,14 +146,42 @@ class SelectionSet:
 
         ndraw = int(f.attrs["total_generated"])
 
-        # FAR: per-search columns
-        searches = [s.decode() if isinstance(s, bytes) else str(s)
-                    for s in f.attrs["searches"]]
+        # FAR: discover search pipelines from the file
+        # f.attrs["searches"] lists pipeline names; each has a "{name}_far" dataset
+        # Handle the many ways h5py can encode string arrays in attrs
+        try:
+            raw = f.attrs["searches"]
+            if isinstance(raw, np.ndarray):
+                search_list = [x.decode() if isinstance(x, bytes) else str(x)
+                               for x in raw.flat]
+            elif isinstance(raw, (list, tuple)):
+                search_list = [x.decode() if isinstance(x, bytes) else str(x)
+                               for x in raw]
+            elif isinstance(raw, bytes):
+                search_list = [raw.decode()]
+            elif isinstance(raw, str):
+                search_list = [raw]
+            else:
+                search_list = [str(raw)]
+        except Exception:
+            search_list = []
+
+        # Collect FAR columns: try each search name, also scan for any *_far datasets
         fars_per_search = []
-        for s in searches:
-            col = f"{s}_far"
-            if col in ev:
+        for s in search_list:
+            col = s + "_far"
+            try:
                 fars_per_search.append(np.asarray(ev[col], float))
+            except KeyError:
+                pass
+        # Fallback: if searches attr was unreliable, scan for *_far datasets
+        if not fars_per_search:
+            for key in ev:
+                if isinstance(key, str) and key.endswith("_far"):
+                    try:
+                        fars_per_search.append(np.asarray(ev[key], float))
+                    except Exception:
+                        pass
         self._fars = np.column_stack(fars_per_search) if fars_per_search else None
 
         # Store
@@ -195,17 +223,36 @@ class SelectionSet:
     # ------------------------------------------------------------------
     # Export
     # ------------------------------------------------------------------
-    def to_darksirens(self, out_path: str, far_threshold: float = 1.0):
+    def to_darksirens(self, out_path: str, far_threshold: float = 1.0,
+                      amax: float = 0.99):
         """Write a pre-processed selection file for darksirens.
 
-        The 1-D chi_eff spin-prior swap is NOT applied (chi_eff_swap_applied=False).
-        darksirens applies it via gwdistributions.
+        Applies the 1-D chi_eff spin-prior swap (chi_eff_swap_applied=True).
+        darksirens reads the result directly — no gwdistributions needed.
+
+        Parameters
+        ----------
+        out_path : str
+        far_threshold : float
+            FAR detection threshold in yr⁻¹.
+        amax : float
+            Maximum spin magnitude for the isotropic prior (default 0.99).
         """
+        from .spin import chi_eff_prior_logprob
+
         self._load()
         det = self.detected_mask(far_threshold)
         n_det = int(det.sum())
         if n_det == 0:
             raise RuntimeError(f"No detected injections at FAR < {far_threshold}")
+
+        # Apply the 1-D chi_eff prior swap
+        chieff_det = self._chieff[det]
+        m1src_det = self._m1src[det]
+        m2src_det = self._m2src[det]
+        logp_chi = chi_eff_prior_logprob(chieff_det, m1src_det, m2src_det, amax=amax)
+        safe_logp = np.clip(logp_chi, a_min=-50.0, a_max=None)
+        pdraw_det = self._pdraw[det] * np.exp(safe_logp)
 
         with h5py.File(out_path, "w") as f:
             f.attrs["format_version"] = "gwcat-selection-1.0"
@@ -215,16 +262,17 @@ class SelectionSet:
             f.attrs["n_detected"] = n_det
             f.attrs["cosmology_H0"] = float(self.H0)
             f.attrs["cosmology_Om0"] = float(self.Om0)
-            f.attrs["chi_eff_swap_applied"] = False
+            f.attrs["chi_eff_swap_applied"] = True
+            f.attrs["chi_eff_amax"] = float(amax)
 
             for name, arr in [
-                ("m1det", self._m1det), ("m2det", self._m2det),
-                ("dL", self._dL), ("chieff", self._chieff),
-                ("ra", self._ra), ("dec", self._dec),
-                ("m1src", self._m1src), ("m2src", self._m2src),
-                ("redshift", self._z), ("pdraw", self._pdraw),
+                ("m1det", self._m1det[det]), ("m2det", self._m2det[det]),
+                ("dL", self._dL[det]), ("chieff", chieff_det),
+                ("ra", self._ra[det]), ("dec", self._dec[det]),
+                ("m1src", m1src_det), ("m2src", m2src_det),
+                ("redshift", self._z[det]), ("pdraw", pdraw_det),
             ]:
-                f.create_dataset(name, data=arr[det], compression="gzip")
+                f.create_dataset(name, data=arr, compression="gzip")
 
         print(f"Wrote {out_path}: n_det={n_det}, ndraw={self._ndraw}, "
               f"FAR<{far_threshold}, H0={self.H0}, Om0={self.Om0}")

@@ -153,7 +153,7 @@ class GWCatalog:
     # ---- darksirens export (Jacobian lives here, and only here) ----------
     def _to_darksirens_format(self, out_path, compact_type="BBH", nsamp=4096,
                               far_max=None, pastro_min=None, z_max=None,
-                              seed=0, replace="auto", cosmology=None):
+                              seed=0, replace="auto", cosmology=None, amax=0.99):
         """Write an HDF5 consumable by darksirens.gw.utils.load_gw_samples.
 
         p_pe convention
@@ -258,6 +258,14 @@ class GWCatalog:
         data = {k: np.concatenate(v) if v else np.array([])
                 for k, v in cols.items()}
 
+        # Apply 1-D chi_eff prior to p_pe
+        if data["chieff"].size > 0:
+            from .spin import chi_eff_prior_logprob
+            logp_chi = chi_eff_prior_logprob(data["chieff"], data["m1src"],
+                                             data["m2src"], amax=amax)
+            safe_logp = np.clip(logp_chi, a_min=-50.0, a_max=None)
+            data["p_pe"] = data["p_pe"] * np.exp(safe_logp)
+
         # Sanity check
         expected = nobs * nsamp
         assert data["m1det"].size == expected, \
@@ -272,7 +280,8 @@ class GWCatalog:
             f.attrs["format_version"] = "gwcat-1.0"
             f.attrs["compact_type"] = compact_type
             f.attrs["mass_prior_basis"] = "uniform_detector_frame"
-            f.attrs["chi_eff_in_p_pe"] = False  # loader must add chi_eff prior
+            f.attrs["chi_eff_in_p_pe"] = True
+            f.attrs["chi_eff_amax"] = float(amax)
             f.attrs["pe_cosmology_H0"] = pe_H0
             f.attrs["pe_cosmology_Om0"] = pe_Om0
             f.attrs.create("event_names",
@@ -371,9 +380,23 @@ def validate_export(gw_path: str, selection_path: str = None, strict: bool = Fal
 
         if "p_pe" in f:
             p = np.array(f["p_pe"])
-            _check("pe_p_pe_finite", np.all(np.isfinite(p)))
-            _check("pe_p_pe_positive", np.all(p > 0),
-                   f"min={p.min():.3e}")
+            if p.size > 0:
+                _check("pe_p_pe_finite", np.all(np.isfinite(p)))
+                _check("pe_p_pe_nonneg", np.all(p >= 0),
+                       f"min={p.min():.3e}")
+                n_zero = int(np.sum(p == 0))
+                if n_zero > 0:
+                    pct = 100 * n_zero / p.size
+                    print(f"  NOTE: {n_zero} ({pct:.1f}%) p_pe samples are zero "
+                          f"(expected at distance-prior tails)")
+                # Check no event is entirely zero-weight
+                p_ev = p.reshape(nobs, nsamp) if nobs > 0 and nsamp > 0 else p
+                if p_ev.ndim == 2:
+                    all_zero_events = np.sum(p_ev, axis=1) == 0
+                    _check("pe_no_allzero_events", not np.any(all_zero_events),
+                           f"{int(all_zero_events.sum())} event(s) have ALL p_pe=0")
+            else:
+                _check("pe_p_pe_nonempty", False, "p_pe is empty")
 
         if "m1src" in f and "m1det" in f:
             _check("pe_m1src_le_m1det",
@@ -397,9 +420,12 @@ def validate_export(gw_path: str, selection_path: str = None, strict: bool = Fal
             if "pdraw" in f:
                 pd = np.array(f["pdraw"])
                 _check("sel_pdraw_length", pd.shape[0] == n_det)
-                _check("sel_pdraw_finite", np.all(np.isfinite(pd)))
-                _check("sel_pdraw_positive", np.all(pd > 0),
-                       f"min={pd.min():.3e}")
+                if pd.size > 0:
+                    _check("sel_pdraw_finite", np.all(np.isfinite(pd)))
+                    _check("sel_pdraw_positive", np.all(pd > 0),
+                           f"min={pd.min():.3e}")
+                else:
+                    _check("sel_pdraw_nonempty", False, "pdraw is empty")
 
         # Cross-check cosmology
         with h5py.File(gw_path, "r") as fg, h5py.File(selection_path, "r") as fs:

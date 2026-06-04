@@ -13,8 +13,8 @@ GWCatalog._to_darksirens_format; the store stays mass-prior-agnostic.
 """
 __version__ = "0.1.0"
 
-from .catalog import GWCatalog
-from .ingest import build_store, inspect, IngestConfig, DEFAULT_PARAMS
+from .catalog import GWCatalog, validate_export
+from .ingest import build_store, merge_store, inspect, IngestConfig, DEFAULT_PARAMS
 from .selection import SelectionSet
 
 # fetch has optional deps (requests, tqdm); import lazily
@@ -29,7 +29,9 @@ def fetch_catalog(*args, **kwargs):
     return _fc(*args, **kwargs)
 
 __all__ = [
-    "GWCatalog", "build_store", "inspect", "IngestConfig", "DEFAULT_PARAMS",
+    "GWCatalog", "SelectionSet",
+    "build_store", "merge_store", "inspect", "IngestConfig", "DEFAULT_PARAMS",
+    "validate_export",
     "fetch_and_build", "fetch_catalog",
     "__version__",
 ]
