@@ -153,10 +153,14 @@ def _is_injection_hdf(fn: str) -> bool:
 
 
 def _is_o3_bbhpop_full(fn: str) -> bool:
-    """Select only the full-O3 BBH injection file (not O3a/O3b splits)."""
+    """Select only the full-O3 BBH injection file (not O3a/O3b GPS-time splits).
+
+    Full file:       endo3_bbhpop-LIGO-T2100113-v12.hdf5           (3 dashes)
+    GPS-split files: endo3_bbhpop-LIGO-T2100113-v12-<gps>-<dur>.hdf5 (5 dashes)
+    """
     return (fn.startswith("endo3_bbhpop")
             and fn.endswith(".hdf5")
-            and fn.count("-") == 2)  # no GPS-time splits in filename
+            and fn.count("-") == 3)  # exactly: endo3_bbhpop-LIGO-T2100113-v12
 
 
 INJECTION_RELEASES: Dict[str, ReleaseInfo] = {
@@ -498,80 +502,6 @@ def fetch_event_table_gwosc(
         url = data.get("links", {}).get("next")
 
     return table
-
-
-def fetch_bbh_names_gwosc(
-    m2_min: float = 3.0,
-    timeout: int = 30,
-    verbose: bool = True,
-) -> list:
-    """Fetch the canonical BBH event name list from the GWOSC v2 API.
-
-    Queries the GWOSC /api/v2/event-versions endpoint for all events that have
-    PE results (i.e. chirp_mass_source is present) and whose secondary mass
-    m2_source > m2_min (default 3.0 Msun), which is the standard threshold
-    used in GWTC papers to classify an event as BBH rather than NSBH or BNS.
-
-    This automatically covers all releases the GWOSC API knows about —
-    currently GWTC-1 through GWTC-4.0, and GWTC-5.0 once GWOSC updates their
-    database (expected within weeks of the May 2026 paper release).
-
-    Parameters
-    ----------
-    m2_min : float
-        Minimum secondary source-frame mass in Msun. 3.0 is the LVK standard
-        NS/BH boundary used in GWTC-4/5 population papers.
-    timeout : int
-        HTTP timeout per request in seconds.
-    verbose : bool
-        Print progress.
-
-    Returns
-    -------
-    list of str
-        Sorted event names, e.g. ["GW150914", "GW151012", ...].
-
-    Notes
-    -----
-    - Events without PE (search-only, no chirp_mass_source) are automatically
-      excluded since the mass filter only applies to events with mass parameters.
-    - The GWOSC API is paginated; this function follows all pages.
-    - Safe to call with no internet: raises URLError; caller should fall back to
-      the static BBH_ALL list in gwcat.bbh_allowed_names.
-    """
-    base = "https://gwosc.org/api/v2/event-versions"
-    params = f"lastver=true&min-mass-2-source={m2_min}&include-default-parameters=true&pagesize=100"
-    url = f"{base}?{params}"
-
-    names = []
-    page = 1
-    while url:
-        req = Request(url, headers={"Accept": "application/json"})
-        with urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode())
-
-        results = data.get("results", [])
-        n_total = data.get("results_count", "?")
-        if verbose and page == 1:
-            print(f"GWOSC BBH query: {n_total} total events with m2_source > {m2_min} Msun")
-
-        for ev in results:
-            name = ev.get("name", "")
-            if name:
-                names.append(name)
-
-        # Follow pagination
-        next_url = data.get("next")
-        if next_url:
-            # next_url is wrapped in angle brackets in some responses
-            next_url = next_url.strip("<>")
-        url = next_url
-        page += 1
-
-    names = sorted(set(names))
-    if verbose:
-        print(f"  → {len(names)} BBH events with PE (m2_source > {m2_min} Msun)")
-    return names
 
 
 # ---------------------------------------------------------------------------
