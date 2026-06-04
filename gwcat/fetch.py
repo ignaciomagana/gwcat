@@ -152,6 +152,13 @@ def _is_injection_hdf(fn: str) -> bool:
     return True
 
 
+def _is_o3_bbhpop_full(fn: str) -> bool:
+    """Select only the full-O3 BBH injection file (not O3a/O3b splits)."""
+    return (fn.startswith("endo3_bbhpop")
+            and fn.endswith(".hdf5")
+            and fn.count("-") == 2)  # no GPS-time splits in filename
+
+
 INJECTION_RELEASES: Dict[str, ReleaseInfo] = {
     "injections-O1O2O3O4": ReleaseInfo(
         record_ids=[19500052],
@@ -166,6 +173,13 @@ INJECTION_RELEASES: Dict[str, ReleaseInfo] = {
         file_filter=_is_injection_hdf,
         description="O4a+O4b-only search sensitivity (GWTC-5.0)",
         observing_run="O4a+O4b",
+    ),
+    "injections-O3-BBH": ReleaseInfo(
+        record_ids=[7890437],
+        concept_ids=[None],
+        file_filter=_is_o3_bbhpop_full,
+        description="O3 BBH search sensitivity (GWTC-3, full O1+O2+O3)",
+        observing_run="O1+O2+O3",
     ),
 }
 

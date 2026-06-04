@@ -19,7 +19,8 @@ For sky-area computation at ingest (optional): `pip install healpy`
 ## End-to-end: PE samples + selection function → darksirens
 
 ```python
-from gwcat import GWCatalog, SelectionSet, build_store, validate_export
+from gwcat import GWCatalog, SelectionSet, CombinedSelectionSet
+from gwcat import build_store, validate_export
 from gwcat.fetch import fetch_catalog
 
 # ── 1. Download PE files from Zenodo ─────────────────────────
@@ -29,8 +30,8 @@ paths_41 = fetch_catalog("GWTC-4.1")
 paths_5  = fetch_catalog("GWTC-5")       # fetches Part 1 + Part 2
 
 # ── 2. Download injection files ──────────────────────────────
-inj_paths = fetch_catalog("injections-O1O2O3O4",
-                          data_dir="./injections")
+fetch_catalog("injections-O3-BBH", data_dir="./injections")   # O1+O2+O3 BBH
+fetch_catalog("injections-O4ab",   data_dir="./injections")   # O4a+O4b
 
 # ── 3. Ingest PE files into the store ────────────────────────
 all_pe = paths_21 + paths_3 + paths_41 + paths_5
@@ -54,9 +55,11 @@ bbh._to_darksirens_format(
     seed=0,
 )
 
-# ── 6. Export selection function for darksirens ──────────────
-sel = SelectionSet("injections/injections-O1O2O3O4/mixture-real_o3_o4a_o4b-cartesian_spins_20260410130052UTC-clipped.hdf")
-sel.to_darksirens("selection_bbh.h5", far_threshold=1.0)
+# ── 6. Export combined selection function ─────────────────────
+sel_o3 = SelectionSet("injections/injections-O3-BBH/endo3_bbhpop-LIGO-T2100113-v12.hdf5")
+sel_o4 = SelectionSet("injections/injections-O4ab/mixture-real_o4a_o4b-cartesian_spins.hdf")
+combined = CombinedSelectionSet([sel_o3, sel_o4])
+combined.to_darksirens("selection_bbh.h5", far_threshold=1.0)
 
 # ── 7. Validate before running darksirens ────────────────────
 validate_export("gw_bbh.h5", "selection_bbh.h5")
@@ -83,8 +86,9 @@ merge_store("store.h5", new_paths)   # duplicates auto-skipped, FAR auto-fetched
 ```bash
 gwcat-fetch --out store.h5                            # download all PE + build (FAR auto-fetched)
 gwcat-fetch --out store.h5 --no-event-table           # skip GWOSC FAR/p_astro fetch
-gwcat-fetch --catalog injections-O1O2O3O4             # download injection sets
-gwcat-fetch --catalog all                             # PE + injections
+gwcat-fetch --catalog injections-O3-BBH               # O3 BBH injection set
+gwcat-fetch --catalog injections-O4ab                  # O4a+b injection set
+gwcat-fetch --catalog all                             # PE + all injection sets
 gwcat-fetch --catalog GWTC-5 --dry-run                # preview files
 gwcat-fetch --no-resolve                              # skip concept DOI resolution
 ```
@@ -121,16 +125,27 @@ m1s, m2s = bbh.source_masses(cosmology=(67.74, 0.3089))
 
 ### `SelectionSet` — injection processing
 
-Only the modern `events/` format is supported, which covers all current LVK
-releases including the cumulative O1–O4b set (Zenodo 19500052).  The legacy O3
-`injections/` format is superseded and will raise a clear error pointing to the
-correct files.
+Reads both LVK injection formats:
+- **`events/` format** (O4 sets, Zenodo 19500064): modern format with log-joint draw PDF
+- **`injections/` format** (O3 BBH, Zenodo 7890437): legacy format with factored draw PDF components
 
 ```python
 sel = SelectionSet("injection_file.hdf", H0=67.74, Om0=0.3089)
 sel.n_injections                                  # total in file
 sel.detection_efficiency(far_threshold=1.0)        # fraction detected
 sel.to_darksirens("selection.h5", far_threshold=1.0)
+```
+
+### `CombinedSelectionSet` — multi-campaign combination
+
+Combines injection sets from different observing runs following
+Essick et al. (2023), with proper ndraw reweighting:
+
+```python
+sel_o3 = SelectionSet("endo3_bbhpop-LIGO-T2100113-v12.hdf5")
+sel_o4 = SelectionSet("injections-O4ab/...-cartesian_spins_*.hdf")
+combined = CombinedSelectionSet([sel_o3, sel_o4])
+combined.to_darksirens("selection_bbh.h5", far_threshold=1.0)
 ```
 
 ### `validate_export` — pre-flight checks
@@ -164,8 +179,9 @@ fetch_catalog("GWTC-2.1")                        # → ./GWTC/GWTC-2p1/
 fetch_catalog("GWTC-5")                           # both Part 1 + Part 2
 
 # Injection sets
-fetch_catalog("injections-O1O2O3O4")              # cumulative O1–O4b
-fetch_catalog("injections-O4ab")                   # O4a+b only
+fetch_catalog("injections-O3-BBH")                # O1+O2+O3 BBH (Zenodo 7890437)
+fetch_catalog("injections-O4ab")                   # O4a+b (Zenodo 19500064)
+fetch_catalog("injections-O1O2O3O4")              # cumulative O1–O4b (Zenodo 19500052)
 ```
 
 ## Zenodo records
@@ -184,11 +200,14 @@ fetch_catalog("injections-O4ab")                   # O4a+b only
 
 | Name | Record | Run |
 |------|--------|-----|
-| injections-O1O2O3O4 | [19500052](https://zenodo.org/records/19500052) | O1–O4b cumulative |
+| injections-O3-BBH    | [7890437](https://zenodo.org/records/7890437)   | O1+O2+O3 BBH only |
 | injections-O4ab      | [19500064](https://zenodo.org/records/19500064) | O4a+b only |
+| injections-O1O2O3O4  | [19500052](https://zenodo.org/records/19500052) | O1–O4b cumulative |
 
-The cumulative record contains cartesian-spin and polar-spin variants.
-`SelectionSet` reads the cartesian files (`*-cartesian_spins_*.hdf`).
+For dark-siren cosmology, use `injections-O3-BBH` + `injections-O4ab` combined
+via `CombinedSelectionSet`.  The cumulative record (O1O2O3O4) mixes
+semi-analytical O1+O2 estimates (no sky location / FAR) with proper O3+O4
+injections, making it harder to combine consistently.
 
 ## darksirens integration
 
@@ -202,9 +221,11 @@ gwcat                             darksirens
    │   + redshift, m1src, m2src      normalise per event
    │   + PE cosmology metadata       ↓ use PE cosmology
    │                                  │
-   ├─ SelectionSet.to_darksirens()─→  load_selection_samples()
-   │   pdraw in (m1det,q,dL)         × p_chieff (gwdistributions)
-   │   6D spin removed               no format branching
+   ├─ CombinedSelectionSet       ─→  load_selection_samples()
+   │   .to_darksirens()              × p_chieff (gwdistributions)
+   │   O3 + O4 campaigns            no format branching
+   │   Essick et al. reweighting     │
+   │   6D spin removed               │
    │   Jacobian + time applied        │
    │   FAR cut applied                │
    │                                  ▼
@@ -218,10 +239,6 @@ gwdistributions).  gwcat stays spin-prior-agnostic.
 
 Source-frame masses and the PE cosmology travel with both export files, so
 darksirens never hardcodes a cosmology for the dL→z conversion.
-
-The legacy O3 `injections/` format is no longer supported in either package.
-Use the cumulative GWTC-5 injection files (Zenodo 19500052) which cover
-O1–O4b in the modern `events/` format.
 
 ## Design
 

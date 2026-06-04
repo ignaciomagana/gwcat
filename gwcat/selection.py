@@ -1,25 +1,38 @@
 """Selection function processing for LVK injection sets.
 
-Reads the modern LVK injection format ('events/' group), which is used by
-ALL current releases including the cumulative O1–O4b set (Zenodo 19500052).
-The legacy O3-only 'injections/' format (Zenodo 7890437) is superseded and
-not supported — use the cumulative files instead.
+Supports two injection formats:
 
-Processing pipeline:
-  1. Read source-frame masses, spins, sky position from 'events/' group
+  * Modern 'events/' format (O4 sets, Zenodo 19500064 / 19500052)
+  * Legacy 'injections/' format (O3 BBH, Zenodo 7890437)
+
+Both formats go through the same processing pipeline:
+  1. Read source-frame masses, spins, sky position
   2. Compute detector-frame masses, chi_eff, redshift
-  3. Divide out the analytical 6-D spin prior from the draw PDF
+  3. Remove the spin component from the draw PDF
   4. Apply (m1src,m2src,z) → (m1det,q,dL) coordinate Jacobian
   5. Normalise by observing time and injection weights
   6. Apply FAR-based detection cut
+
+CombinedSelectionSet merges multiple campaigns (e.g. O3 + O4ab) following
+the multi-campaign VT estimator in Essick et al. (2023):
+  ndraw = N_O3 + N_O4
+  pdraw_i *= N_k / ndraw  for injection i from campaign k
 
 The 1-D chi_eff spin-prior swap is NOT applied here — darksirens handles it
 via gwdistributions.  This keeps gwcat spin-prior-agnostic.
 
 Usage:
-    from gwcat.selection import SelectionSet
+    from gwcat.selection import SelectionSet, CombinedSelectionSet
+
+    # Single campaign
     sel = SelectionSet("injection_file.hdf")
-    sel.to_darksirens("selection_out.h5", far_threshold=1.0)
+    sel.to_darksirens("selection.h5", far_threshold=1.0)
+
+    # Combined O3 + O4
+    sel_o3 = SelectionSet("endo3_bbhpop-...-v12.hdf5")
+    sel_o4 = SelectionSet("injections-O4ab/...-cartesian_spins_*.hdf")
+    combined = CombinedSelectionSet([sel_o3, sel_o4])
+    combined.to_darksirens("selection_bbh.h5", far_threshold=1.0)
 """
 from __future__ import annotations
 
@@ -70,16 +83,11 @@ class SelectionSet:
             if "events" in f:
                 self._read_events(f)
             elif "injections" in f:
-                raise RuntimeError(
-                    f"{self.path} uses the legacy O3 'injections/' format. "
-                    "This format is superseded by the cumulative GWTC-5 "
-                    "injection sets (Zenodo 19500052 / 19500064) which cover "
-                    "O1–O4b in the modern 'events/' format. Use those instead."
-                )
+                self._read_injections(f)
             else:
                 raise RuntimeError(
                     f"Unrecognised injection format in {self.path}: "
-                    "expected 'events/' group."
+                    "expected 'events/' or 'injections/' group."
                 )
         self._loaded = True
 
@@ -198,6 +206,86 @@ class SelectionSet:
         self._ndraw = ndraw
         self._T_yr = T_yr
 
+    def _read_injections(self, f):
+        """Read the O3 'injections/' format (e.g. endo3_bbhpop files).
+
+        The O3 format stores the draw PDF in factored components, so we
+        multiply mass × redshift PDFs directly instead of dividing out an
+        analytical spin prior.  Detector-frame masses and redshift are also
+        stored, avoiding a cosmology inversion.
+        """
+        inj = f["injections"]
+
+        # Source-frame and detector-frame parameters (both stored directly)
+        m1src = np.asarray(inj["mass1_source"], float)
+        m2src = np.asarray(inj["mass2_source"], float)
+        m1det = np.asarray(inj["mass1"], float)
+        m2det = np.asarray(inj["mass2"], float)
+        dL = np.asarray(inj["distance"], float)
+        z = np.asarray(inj["redshift"], float)
+        ra = np.asarray(inj["right_ascension"], float)
+        dec = np.asarray(inj["declination"], float)
+
+        # chi_eff from z-components
+        s1z = np.asarray(inj["spin1z"], float)
+        s2z = np.asarray(inj["spin2z"], float)
+        chieff = (m1src * s1z + m2src * s2z) / (m1src + m2src)
+
+        # Spin-free draw PDF from factored components
+        p_mass = np.asarray(inj["mass1_source_mass2_source_sampling_pdf"], float)
+        p_z = np.asarray(inj["redshift_sampling_pdf"], float)
+        ln_pdraw_no_spin = np.log(np.maximum(p_mass * p_z, 1e-300))
+
+        # Jacobian: (m1src, m2src, z) → (m1det, q, dL)
+        ddL = _ddL_dz(z, dL, self.H0, self.Om0)
+        pdraw = np.exp(ln_pdraw_no_spin) * m1det / (1 + z) ** 2 / ddL
+
+        # Time normalisation
+        T_s = f.attrs.get("analysis_time_s",
+                          inj.attrs.get("analysis_time_s"))
+        if T_s is None:
+            raise RuntimeError(
+                f"No analysis_time_s attribute found in {self.path}")
+        T_yr = float(T_s) / (3600 * 24 * 365.25)
+        pdraw /= T_yr
+
+        # Injection weights (mixture_weight = 1.0 for single-subpop files)
+        if "mixture_weight" in inj:
+            pdraw /= np.asarray(inj["mixture_weight"], float)
+
+        ndraw = int(f.attrs.get("total_generated",
+                                inj.attrs.get("total_generated", 0)))
+
+        # FAR columns: O3 uses hardcoded names
+        fars_per_search = []
+        for col in ["far_gstlal", "far_pycbc_bbh", "far_pycbc_hyperbank",
+                     "far_mbta", "far_cwb"]:
+            if col in inj:
+                fars_per_search.append(np.asarray(inj[col], float))
+        # Also scan for any other *far* columns we might have missed
+        if not fars_per_search:
+            for key in inj:
+                if isinstance(key, str) and key.startswith("far_"):
+                    try:
+                        fars_per_search.append(np.asarray(inj[key], float))
+                    except Exception:
+                        pass
+        self._fars = np.column_stack(fars_per_search) if fars_per_search else None
+
+        # Store (same attributes as _read_events)
+        self._m1det = m1det
+        self._m2det = m2det
+        self._dL = dL
+        self._chieff = chieff
+        self._ra = ra
+        self._dec = dec
+        self._m1src = m1src
+        self._m2src = m2src
+        self._z = z
+        self._pdraw = pdraw
+        self._ndraw = ndraw
+        self._T_yr = T_yr
+
     # ------------------------------------------------------------------
     # Detection cut
     # ------------------------------------------------------------------
@@ -276,4 +364,163 @@ class SelectionSet:
 
         print(f"Wrote {out_path}: n_det={n_det}, ndraw={self._ndraw}, "
               f"FAR<{far_threshold}, H0={self.H0}, Om0={self.Om0}")
+        return out_path
+
+
+class CombinedSelectionSet:
+    """Combine injection sets from multiple observing campaigns.
+
+    Implements the multi-campaign VT estimator (Essick et al. 2023):
+    each campaign contributes its detected injections weighted by its
+    share of the total generated count, so the combined estimator is
+
+        ⟨VT⟩ = ⟨VT⟩_A + ⟨VT⟩_B = (1/N_total) Σ_det [Λ(θ) / pdraw(θ)]
+
+    where pdraw for injection i from campaign k is rescaled:
+
+        pdraw_combined_i = pdraw_k_i × (N_k / N_total)
+
+    Parameters
+    ----------
+    selection_sets : list of SelectionSet
+        One per observing campaign (e.g. O3 and O4ab).
+        All must use the same reference cosmology.
+
+    Usage
+    -----
+    >>> sel_o3 = SelectionSet("endo3_bbhpop-...-v12.hdf5")
+    >>> sel_o4 = SelectionSet("injections-O4ab/...-cartesian_spins_*.hdf")
+    >>> combined = CombinedSelectionSet([sel_o3, sel_o4])
+    >>> combined.to_darksirens("selection_bbh.h5", far_threshold=1.0)
+    """
+
+    def __init__(self, selection_sets):
+        if not selection_sets:
+            raise ValueError("Need at least one SelectionSet")
+        self._sets = list(selection_sets)
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+    @property
+    def n_campaigns(self) -> int:
+        return len(self._sets)
+
+    @property
+    def n_injections(self) -> int:
+        return sum(s.n_injections for s in self._sets)
+
+    def detection_efficiency(self, far_threshold: float = 1.0) -> float:
+        n_det = sum(int(s.detected_mask(far_threshold).sum()) for s in self._sets)
+        return n_det / self.n_injections
+
+    # ------------------------------------------------------------------
+    # Export
+    # ------------------------------------------------------------------
+    def to_darksirens(self, out_path: str, far_threshold: float = 1.0,
+                      amax: float = 0.99):
+        """Write a combined selection file for darksirens.
+
+        Parameters
+        ----------
+        out_path : str
+        far_threshold : float
+            FAR detection threshold in yr⁻¹, applied per campaign.
+        amax : float
+            Maximum spin magnitude for the chi_eff prior (default 0.99).
+        """
+        from .spin import chi_eff_prior_logprob
+
+        # Load all campaigns
+        for s in self._sets:
+            s._load()
+
+        # Cosmology consistency check
+        H0s = [s.H0 for s in self._sets]
+        Om0s = [s.Om0 for s in self._sets]
+        if max(H0s) - min(H0s) > 1.0 or max(Om0s) - min(Om0s) > 0.05:
+            warnings.warn(
+                f"Cosmology mismatch across campaigns: "
+                f"H0={H0s}, Om0={Om0s}. Results may be inconsistent."
+            )
+
+        # Combined ndraw for Essick et al. reweighting
+        ndraw_per = [s._ndraw for s in self._sets]
+        ndraw_total = sum(ndraw_per)
+
+        cols = {k: [] for k in ["m1det", "m2det", "dL", "chieff",
+                                "ra", "dec", "m1src", "m2src", "z", "pdraw"]}
+        n_det_total = 0
+        campaign_info = []
+
+        for k, s in enumerate(self._sets):
+            det = s.detected_mask(far_threshold)
+            n_det_k = int(det.sum())
+            if n_det_k == 0:
+                warnings.warn(
+                    f"Campaign {s.path}: no detected injections at "
+                    f"FAR < {far_threshold}")
+                continue
+
+            # Essick et al. reweighting: pdraw_i *= N_k / N_total
+            frac = ndraw_per[k] / ndraw_total
+            pdraw_k = s._pdraw[det] * frac
+
+            cols["m1det"].append(s._m1det[det])
+            cols["m2det"].append(s._m2det[det])
+            cols["dL"].append(s._dL[det])
+            cols["chieff"].append(s._chieff[det])
+            cols["ra"].append(s._ra[det])
+            cols["dec"].append(s._dec[det])
+            cols["m1src"].append(s._m1src[det])
+            cols["m2src"].append(s._m2src[det])
+            cols["z"].append(s._z[det])
+            cols["pdraw"].append(pdraw_k)
+            n_det_total += n_det_k
+            campaign_info.append(
+                f"{s.path}: N={ndraw_per[k]}, T={s._T_yr:.2f}yr, "
+                f"n_det={n_det_k}, frac={frac:.4f}")
+
+        if n_det_total == 0:
+            raise RuntimeError(
+                f"No detected injections across {len(self._sets)} campaigns "
+                f"at FAR < {far_threshold}")
+
+        # Concatenate
+        data = {k: np.concatenate(v) for k, v in cols.items()}
+
+        # Apply 1-D chi_eff prior swap
+        logp_chi = chi_eff_prior_logprob(
+            data["chieff"], data["m1src"], data["m2src"], amax=amax)
+        safe_logp = np.clip(logp_chi, a_min=-50.0, a_max=None)
+        data["pdraw"] *= np.exp(safe_logp)
+
+        # Write
+        with h5py.File(out_path, "w") as f:
+            f.attrs["format_version"] = "gwcat-selection-1.0"
+            f.attrs["ndraw"] = ndraw_total
+            f.attrs["T_obs_yr"] = float(sum(s._T_yr for s in self._sets))
+            f.attrs["far_threshold"] = float(far_threshold)
+            f.attrs["n_detected"] = n_det_total
+            f.attrs["cosmology_H0"] = float(self._sets[0].H0)
+            f.attrs["cosmology_Om0"] = float(self._sets[0].Om0)
+            f.attrs["chi_eff_swap_applied"] = True
+            f.attrs["chi_eff_amax"] = float(amax)
+            f.attrs["n_campaigns"] = len(self._sets)
+            f.attrs.create("campaign_ndraws",
+                           np.array(ndraw_per, dtype=np.int64))
+
+            for name, arr in [
+                ("m1det", data["m1det"]), ("m2det", data["m2det"]),
+                ("dL", data["dL"]), ("chieff", data["chieff"]),
+                ("ra", data["ra"]), ("dec", data["dec"]),
+                ("m1src", data["m1src"]), ("m2src", data["m2src"]),
+                ("redshift", data["z"]), ("pdraw", data["pdraw"]),
+            ]:
+                f.create_dataset(name, data=arr, compression="gzip")
+
+        for info in campaign_info:
+            print(f"  {info}")
+        print(f"Wrote {out_path}: n_det={n_det_total}, ndraw={ndraw_total}, "
+              f"FAR<{far_threshold}, campaigns={len(self._sets)}")
         return out_path
