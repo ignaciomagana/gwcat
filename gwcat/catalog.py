@@ -315,7 +315,8 @@ class GWCatalog:
             f.attrs["mock_data"] = False
             # --- Provenance (gwcat-specific) ---
             f.attrs["format_version"] = "gwcat-1.0"
-            f.attrs["compact_type"] = compact_type
+            f.attrs["compact_type"] = ("" if compact_type is None
+                                       else str(compact_type))
             f.attrs["mass_prior_basis"] = "uniform_detector_frame"
             f.attrs["chi_eff_in_p_pe"] = True
             f.attrs["chi_eff_amax"] = float(amax)

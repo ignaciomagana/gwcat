@@ -470,16 +470,21 @@ def fetch_and_build(
 
 _GWOSC_BBH_EXPECTED_NAMES = 259
 _GWOSC_KNOWN_NON_BBH = {
-    # O4a NSBH / mass-gap candidates explicitly excluded from BBH selections.
-    "GW230529_181500",
-    "GW230518_125908",
-    # O3 BNS / NSBH candidates that may appear in broad GWOSC queries.
+    # BNS / NSBH / mass-gap candidates that may appear in broad GWOSC
+    # mass-threshold queries. Keep this lower-level guard in sync with
+    # gwcat.bbh_allowed_names.NON_BBH_EXCLUSIONS so callers of
+    # fetch_bbh_names_gwosc() and fetch_bbh_list() get the same BBH selection.
+    "GW170817",
     "GW190425",
+    "GW190425_232155",
     "GW190426_152155",
     "GW190814",
     "GW190917_114630",
     "GW200105_162426",
     "GW200115_042309",
+    "GW230518_125908",
+    "GW230529_181500",
+    "GW240525_031210",
 }
 
 
