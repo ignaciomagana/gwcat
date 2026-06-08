@@ -46,10 +46,14 @@ class GWCatalog:
 
     def select(self, compact_type=None, far_max=None, pastro_min=None,
                snr_min=None, z_max=None, m1_src_range=None, m2_src_range=None,
-               sky_area_max=None, names=None, allowed_names=None):
+               sky_area_max=None, names=None, allowed_names=None,
+               allowed_names_authoritative=True):
         m = np.ones(len(self.names), dtype=bool)
         if compact_type is not None:
-            m &= (self.meta["compact_type"] == compact_type)
+            apply_compact_type = (allowed_names is None or
+                                  not allowed_names_authoritative)
+            if apply_compact_type:
+                m &= (self.meta["compact_type"] == compact_type)
         if far_max is not None:
             far = self.meta["far"]
             m &= np.where(np.isnan(far), False, far <= far_max)
@@ -78,6 +82,19 @@ class GWCatalog:
                     f"allowed_names: {len(missing)} name(s) not found in store "
                     f"and will be skipped: {sorted(missing)}"
                 )
+            if compact_type is not None and allowed_names is not None:
+                present = np.isin(self.names, _whitelist_arr)
+                dropped = self.names[present &
+                                     (self.meta["compact_type"] != compact_type)]
+                if len(dropped):
+                    action = ("will not be dropped because allowed_names is "
+                              "authoritative" if allowed_names_authoritative
+                              else "will be dropped")
+                    warnings.warn(
+                        f"compact_type={compact_type!r} excludes {len(dropped)} "
+                        f"allowed_names event(s); they {action}: "
+                        f"{sorted(dropped.tolist())}"
+                    )
             m &= np.isin(self.names, _whitelist_arr)
         sel = np.nonzero(m & np.isin(np.arange(len(self.names)), self._sel))[0]
         if (far_max is not None or pastro_min is not None):
@@ -160,10 +177,11 @@ class GWCatalog:
         return d["mass_1"] / (1 + z), d["mass_2"] / (1 + z)
 
     # ---- darksirens export (Jacobian lives here, and only here) ----------
-    def _to_darksirens_format(self, out_path, compact_type="BBH", nsamp=4096,
+    def _to_darksirens_format(self, out_path, compact_type=None, nsamp=4096,
                               far_max=None, pastro_min=None, z_max=None,
                               seed=0, replace="auto", cosmology=None, amax=0.99,
-                              allowed_names=None):
+                              allowed_names=None,
+                              allowed_names_authoritative=True):
         """Write an HDF5 consumable by darksirens.gw.utils.load_gw_samples.
 
         p_pe convention
@@ -187,9 +205,18 @@ class GWCatalog:
         z_max : float or None
             Per-sample redshift cut.  Samples above z_max are dropped BEFORE
             resampling to nsamp.  Requires cosmology or stored redshift.
+        compact_type : str or None
+            Optional metadata compact-type cut.  The default None means no
+            derived compact-type gate is applied; use compact_type="BBH" only
+            when that additional metadata cut is desired.
+        allowed_names_authoritative : bool
+            If True, allowed_names is treated as authoritative and compact_type
+            is not applied as an additional gate.  A warning is still emitted
+            when compact_type would exclude allowed names.
         """
         sub = self.select(compact_type=compact_type, far_max=far_max,
-                          pastro_min=pastro_min, allowed_names=allowed_names)
+                          pastro_min=pastro_min, allowed_names=allowed_names,
+                          allowed_names_authoritative=allowed_names_authoritative)
         need = ["mass_1", "mass_2", "luminosity_distance", "ra", "dec",
                 "chi_eff", "p_dL_pe"]
         per = sub.get(need, per_event=True)
