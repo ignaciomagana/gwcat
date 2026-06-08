@@ -40,7 +40,42 @@ import warnings
 import numpy as np
 import h5py
 
-from .cosmology import make_cosmology, z_of_dL, PLANCK15
+from .cosmology import PLANCK15
+
+
+def _h5_field_names(table):
+    """Return available column names for an HDF group or compound dataset."""
+    if isinstance(table, h5py.Dataset) and table.dtype.names is not None:
+        return set(table.dtype.names)
+    return set(table.keys())
+
+
+def _h5_has_field(table, name):
+    """Whether an HDF group or compound dataset has a column/field."""
+    return name in _h5_field_names(table)
+
+
+def _h5_read_field(table, name, dtype=float):
+    """Read one column from an HDF group or compound dataset."""
+    if not _h5_has_field(table, name):
+        available = sorted(_h5_field_names(table))
+        raise KeyError(
+            f"Field {name!r} not found. Available fields include: "
+            f"{available[:30]}{' ...' if len(available) > 30 else ''}"
+        )
+    return np.asarray(table[name], dtype)
+
+
+def _h5_first_field(table, names, dtype=float):
+    """Read the first available column from a list of aliases."""
+    for name in names:
+        if _h5_has_field(table, name):
+            return _h5_read_field(table, name, dtype), name
+    available = sorted(_h5_field_names(table))
+    raise KeyError(
+        f"None of the fields {names!r} found. Available fields include: "
+        f"{available[:30]}{' ...' if len(available) > 30 else ''}"
+    )
 
 
 def _ddL_dz(z, dL_mpc, H0, Om0):
@@ -92,71 +127,122 @@ class SelectionSet:
         self._loaded = True
 
     def _read_events(self, f):
-        """Read the 'events/' format (used by all current LVK injection sets)."""
+        """Read the O4 ``events`` format.
+
+        The O4 Zenodo files store ``events`` as a single compound HDF5
+        dataset, while some downstream/older files expose the same columns as
+        datasets in an ``events/`` group.  Support both layouts here.
+        """
         ev = f["events"]
 
-        # Source-frame parameters
-        m1src = np.asarray(ev["mass1_source"], float)
-        m2src = np.asarray(ev["mass2_source"], float)
-        dL = np.asarray(ev["luminosity_distance"], float)
-        ra = np.asarray(ev["right_ascension"], float)
-        dec = np.asarray(ev["declination"], float)
+        # Source-frame parameters.  The O4 release also stores detector-frame
+        # masses and redshift directly; use them when present so that we do not
+        # introduce small differences by re-inverting dL with our cosmology.
+        m1src = _h5_read_field(ev, "mass1_source")
+        m2src = _h5_read_field(ev, "mass2_source")
+        dL = _h5_read_field(ev, "luminosity_distance")
+        ra = _h5_read_field(ev, "right_ascension")
+        dec = _h5_read_field(ev, "declination")
 
-        # Spin components (cartesian)
-        s1x = np.asarray(ev["spin1x"], float)
-        s1y = np.asarray(ev["spin1y"], float)
-        s1z = np.asarray(ev["spin1z"], float)
-        s2x = np.asarray(ev["spin2x"], float)
-        s2y = np.asarray(ev["spin2y"], float)
-        s2z = np.asarray(ev["spin2z"], float)
+        z, _ = _h5_first_field(ev, ["z", "redshift"])
+        if _h5_has_field(ev, "mass1_detector"):
+            m1det = _h5_read_field(ev, "mass1_detector")
+        else:
+            m1det = m1src * (1 + z)
+        if _h5_has_field(ev, "mass2_detector"):
+            m2det = _h5_read_field(ev, "mass2_detector")
+        else:
+            m2det = m2src * (1 + z)
 
-        # Derived
-        chieff = (m1src * s1z + m2src * s2z) / (m1src + m2src)
-        cosmo = make_cosmology(self.H0, self.Om0)
-        z = z_of_dL(dL, cosmo)
-        m1det = m1src * (1 + z)
-        m2det = m2src * (1 + z)
+        # Spin components (cartesian) and chi_eff.  Prefer the release-provided
+        # chi_eff if available, otherwise derive it from the z-components.
+        s1x = _h5_read_field(ev, "spin1x")
+        s1y = _h5_read_field(ev, "spin1y")
+        s1z = _h5_read_field(ev, "spin1z")
+        s2x = _h5_read_field(ev, "spin2x")
+        s2y = _h5_read_field(ev, "spin2y")
+        s2z = _h5_read_field(ev, "spin2z")
+        if _h5_has_field(ev, "chi_eff"):
+            chieff = _h5_read_field(ev, "chi_eff")
+        else:
+            chieff = (m1src * s1z + m2src * s2z) / (m1src + m2src)
 
-        # Injection weights
-        weights = np.asarray(ev["weights"], float)
+        weights = _h5_read_field(ev, "weights")
 
-        # Joint log-draw PDF (9-D: m1src, m2src, z, 6 spin components)
-        ln_pdraw_joint = np.asarray(
-            ev["lnpdraw_mass1_source_mass2_source_redshift_"
-               "spin1x_spin1y_spin1z_spin2x_spin2y_spin2z"], float)
+        # Draw probability in source-frame component masses and redshift, with
+        # spins removed.  Older/current-development O4 files may contain a
+        # single joint log-density over masses, redshift, and cartesian spins;
+        # the public O4ab clipped release instead stores factored log-density
+        # columns, including spin magnitudes/angles.  In the factored case we
+        # simply omit all spin terms so darksirens can apply its chi_eff prior.
+        joint_cart = (
+            "lnpdraw_mass1_source_mass2_source_redshift_"
+            "spin1x_spin1y_spin1z_spin2x_spin2y_spin2z"
+        )
+        joint_no_spin_names = [
+            "lnpdraw_mass1_source_mass2_source_redshift",
+            "lnpdraw_mass1_source_mass2_source_z",
+        ]
+        if _h5_has_field(ev, joint_cart):
+            ln_pdraw_joint = _h5_read_field(ev, joint_cart)
 
-        # Analytical 6-D isotropic spin prior:
-        #   p(s1x,s1y,s1z,s2x,s2y,s2z) = 1 / (16 pi^2 a1^2 a2^2 amax^2)
-        # where ai = |si|.  Divide this out so darksirens can replace it
-        # with the 1-D chi_eff marginal.
-        a1 = np.sqrt(s1x ** 2 + s1y ** 2 + s1z ** 2)
-        a2 = np.sqrt(s2x ** 2 + s2y ** 2 + s2z ** 2)
-        amax = 0.99
-        # Guard against a1 or a2 = 0 (vanishing spin magnitude)
-        a1 = np.maximum(a1, 1e-30)
-        a2 = np.maximum(a2, 1e-30)
-        ln_pdraw_spin6d = -np.log(16.0 * np.pi ** 2 * a1 ** 2 * a2 ** 2 * amax ** 2)
-
-        # Remove 6-D spin; do NOT add 1-D chi_eff (darksirens does that)
-        ln_pdraw_no_spin = ln_pdraw_joint - ln_pdraw_spin6d
+            # Analytical 6-D isotropic cartesian spin prior:
+            #   p(s1x,s1y,s1z,s2x,s2y,s2z)
+            #     = 1 / (16 pi^2 a1^2 a2^2 amax^2)
+            # where ai = |si|.  Divide this out so darksirens can replace it
+            # with the 1-D chi_eff marginal.
+            a1 = np.sqrt(s1x ** 2 + s1y ** 2 + s1z ** 2)
+            a2 = np.sqrt(s2x ** 2 + s2y ** 2 + s2z ** 2)
+            amax = 0.99
+            a1 = np.maximum(a1, 1e-30)
+            a2 = np.maximum(a2, 1e-30)
+            ln_pdraw_spin6d = -np.log(
+                16.0 * np.pi ** 2 * a1 ** 2 * a2 ** 2 * amax ** 2)
+            ln_pdraw_no_spin = ln_pdraw_joint - ln_pdraw_spin6d
+        elif any(_h5_has_field(ev, name) for name in joint_no_spin_names):
+            ln_pdraw_no_spin, _ = _h5_first_field(ev, joint_no_spin_names)
+        elif (_h5_has_field(ev, "lnpdraw_mass1_source")
+              and _h5_has_field(ev, "lnpdraw_mass2_source_GIVEN_mass1_source")
+              and (_h5_has_field(ev, "lnpdraw_z")
+                   or _h5_has_field(ev, "lnpdraw_redshift"))):
+            ln_pdraw_z, _ = _h5_first_field(
+                ev, ["lnpdraw_z", "lnpdraw_redshift"])
+            ln_pdraw_no_spin = (
+                _h5_read_field(ev, "lnpdraw_mass1_source")
+                + _h5_read_field(ev, "lnpdraw_mass2_source_GIVEN_mass1_source")
+                + ln_pdraw_z
+            )
+        else:
+            lnp_fields = sorted(
+                name for name in _h5_field_names(ev) if name.startswith("lnpdraw"))
+            raise RuntimeError(
+                "Could not construct the spin-free O4 draw PDF. Expected either "
+                f"{joint_cart!r}, one of {joint_no_spin_names!r}, or the "
+                "factored public O4 fields "
+                "'lnpdraw_mass1_source', "
+                "'lnpdraw_mass2_source_GIVEN_mass1_source', and "
+                "'lnpdraw_z'/'lnpdraw_redshift'. Available lnpdraw fields: "
+                f"{lnp_fields}")
 
         # Coordinate Jacobian: (m1src, m2src, z) → (m1det, q, dL)
         #   |J| = m1det / (1+z)^2 / (ddL/dz)
-        ddL = _ddL_dz(z, dL, self.H0, self.Om0)
+        if _h5_has_field(ev, "dluminosity_distance_dredshift"):
+            ddL = _h5_read_field(ev, "dluminosity_distance_dredshift")
+        else:
+            ddL = _ddL_dz(z, dL, self.H0, self.Om0)
         pdraw = np.exp(ln_pdraw_no_spin) * m1det / (1 + z) ** 2 / ddL
 
-        # Time normalisation
+        # Time normalisation and mixture/month weights.  The O4 examples keep
+        # weights in the numerator of importance-sampling sums; equivalently,
+        # divide the stored draw density by weights.
         T_yr = f.attrs["total_analysis_time"] / (3600 * 24 * 365.25)
         pdraw /= T_yr
-
-        # Injection weights (reweighting factor for non-uniform draw campaigns)
         pdraw /= weights
 
         ndraw = int(f.attrs["total_generated"])
 
-        # FAR: discover search pipelines from the file
-        # f.attrs["searches"] lists pipeline names; each has a "{name}_far" dataset
-        # Handle the many ways h5py can encode string arrays in attrs
+        # FAR: discover search pipelines from the file, and handle both O4
+        # names (e.g. "pycbc_far", "cwb-bbh_far") and older names.
         try:
             raw = f.attrs["searches"]
             if isinstance(raw, np.ndarray):
@@ -174,20 +260,19 @@ class SelectionSet:
         except Exception:
             search_list = []
 
-        # Collect FAR columns: try each search name, also scan for any *_far datasets
         fars_per_search = []
         for s in search_list:
-            col = s + "_far"
-            try:
-                fars_per_search.append(np.asarray(ev[col], float))
-            except KeyError:
-                pass
-        # Fallback: if searches attr was unreliable, scan for *_far datasets
+            for col in (s + "_far", "far_" + s):
+                if _h5_has_field(ev, col):
+                    fars_per_search.append(_h5_read_field(ev, col))
+                    break
         if not fars_per_search:
-            for key in ev:
-                if isinstance(key, str) and key.endswith("_far"):
+            for key in _h5_field_names(ev):
+                if (isinstance(key, str)
+                        and (key.endswith("_far")
+                             or key.startswith("far_"))):
                     try:
-                        fars_per_search.append(np.asarray(ev[key], float))
+                        fars_per_search.append(_h5_read_field(ev, key))
                     except Exception:
                         pass
         self._fars = np.column_stack(fars_per_search) if fars_per_search else None
