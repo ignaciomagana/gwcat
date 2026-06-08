@@ -46,7 +46,7 @@ class GWCatalog:
 
     def select(self, compact_type=None, far_max=None, pastro_min=None,
                snr_min=None, z_max=None, m1_src_range=None, m2_src_range=None,
-               sky_area_max=None, names=None):
+               sky_area_max=None, names=None, allowed_names=None):
         m = np.ones(len(self.names), dtype=bool)
         if compact_type is not None:
             m &= (self.meta["compact_type"] == compact_type)
@@ -68,8 +68,17 @@ class GWCatalog:
         if sky_area_max is not None and "sky_area_90" in self.meta:
             sa = self.meta["sky_area_90"]
             m &= np.where(np.isnan(sa), False, sa <= sky_area_max)
-        if names is not None:
-            m &= np.isin(self.names, np.asarray(names))
+        _whitelist = allowed_names if allowed_names is not None else names
+        if _whitelist is not None:
+            import warnings
+            _whitelist_arr = np.asarray(_whitelist)
+            missing = set(_whitelist_arr) - set(self.names)
+            if missing:
+                warnings.warn(
+                    f"allowed_names: {len(missing)} name(s) not found in store "
+                    f"and will be skipped: {sorted(missing)}"
+                )
+            m &= np.isin(self.names, _whitelist_arr)
         sel = np.nonzero(m & np.isin(np.arange(len(self.names)), self._sel))[0]
         if (far_max is not None or pastro_min is not None):
             miss = np.isnan(self.meta["far" if far_max is not None else "pastro"][sel])
@@ -153,7 +162,8 @@ class GWCatalog:
     # ---- darksirens export (Jacobian lives here, and only here) ----------
     def _to_darksirens_format(self, out_path, compact_type="BBH", nsamp=4096,
                               far_max=None, pastro_min=None, z_max=None,
-                              seed=0, replace="auto", cosmology=None, amax=0.99):
+                              seed=0, replace="auto", cosmology=None, amax=0.99,
+                              allowed_names=None):
         """Write an HDF5 consumable by darksirens.gw.utils.load_gw_samples.
 
         p_pe convention
@@ -179,7 +189,7 @@ class GWCatalog:
             resampling to nsamp.  Requires cosmology or stored redshift.
         """
         sub = self.select(compact_type=compact_type, far_max=far_max,
-                          pastro_min=pastro_min)
+                          pastro_min=pastro_min, allowed_names=allowed_names)
         need = ["mass_1", "mass_2", "luminosity_distance", "ra", "dec",
                 "chi_eff", "p_dL_pe"]
         per = sub.get(need, per_event=True)
