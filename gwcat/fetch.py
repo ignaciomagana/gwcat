@@ -31,6 +31,7 @@ import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
+from urllib.parse import urlencode
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError
 
@@ -466,6 +467,124 @@ def fetch_and_build(
                 extra_params=extra_params)
     return out
 
+
+_GWOSC_BBH_EXPECTED_NAMES = 259
+_GWOSC_KNOWN_NON_BBH = {
+    # O4a NSBH / mass-gap candidates explicitly excluded from BBH selections.
+    "GW230529_181500",
+    "GW230518_125908",
+    # O3 BNS / NSBH candidates that may appear in broad GWOSC queries.
+    "GW190425",
+    "GW190426_152155",
+    "GW190814",
+    "GW190917_114630",
+    "GW200105_162426",
+    "GW200115_042309",
+}
+
+
+def _clean_gwosc_event_name(name: object) -> str:
+    """Return a GWOSC event name without an API version suffix."""
+    return re.sub(r"-v\d+$", "", str(name or ""))
+
+
+def _gwosc_json(url: str, timeout: int) -> dict:
+    """Fetch one GWOSC JSON page."""
+    req = Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "gwcat-fetch/0.1 (+https://github.com/ignaciomagana/gwcat)",
+        },
+    )
+    with urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _gwosc_best_parameter(parameters: object, *names: str) -> Optional[float]:
+    """Extract a parameter's best value from GWOSC parameter objects."""
+    wanted = set(names)
+    if not isinstance(parameters, list):
+        return None
+    for param in parameters:
+        if not isinstance(param, dict) or param.get("name") not in wanted:
+            continue
+        value = param.get("best")
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def fetch_bbh_names_gwosc(
+    m2_min: float = 3.0,
+    verbose: bool = True,
+    timeout: int = 30,
+) -> list[str]:
+    """Return BBH event names from the paginated GWOSC v2 event API.
+
+    The GWOSC endpoint is filtered for the latest event version with a
+    secondary source-frame mass above ``m2_min`` and default parameters included.
+    Events are kept only when the returned default PE parameters contain
+    ``mass_2_source`` (or the legacy alias ``m2_source``) above the threshold.
+    Known BNS/NSBH events are explicitly removed as a safety guard.
+    """
+    query = urlencode(
+        {
+            "include-default-parameters": "true",
+            "lastver": "true",
+            "min-mass-2-source": m2_min,
+            "pagesize": 100,
+        }
+    )
+    url = f"https://gwosc.org/api/v2/event-versions?{query}"
+    names: set[str] = set()
+    page = 0
+    seen_urls: set[str] = set()
+
+    while url:
+        if url in seen_urls:
+            raise RuntimeError(f"GWOSC pagination loop detected at {url}")
+        seen_urls.add(url)
+        page += 1
+        if verbose:
+            print(f"fetch_bbh_names_gwosc: fetching page {page}: {url}")
+
+        data = _gwosc_json(url, timeout=timeout)
+        for event in data.get("results", []):
+            if not isinstance(event, dict):
+                continue
+            name = _clean_gwosc_event_name(
+                event.get("name") or event.get("shortName") or event.get("grace_id")
+            )
+            if not name or name in _GWOSC_KNOWN_NON_BBH:
+                continue
+
+            params = event.get("default_parameters")
+            m2_source = _gwosc_best_parameter(params, "mass_2_source", "m2_source")
+            if m2_source is None or m2_source <= m2_min:
+                continue
+            names.add(name)
+
+        url = data.get("next")
+
+    result = sorted(names)
+    if verbose:
+        print(f"fetch_bbh_names_gwosc: selected {len(result)} BBH candidates")
+    if len(result) < _GWOSC_BBH_EXPECTED_NAMES:
+        warnings.warn(
+            "GWOSC returned only "
+            f"{len(result)} BBH names with PE mass_2_source > {m2_min}; "
+            f"GWTC-5-era data are expected to contain at least "
+            f"{_GWOSC_BBH_EXPECTED_NAMES}. Callers may be relying on an "
+            "incomplete live GWOSC index.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return result
 
 # ---------------------------------------------------------------------------
 # Helpers: FAR / p_astro from GWOSC event API
