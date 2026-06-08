@@ -55,14 +55,15 @@ bbh_names = fetch_bbh_list()              # live from GWOSC
 cat = GWCatalog("store.h5")
 cat.summary()                             # compact event table
 bbh = cat.select(
-    compact_type="BBH",
-    allowed_names=bbh_names,              # curated GWTC-5 BBH list
+    allowed_names=bbh_names,              # authoritative GWTC-5 BBH list
 )
 print(f"Selected {bbh.n_events} events")
 
 # ── 6. Export PE samples for darksirens ──────────────────────
-bbh._to_darksirens_format(
+cat._to_darksirens_format(
     "gw_bbh.h5",
+    compact_type=None,                    # no derived gate; whitelist is authoritative
+    allowed_names=bbh_names,
     nsamp=4096,
     z_max=10.0,                           # per-sample redshift cut
     cosmology=(67.74, 0.3089),
@@ -115,16 +116,17 @@ needed.
 ```python
 # Allowed list + additional mass cut
 bbh = cat.select(
-    compact_type="BBH",
     allowed_names=bbh_names,
     m1_src_range=(5, 100),
     snr_min=8.0,
 )
 
-# Or pass directly to the exporter (skips a separate select() call)
+# Or pass directly to the exporter (skips a separate select() call).
+# compact_type=None avoids adding a derived compact-type gate on top of the
+# authoritative whitelist.
 cat._to_darksirens_format(
     "gw_bbh.h5",
-    compact_type="BBH",
+    compact_type=None,
     allowed_names=bbh_names,
     nsamp=4096,
     cosmology=(67.74, 0.3089),
@@ -166,8 +168,7 @@ cat.event_names                                   # array of GW names
 
 # Metadata-based selection (no I/O, all cuts composable)
 bbh = cat.select(
-    compact_type="BBH",
-    allowed_names=bbh_names,                      # curated BBH list (recommended)
+    allowed_names=bbh_names,                      # authoritative BBH list (recommended)
     snr_min=8.0,
     m1_src_range=(5, 100),
     sky_area_max=500,                             # requires healpy at ingest
@@ -327,7 +328,9 @@ darksirens never hardcodes a cosmology for the dL→z conversion.
 - **BBH selection via `allowed_names`**: the recommended way to select BBH
   events is via `fetch_bbh_list()` (GWOSC live) or the static `BBH_ALL`,
   rather than FAR/p_astro cuts that require a separately fetched event table.
-  `compact_type="BBH"` (mass-based) is applied on top as an additional guard.
+  `allowed_names` is treated as authoritative by default, so a derived
+  `compact_type="BBH"` metadata cut is not required. If both are supplied,
+  gwcat warns about whitelist events that the compact-type cut would exclude.
 - **Sky area at ingest** (optional): 90% credible area computed via HEALPix
   and stored as `sky_area_90` metadata, enabling `select(sky_area_max=...)`.
   Requires `healpy`; NaN if absent.
