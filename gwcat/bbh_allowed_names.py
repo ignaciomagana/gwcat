@@ -37,6 +37,11 @@ GWTC-5.0 context (arxiv:2605.27225, submitted 26 May 2026)
 """
 from __future__ import annotations
 
+import re
+import warnings
+from pathlib import Path
+from typing import Optional, Union
+
 # ── O1 + O2 (10 events) ──────────────────────────────────────────────────────
 BBH_O1O2 = [
     "GW150914", "GW151012", "GW151226",
@@ -106,6 +111,180 @@ BBH_O4B: list = []  # filled by fetch_bbh_list() / refresh_bbh_list()
 
 # ── Combined static list (O1–O4a confirmed; O4b pending GWOSC API update) ────
 BBH_ALL: list = BBH_O1O2 + BBH_O3A + BBH_O3B + BBH_O4A + BBH_O4B
+
+
+# Names that should not be added opportunistically from cache/store discovery.
+# The static base is left unchanged; this guard only filters dynamically
+# discovered names whose files/metadata are not otherwise mass-classified here.
+KNOWN_NON_BBH_NAMES = {
+    "GW170817",          # BNS
+    "GW190425",          # BNS short-form, if seen in filenames
+    "GW190425_232155",   # BNS event name used by GWOSC catalogs
+    "GW230518_125908",   # NSBH (GWTC-4.1)
+    "GW230529_181500",   # NSBH (GWTC-4.1)
+}
+
+_EVENT_NAME_RE = re.compile(r"GW\d{6}_\d{6}|GW\d{6}")
+_GWTC5_DIR_NAMES = ("GWTC-5", "GWTC-5p0", "GWTC-5.0")
+
+
+def _decode_hdf5_str(value) -> str:
+    """Decode an HDF5 scalar/string-ish value into a Python string."""
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return str(value)
+
+
+def _is_gwtc5_or_o4b_catalog(label: str) -> bool:
+    """Return True when a metadata catalog label identifies GWTC-5/O4b."""
+    normalized = re.sub(r"[._\s]", "-", str(label)).upper()
+    return "GWTC-5" in normalized or "GWTC5" in normalized or "O4B" in normalized
+
+
+def _event_name_from_candidate(path: Path) -> Optional[str]:
+    """Extract a GW event name using the ingest.event_name_from_path regex."""
+    # Keep this regex synchronized with gwcat.ingest.event_name_from_path.
+    match = _EVENT_NAME_RE.search(path.name)
+    return match.group(0) if match else None
+
+
+def _gwtc5_cache_dirs(data_dir: Union[str, Path]) -> list[Path]:
+    """Return existing likely GWTC-5 cache directories in deterministic order."""
+    root = Path(data_dir)
+    candidates = []
+
+    if root.name in _GWTC5_DIR_NAMES or _is_gwtc5_or_o4b_catalog(root.name):
+        candidates.append(root)
+    candidates.extend(root / dirname for dirname in _GWTC5_DIR_NAMES)
+
+    # Include any existing catalog directory matching the naming convention used
+    # by fetch_catalog("GWTC-5") even if callers chose a custom spelling.
+    if root.exists() and root.is_dir():
+        try:
+            for child in root.iterdir():
+                if child.is_dir() and _is_gwtc5_or_o4b_catalog(child.name):
+                    candidates.append(child)
+        except OSError:
+            pass
+
+    seen = set()
+    out = []
+    for candidate in candidates:
+        resolved = candidate.resolve() if candidate.exists() else candidate.absolute()
+        if resolved in seen or not candidate.exists() or not candidate.is_dir():
+            continue
+        seen.add(resolved)
+        out.append(candidate)
+    return sorted(out, key=lambda p: str(p))
+
+
+def _discover_cached_gwtc5_names(data_dir: Union[str, Path]) -> set[str]:
+    """Discover cached GWTC-5/O4b event names from local PE-file paths."""
+    names: set[str] = set()
+    for directory in _gwtc5_cache_dirs(data_dir):
+        try:
+            paths = sorted(directory.rglob("*"), key=lambda p: str(p))
+        except OSError:
+            continue
+        for path in paths:
+            if not path.is_file():
+                continue
+            name = _event_name_from_candidate(path)
+            if name and name not in KNOWN_NON_BBH_NAMES:
+                names.add(name)
+    return names
+
+
+def _read_store_gwtc5_names(store_path: Union[str, Path]) -> set[str]:
+    """Read GWTC-5/O4b event names from a gwcat HDF5 store, if possible."""
+    names: set[str] = set()
+    try:
+        import h5py
+    except Exception as exc:
+        warnings.warn(
+            "get_bbh_allowed_names: cannot read HDF5 store without "
+            f"h5py ({exc})"
+        )
+        return names
+
+    try:
+        with h5py.File(store_path, "r") as f:
+            if "index/event_names" not in f or "meta/catalog" not in f:
+                return names
+            event_names = [_decode_hdf5_str(n) for n in f["index/event_names"][:]]
+            catalogs = [_decode_hdf5_str(c) for c in f["meta/catalog"][:]]
+            for name, catalog in zip(event_names, catalogs):
+                if (
+                    _is_gwtc5_or_o4b_catalog(catalog)
+                    and name not in KNOWN_NON_BBH_NAMES
+                ):
+                    names.add(name)
+    except Exception as exc:
+        warnings.warn(
+            f"get_bbh_allowed_names: failed to read store {store_path!r} "
+            f"({exc})"
+        )
+    return names
+
+
+def get_bbh_allowed_names(
+    data_dir: Union[str, Path] = "./GWTC",
+    store_path: Optional[Union[str, Path]] = None,
+    prefer_gwosc: bool = True,
+    expected: int = 259,
+) -> list[str]:
+    """Return the best available BBH allowed-name list for catalog selection.
+
+    The hardcoded :data:`BBH_ALL` list is always the base.  When it has fewer
+    than ``expected`` names, local GWTC-5/O4b cache directories are scanned for
+    event names using the same event-name regex as
+    :func:`gwcat.ingest.event_name_from_path`.  GWTC-5/O4b PE files are treated
+    as BBH by construction except for explicit known BNS/NSBH names.
+
+    If ``store_path`` is supplied, names in ``index/event_names`` whose matching
+    ``meta/catalog`` entry identifies GWTC-5/O4b are also added.  Finally, when
+    ``prefer_gwosc`` is true, the live GWOSC BBH list is used only if it returns
+    at least as many names as the static/cache/store combination.
+
+    A warning is emitted whenever the final count differs from ``expected``;
+    the warning includes per-source counts to aid cache/GWOSC debugging.
+    """
+    static_names = set(BBH_ALL)
+    cache_names: set[str] = set()
+    store_names: set[str] = set()
+    gwosc_names: set[str] = set()
+    gwosc_used = False
+
+    combined = set(static_names)
+    if len(static_names) < expected:
+        cache_names = _discover_cached_gwtc5_names(data_dir)
+        combined.update(cache_names)
+
+    if store_path is not None:
+        store_names = _read_store_gwtc5_names(store_path)
+        combined.update(store_names)
+
+    final = set(combined)
+    if prefer_gwosc:
+        try:
+            gwosc_names = set(fetch_bbh_list(verbose=False))
+            if len(gwosc_names) >= len(combined):
+                final = set(gwosc_names)
+                gwosc_used = True
+        except Exception as exc:
+            warnings.warn(f"get_bbh_allowed_names: GWOSC BBH query failed ({exc})")
+
+    if len(final) != expected:
+        gwosc_store_names = gwosc_names | store_names
+        warnings.warn(
+            "get_bbh_allowed_names: final BBH count "
+            f"{len(final)} != expected {expected} "
+            f"(static={len(static_names)}, cache={len(cache_names)}, "
+            f"GWOSC/store={len(gwosc_store_names)}, "
+            f"GWOSC_used={gwosc_used})"
+        )
+
+    return sorted(final)
 
 
 # ── Dynamic loader ────────────────────────────────────────────────────────────
