@@ -791,8 +791,27 @@ def fetch_event_table_gwosc(
 _AVAILABLE = sorted(k for k in RELEASES if k not in _ALIAS_NAMES)  # hide aliases
 _PE_CATALOGS = list_release_manifests()
 
-def _cli():
+def _cli(argv=None, _deprecated: bool = True, default_write_summary: bool = False):
+    """Fetch CLI. Also the implementation behind the unified ``gwcat fetch``
+    subcommand (PR 10), which calls this with ``_deprecated=False,
+    default_write_summary=True`` so every flag defined here is automatically
+    available under both surfaces.
+
+    argv : list of str, optional
+        Parsed instead of ``sys.argv[1:]`` when given.
+    _deprecated : bool
+        When True (the default, used by the standalone ``gwcat-fetch``
+        console script), print a one-line pointer to ``gwcat fetch`` on
+        stderr before continuing with unchanged behavior.
+    default_write_summary : bool
+        Whether a ``--out`` build gets a validation summary by default
+        (``--no-summary`` always disables it). False for the deprecated
+        standalone script; the unified CLI passes True.
+    """
     import argparse
+    if _deprecated:
+        print("gwcat-fetch is deprecated; use `gwcat fetch` instead "
+              "(same options; see `gwcat fetch --help`).", file=sys.stderr)
 
     ap = argparse.ArgumentParser(
         prog="gwcat-fetch",
@@ -835,8 +854,11 @@ def _cli():
                          "event metadata from --cache-dir (required), and "
                          "require every file to already exist locally. Same "
                          "as setting GWCAT_OFFLINE=1.")
+    ap.add_argument("--no-summary", action="store_true",
+                    help="Skip writing validation_summary.json/.md next to "
+                         "--out.")
 
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     catalogs = args.catalog
     if catalogs == ["all"] or catalogs == "all":
@@ -883,8 +905,10 @@ def _cli():
 
         from .ingest import build_store
         print(f"\n--- Building store from {len(pe_paths)} PE files ---")
+        write_summary = default_write_summary and not args.no_summary
         build_store(pe_paths, args.out, event_table=event_table,
-                    cache_dir=args.cache_dir, offline=offline)
+                    cache_dir=args.cache_dir, offline=offline,
+                    write_summary=write_summary)
     else:
         print(f"\nDownloaded {len(all_paths)} files to {args.data_dir}/")
         if pe_paths:

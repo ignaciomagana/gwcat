@@ -147,15 +147,85 @@ merge_store("store.h5", new_paths)   # duplicates auto-skipped, FAR auto-fetched
 
 ## Quick start (CLI)
 
+One console script, `gwcat`, with a subcommand per pipeline stage:
+
 ```bash
-gwcat-fetch --out store.h5                            # download all PE + build (FAR auto-fetched)
-gwcat-fetch --out store.h5 --no-event-table           # skip GWOSC FAR/p_astro fetch
-gwcat-fetch --catalog injections-O3-BBH               # O3 BBH injection set
-gwcat-fetch --catalog injections-O4ab                 # O4a+b injection set
-gwcat-fetch --catalog all                             # PE + all injection sets
-gwcat-fetch --catalog GWTC-5 --dry-run                # preview files
-gwcat-fetch --no-resolve                              # skip concept DOI resolution
+gwcat fetch --out store.h5                            # download all PE + build (FAR auto-fetched)
+gwcat fetch --out store.h5 --no-event-table           # skip GWOSC FAR/p_astro fetch
+gwcat fetch --catalog injections-O3-BBH               # O3 BBH injection set
+gwcat fetch --catalog injections-O4ab                 # O4a+b injection set
+gwcat fetch --catalog all                             # PE + all injection sets
+gwcat fetch --catalog GWTC-5 --dry-run                # preview files
+gwcat fetch --no-resolve                              # skip concept DOI resolution
+
+gwcat ingest --glob "./GWTC/GWTC5/*.h5" --out store.h5              # raw PE files -> store.h5
+gwcat ingest --glob "./GWTC/GWTC5/*.h5" --out store.h5 \
+             --sample-sets all --cache-dir ./cache                   # PR6/PR8 options
+
+gwcat inspect store.h5                                # events, sample sets, params,
+                                                       # availability, source classes
+gwcat inspect store.h5 --json                         # same, machine-readable
+
+gwcat export-darksirens store.h5 --out gw_bbh.h5 \
+    --source-class bbh --spin-prior-mode include \
+    --waveform-policy mixed-first --cosmology 67.74,0.3089 \
+    --far-max 1.0 --allow-missing-far --nsamp 4096 --seed 0
+
+gwcat selection --injections inj_o3.hdf inj_o4.hdf \
+    --out selection_bbh.h5 --source-class bbh --far-threshold 1.0 \
+    --H0 67.74 --Om0 0.3089
+
+gwcat validate gw_bbh.h5 selection_bbh.h5             # exit 0 iff every check passes
 ```
+
+Run `gwcat --help` / `gwcat <subcommand> --help` for the full flag reference.
+See `examples/bbh_workflow.md` and `examples/all_cbc_workflow.md` for the
+complete full-data command sequences, and `examples/tutorial_fake_data.md` +
+`examples/make_fake_store.py` for a fully offline walkthrough on synthetic
+data (`make → inspect → export-darksirens → selection → validate`) that
+mirrors what `tests/test_cli.py` drives end-to-end.
+
+The standalone `gwcat-fetch` / `gwcat-ingest` scripts still work unchanged
+(same flags, same behavior) but are deprecated: they print a one-line pointer
+to `gwcat fetch` / `gwcat ingest` on stderr before delegating.
+
+### Validation summaries
+
+Every `gwcat ingest` / `gwcat export-darksirens` / `gwcat selection` run
+writes `<out>.validation_summary.json` and `<out>.validation_summary.md`
+next to its output by default (pass `--no-summary` to skip). At the library
+level this is opt-in via `write_summary=True` on `build_store`,
+`GWCatalog.to_darksirens`, and `SelectionSet`/`CombinedSelectionSet.to_darksirens`
+(default `False`, so existing calls are unaffected). The `.md` is a
+human-rendering of the exact same dict written to `.json` -- never a separate
+computation.
+
+Fields actually reported (never fabricated -- a value not available from the
+store/export is simply omitted): `package_version`, `schema_version`,
+`n_events`, `event_names`, `stored_parameters`, `missing_required_parameters`,
+`missing_optional_parameters`, `partial_availability` (per-parameter count of
+events where it is NaN-filled), `source_class_counts`, `waveform_counts`,
+`approximant_counts`, `sample_set_counts_per_event`, `far_missing_count`,
+`far_available_count`, `p_astro_available_count`, `per_event_cosmology_present`
+/ `per_event_cosmology_varies`, plus per-`kind` fields:
+
+* `kind="ingest"` (from `build_store`): `n_files_provided`,
+  `n_unique_events_ingested`, `n_rows_ingested`, `sample_sets_mode`,
+  `source_file_checksums` (when `file_provenance` was passed).
+* `kind="darksirens_export"` (from `GWCatalog.to_darksirens`):
+  `n_events_considered`, `n_events_exported`,
+  `n_events_skipped_after_selection`, `event_names_exported`,
+  `source_class_filter`, `event_list_filter`, `far_policy`,
+  `allow_missing_far`, `require_far`, `n_events_missing_far`,
+  `spin_prior_mode`, `chi_eff_prior_applied_to_p_pe`, `cosmology_mode`,
+  `cosmology_override_used`, `cosmology_per_event_varies`, `waveform_policy`,
+  `approximant`, `homogeneous_sample_sets`.
+* `kind="selection_export"` (from `SelectionSet`/`CombinedSelectionSet`):
+  `n_campaigns`, `n_injections_total`, `n_injections_before_filter`,
+  `n_injections_after_filter`, `n_detected`, `ndraw`, `far_threshold`,
+  `significance_columns`, `source_class_counts_detected`, `cosmology_H0`,
+  `cosmology_Om0`, `p_astro_available` (always `False` -- selection files
+  never carry per-injection `p_astro`).
 
 ## Modules
 
@@ -401,7 +471,7 @@ fetch_catalog("GWTC-5", data_dir="./GWTC", cache_dir="./GWTC/.cache", offline=Tr
 fetch_event_table_gwosc(cache_dir="./GWTC/.cache", offline=True)
 ```
 
-Set `GWCAT_OFFLINE=1` (or `gwcat-fetch --offline --cache-dir ...`) to force
+Set `GWCAT_OFFLINE=1` (or `gwcat fetch --offline --cache-dir ...`) to force
 offline mode without threading `offline=True` through every call. A cache
 miss in offline mode raises `gwcat.fetch_cache.OfflineCacheMissError` naming
 the exact missing file — it never silently falls back to a network call.

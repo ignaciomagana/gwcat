@@ -45,6 +45,8 @@ Usage:
 from __future__ import annotations
 
 import warnings
+from typing import Optional
+
 import numpy as np
 import h5py
 
@@ -512,7 +514,9 @@ class SelectionSet:
     # Export
     # ------------------------------------------------------------------
     def to_darksirens(self, out_path: str, far_threshold: float = 1.0,
-                      amax: float = 0.99, source_class=None):
+                      amax: float = 0.99, source_class=None,
+                      write_summary: bool = False,
+                      summary_context: Optional[dict] = None):
         """Write a pre-processed selection file for darksirens.
 
         Applies the 1-D chi_eff spin-prior swap: the injection spin-draw
@@ -539,6 +543,13 @@ class SelectionSet:
             that filtering is *subsetting*, not reweighting: ``ndraw`` is left
             unchanged, and the analyst must pair the file with a PE export
             filtered to the same class(es).  Recorded in the output attrs.
+        write_summary : bool, default False
+            (PR 10) When True, write ``<out_path>.validation_summary.json`` and
+            ``.md`` next to ``out_path`` (see :mod:`gwcat.validation_summary`).
+            The unified ``gwcat selection`` CLI turns this on by default
+            (``--no-summary`` to disable).
+        summary_context : dict, optional
+            Extra fields merged into the written summary.
         """
         from .spin import chi_eff_prior_logprob
 
@@ -598,6 +609,42 @@ class SelectionSet:
             ]:
                 f.create_dataset(name, data=arr, compression="gzip")
 
+        if write_summary:
+            from .validation_summary import (write_validation_summary,
+                                            value_counts, package_version)
+            classes_det = (classify_by_mass(m1src_det, m2src_det,
+                                            self._nsbh_mass_threshold)
+                          if n_det else [])
+            summary = {
+                "kind": "selection_export",
+                "output_path": str(out_path),
+                "package_version": package_version(),
+                "schema_version": "gwcat-selection-1.0",
+                "n_campaigns": 1,
+                "n_injections_total": int(self.n_injections),
+                "n_injections_before_filter": n_before,
+                "n_injections_after_filter": n_after,
+                "n_detected": n_det,
+                "ndraw": int(self._ndraw),
+                "T_obs_yr": float(self._T_yr),
+                "far_threshold": float(far_threshold),
+                "significance_columns": list(self._far_columns),
+                "significance_available": bool(self._far_columns),
+                "p_astro_available": False,
+                "source_class_filter": (None if source_class is None
+                                        else str(source_class)),
+                "source_class_counts_detected": (
+                    value_counts([normalize_source_class(c) for c in classes_det])),
+                "cosmology_H0": float(self.H0),
+                "cosmology_Om0": float(self.Om0),
+                "cosmology_override_used": bool(self._cosmology_override),
+                "spin_prior_mode": "include",
+                "chi_eff_prior_applied_to_pdraw": True,
+            }
+            if summary_context:
+                summary.update(summary_context)
+            write_validation_summary(out_path, summary)
+
         print(f"Wrote {out_path}: n_det={n_det}, ndraw={self._ndraw}, "
               f"FAR<{far_threshold}, H0={self.H0}, Om0={self.Om0}, "
               f"source_class={source_class}")
@@ -655,7 +702,9 @@ class CombinedSelectionSet:
     # Export
     # ------------------------------------------------------------------
     def to_darksirens(self, out_path: str, far_threshold: float = 1.0,
-                      amax: float = 0.99, source_class=None):
+                      amax: float = 0.99, source_class=None,
+                      write_summary: bool = False,
+                      summary_context: Optional[dict] = None):
         """Write a combined selection file for darksirens.
 
         Parameters
@@ -672,6 +721,11 @@ class CombinedSelectionSet:
             the single-campaign exporter this is subsetting, not reweighting:
             each campaign's ``ndraw`` share is unchanged, so the Essick et al.
             fractions ``N_k / N_total`` are identical to the unfiltered file.
+        write_summary : bool, default False
+            (PR 10) When True, write ``<out_path>.validation_summary.json`` and
+            ``.md`` next to ``out_path``.  See :mod:`gwcat.validation_summary`.
+        summary_context : dict, optional
+            Extra fields merged into the written summary.
         """
         from .spin import chi_eff_prior_logprob
 
@@ -790,6 +844,46 @@ class CombinedSelectionSet:
                 ("redshift", data["z"]), ("pdraw", data["pdraw"]),
             ]:
                 f.create_dataset(name, data=arr, compression="gzip")
+
+        if write_summary:
+            from .validation_summary import (write_validation_summary,
+                                            value_counts, package_version)
+            classes_det = (classify_by_mass(data["m1src"], data["m2src"],
+                                            self._sets[0]._nsbh_mass_threshold)
+                          if n_det_total else [])
+            summary = {
+                "kind": "selection_export",
+                "output_path": str(out_path),
+                "package_version": package_version(),
+                "schema_version": "gwcat-selection-1.0",
+                "n_campaigns": len(self._sets),
+                "campaign_paths": [s.path for s in self._sets],
+                "campaign_ndraws": list(ndraw_per),
+                "n_injections_total": int(self.n_injections),
+                "n_injections_before_filter": n_before_total,
+                "n_injections_after_filter": n_after_total,
+                "n_detected": n_det_total,
+                "ndraw": int(ndraw_total),
+                "T_obs_yr": float(sum(s._T_yr for s in self._sets)),
+                "far_threshold": float(far_threshold),
+                "significance_columns": list(far_columns_union),
+                "significance_available": bool(far_columns_union),
+                "p_astro_available": False,
+                "source_class_filter": (None if source_class is None
+                                        else str(source_class)),
+                "source_class_counts_detected": (
+                    value_counts([normalize_source_class(c) for c in classes_det])),
+                "cosmology_H0": float(self._sets[0].H0),
+                "cosmology_Om0": float(self._sets[0].Om0),
+                "cosmology_override_used": bool(
+                    any(getattr(s, "_cosmology_override", False)
+                        for s in self._sets)),
+                "spin_prior_mode": "include",
+                "chi_eff_prior_applied_to_pdraw": True,
+            }
+            if summary_context:
+                summary.update(summary_context)
+            write_validation_summary(out_path, summary)
 
         for info in campaign_info:
             print(f"  {info}")
