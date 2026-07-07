@@ -38,141 +38,62 @@ from __future__ import annotations
 
 import re
 import warnings
+from importlib import resources
 from pathlib import Path
 from typing import Optional, Union
 
-# ── O1 + O2 (10 events) ──────────────────────────────────────────────────────
-BBH_O1O2 = [
-    "GW150914", "GW151012", "GW151226",
-    "GW170104", "GW170608", "GW170729",
-    "GW170809", "GW170814", "GW170818", "GW170823",
-]
+# ── Bundled event-list data files ─────────────────────────────────────────────
+# The BBH event lists used to be Python literals in this module.  They now live
+# as plain-text data files under ``gwcat/data/event_lists/`` (with a
+# ``provenance.yaml`` recording where each list came from) so the sample can be
+# updated, diffed, and packaged without editing Python.  These helpers read them
+# back into the module-level names the rest of the code (and users) rely on.
+_EVENT_LIST_DIRNAME = ("data", "event_lists")
 
-# ── O3a BBH/mass-gap sample (GWTC-3 population table) ────────────────
-# Known BNS/NSBH candidates are filtered by NON_BBH_EXCLUSIONS.
-BBH_O3A = [
-    "GW190408_181802", "GW190412_053044", "GW190413_052954",
-    "GW190413_134308", "GW190421_213856", "GW190503_185404",
-    "GW190512_180714", "GW190513_205428", "GW190517_055101",
-    "GW190519_153544", "GW190521_030229", "GW190521_074359",
-    "GW190527_092055", "GW190602_175927", "GW190620_030421",
-    "GW190630_185205", "GW190701_203306", "GW190706_222641",
-    "GW190707_093326", "GW190708_232457", "GW190719_215514",
-    "GW190720_000836", "GW190725_174728", "GW190727_060333",
-    "GW190728_064510", "GW190731_140936", "GW190803_022701",
-    "GW190805_211137", "GW190814_211039", "GW190828_063405",
-    "GW190828_065509", "GW190910_112807", "GW190915_235702",
-    "GW190924_021846", "GW190925_232845", "GW190929_012149",
-    "GW190930_133541",
-]
 
-# ── O3b BBH/mass-gap sample (GWTC-3 population table) ────────────────
-# Known BNS/NSBH candidates are filtered by NON_BBH_EXCLUSIONS.
-BBH_O3B = [
-    "GW191103_012549", "GW191105_143521", "GW191109_010717",
-    "GW191127_050227", "GW191129_134029", "GW191204_171526",
-    "GW191215_223052", "GW191216_213338", "GW191222_033537",
-    "GW191230_180458", "GW200112_155838", "GW200128_022011",
-    "GW200129_065458", "GW200202_154313", "GW200208_130117",
-    "GW200209_085452", "GW200216_220804", "GW200219_094415",
-    "GW200224_222234", "GW200225_060421", "GW200302_015811",
-    "GW200311_115853", "GW200316_215756",
-]
+def _event_list_path(fname: str) -> Path:
+    """Return the on-disk path to a bundled event-list data file."""
+    try:
+        base = resources.files("gwcat")
+        for part in _EVENT_LIST_DIRNAME:
+            base = base / part
+        candidate = base / fname
+        # ``resources.files`` may return a non-filesystem traversable; fall back
+        # below if it cannot be represented as a real path.
+        return Path(str(candidate))
+    except (ModuleNotFoundError, AttributeError, TypeError, NotImplementedError):
+        return Path(__file__).parent.joinpath(*_EVENT_LIST_DIRNAME, fname)
 
-# ── O4a (GWTC-4.1 population BBH sample) ───────────────────────────────
-# Source: GWTC-5.0 population data release Event_list/GWTC4.1_BBH.txt.
-# Known BNS/NSBH/mass-gap events are kept in NON_BBH_EXCLUSIONS below.
-BBH_O4A = [
-    "GW230601_224134", "GW230605_065343", "GW230606_004305",
-    "GW230608_205047", "GW230609_064958", "GW230624_113103",
-    "GW230627_015337", "GW230628_231200", "GW230630_125806",
-    "GW230630_234532", "GW230702_185453", "GW230704_021211",
-    "GW230704_212616", "GW230706_104333", "GW230707_124047",
-    "GW230708_053705", "GW230708_230935", "GW230709_122727",
-    "GW230712_090405", "GW230723_101834", "GW230726_002940",
-    "GW230729_082317", "GW230731_215307", "GW230803_033412",
-    "GW230805_034249", "GW230806_204041", "GW230811_032116",
-    "GW230814_061920", "GW230814_230901", "GW230819_171910",
-    "GW230820_212515", "GW230824_033047", "GW230825_041334",
-    "GW230831_015414", "GW230904_051013", "GW230911_195324",
-    "GW230914_111401", "GW230919_215712", "GW230920_071124",
-    "GW230922_020344", "GW230922_040658", "GW230924_124453",
-    "GW230927_043729", "GW230927_153832", "GW230928_215827",
-    "GW230930_110730", "GW231001_140220", "GW231004_232346",
-    "GW231005_021030", "GW231005_091549", "GW231008_142521",
-    "GW231014_040532", "GW231018_233037", "GW231020_142947",
-    "GW231026_130704", "GW231028_153006", "GW231029_111508",
-    "GW231102_071736", "GW231104_133418", "GW231108_125142",
-    "GW231110_040320", "GW231113_122623", "GW231113_150041",
-    "GW231113_200417", "GW231114_043211", "GW231118_005626",
-    "GW231118_071402", "GW231118_090602", "GW231119_075248",
-    "GW231123_135430", "GW231127_165300", "GW231129_081745",
-    "GW231206_233134", "GW231206_233901", "GW231213_111417",
-    "GW231221_135041", "GW231223_032836", "GW231223_075055",
-    "GW231223_202619", "GW231224_024321", "GW231226_101520",
-    "GW231230_170116", "GW231231_154016", "GW240104_164932",
-    "GW240107_013215", "GW240109_050431",
-]
 
-# ── O4b (GWTC-5.0 population BBH sample) ───────────────────────────────
-# Source: GWTC-5.0 population data release Event_list/GWTC5_BBH.txt.
-BBH_O4B = [
-    "GW240413_022019", "GW240414_054515", "GW240420_175625",
-    "GW240426_031451", "GW240428_225440", "GW240501_033534",
-    "GW240505_133552", "GW240507_041632", "GW240511_031507",
-    "GW240512_024139", "GW240513_183302", "GW240514_121713",
-    "GW240515_005301", "GW240519_012815", "GW240520_213616",
-    "GW240525_031210", "GW240526_093944", "GW240527_183429",
-    "GW240527_230910", "GW240530_012417", "GW240531_040326",
-    "GW240531_075248", "GW240601_061200", "GW240601_231004",
-    "GW240612_081540", "GW240615_113620", "GW240615_160735",
-    "GW240618_071627", "GW240621_195059", "GW240621_200935",
-    "GW240621_214041", "GW240622_004008", "GW240627_131622",
-    "GW240629_145256", "GW240630_101703", "GW240703_191355",
-    "GW240705_053215", "GW240716_034900", "GW240824_205609",
-    "GW240825_055146", "GW240830_211120", "GW240902_143306",
-    "GW240907_153833", "GW240908_082628", "GW240908_125134",
-    "GW240910_103535", "GW240915_001357", "GW240915_105151",
-    "GW240916_184352", "GW240919_061559", "GW240920_073424",
-    "GW240920_124024", "GW240921_201835", "GW240922_142106",
-    "GW240923_204006", "GW240924_000316", "GW240925_005809",
-    "GW240930_035959", "GW240930_234614", "GW241002_030559",
-    "GW241006_015333", "GW241007_082943", "GW241009_022835",
-    "GW241009_084816", "GW241009_220455", "GW241011_233834",
-    "GW241101_220523", "GW241102_124058", "GW241102_144729",
-    "GW241109_033317", "GW241109_115924", "GW241110_124123",
-    "GW241111_111552", "GW241113_163507", "GW241114_024711",
-    "GW241114_235258", "GW241116_151753", "GW241124_024914",
-    "GW241125_010116", "GW241127_061008", "GW241129_021832",
-    "GW241130_034908", "GW241130_110422", "GW241201_055758",
-    "GW241210_060606", "GW241210_120900", "GW241225_042553",
-    "GW241225_082815", "GW241229_155844", "GW241230_084504",
-    "GW241230_233618", "GW241231_054133", "GW250101_011205",
-    "GW250104_015122", "GW250108_152221", "GW250109_010541",
-    "GW250109_074552", "GW250114_082203", "GW250116_015318",
-    "GW250118_023225", "GW250118_055802", "GW250118_170523",
-    "GW250119_025138", "GW250119_190238",
-]
+def _read_event_list_file(fname: str) -> list[str]:
+    """Read an event-list data file, one name per line.
+
+    Blank lines and ``#`` comments (including trailing inline comments) are
+    ignored.  Order is preserved as it appears in the file.
+    """
+    path = _event_list_path(fname)
+    if not path.exists():
+        path = Path(__file__).parent.joinpath(*_EVENT_LIST_DIRNAME, fname)
+    names: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.split("#", 1)[0].strip()
+        if line:
+            names.append(line)
+    return names
+
+
+# ── O1–O4b BBH samples (loaded from bundled data files) ───────────────────────
+BBH_O1O2 = _read_event_list_file("bbh_o1o2.txt")
+BBH_O3A = _read_event_list_file("bbh_o3a.txt")
+BBH_O3B = _read_event_list_file("bbh_o3b.txt")
+BBH_O4A = _read_event_list_file("bbh_o4a.txt")
+BBH_O4B = _read_event_list_file("bbh_o4b.txt")
 
 # Names that must never be admitted to the BBH whitelist.  This includes
 # established BNS/NSBH events and low-mass/mass-gap systems that can appear in
 # broad PE/cache manifests but are outside this package's BBH-only selection.
-NON_BBH_EXCLUSIONS = {
-    "GW170817",          # BNS (GWTC-1)
-    "GW190425",          # BNS short-form, if seen in filenames
-    "GW190425_232155",   # BNS (GWTC-2.1)
-    "GW190426_152155",   # NSBH candidate (GWTC-2.1)
-    "GW190814",          # NSBH / mass-gap candidate (GWTC-2.1)
-    "GW190917_114630",   # NSBH candidate (GWTC-2.1)
-    "GW200105_162426",   # NSBH (GWTC-3)
-    "GW200115_042309",   # NSBH (GWTC-3)
-    "GW230518_125908",   # NSBH (GWTC-4.1)
-    "GW230529_181500",   # NSBH / mass-gap event (GWTC-4.1)
-    # Present in the GWTC-5 PE/population manifests, but excluded here to keep
-    # the static/cache O4b BBH sample aligned with the 103-event target used by
-    # the package's GWTC-5 selection tests.
-    "GW240525_031210",
-}
+# Loaded from data/event_lists/non_bbh_exclusions.txt (see provenance.yaml).
+NON_BBH_EXCLUSIONS = set(_read_event_list_file("non_bbh_exclusions.txt"))
 
 
 def _unique_sorted_bbh_names(*groups: list[str]) -> list[str]:

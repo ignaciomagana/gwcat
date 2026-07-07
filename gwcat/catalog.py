@@ -18,6 +18,8 @@ import numpy as np
 import h5py
 
 from .cosmology import make_cosmology, z_of_dL
+from .source_class import (normalize_source_class, resolve_filter_classes,
+                           load_event_list)
 
 
 class GWCatalog:
@@ -37,6 +39,13 @@ class GWCatalog:
         self.names = np.array([n.decode() if isinstance(n, bytes) else n
                                for n in self.names])
         self._sel = np.arange(len(self.names)) if _sel is None else np.asarray(_sel)
+        self._source_class_cache = None
+        # Provenance of the most recent select() call (defaults for a fresh
+        # catalog with no filters applied yet).
+        self._far_policy = "none"
+        self._n_missing_far = 0
+        self._selection_source_class = None
+        self._selection_event_list = None
 
     # ---- selection (operates on metadata only; cheap) --------------------
     @property
@@ -47,19 +56,75 @@ class GWCatalog:
     def event_names(self):
         return self.names[self._sel]
 
+    @property
+    def source_class(self):
+        """Canonical per-event source-class labels for ALL events in the store.
+
+        Prefers the ``meta/source_class`` column; falls back to the legacy
+        ``meta/compact_type`` column; otherwise ``Unknown``.  Always returns
+        canonical labels (BBH/NSBH/BNS/MassGap/Unknown).
+        """
+        if self._source_class_cache is None:
+            if "source_class" in self.meta:
+                raw = self.meta["source_class"]
+            elif "compact_type" in self.meta:
+                raw = self.meta["compact_type"]
+            else:
+                raw = ["Unknown"] * len(self.names)
+            self._source_class_cache = np.array(
+                [normalize_source_class(x) for x in raw])
+        return self._source_class_cache
+
+    def _far_available_mask(self):
+        """Boolean per-event mask: is a usable FAR present for this event?
+
+        Uses the explicit ``meta/far_available`` column when the store provides
+        it; otherwise derives availability from a finite ``meta/far`` value.
+        Absent FAR is a valid, non-crashing state.
+        """
+        if "far_available" in self.meta:
+            return np.asarray(self.meta["far_available"], dtype=float) > 0.5
+        if "far" in self.meta:
+            return np.isfinite(np.asarray(self.meta["far"], dtype=float))
+        return np.zeros(len(self.names), dtype=bool)
+
     def select(self, compact_type=None, far_max=None, pastro_min=None,
                snr_min=None, z_max=None, m1_src_range=None, m2_src_range=None,
                sky_area_max=None, names=None, allowed_names=None,
-               allowed_names_authoritative=True):
+               allowed_names_authoritative=True, source_class=None,
+               event_list=None, allow_missing_far=False, require_far=False):
+        """Return a filtered view of the catalog (no sample copy).
+
+        Source-class / event-list / FAR options (PR 2)
+        ------------------------------------------------
+        source_class : str, iterable, or None
+            Filter by canonical source class using the ``bbh``/``nsbh``/``bns``/
+            ``cbc`` keywords (``cbc`` = all compact-binary classes) or a
+            canonical class name.  Operates on the ``meta/source_class`` column
+            (falling back to ``meta/compact_type``), NOT on a static name list.
+        event_list : str, path, iterable, or None
+            Restrict the selection to a user event-list file (one name per line;
+            ``#`` comments allowed) or an in-memory sequence of event names.
+        allow_missing_far, require_far : bool
+            Policy for ``far_max`` when a selected event has no FAR
+            (``far_available=False``).  ``require_far=True`` fails loudly;
+            ``allow_missing_far=True`` keeps the event, warns, and records the
+            absence; the default drops missing-FAR events (legacy behavior).
+        """
+        import warnings
+        if require_far and allow_missing_far:
+            raise ValueError(
+                "require_far and allow_missing_far are mutually exclusive")
+
         m = np.ones(len(self.names), dtype=bool)
         if compact_type is not None:
             apply_compact_type = (allowed_names is None or
                                   not allowed_names_authoritative)
             if apply_compact_type:
                 m &= (self.meta["compact_type"] == compact_type)
-        if far_max is not None:
-            far = self.meta["far"]
-            m &= np.where(np.isnan(far), False, far <= far_max)
+        if source_class is not None:
+            allowed_classes = resolve_filter_classes(source_class)
+            m &= np.isin(self.source_class, list(allowed_classes))
         if pastro_min is not None:
             pa = self.meta["pastro"]
             m &= np.where(np.isnan(pa), False, pa >= pastro_min)
@@ -77,7 +142,6 @@ class GWCatalog:
             m &= np.where(np.isnan(sa), False, sa <= sky_area_max)
         _whitelist = allowed_names if allowed_names is not None else names
         if _whitelist is not None:
-            import warnings
             _whitelist_arr = np.asarray(_whitelist)
             missing = set(_whitelist_arr) - set(self.names)
             if missing:
@@ -99,14 +163,74 @@ class GWCatalog:
                         f"{sorted(dropped.tolist())}"
                     )
             m &= np.isin(self.names, _whitelist_arr)
-        sel = np.nonzero(m & np.isin(np.arange(len(self.names)), self._sel))[0]
-        if (far_max is not None or pastro_min is not None):
-            miss = np.isnan(self.meta["far" if far_max is not None else "pastro"][sel])
-            if miss.any():
-                import warnings
-                warnings.warn("FAR/p_astro NaN for some events; populate via "
+
+        # User event-list file / sequence (additional intersection gate).
+        if event_list is not None:
+            listed = load_event_list(event_list)
+            listed_arr = np.asarray(listed)
+            missing_ev = set(listed_arr) - set(self.names)
+            if missing_ev:
+                warnings.warn(
+                    f"event_list: {len(missing_ev)} name(s) not found in store "
+                    f"and will be skipped: {sorted(missing_ev)}"
+                )
+            m &= np.isin(self.names, listed_arr)
+
+        # ── FAR handling with explicit missing-FAR policy ─────────────────
+        far_policy = "none"
+        n_missing_far = 0
+        if far_max is not None:
+            far = (np.asarray(self.meta["far"], dtype=float)
+                   if "far" in self.meta else np.full(len(self.names), np.nan))
+            fa = self._far_available_mask()
+            in_scope = np.isin(np.arange(len(self.names)), self._sel)
+            # Events passing every other filter and in the current selection.
+            candidates = m & in_scope
+            missing_mask = candidates & ~fa
+            n_missing_far = int(missing_mask.sum())
+            below = np.zeros(len(self.names), dtype=bool)
+            below[fa] = far[fa] <= far_max
+            if require_far:
+                if n_missing_far > 0:
+                    raise ValueError(
+                        f"require_far=True but {n_missing_far} selected event(s) "
+                        f"have no FAR (far_available=False): "
+                        f"{sorted(self.names[missing_mask].tolist())}. "
+                        f"Pass allow_missing_far=True to keep them instead.")
+                m &= below
+                far_policy = "require"
+            elif allow_missing_far:
+                if n_missing_far > 0:
+                    warnings.warn(
+                        f"allow_missing_far=True: keeping {n_missing_far} "
+                        f"event(s) with missing FAR through the far_max cut: "
+                        f"{sorted(self.names[missing_mask].tolist())}")
+                m &= (below | ~fa)
+                far_policy = "allow_missing"
+            else:
+                if n_missing_far > 0:
+                    warnings.warn(
+                        f"far_max cut dropped {n_missing_far} event(s) with "
+                        f"missing FAR (far_available=False); pass "
+                        f"allow_missing_far=True to keep them or require_far=True "
+                        f"to fail loudly: {sorted(self.names[missing_mask].tolist())}")
+                m &= below
+                far_policy = "drop_missing"
+
+        if pastro_min is not None and "pastro" in self.meta:
+            sel_pre = np.nonzero(m & np.isin(np.arange(len(self.names)),
+                                             self._sel))[0]
+            if np.isnan(np.asarray(self.meta["pastro"], dtype=float)[sel_pre]).any():
+                warnings.warn("p_astro NaN for some events; populate via "
                               "event_table at ingest to use these cuts.")
-        return GWCatalog(self.path, _sel=sel)
+
+        sel = np.nonzero(m & np.isin(np.arange(len(self.names)), self._sel))[0]
+        result = GWCatalog(self.path, _sel=sel)
+        result._far_policy = far_policy
+        result._n_missing_far = n_missing_far
+        result._selection_source_class = source_class
+        result._selection_event_list = event_list
+        return result
 
     # ---- sample access ---------------------------------------------------
     def _slices(self):
@@ -184,7 +308,9 @@ class GWCatalog:
                       far_max=None, pastro_min=None, z_max=None,
                       seed=0, replace="auto", cosmology=None, amax=0.99,
                       allowed_names=None,
-                      allowed_names_authoritative=True):
+                      allowed_names_authoritative=True,
+                      source_class=None, event_list=None,
+                      allow_missing_far=False, require_far=False):
         """Write an HDF5 consumable by darksirens.gw.utils.load_gw_samples.
 
         p_pe convention
@@ -216,10 +342,23 @@ class GWCatalog:
             If True, allowed_names is treated as authoritative and compact_type
             is not applied as an additional gate.  A warning is still emitted
             when compact_type would exclude allowed names.
+        source_class : str, iterable, or None
+            Source-class filter (``bbh``/``nsbh``/``bns``/``cbc`` or a canonical
+            class).  ``cbc`` selects all compact-binary classes.  See
+            :meth:`select`.
+        event_list : str, path, iterable, or None
+            User event-list filter (file path or in-memory sequence).
+        allow_missing_far, require_far : bool
+            Missing-FAR policy for the ``far_max`` cut; recorded in the output
+            HDF5 provenance attributes ``far_policy``, ``allow_missing_far``,
+            ``require_far``, and ``n_events_missing_far``.
         """
         sub = self.select(compact_type=compact_type, far_max=far_max,
                           pastro_min=pastro_min, allowed_names=allowed_names,
-                          allowed_names_authoritative=allowed_names_authoritative)
+                          allowed_names_authoritative=allowed_names_authoritative,
+                          source_class=source_class, event_list=event_list,
+                          allow_missing_far=allow_missing_far,
+                          require_far=require_far)
         need = ["mass_1", "mass_2", "luminosity_distance", "ra", "dec",
                 "chi_eff", "p_dL_pe"]
         per = sub.get(need, per_event=True)
@@ -325,6 +464,18 @@ class GWCatalog:
             f.attrs["chi_eff_amax"] = float(amax)
             f.attrs["pe_cosmology_H0"] = pe_H0
             f.attrs["pe_cosmology_Om0"] = pe_Om0
+            # --- Source-class / FAR-policy provenance (PR 2) ---
+            f.attrs["source_class_filter"] = (
+                "" if source_class is None else str(source_class))
+            f.attrs["event_list_filter"] = (
+                "" if event_list is None
+                else (str(event_list) if isinstance(event_list, (str, bytes))
+                      else "custom_sequence"))
+            f.attrs["far_policy"] = getattr(sub, "_far_policy", "none")
+            f.attrs["allow_missing_far"] = bool(allow_missing_far)
+            f.attrs["require_far"] = bool(require_far)
+            f.attrs["n_events_missing_far"] = int(
+                getattr(sub, "_n_missing_far", 0))
             f.attrs.create("event_names",
                            np.array([str(k) for k in kept],
                                     dtype=h5py.string_dtype()))

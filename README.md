@@ -177,6 +177,26 @@ bbh = cat.select(
 # FAR/pastro cuts still available when event_table was populated at ingest
 bbh = cat.select(compact_type="BBH", far_max=1.0, pastro_min=0.9)
 
+# --- Source-class selection (BBH / NSBH / BNS / all-CBC) ---
+# Filters on per-event source_class metadata (falls back to compact_type),
+# NOT on a static event-name list.  "cbc" = all compact-binary classes.
+bbh  = cat.select(source_class="bbh")
+nsbh = cat.select(source_class="nsbh")
+bns  = cat.select(source_class="bns")
+cbc  = cat.select(source_class="cbc")             # everything
+
+# --- User event-list filtering ---
+sub = cat.select(event_list="my_events.txt")      # one name per line, # comments ok
+sub = cat.select(event_list=["GW150914", "GW170817"])
+
+# --- Missing-FAR policy on far_max cuts ---
+# Public metadata may not expose FAR; far_available=False is a valid state.
+sub = cat.select(far_max=1.0, allow_missing_far=True)  # keep, warn, record
+sub = cat.select(far_max=1.0, require_far=True)        # fail loudly if any FAR missing
+# default: drop missing-FAR events (with a warning).  to_darksirens records the
+# choice in output attrs: far_policy, allow_missing_far, require_far,
+# n_events_missing_far, source_class_filter, event_list_filter.
+
 # Read posterior samples
 d = bbh.get(["mass_1", "luminosity_distance"])    # flat concatenated
 d = bbh.get(["mass_1"], per_event=True)           # list of arrays per event

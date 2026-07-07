@@ -43,6 +43,7 @@ import h5py
 
 from .cosmology import (make_cosmology, uniform_source_frame_prob,
                         PLANCK15, O4_FALLBACK)
+from .source_class import normalize_source_class
 
 # --------------------------------------------------------------------------
 # Parameter sets
@@ -66,15 +67,28 @@ EXTRA_DEFAULT_PARAMS = [
 DEFAULT_PARAMS = WAVEFORM_PARAMS + EXTRA_DEFAULT_PARAMS
 
 # Per-event metadata columns (scalars). NaN where unavailable from the PE file.
+#
+# Source-class metadata model (see gwcat.source_class):
+#   floats  -> p_astro, p_bbh, p_nsbh, p_bns, p_terr, far, far_available
+#   strings -> release, observing_run, source_class, source_class_method,
+#              source_class_reference, metadata_source
+# far_available is stored as a 0.0/1.0 float mask so that "FAR is genuinely
+# absent" (far_available=0) is a first-class, non-crashing state independent of
+# whether the far column happens to be NaN.
 META_FLOAT_FIELDS = [
     "far", "pastro", "snr_med",
     "m1_src_med", "m2_src_med",
     "dL_prior_H0", "dL_prior_Om0", "dL_prior_min", "dL_prior_max",
     "f_ref", "nsamp_original", "sky_area_90",
+    # source-class contract
+    "p_astro", "p_bbh", "p_nsbh", "p_bns", "p_terr", "far_available",
 ]
 META_STR_FIELDS = [
     "name", "catalog", "analysis_used", "dL_prior_source",
     "mass_prior_kind", "compact_type",
+    # source-class contract
+    "release", "observing_run", "source_class", "source_class_method",
+    "source_class_reference", "metadata_source",
 ]
 
 # Default waveform priority when no Mixed set exists (O4b/GWTC-5 events).
@@ -300,6 +314,29 @@ def _classify(m1_src, m2_src, thr):
     return "BNS"
 
 
+def _observing_run_from_name(name: str) -> str:
+    """Best-effort observing-run label from a GWOSC event name.
+
+    Returns "" (explicit absence) when the name does not carry a parseable
+    date.  This is a coarse mapping and callers may override it with authoritative
+    release/manifest metadata later.
+    """
+    m = re.match(r"GW(\d{2})(\d{2})", str(name))
+    if not m:
+        return ""
+    yy, mm = m.group(1), int(m.group(2))
+    mapping = {
+        "15": "O1", "16": "O1",
+        "17": "O2",
+        "19": "O3a" if mm <= 9 else "O3b",
+        "20": "O3b",
+        "23": "O4a",
+        "24": "O4a" if mm <= 3 else "O4b",
+        "25": "O4b",
+    }
+    return mapping.get(yy, "")
+
+
 def _sky_area_90(ra_samples, dec_samples, nside=64):
     """Estimate the 90% credible sky area (deg^2) from posterior ra/dec samples.
 
@@ -412,6 +449,17 @@ def build_store(paths, out_path, params=None, extra_params=None,
         f_ref = _read_f_ref(data, analysis)
         et = event_table.get(name, {})
 
+        # ── Source-class contract ──────────────────────────────────────────
+        compact = _classify(m1s, m2s, cfg.nsbh_mass_threshold)
+        far_val = float(et.get("far", np.nan))
+        # far_available is an explicit state: True only when a finite FAR was
+        # actually supplied by the event table (public metadata may omit it).
+        far_available = 1.0 if np.isfinite(far_val) else 0.0
+        # p_astro / component probabilities come from the event table when
+        # present; otherwise stay NaN (explicit absence).
+        p_astro = float(et.get("p_astro", et.get("pastro", np.nan)))
+        metadata_source = "event_table" if et else "pe_file_only"
+
         names.append(name)
         offsets.append(offsets[-1] + n)
         meta["name"].append(name)
@@ -419,8 +467,22 @@ def build_store(paths, out_path, params=None, extra_params=None,
         meta["analysis_used"].append(analysis)
         meta["dL_prior_source"].append(src)
         meta["mass_prior_kind"].append("uniform_detector_frame")  # validated below
-        meta["compact_type"].append(_classify(m1s, m2s, cfg.nsbh_mass_threshold))
-        meta["far"].append(float(et.get("far", np.nan)))
+        meta["compact_type"].append(compact)
+        # canonical source-class metadata (parallel to legacy compact_type)
+        meta["source_class"].append(normalize_source_class(compact))
+        meta["source_class_method"].append("mass_threshold")
+        meta["source_class_reference"].append(
+            f"m2_source<{cfg.nsbh_mass_threshold}Msun -> NS component")
+        meta["release"].append(catalog)
+        meta["observing_run"].append(_observing_run_from_name(name))
+        meta["metadata_source"].append(metadata_source)
+        meta["far_available"].append(far_available)
+        meta["p_astro"].append(p_astro)
+        meta["p_bbh"].append(float(et.get("p_bbh", np.nan)))
+        meta["p_nsbh"].append(float(et.get("p_nsbh", np.nan)))
+        meta["p_bns"].append(float(et.get("p_bns", np.nan)))
+        meta["p_terr"].append(float(et.get("p_terr", np.nan)))
+        meta["far"].append(far_val)
         meta["pastro"].append(float(et.get("pastro", np.nan)))
         meta["snr_med"].append(snr)
         meta["m1_src_med"].append(m1s)

@@ -17,6 +17,9 @@ __version__ = "0.1.0"
 from .catalog import GWCatalog, validate_export
 from .ingest import build_store, merge_store, inspect, IngestConfig, DEFAULT_PARAMS
 from .selection import SelectionSet, CombinedSelectionSet
+from .source_class import (SOURCE_CLASSES, SourceClassMeta,
+                          normalize_source_class, resolve_filter_classes,
+                          load_event_list)
 
 # fetch has optional deps (requests, tqdm); import lazily
 def fetch_and_build(*args, **kwargs):
@@ -33,6 +36,8 @@ __all__ = [
     "GWCatalog", "SelectionSet", "CombinedSelectionSet",
     "build_store", "merge_store", "inspect", "IngestConfig", "DEFAULT_PARAMS",
     "validate_export",
+    "SOURCE_CLASSES", "SourceClassMeta", "normalize_source_class",
+    "resolve_filter_classes", "load_event_list",
     "fetch_and_build", "fetch_catalog",
     "__version__",
 ]
