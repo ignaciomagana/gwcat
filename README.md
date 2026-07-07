@@ -208,39 +208,85 @@ chi = bbh.chi_eff()
 m1s, m2s = bbh.source_masses(cosmology=(67.74, 0.3089))
 ```
 
-### `SelectionSet` — injection processing
+### `SelectionSet` — injection processing (all CBC)
 
 Reads both LVK injection formats:
 - **`events/` format** (O4 sets, Zenodo 19500064): modern format with log-joint draw PDF
 - **`injections/` format** (O3 BBH, Zenodo 7890437): legacy format with factored draw PDF components
 
+Selection products are **not BBH-only**.  Pass `source_class` to subset the
+injections by source class — BBH / NSBH / BNS / MassGap / `cbc` (all
+compact-binary classes).  Injections are classified by their *injected*
+source-frame component masses using the **same shared mass-threshold classifier**
+(`gwcat.source_class.classify_by_mass`, NS/BH split at 3 M⊙) that labels PE
+events, so a `bbh` selection of injections is consistent with a `bbh` selection
+of PE events by construction.  `source_class=None` (the default) applies no
+restriction and is byte-identical to the pre-existing export.
+
 ```python
 sel = SelectionSet("injection_file.hdf", H0=67.74, Om0=0.3089)
 sel.n_injections                                  # total in file
 sel.detection_efficiency(far_threshold=1.0)       # fraction detected
-sel.to_darksirens("selection.h5", far_threshold=1.0)
+sel.source_class_mask("nsbh")                     # boolean mask by injected mass
+sel.to_darksirens("selection_bbh.h5", far_threshold=1.0, source_class="bbh")
 ```
+
+**Source-class filtering is subsetting, not reweighting.** `ndraw`
+(`total_generated`) is left unchanged, following the Essick et al. (2023)
+multi-campaign estimator; the analyst **must** pair a class-filtered selection
+file with a PE export filtered to the *same* class(es).  Every export records
+explicit provenance in its attrs:
+
+- `pdraw_state` — what the exported `pdraw` represents after all manipulations
+  (draw density in the `(m1det, q, dL)` basis with the 1-D chi_eff prior swapped
+  in, normalised by `T_obs` and injection weights);
+- `source_class_filter`, `source_class_method`, `nsbh_mass_threshold`,
+  `n_injections_before_filter`, `n_injections_after_filter`, and a
+  `source_class_filter_note` when a filter was applied;
+- search/significance provenance: `significance_columns` (which FAR pipeline
+  columns were thresholded), `significance_type`, `significance_far_threshold`,
+  `significance_available`, and `p_astro_available=False` (explicit absence —
+  no per-injection `p_astro` is used for thresholding), mirroring the FAR
+  contract.
 
 ### `CombinedSelectionSet` — multi-campaign combination
 
 Combines injection sets from different observing runs following
-Essick et al. (2023), with proper ndraw reweighting:
+Essick et al. (2023), with proper ndraw reweighting.  `source_class` applies
+per campaign (again subsetting only — the `N_k / N_total` fractions are
+unchanged):
 
 ```python
 sel_o3 = SelectionSet("endo3_bbhpop-LIGO-T2100113-v12.hdf5")
 sel_o4 = SelectionSet("injections-O4ab/...-cartesian_spins_*.hdf")
 combined = CombinedSelectionSet([sel_o3, sel_o4])
-combined.to_darksirens("selection_bbh.h5", far_threshold=1.0)
+combined.to_darksirens("selection_bbh.h5", far_threshold=1.0, source_class="bbh")
 ```
 
-### `validate_export` — pre-flight checks
+### `validate_export` — pre-flight checks & cross-validation
 
 ```python
 from gwcat import validate_export
 results = validate_export("gw_bbh.h5", "selection_bbh.h5")
-# Checks: array lengths, p_pe/pdraw finite+positive, source≤detector masses,
-# format versions, cosmology consistency between PE and selection files.
+# Internal checks: array lengths, p_pe/pdraw finite+positive, source≤detector
+# masses, format versions.
 ```
+
+When a selection file is supplied, `validate_export` **cross-validates the PE
+export against the selection export** and raises a clear `ValueError` on any
+contract mismatch (the point is to stop a file that looks valid while carrying
+the wrong prior/cosmology/source class):
+
+- **spin-prior contract** — `spin_prior_mode` must match and the
+  `chi_eff_prior_applied_to_p_pe` / `chi_eff_prior_applied_to_pdraw` flags must
+  agree, so the chi_eff prior is applied exactly once end-to-end;
+- **cosmology** — the selection cosmology must match the PE cosmology; when the
+  PE export carries per-event cosmologies (`cosmology_per_event_varies=True`),
+  every per-event value is compared against the single selection cosmology
+  rather than a legacy scalar;
+- **source-class compatibility** — the PE and selection `source_class_filter`
+  attrs must resolve to the same canonical class set (the injections must cover
+  the same source class(es) as the PE events).
 
 ### `merge_store` / `merge_stores` — incremental ingest
 

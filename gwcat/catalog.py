@@ -19,7 +19,7 @@ import h5py
 
 from .cosmology import make_cosmology, z_of_dL
 from .source_class import (normalize_source_class, resolve_filter_classes,
-                           load_event_list)
+                           load_event_list, SOURCE_CLASSES)
 
 
 class GWCatalog:
@@ -838,8 +838,29 @@ def validate_export(gw_path: str, selection_path: str = None, strict: bool = Fal
       * if selection_path: cosmology consistent, pdraw finite/positive,
         ndraw > n_detected, chi_eff_swap_applied flag present
 
+    Cross-validation (PR 9).  When ``selection_path`` is given, the PE export and
+    the selection export are checked for *contract* agreement and any mismatch
+    raises ``ValueError`` with a specific message (independent of ``strict`` --
+    a contract mismatch is always a hard error, since the whole point is to stop
+    a file that looks valid while carrying the wrong prior/cosmology/source
+    class):
+
+      (a) spin-prior contract: ``spin_prior_mode`` must match and the
+          ``chi_eff_prior_applied_to_p_pe`` / ``chi_eff_prior_applied_to_pdraw``
+          flags must agree (else the chi_eff prior is double-counted / omitted);
+      (b) cosmology: the selection cosmology must match the PE cosmology.  When
+          the PE export carries per-event cosmologies
+          (``cosmology_per_event_varies=True``, PR 4), every per-event value is
+          compared against the single selection cosmology rather than the legacy
+          scalar;
+      (c) source-class compatibility: the PE ``source_class_filter`` and the
+          selection ``source_class_filter`` must resolve to the same canonical
+          class set (the injections must cover the same source class(es) as the
+          PE events).
+
     Returns a dict of {check_name: passed_bool}.  If strict=True, raises on
-    the first failure.
+    the first internal-consistency failure; the cross-validation contract
+    checks above always raise on mismatch.
     """
     results = {}
 
@@ -916,18 +937,96 @@ def validate_export(gw_path: str, selection_path: str = None, strict: bool = Fal
                 else:
                     _check("sel_pdraw_nonempty", False, "pdraw is empty")
 
-        # Cross-check cosmology
+        # ── Cross-validation: PE export <-> selection export contract ──────
+        # Contract mismatches ALWAYS raise (a "looks-valid" file with the wrong
+        # prior/cosmology/source-class is exactly what we must stop).
         with h5py.File(gw_path, "r") as fg, h5py.File(selection_path, "r") as fs:
-            pe_H0 = fg.attrs.get("pe_cosmology_H0")
-            sel_H0 = fs.attrs.get("cosmology_H0")
-            if pe_H0 is not None and sel_H0 is not None:
-                _check("cosmo_H0_consistent", abs(pe_H0 - sel_H0) < 1.0,
-                       f"PE H0={pe_H0}, sel H0={sel_H0}")
-            pe_Om = fg.attrs.get("pe_cosmology_Om0")
-            sel_Om = fs.attrs.get("cosmology_Om0")
-            if pe_Om is not None and sel_Om is not None:
-                _check("cosmo_Om0_consistent", abs(pe_Om - sel_Om) < 0.05,
-                       f"PE Om0={pe_Om}, sel Om0={sel_Om}")
+            def _sattr(fobj, name, default=None):
+                v = fobj.attrs.get(name, default)
+                return v.decode() if isinstance(v, bytes) else v
+
+            def _fail(name, msg):
+                results[name] = False
+                raise ValueError(f"validate_export FAILED: {name}. {msg}")
+
+            # (a) Spin-prior contract agreement -----------------------------
+            pe_mode = _sattr(fg, "spin_prior_mode")
+            sel_mode = _sattr(fs, "spin_prior_mode")
+            if pe_mode is not None and sel_mode is not None:
+                if pe_mode != sel_mode:
+                    _fail("xcheck_spin_prior_mode",
+                          f"PE spin_prior_mode={pe_mode!r} but selection "
+                          f"spin_prior_mode={sel_mode!r}. Both must match or the "
+                          f"chi_eff prior is double-counted / omitted.")
+                results["xcheck_spin_prior_mode"] = True
+            if ("chi_eff_prior_applied_to_p_pe" in fg.attrs
+                    and "chi_eff_prior_applied_to_pdraw" in fs.attrs):
+                pe_chi = bool(fg.attrs["chi_eff_prior_applied_to_p_pe"])
+                sel_chi = bool(fs.attrs["chi_eff_prior_applied_to_pdraw"])
+                if pe_chi != sel_chi:
+                    _fail("xcheck_chi_eff_flag",
+                          f"PE chi_eff_prior_applied_to_p_pe={pe_chi} but "
+                          f"selection chi_eff_prior_applied_to_pdraw={sel_chi}. "
+                          f"The chi_eff prior must be applied to both or neither.")
+                results["xcheck_chi_eff_flag"] = True
+
+            # (b) Cosmology agreement (PR 4 per-event arrays) ---------------
+            sel_H0 = _sattr(fs, "cosmology_H0")
+            sel_Om = _sattr(fs, "cosmology_Om0")
+            if sel_H0 is not None and sel_Om is not None:
+                varies = bool(fg.attrs.get("cosmology_per_event_varies", False))
+                if varies:
+                    pe_H0_arr = np.asarray(
+                        fg.attrs.get("cosmology_H0_per_event", []), dtype=float)
+                    pe_Om_arr = np.asarray(
+                        fg.attrs.get("cosmology_Om0_per_event", []), dtype=float)
+                    bad = ((np.abs(pe_H0_arr - float(sel_H0)) >= 1.0).any()
+                           or (np.abs(pe_Om_arr - float(sel_Om)) >= 0.05).any())
+                    if bad:
+                        h0rng = ((pe_H0_arr.min(), pe_H0_arr.max())
+                                 if pe_H0_arr.size else ("?", "?"))
+                        omrng = ((pe_Om_arr.min(), pe_Om_arr.max())
+                                 if pe_Om_arr.size else ("?", "?"))
+                        _fail("xcheck_cosmology",
+                              f"PE export uses per-event cosmologies "
+                              f"(cosmology_per_event_varies=True) with H0 in "
+                              f"{h0rng} and Om0 in {omrng} that do not all match "
+                              f"the single selection cosmology (H0={sel_H0}, "
+                              f"Om0={sel_Om}). Re-export the selection under a "
+                              f"matching cosmology, or use a single-cosmology PE "
+                              f"export.")
+                    results["xcheck_cosmology"] = True
+                else:
+                    pe_H0 = fg.attrs.get("pe_cosmology_H0")
+                    pe_Om = fg.attrs.get("pe_cosmology_Om0")
+                    if pe_H0 is not None and abs(float(pe_H0) - float(sel_H0)) >= 1.0:
+                        _fail("xcheck_cosmology",
+                              f"PE cosmology H0={pe_H0} disagrees with selection "
+                              f"H0={sel_H0} (|Δ| >= 1.0).")
+                    if pe_Om is not None and abs(float(pe_Om) - float(sel_Om)) >= 0.05:
+                        _fail("xcheck_cosmology",
+                              f"PE cosmology Om0={pe_Om} disagrees with selection "
+                              f"Om0={sel_Om} (|Δ| >= 0.05).")
+                    results["xcheck_cosmology"] = True
+
+            # (c) Source-class compatibility --------------------------------
+            def _sc_classes(raw):
+                s = "" if raw is None else str(raw)
+                if s == "":
+                    return set(SOURCE_CLASSES)
+                return set(resolve_filter_classes(s))
+
+            pe_scf = _sattr(fg, "source_class_filter", "")
+            sel_scf = _sattr(fs, "source_class_filter", "")
+            pe_classes = _sc_classes(pe_scf)
+            sel_classes = _sc_classes(sel_scf)
+            if pe_classes != sel_classes:
+                _fail("xcheck_source_class",
+                      f"PE source_class_filter={pe_scf!r} -> {sorted(pe_classes)} "
+                      f"but selection source_class_filter={sel_scf!r} -> "
+                      f"{sorted(sel_classes)}. The selection injections must "
+                      f"cover the same source class(es) as the PE events.")
+            results["xcheck_source_class"] = True
 
     n_pass = sum(results.values())
     n_total = len(results)
