@@ -60,7 +60,7 @@ bbh = cat.select(
 print(f"Selected {bbh.n_events} events")
 
 # ── 6. Export PE samples for darksirens ──────────────────────
-cat._to_darksirens_format(
+cat.to_darksirens(
     "gw_bbh.h5",
     compact_type=None,                    # no derived gate; whitelist is authoritative
     allowed_names=bbh_names,
@@ -124,7 +124,7 @@ bbh = cat.select(
 # Or pass directly to the exporter (skips a separate select() call).
 # compact_type=None avoids adding a derived compact-type gate on top of the
 # authoritative whitelist.
-cat._to_darksirens_format(
+cat.to_darksirens(
     "gw_bbh.h5",
     compact_type=None,
     allowed_names=bbh_names,
@@ -295,7 +295,7 @@ gwcat                             darksirens
 ─────                             ──────────
  store.h5                             │
    │                                  │
-   ├─ _to_darksirens_format()  ──→  load_gw_samples()
+   ├─ to_darksirens()          ──→  load_gw_samples()
    │   allowed_names filter          × p_chieff (gwdistributions)
    │   p_pe = m1det × p_dL_pe        normalise per event
    │   + redshift, m1src, m2src      ↓ use PE cosmology
@@ -324,7 +324,8 @@ darksirens never hardcodes a cosmology for the dL→z conversion.
 
 - **Store layout**: concatenated 1-D columns + integer `offsets` index.
 - **Mass-prior-agnostic store**: keeps `p_dL_pe` + its cosmology.
-  The mass Jacobian is applied only in `_to_darksirens_format`.
+  The mass Jacobian is applied only in `to_darksirens`
+  (`_to_darksirens_format` is a deprecated alias kept for compatibility).
 - **BBH selection via `allowed_names`**: the recommended way to select BBH
   events is via `fetch_bbh_list()` (GWOSC live) or the static `BBH_ALL`,
   rather than FAR/p_astro cuts that require a separately fetched event table.

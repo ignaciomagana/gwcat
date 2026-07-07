@@ -5,11 +5,14 @@
   * event(name)             -> per-event dict
   * derived methods          -> chi_eff, q, chirp_mass, source masses, redshift,
                                 computed on demand (NOT stored)
-  * _to_darksirens_format()  -> the ONLY place the (m1det,q,dL)-basis mass
+  * to_darksirens()          -> the ONLY place the (m1det,q,dL)-basis mass
                                 Jacobian is applied. Writes exactly what
                                 darksirens.gw.utils.load_gw_samples reads.
+                                (_to_darksirens_format is a deprecated alias.)
 """
 from __future__ import annotations
+
+import warnings
 
 import numpy as np
 import h5py
@@ -177,11 +180,11 @@ class GWCatalog:
         return d["mass_1"] / (1 + z), d["mass_2"] / (1 + z)
 
     # ---- darksirens export (Jacobian lives here, and only here) ----------
-    def _to_darksirens_format(self, out_path, compact_type=None, nsamp=4096,
-                              far_max=None, pastro_min=None, z_max=None,
-                              seed=0, replace="auto", cosmology=None, amax=0.99,
-                              allowed_names=None,
-                              allowed_names_authoritative=True):
+    def to_darksirens(self, out_path, compact_type=None, nsamp=4096,
+                      far_max=None, pastro_min=None, z_max=None,
+                      seed=0, replace="auto", cosmology=None, amax=0.99,
+                      allowed_names=None,
+                      allowed_names_authoritative=True):
         """Write an HDF5 consumable by darksirens.gw.utils.load_gw_samples.
 
         p_pe convention
@@ -333,6 +336,21 @@ class GWCatalog:
         print(f"Wrote {out_path}: nobs={nobs}, nsamp={nsamp}, "
               f"H0={pe_H0}, Om0={pe_Om0}, compact_type={compact_type}")
         return out_path
+
+    def _to_darksirens_format(self, *args, **kwargs):
+        """Deprecated alias for :meth:`to_darksirens`.
+
+        Kept for backward compatibility with existing scripts/notebooks.
+        Will be removed in a future release; migrate to ``to_darksirens``.
+        """
+        warnings.warn(
+            "GWCatalog._to_darksirens_format is deprecated and will be "
+            "removed in a future release; use GWCatalog.to_darksirens "
+            "instead (identical signature and behavior).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.to_darksirens(*args, **kwargs)
 
     # ---- diagnostics ---------------------------------------------------------
     @property
