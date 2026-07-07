@@ -242,15 +242,22 @@ results = validate_export("gw_bbh.h5", "selection_bbh.h5")
 # format versions, cosmology consistency between PE and selection files.
 ```
 
-### `merge_store` — incremental ingest
+### `merge_store` / `merge_stores` — incremental ingest
 
 ```python
-from gwcat import merge_store
-merge_store("store.h5", new_pe_paths)             # appends in place
+from gwcat import merge_store, merge_stores
+merge_store("store.h5", new_pe_paths)             # appends PE files in place
 merge_store("store.h5", new_paths, out_path="store_v2.h5")  # or to a new file
+merge_stores("a.h5", "b.h5", "merged.h5")         # merge two existing stores
 ```
 
-Skips duplicate event names automatically.
+Skips duplicate event names automatically.  Both merges are
+**schema-preserving**: the output holds the *union* of parameters across the
+inputs.  A parameter present in only some events (e.g. BNS tidal columns absent
+from BBH events) is kept as a full column, NaN-filled for the events that lack
+it and marked unavailable in the availability mask — never silently dropped by
+intersection.  Meta fields merge as a union too, with explicit-absence defaults
+(NaN for floats, `""` for strings).
 
 ### `fetch_catalog` — Zenodo downloader
 
@@ -420,6 +427,23 @@ grid (with a warning) instead of being pinned to `zmax`.
 ## Design
 
 - **Store layout**: concatenated 1-D columns + integer `offsets` index.
+- **Union parameter schema** (schema 1.1): ingest and merge store the *union*
+  of parameters across events, not the intersection. A parameter present for
+  only some events is kept as a full column, NaN-filled for the events that lack
+  it, and a per-event × per-parameter boolean **availability mask** is stored at
+  `avail/mask` (rows aligned with `index/event_names`, columns with
+  `attrs/param_names`). Legacy stores (schema 1.0, no mask) still load: every
+  stored column is treated as available for every event, which is exact because
+  the old intersection ingest guaranteed it. See `gwcat.schema` for the
+  parameter groups (`core_intrinsic`, `core_extrinsic`, `spin`, `bns_nsbh`,
+  `diagnostic`) and the per-export required-parameter lists.
+- **Required vs optional parameters**: `GWCatalog.get(params)` raises a clear,
+  named `MissingParameterError` (a `KeyError` subclass) when a required
+  parameter is absent — pass `required=False` for a NaN-filled column plus
+  `param_available(param)` availability. Exports declare their required columns
+  (`gwcat.schema.EXPORT_REQUIREMENTS`); `to_darksirens` fails loudly, naming the
+  parameter **and** the offending event(s), if a required column is absent from
+  the store or NaN-filled for a selected event.
 - **Mass-prior-agnostic store**: keeps `p_dL_pe` + its cosmology.
   The mass Jacobian is applied only in `to_darksirens`
   (`_to_darksirens_format` is a deprecated alias kept for compatibility).

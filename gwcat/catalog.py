@@ -31,6 +31,14 @@ class GWCatalog:
             self.offsets = f["index/offsets"][:]
             self.names = np.array([n for n in f["index/event_names"][:]])
             self.meta = {k: f[f"meta/{k}"][:] for k in f["meta"].keys()}
+            # Per-event x per-parameter availability mask (PR 5).  Legacy stores
+            # (schema < 1.1) have no mask; treat every stored column as available
+            # for every event, which is exact because the old intersection
+            # ingest guaranteed it.
+            if "avail" in f and "mask" in f["avail"]:
+                avail = np.asarray(f["avail/mask"][:], dtype=bool)
+            else:
+                avail = None
         # decode bytes -> str for string meta
         for k, v in self.meta.items():
             if v.dtype.kind in ("S", "O"):
@@ -38,6 +46,11 @@ class GWCatalog:
                                          for x in v])
         self.names = np.array([n.decode() if isinstance(n, bytes) else n
                                for n in self.names])
+        #: param name -> column index into ``self.avail`` / ``self.params``.
+        self._param_index = {p: j for j, p in enumerate(self.params)}
+        self.avail = (avail if avail is not None
+                      else np.ones((len(self.names), len(self.params)),
+                                   dtype=bool))
         self._sel = np.arange(len(self.names)) if _sel is None else np.asarray(_sel)
         self._source_class_cache = None
         # Provenance of the most recent select() call (defaults for a fresh
@@ -236,24 +249,64 @@ class GWCatalog:
     def _slices(self):
         return [(self.offsets[i], self.offsets[i + 1]) for i in self._sel]
 
-    def get(self, params, per_event=False):
+    def get(self, params, per_event=False, required=True, fill_value=np.nan):
         """Read columns for the current selection.
 
         per_event=False -> dict of flat concatenated arrays.
         per_event=True  -> dict of lists (one array per event).
+
+        Required vs optional access (PR 5)
+        ----------------------------------
+        required : bool, default True
+            When True (the default, preserving the historical contract), a
+            requested parameter that is not in the store raises a clear
+            :class:`gwcat.schema.MissingParameterError` (a ``KeyError`` subclass)
+            naming the parameter and the stored set -- never a bare ``KeyError``.
+        fill_value : float, default NaN
+            When ``required=False``, a parameter absent from the store is
+            returned as a ``fill_value``-filled column shaped like the current
+            selection instead of raising.  Parameters present in the store but
+            NaN-filled for some events at ingest return their stored values
+            as-is; use :meth:`param_available` to learn which events had them.
         """
+        from .schema import MissingParameterError
         params = [params] if isinstance(params, str) else list(params)
         out = {p: [] for p in params}
         sl = self._slices()
         with h5py.File(self.path, "r") as f:
             for p in params:
-                if p not in self.params:
-                    raise KeyError(f"{p} not in store; stored: {self.params}")
+                if p not in self._param_index:
+                    if required:
+                        raise MissingParameterError(
+                            f"required parameter {p!r} is not in the store; "
+                            f"stored parameters are {self.params}. Pass "
+                            f"required=False for a {fill_value}-filled column.")
+                    out[p] = [np.full(b - a, fill_value) for (a, b) in sl]
+                    continue
                 d = f[f"samples/{p}"]
                 out[p] = [d[a:b] for (a, b) in sl]
         if per_event:
             return out
         return {p: np.concatenate(v) if v else np.array([]) for p, v in out.items()}
+
+    def param_available(self, param):
+        """Boolean per-event availability of ``param`` for the current selection.
+
+        True where the event actually provided the parameter at ingest, False
+        where its slice is NaN-filled.  A parameter not in the store returns an
+        all-False array (its column is entirely absent).
+        """
+        sel = np.asarray(self._sel)
+        if param not in self._param_index:
+            return np.zeros(sel.size, dtype=bool)
+        return self.avail[sel, self._param_index[param]]
+
+    def _require_params(self, need, export="export"):
+        """Fail loudly if any ``need`` parameter is absent from the store or
+        unavailable (NaN-filled) for a selected event, naming param + events."""
+        from .schema import check_required
+        check_required(need, self.params, self.avail, self.names,
+                       np.asarray(self._sel), self._param_index, export=export)
 
     def event(self, name, params=None):
         i = int(np.nonzero(self.names == name)[0][0])
@@ -411,8 +464,13 @@ class GWCatalog:
                           source_class=source_class, event_list=event_list,
                           allow_missing_far=allow_missing_far,
                           require_far=require_far)
-        need = ["mass_1", "mass_2", "luminosity_distance", "ra", "dec",
-                "chi_eff", "p_dL_pe"]
+        from .schema import DARKSIRENS_REQUIRED
+        need = list(DARKSIRENS_REQUIRED)
+        # Required-parameter contract (PR 5): fail loudly -- naming the missing
+        # parameter(s) and event(s) -- if a required export column is absent
+        # from the store or NaN-filled for any selected event, rather than
+        # producing a silently-wrong export.
+        sub._require_params(need, export="darksirens export")
         per = sub.get(need, per_event=True)
         rng = np.random.default_rng(seed)
 

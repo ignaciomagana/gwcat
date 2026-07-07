@@ -15,11 +15,14 @@ GWCatalog.to_darksirens; the store stays mass-prior-agnostic.
 __version__ = "0.1.0"
 
 from .catalog import GWCatalog, validate_export
-from .ingest import build_store, merge_store, inspect, IngestConfig, DEFAULT_PARAMS
+from .ingest import (build_store, merge_store, merge_stores, inspect,
+                     IngestConfig, DEFAULT_PARAMS)
 from .selection import SelectionSet, CombinedSelectionSet
 from .source_class import (SOURCE_CLASSES, SourceClassMeta,
                           normalize_source_class, resolve_filter_classes,
                           load_event_list)
+from .schema import (PARAMETER_GROUPS, EXPORT_REQUIREMENTS, DARKSIRENS_REQUIRED,
+                    MissingParameterError, required_params)
 
 # fetch has optional deps (requests, tqdm); import lazily
 def fetch_and_build(*args, **kwargs):
@@ -34,10 +37,13 @@ def fetch_catalog(*args, **kwargs):
 
 __all__ = [
     "GWCatalog", "SelectionSet", "CombinedSelectionSet",
-    "build_store", "merge_store", "inspect", "IngestConfig", "DEFAULT_PARAMS",
+    "build_store", "merge_store", "merge_stores", "inspect", "IngestConfig",
+    "DEFAULT_PARAMS",
     "validate_export",
     "SOURCE_CLASSES", "SourceClassMeta", "normalize_source_class",
     "resolve_filter_classes", "load_event_list",
+    "PARAMETER_GROUPS", "EXPORT_REQUIREMENTS", "DARKSIRENS_REQUIRED",
+    "MissingParameterError", "required_params",
     "fetch_and_build", "fetch_catalog",
     "__version__",
 ]

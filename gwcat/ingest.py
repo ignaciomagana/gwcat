@@ -402,8 +402,7 @@ def build_store(paths, out_path, params=None, extra_params=None,
         params += [p for p in extra_params if p not in params]
     event_table = _resolve_event_table(event_table)
 
-    col_chunks = {p: [] for p in params}      # only filled for params present
-    stored_params = None
+    records = []   # per event: (name, n_samples, {param: array}) -- union schema
     offsets = [0]
     names, meta = [], {k: [] for k in META_FLOAT_FIELDS + META_STR_FIELDS}
 
@@ -415,18 +414,11 @@ def build_store(paths, out_path, params=None, extra_params=None,
         analysis = select_analysis(analyses, prefix, cfg)
         s = samples_dict[analysis]
 
-        present = [p for p in params if p in s]
-        if stored_params is None:
-            stored_params = present
-        elif present != stored_params:
-            # keep the intersection stable across events
-            inter = [p for p in stored_params if p in present]
-            for p in set(stored_params) - set(inter):
-                col_chunks.pop(p, None)
-            stored_params = inter
         n = len(np.asarray(s["luminosity_distance"]))
-        for p in stored_params:
-            col_chunks[p].append(np.asarray(s[p], dtype=np.float64))
+        # Union schema: keep EVERY candidate parameter this event actually has.
+        # Parameters a given event lacks are NaN-filled for that event's slice
+        # later; we never drop a whole column just because one event lacks it.
+        rec = {p: np.asarray(s[p], dtype=np.float64) for p in params if p in s}
 
         dL = np.asarray(s["luminosity_distance"], float)
         H0, Om0, dmin, dmax, src = resolve_dL_prior(catalog, analysis, analyses,
@@ -439,7 +431,8 @@ def build_store(paths, out_path, params=None, extra_params=None,
                               f"(assumed cosmology may be wrong)")
         # distance prior evaluated per sample, stored mass-prior-agnostic
         p_dL = uniform_source_frame_prob(dL, make_cosmology(H0, Om0), dmin, dmax)
-        col_chunks.setdefault("p_dL_pe", []).append(p_dL)
+        rec["p_dL_pe"] = p_dL
+        records.append((name, n, rec))
 
         # metadata
         m1s = float(np.median(s["mass_1_source"])) if "mass_1_source" in s else np.nan
@@ -501,13 +494,62 @@ def build_store(paths, out_path, params=None, extra_params=None,
             meta["sky_area_90"].append(np.nan)
         print(f"[{catalog}] {name}: {n} samp, analysis={analysis}, prior={src}")
 
-    if "p_dL_pe" not in stored_params:
-        stored_params = stored_params + ["p_dL_pe"]
+    # Assemble the UNION of parameters across events, NaN-filling event slices
+    # where a parameter is absent, and build the per-event availability mask.
+    union_params, columns, avail = _assemble_union(
+        records, list(params) + ["p_dL_pe"])
 
-    _write_store(out_path, stored_params, col_chunks, offsets, names, meta, cfg)
+    _write_store(out_path, union_params, columns, offsets, names, avail, meta, cfg)
     print(f"\nWrote {out_path}: {len(names)} events, "
-          f"{offsets[-1]} total samples, params={stored_params}")
+          f"{offsets[-1]} total samples, params={union_params}")
     return out_path
+
+
+def _assemble_union(records, candidate_params):
+    """Assemble union-schema columns + an availability mask from per-event data.
+
+    Parameters
+    ----------
+    records : list of (name, n_samples, {param: 1-D array})
+        One entry per event.  Each dict holds only the parameters that event
+        actually provides.
+    candidate_params : sequence of str
+        Column order to consider.  A parameter is stored iff at least one event
+        provides it; the stored order follows ``candidate_params`` (duplicates
+        removed, first occurrence kept).
+
+    Returns
+    -------
+    union_params : list of str
+        Parameters present in >= 1 event, in ``candidate_params`` order.
+    columns : dict {param: 1-D float64 array}
+        Concatenated across events; NaN where an event lacks the parameter.
+    avail : 2-D bool array, shape (n_events, len(union_params))
+        ``avail[i, j]`` is True iff event ``i`` actually provided
+        ``union_params[j]`` (False marks a NaN-filled slice).
+    """
+    seen, ordered = set(), []
+    for p in candidate_params:
+        if p not in seen:
+            seen.add(p)
+            ordered.append(p)
+    union_params = [p for p in ordered
+                    if any(p in rec for (_n, _c, rec) in records)]
+
+    n_events = len(records)
+    avail = np.zeros((n_events, len(union_params)), dtype=bool)
+    columns = {}
+    for j, p in enumerate(union_params):
+        chunks = []
+        for i, (_name, n, rec) in enumerate(records):
+            if p in rec:
+                chunks.append(np.asarray(rec[p], dtype=np.float64))
+                avail[i, j] = True
+            else:
+                chunks.append(np.full(n, np.nan, dtype=np.float64))
+        columns[p] = (np.concatenate(chunks) if chunks
+                      else np.array([], dtype=np.float64))
+    return union_params, columns, avail
 
 
 def _read_f_ref(data, analysis):
@@ -522,25 +564,178 @@ def _read_f_ref(data, analysis):
     return None
 
 
-def _write_store(out_path, stored_params, col_chunks, offsets, names, meta, cfg):
+#: Schema version written by build_store/merge since PR 5.  1.1 adds the
+#: ``avail/mask`` availability dataset on top of the 1.0 layout.  Stores written
+#: as "1.0" (or with no version) have no mask; readers treat every stored column
+#: as available for every event (see :meth:`GWCatalog.__init__`), which is exact
+#: for legacy stores because the old intersection ingest guaranteed it.
+SCHEMA_VERSION = "1.1"
+
+
+def _write_store(out_path, stored_params, columns, offsets, names, avail, meta,
+                 cfg):
+    """Write a store.h5 with the union parameter set + availability mask.
+
+    ``columns`` maps each stored parameter to a full-length (already
+    concatenated) 1-D array.  ``avail`` is a (n_events, n_params) bool mask
+    aligned with ``names`` (rows) and ``stored_params`` (columns).
+    """
     dt_str = h5py.string_dtype(encoding="utf-8")
+    avail = np.asarray(avail, dtype=bool)
     with h5py.File(out_path, "w") as f:
-        f.attrs["schema_version"] = "1.0"
+        f.attrs["schema_version"] = SCHEMA_VERSION
         f.attrs.create("param_names",
                        np.array(stored_params, dtype=h5py.string_dtype()))
         f.attrs["n_events"] = len(names)
         g = f.create_group("samples")
         for p in stored_params:
-            arr = np.concatenate(col_chunks[p]) if col_chunks.get(p) else np.array([])
-            g.create_dataset(p, data=arr, compression=cfg.compression, shuffle=True)
+            arr = np.asarray(columns.get(p, np.array([])), dtype=np.float64)
+            g.create_dataset(p, data=arr, compression=cfg.compression,
+                             shuffle=True)
         idx = f.create_group("index")
         idx.create_dataset("offsets", data=np.asarray(offsets, dtype=np.int64))
-        idx.create_dataset("event_names", data=np.array(names, dtype=object), dtype=dt_str)
+        idx.create_dataset("event_names", data=np.array(names, dtype=object),
+                           dtype=dt_str)
+        # Per-event x per-parameter availability mask (rows aligned with
+        # index/event_names, columns aligned with attrs/param_names).
+        ag = f.create_group("avail")
+        ag.create_dataset("mask", data=avail, compression=cfg.compression)
         mg = f.create_group("meta")
         for k in META_FLOAT_FIELDS:
             mg.create_dataset(k, data=np.asarray(meta[k], dtype=np.float64))
         for k in META_STR_FIELDS:
             mg.create_dataset(k, data=np.array(meta[k], dtype=object), dtype=dt_str)
+
+
+# --------------------------------------------------------------------------
+# Store read / merge helpers (schema-preserving)
+# --------------------------------------------------------------------------
+def _decode(x):
+    return x.decode() if isinstance(x, (bytes, bytearray)) else str(x)
+
+
+def _read_store(path):
+    """Read a store.h5 into an in-memory dict (schema-agnostic).
+
+    Derives an all-True availability mask for legacy stores that predate the
+    ``avail/mask`` dataset -- exact for those stores because the old
+    intersection ingest guaranteed every stored column was present for every
+    event.
+    """
+    with h5py.File(path, "r") as f:
+        params = [_decode(p) for p in f.attrs["param_names"]]
+        offsets = f["index/offsets"][:].astype(np.int64)
+        names = [_decode(n) for n in f["index/event_names"][:]]
+        n_events = len(names)
+        samples = {p: f[f"samples/{p}"][:] for p in params}
+        if "avail" in f and "mask" in f["avail"]:
+            avail = np.asarray(f["avail/mask"][:], dtype=bool)
+        else:
+            avail = np.ones((n_events, len(params)), dtype=bool)
+        meta = {}
+        if "meta" in f:
+            for k in META_FLOAT_FIELDS:
+                if k in f["meta"]:
+                    meta[k] = list(f[f"meta/{k}"][:])
+            for k in META_STR_FIELDS:
+                if k in f["meta"]:
+                    meta[k] = [_decode(v) for v in f[f"meta/{k}"][:]]
+    return dict(params=params, offsets=offsets, names=names, samples=samples,
+                avail=avail, meta=meta, n_events=n_events)
+
+
+def _subset_store(S, keep):
+    """Return a copy of an in-memory store restricted to event indices ``keep``."""
+    keep = list(keep)
+    slices = [(int(S["offsets"][i]), int(S["offsets"][i + 1])) for i in keep]
+    samples = {}
+    for p in S["params"]:
+        col = S["samples"][p]
+        samples[p] = (np.concatenate([col[a:b] for a, b in slices]) if slices
+                      else np.array([], dtype=col.dtype))
+    offs = [0]
+    for a, b in slices:
+        offs.append(offs[-1] + (b - a))
+    avail = S["avail"][keep, :] if keep else S["avail"][:0, :]
+    meta = {k: [v[i] for i in keep] for k, v in S["meta"].items()}
+    return dict(params=S["params"], offsets=np.asarray(offs, dtype=np.int64),
+                names=[S["names"][i] for i in keep], samples=samples,
+                avail=avail, meta=meta, n_events=len(keep))
+
+
+def merge_stores(store_a, store_b, out_path, cfg: Optional[IngestConfig] = None,
+                 skip_duplicates: bool = True):
+    """Merge two existing store.h5 files, PRESERVING the union of parameters.
+
+    A parameter present in only one store becomes a full column in the output:
+    the events from the store that lacked it are NaN-filled and marked
+    unavailable in the availability mask.  No column is ever dropped because one
+    store is missing it.  Meta fields merge as a union too, with explicit-absence
+    defaults (NaN for floats, "" for strings).
+
+    Events in ``store_b`` whose names already appear in ``store_a`` are skipped
+    when ``skip_duplicates`` is True (a warning is emitted).
+
+    Returns the output path.
+    """
+    cfg = cfg or IngestConfig()
+    A = _read_store(store_a)
+    B = _read_store(store_b)
+
+    if skip_duplicates:
+        dupes = set(A["names"]) & set(B["names"])
+        if dupes:
+            warnings.warn(f"Duplicate events skipped from the second store: "
+                          f"{sorted(dupes)}")
+            keep = [i for i, n in enumerate(B["names"]) if n not in dupes]
+            B = _subset_store(B, keep)
+
+    # Union parameter order: store A's columns first, then B's new columns.
+    union_params = list(A["params"]) + [p for p in B["params"]
+                                        if p not in A["params"]]
+    a_total = int(A["offsets"][-1]) if A["n_events"] else 0
+    b_total = int(B["offsets"][-1]) if B["n_events"] else 0
+
+    columns = {}
+    for p in union_params:
+        a_col = (A["samples"][p] if p in A["samples"]
+                 else np.full(a_total, np.nan, dtype=np.float64))
+        b_col = (B["samples"][p] if p in B["samples"]
+                 else np.full(b_total, np.nan, dtype=np.float64))
+        columns[p] = np.concatenate([a_col, b_col])
+
+    a_idx = {p: j for j, p in enumerate(A["params"])}
+    b_idx = {p: j for j, p in enumerate(B["params"])}
+    n_total = A["n_events"] + B["n_events"]
+    avail = np.zeros((n_total, len(union_params)), dtype=bool)
+    for j, p in enumerate(union_params):
+        if p in a_idx and A["n_events"]:
+            avail[:A["n_events"], j] = A["avail"][:, a_idx[p]]
+        if p in b_idx and B["n_events"]:
+            avail[A["n_events"]:, j] = B["avail"][:, b_idx[p]]
+
+    offsets = (np.concatenate([A["offsets"], B["offsets"][1:] + a_total])
+               .astype(np.int64) if B["n_events"] else A["offsets"])
+    names = list(A["names"]) + list(B["names"])
+
+    # Union of meta fields; explicit-absence defaults for a field a store lacks.
+    merged_meta = {}
+    for k in set(A["meta"]) | set(B["meta"]):
+        fill = np.nan if k in META_FLOAT_FIELDS else ""
+        a_v = A["meta"].get(k, [fill] * A["n_events"])
+        b_v = B["meta"].get(k, [fill] * B["n_events"])
+        merged_meta[k] = list(a_v) + list(b_v)
+    # Ensure every declared meta field exists (writer requires all keys).
+    for k in META_FLOAT_FIELDS:
+        merged_meta.setdefault(k, [np.nan] * n_total)
+    for k in META_STR_FIELDS:
+        merged_meta.setdefault(k, [""] * n_total)
+
+    _write_store(out_path, union_params, columns, offsets, names, avail,
+                 merged_meta, cfg)
+    print(f"Merged stores: {A['n_events']} + {B['n_events']} = {n_total} "
+          f"events, params={union_params} → {out_path}")
+    return out_path
 
 
 # --------------------------------------------------------------------------
@@ -550,6 +745,11 @@ def merge_store(existing_path: str, new_paths, out_path: str = None,
                 cfg: Optional[IngestConfig] = None, event_table=None,
                 extra_params=None):
     """Append new events to an existing store without re-ingesting everything.
+
+    Schema-preserving (PR 5): the merged store holds the UNION of parameters.
+    A parameter present in only some events (e.g. BNS tidal columns absent from
+    BBH events) is kept as a full column, NaN-filled and marked unavailable for
+    the events that lack it -- never silently dropped by intersection.
 
     Parameters
     ----------
@@ -572,126 +772,31 @@ def merge_store(existing_path: str, new_paths, out_path: str = None,
     event_table = _resolve_event_table(event_table)
     out_path = out_path or existing_path
 
-    # Read existing store
-    with h5py.File(existing_path, "r") as f:
-        old_params = [p.decode() if isinstance(p, bytes) else str(p)
-                      for p in f.attrs["param_names"]]
-        old_offsets = f["index/offsets"][:]
-        old_names = [n.decode() if isinstance(n, bytes) else str(n)
-                     for n in f["index/event_names"][:]]
-        old_samples = {p: f[f"samples/{p}"][:] for p in old_params}
-        old_meta = {}
-        for k in META_FLOAT_FIELDS:
-            if k in f["meta"]:
-                old_meta[k] = list(f[f"meta/{k}"][:])
-        for k in META_STR_FIELDS:
-            if k in f["meta"]:
-                vals = f[f"meta/{k}"][:]
-                old_meta[k] = [v.decode() if isinstance(v, bytes) else str(v)
-                               for v in vals]
+    old = _read_store(existing_path)
 
-    # Build the new events into a temporary store
+    # Candidate columns for the new events: the generous default set plus any
+    # columns the existing store already has (minus the computed p_dL_pe, which
+    # build_store always appends) plus any user extras.  This lets the new
+    # events keep their own extra columns (e.g. tidal params) which merge_stores
+    # then unions with the existing schema.
+    candidates = []
+    for p in list(DEFAULT_PARAMS) + list(old["params"]) + list(extra_params or []):
+        if p != "p_dL_pe" and p not in candidates:
+            candidates.append(p)
+
     tmpdir = tempfile.mkdtemp()
-    tmp_new = os.path.join(tmpdir, "new.h5")
-    params = list(old_params)
-    if extra_params:
-        params += [p for p in extra_params if p not in params]
-    build_store(new_paths, tmp_new, params=params, cfg=cfg, event_table=event_table)
+    try:
+        tmp_new = os.path.join(tmpdir, "new.h5")
+        build_store(new_paths, tmp_new, params=candidates, cfg=cfg,
+                    event_table=event_table)
 
-    # Read the new store
-    with h5py.File(tmp_new, "r") as f:
-        new_params = [p.decode() if isinstance(p, bytes) else str(p)
-                      for p in f.attrs["param_names"]]
-        new_offsets = f["index/offsets"][:]
-        new_names = [n.decode() if isinstance(n, bytes) else str(n)
-                     for n in f["index/event_names"][:]]
-        new_samples = {p: f[f"samples/{p}"][:] for p in new_params}
-        new_meta = {}
-        for k in META_FLOAT_FIELDS:
-            if k in f["meta"]:
-                new_meta[k] = list(f[f"meta/{k}"][:])
-        for k in META_STR_FIELDS:
-            if k in f["meta"]:
-                vals = f[f"meta/{k}"][:]
-                new_meta[k] = [v.decode() if isinstance(v, bytes) else str(v)
-                               for v in vals]
+        tmp_merged = os.path.join(tmpdir, "merged.h5")
+        merge_stores(existing_path, tmp_new, tmp_merged, cfg=cfg,
+                     skip_duplicates=True)
+        shutil.move(tmp_merged, out_path)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
-    # Check for duplicate events
-    dupes = set(old_names) & set(new_names)
-    if dupes:
-        warnings.warn(f"Duplicate events will be skipped: {dupes}")
-        keep = [i for i, n in enumerate(new_names) if n not in dupes]
-        if not keep:
-            print("No new events to add.")
-            return existing_path
-        new_names = [new_names[i] for i in keep]
-        # Slice new samples and meta
-        new_slices = [(new_offsets[i], new_offsets[i + 1]) for i in keep]
-        for p in new_params:
-            new_samples[p] = np.concatenate([new_samples[p][a:b] for a, b in new_slices])
-        new_offsets_clean = [0]
-        for a, b in new_slices:
-            new_offsets_clean.append(new_offsets_clean[-1] + (b - a))
-        new_offsets = np.array(new_offsets_clean, dtype=np.int64)
-        for k in new_meta:
-            new_meta[k] = [new_meta[k][i] for i in keep]
-
-    # Merge: use intersection of params
-    merged_params = [p for p in old_params if p in new_params]
-
-    # Concatenate samples
-    merged_samples = {}
-    old_total = old_offsets[-1]
-    for p in merged_params:
-        merged_samples[p] = np.concatenate([old_samples[p], new_samples[p]])
-
-    # Merge offsets
-    merged_offsets = np.concatenate([
-        old_offsets,
-        new_offsets[1:] + old_total
-    ]).astype(np.int64)
-
-    # Merge names and meta
-    merged_names = old_names + new_names
-    merged_meta = {}
-    for k in set(list(old_meta.keys()) + list(new_meta.keys())):
-        old_v = old_meta.get(k, [np.nan] * len(old_names) if k in META_FLOAT_FIELDS
-                             else [""] * len(old_names))
-        new_v = new_meta.get(k, [np.nan] * len(new_names) if k in META_FLOAT_FIELDS
-                             else [""] * len(new_names))
-        merged_meta[k] = list(old_v) + list(new_v)
-
-    # Write merged store
-    tmp_merged = os.path.join(tmpdir, "merged.h5")
-    dt_str = h5py.string_dtype(encoding="utf-8")
-    with h5py.File(tmp_merged, "w") as f:
-        f.attrs["schema_version"] = "1.0"
-        f.attrs.create("param_names",
-                       np.array(merged_params, dtype=h5py.string_dtype()))
-        f.attrs["n_events"] = len(merged_names)
-        g = f.create_group("samples")
-        for p in merged_params:
-            g.create_dataset(p, data=merged_samples[p],
-                             compression=cfg.compression, shuffle=True)
-        idx = f.create_group("index")
-        idx.create_dataset("offsets", data=merged_offsets)
-        idx.create_dataset("event_names",
-                           data=np.array(merged_names, dtype=object), dtype=dt_str)
-        mg = f.create_group("meta")
-        for k in META_FLOAT_FIELDS:
-            if k in merged_meta:
-                mg.create_dataset(k, data=np.asarray(merged_meta[k], dtype=np.float64))
-        for k in META_STR_FIELDS:
-            if k in merged_meta:
-                mg.create_dataset(k, data=np.array(merged_meta[k], dtype=object),
-                                  dtype=dt_str)
-
-    # Move to final location
-    shutil.move(tmp_merged, out_path)
-    shutil.rmtree(tmpdir, ignore_errors=True)
-
-    print(f"Merged store: {len(old_names)} + {len(new_names)} = "
-          f"{len(merged_names)} events → {out_path}")
     return out_path
 
 
