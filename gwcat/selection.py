@@ -49,6 +49,27 @@ import numpy as np
 import h5py
 
 from .cosmology import PLANCK15
+from .source_class import (classify_by_mass, normalize_source_class,
+                          resolve_filter_classes, DEFAULT_NSBH_MASS_THRESHOLD)
+
+# Human-readable description of what the exported ``pdraw`` represents after all
+# of the code's manipulations (see the module docstring / to_darksirens).  Both
+# the single and combined exporters write it verbatim so downstream code can
+# read the state instead of re-deriving it.
+PDRAW_STATE = (
+    "draw_density_in_(m1det,q,dL)_basis_with_1D_chi_eff_prior_included; "
+    "per-injection spin draw removed at load and replaced by the isotropic "
+    "chi_eff prior on export (chi_eff swap); normalised by T_obs and injection "
+    "weights. Detector-frame masses in Msun, dL in Mpc."
+)
+
+# Note recorded whenever a source-class filter subsets the injections: this is
+# subsetting (Essick et al.), NOT a reweighting, so ndraw is left unchanged.
+SOURCE_CLASS_FILTER_NOTE = (
+    "source-class filtering subsets injections by injected source-frame mass; "
+    "ndraw (total_generated) is NOT rescaled. The analyst MUST pair this "
+    "selection file with a PE export filtered to the same source class(es)."
+)
 
 
 def _h5_field_names(table):
@@ -86,6 +107,45 @@ def _h5_first_field(table, names, dtype=float):
     )
 
 
+def _write_selection_provenance(f, source_class, nsbh_mass_threshold,
+                                n_before, n_after, far_columns, far_threshold):
+    """Write the PR9 pdraw / source-class / significance provenance attrs.
+
+    Shared by :meth:`SelectionSet.to_darksirens` and
+    :meth:`CombinedSelectionSet.to_darksirens` so the two exporters record the
+    same contract in the same way.  Records truthfully what the code did; it
+    changes none of the math.
+    """
+    # ── pdraw state ────────────────────────────────────────────────────────
+    f.attrs["pdraw_state"] = PDRAW_STATE
+
+    # ── Source-class filter provenance ─────────────────────────────────────
+    f.attrs["source_class_filter"] = (
+        "" if source_class is None
+        else (str(source_class) if isinstance(source_class, (str, bytes))
+              else ",".join(str(x) for x in source_class)))
+    f.attrs["source_class_method"] = (
+        "none" if source_class is None else "mass_threshold")
+    f.attrs["nsbh_mass_threshold"] = float(nsbh_mass_threshold)
+    f.attrs["n_injections_before_filter"] = int(n_before)
+    f.attrs["n_injections_after_filter"] = int(n_after)
+    if source_class is not None:
+        f.attrs["source_class_filter_note"] = SOURCE_CLASS_FILTER_NOTE
+
+    # ── Search / significance provenance (explicit-absence, per the FAR
+    #    contract): record which columns/pipelines were thresholded, the
+    #    threshold applied, and that no per-injection p_astro was used. ──────
+    cols = [str(c) for c in (far_columns or [])]
+    f.attrs.create("significance_columns",
+                   np.array(cols, dtype=h5py.string_dtype()))
+    f.attrs["significance_type"] = "far"
+    f.attrs["significance_far_threshold"] = float(far_threshold)
+    f.attrs["significance_available"] = bool(len(cols) > 0)
+    # No per-injection p_astro is read/used for thresholding here; record the
+    # absence explicitly rather than pretending it exists.
+    f.attrs["p_astro_available"] = False
+
+
 def _ddL_dz(z, dL_mpc, H0, Om0):
     """d(dL)/dz evaluated at z.  dL in Mpc."""
     c_kms = 299792.458
@@ -110,12 +170,22 @@ class SelectionSet:
         Reference cosmology for dL↔z conversion.  Defaults to Planck15.
     """
 
-    def __init__(self, path: str, H0: float = None, Om0: float = None):
+    def __init__(self, path: str, H0: float = None, Om0: float = None,
+                 nsbh_mass_threshold: float = None):
         self.path = path
         self.H0 = H0 or PLANCK15.H0.value
         self.Om0 = Om0 or PLANCK15.Om0
         # Whether the caller supplied a non-default reference cosmology.
         self._cosmology_override = (H0 is not None) or (Om0 is not None)
+        # Source-frame NS/BH mass threshold for source-class filtering of
+        # injections.  Defaults to the SAME shared constant used by PE-event
+        # classification (gwcat.ingest) so injections and events cannot drift.
+        self._nsbh_mass_threshold = (
+            DEFAULT_NSBH_MASS_THRESHOLD if nsbh_mass_threshold is None
+            else float(nsbh_mass_threshold))
+        # Names of the FAR/significance columns actually used for thresholding;
+        # populated by _read_events / _read_injections (explicit provenance).
+        self._far_columns = []
         self._loaded = False
 
     # ------------------------------------------------------------------
@@ -271,10 +341,12 @@ class SelectionSet:
             search_list = []
 
         fars_per_search = []
+        far_columns = []
         for s in search_list:
             for col in (s + "_far", "far_" + s):
                 if _h5_has_field(ev, col):
                     fars_per_search.append(_h5_read_field(ev, col))
+                    far_columns.append(col)
                     break
         if not fars_per_search:
             for key in _h5_field_names(ev):
@@ -283,9 +355,11 @@ class SelectionSet:
                              or key.startswith("far_"))):
                     try:
                         fars_per_search.append(_h5_read_field(ev, key))
+                        far_columns.append(key)
                     except Exception:
                         pass
         self._fars = np.column_stack(fars_per_search) if fars_per_search else None
+        self._far_columns = far_columns
 
         # Store
         self._m1det = m1det
@@ -353,19 +427,23 @@ class SelectionSet:
 
         # FAR columns: O3 uses hardcoded names
         fars_per_search = []
+        far_columns = []
         for col in ["far_gstlal", "far_pycbc_bbh", "far_pycbc_hyperbank",
                      "far_mbta", "far_cwb"]:
             if col in inj:
                 fars_per_search.append(np.asarray(inj[col], float))
+                far_columns.append(col)
         # Also scan for any other *far* columns we might have missed
         if not fars_per_search:
             for key in inj:
                 if isinstance(key, str) and key.startswith("far_"):
                     try:
                         fars_per_search.append(np.asarray(inj[key], float))
+                        far_columns.append(key)
                     except Exception:
                         pass
         self._fars = np.column_stack(fars_per_search) if fars_per_search else None
+        self._far_columns = far_columns
 
         # Store (same attributes as _read_events)
         self._m1det = m1det
@@ -392,6 +470,33 @@ class SelectionSet:
         return np.any(self._fars < far_threshold, axis=1)
 
     # ------------------------------------------------------------------
+    # Source-class filtering (PR 9)
+    # ------------------------------------------------------------------
+    def source_class_mask(self, source_class=None) -> np.ndarray:
+        """Boolean mask selecting injections in the requested source class(es).
+
+        Injections are classified by their *injected* source-frame component
+        masses using the SAME shared mass-threshold classifier as PE-event
+        ingest (:func:`gwcat.source_class.classify_by_mass`), so a ``bbh``
+        selection of injections is consistent with a ``bbh`` selection of PE
+        events.  ``source_class=None`` (the default) applies no restriction and
+        returns an all-True mask -- byte-identical to the pre-PR9 behavior.
+
+        Accepts the ``bbh``/``nsbh``/``bns``/``massgap``/``cbc`` keywords (``cbc``
+        = all compact-binary classes), a canonical class name, or an iterable of
+        those.
+        """
+        self._load()
+        n = len(self._m1src)
+        if source_class is None:
+            return np.ones(n, dtype=bool)
+        labels = classify_by_mass(self._m1src, self._m2src,
+                                  self._nsbh_mass_threshold)
+        canonical = np.array([normalize_source_class(x) for x in labels])
+        allowed = resolve_filter_classes(source_class)
+        return np.isin(canonical, list(allowed))
+
+    # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------
     @property
@@ -407,7 +512,7 @@ class SelectionSet:
     # Export
     # ------------------------------------------------------------------
     def to_darksirens(self, out_path: str, far_threshold: float = 1.0,
-                      amax: float = 0.99):
+                      amax: float = 0.99, source_class=None):
         """Write a pre-processed selection file for darksirens.
 
         Applies the 1-D chi_eff spin-prior swap: the injection spin-draw
@@ -425,22 +530,38 @@ class SelectionSet:
             FAR detection threshold in yr⁻¹.
         amax : float
             Maximum spin magnitude for the isotropic prior (default 0.99).
+        source_class : str, iterable, or None
+            Optional source-class filter (``bbh``/``nsbh``/``bns``/``massgap``/
+            ``cbc`` or a canonical class).  Injections are classified by their
+            injected source-frame masses with the SAME shared thresholds as PE
+            events (see :meth:`source_class_mask`).  ``None`` (default) applies
+            no restriction and is byte-identical to the pre-PR9 export.  Note
+            that filtering is *subsetting*, not reweighting: ``ndraw`` is left
+            unchanged, and the analyst must pair the file with a PE export
+            filtered to the same class(es).  Recorded in the output attrs.
         """
         from .spin import chi_eff_prior_logprob
 
         self._load()
         det = self.detected_mask(far_threshold)
-        n_det = int(det.sum())
+        sc_mask = self.source_class_mask(source_class)
+        n_before = int(det.size)
+        n_after = int(sc_mask.sum())
+        keep = det & sc_mask
+        n_det = int(keep.sum())
         if n_det == 0:
-            raise RuntimeError(f"No detected injections at FAR < {far_threshold}")
+            raise RuntimeError(
+                f"No detected injections at FAR < {far_threshold}"
+                + ("" if source_class is None
+                   else f" in source class {source_class!r}"))
 
         # Apply the 1-D chi_eff prior swap
-        chieff_det = self._chieff[det]
-        m1src_det = self._m1src[det]
-        m2src_det = self._m2src[det]
+        chieff_det = self._chieff[keep]
+        m1src_det = self._m1src[keep]
+        m2src_det = self._m2src[keep]
         logp_chi = chi_eff_prior_logprob(chieff_det, m1src_det, m2src_det, amax=amax)
         safe_logp = np.clip(logp_chi, a_min=-50.0, a_max=None)
-        pdraw_det = self._pdraw[det] * np.exp(safe_logp)
+        pdraw_det = self._pdraw[keep] * np.exp(safe_logp)
 
         with h5py.File(out_path, "w") as f:
             f.attrs["format_version"] = "gwcat-selection-1.0"
@@ -462,18 +583,24 @@ class SelectionSet:
             # distance PRIOR is removed (injections have a draw distribution).
             f.attrs["distance_prior_removed"] = False
             f.attrs["cosmology_override_used"] = bool(self._cosmology_override)
+            _write_selection_provenance(
+                f, source_class=source_class,
+                nsbh_mass_threshold=self._nsbh_mass_threshold,
+                n_before=n_before, n_after=n_after,
+                far_columns=self._far_columns, far_threshold=far_threshold)
 
             for name, arr in [
-                ("m1det", self._m1det[det]), ("m2det", self._m2det[det]),
-                ("dL", self._dL[det]), ("chieff", chieff_det),
-                ("ra", self._ra[det]), ("dec", self._dec[det]),
+                ("m1det", self._m1det[keep]), ("m2det", self._m2det[keep]),
+                ("dL", self._dL[keep]), ("chieff", chieff_det),
+                ("ra", self._ra[keep]), ("dec", self._dec[keep]),
                 ("m1src", m1src_det), ("m2src", m2src_det),
-                ("redshift", self._z[det]), ("pdraw", pdraw_det),
+                ("redshift", self._z[keep]), ("pdraw", pdraw_det),
             ]:
                 f.create_dataset(name, data=arr, compression="gzip")
 
         print(f"Wrote {out_path}: n_det={n_det}, ndraw={self._ndraw}, "
-              f"FAR<{far_threshold}, H0={self.H0}, Om0={self.Om0}")
+              f"FAR<{far_threshold}, H0={self.H0}, Om0={self.Om0}, "
+              f"source_class={source_class}")
         return out_path
 
 
@@ -528,7 +655,7 @@ class CombinedSelectionSet:
     # Export
     # ------------------------------------------------------------------
     def to_darksirens(self, out_path: str, far_threshold: float = 1.0,
-                      amax: float = 0.99):
+                      amax: float = 0.99, source_class=None):
         """Write a combined selection file for darksirens.
 
         Parameters
@@ -538,6 +665,13 @@ class CombinedSelectionSet:
             FAR detection threshold in yr⁻¹, applied per campaign.
         amax : float
             Maximum spin magnitude for the chi_eff prior (default 0.99).
+        source_class : str, iterable, or None
+            Optional source-class filter applied per campaign by injected
+            source-frame mass (see :meth:`SelectionSet.source_class_mask`).
+            ``None`` (default) is byte-identical to the pre-PR9 export.  As in
+            the single-campaign exporter this is subsetting, not reweighting:
+            each campaign's ``ndraw`` share is unchanged, so the Essick et al.
+            fractions ``N_k / N_total`` are identical to the unfiltered file.
         """
         from .spin import chi_eff_prior_logprob
 
@@ -561,30 +695,43 @@ class CombinedSelectionSet:
         cols = {k: [] for k in ["m1det", "m2det", "dL", "chieff",
                                 "ra", "dec", "m1src", "m2src", "z", "pdraw"]}
         n_det_total = 0
+        n_before_total = 0
+        n_after_total = 0
+        far_columns_union = []
         campaign_info = []
 
         for k, s in enumerate(self._sets):
             det = s.detected_mask(far_threshold)
-            n_det_k = int(det.sum())
+            sc_mask = s.source_class_mask(source_class)
+            keep = det & sc_mask
+            n_before_total += int(det.size)
+            n_after_total += int(sc_mask.sum())
+            for c in s._far_columns:
+                if c not in far_columns_union:
+                    far_columns_union.append(c)
+            n_det_k = int(keep.sum())
             if n_det_k == 0:
                 warnings.warn(
                     f"Campaign {s.path}: no detected injections at "
-                    f"FAR < {far_threshold}")
+                    f"FAR < {far_threshold}"
+                    + ("" if source_class is None
+                       else f" in source class {source_class!r}"))
                 continue
 
-            # Essick et al. reweighting: pdraw_i *= N_k / N_total
+            # Essick et al. reweighting: pdraw_i *= N_k / N_total.  Source-class
+            # filtering is subsetting only -- N_k/N_total is unchanged.
             frac = ndraw_per[k] / ndraw_total
-            pdraw_k = s._pdraw[det] * frac
+            pdraw_k = s._pdraw[keep] * frac
 
-            cols["m1det"].append(s._m1det[det])
-            cols["m2det"].append(s._m2det[det])
-            cols["dL"].append(s._dL[det])
-            cols["chieff"].append(s._chieff[det])
-            cols["ra"].append(s._ra[det])
-            cols["dec"].append(s._dec[det])
-            cols["m1src"].append(s._m1src[det])
-            cols["m2src"].append(s._m2src[det])
-            cols["z"].append(s._z[det])
+            cols["m1det"].append(s._m1det[keep])
+            cols["m2det"].append(s._m2det[keep])
+            cols["dL"].append(s._dL[keep])
+            cols["chieff"].append(s._chieff[keep])
+            cols["ra"].append(s._ra[keep])
+            cols["dec"].append(s._dec[keep])
+            cols["m1src"].append(s._m1src[keep])
+            cols["m2src"].append(s._m2src[keep])
+            cols["z"].append(s._z[keep])
             cols["pdraw"].append(pdraw_k)
             n_det_total += n_det_k
             campaign_info.append(
@@ -594,7 +741,9 @@ class CombinedSelectionSet:
         if n_det_total == 0:
             raise RuntimeError(
                 f"No detected injections across {len(self._sets)} campaigns "
-                f"at FAR < {far_threshold}")
+                f"at FAR < {far_threshold}"
+                + ("" if source_class is None
+                   else f" in source class {source_class!r}"))
 
         # Concatenate
         data = {k: np.concatenate(v) for k, v in cols.items()}
@@ -627,6 +776,11 @@ class CombinedSelectionSet:
             f.attrs["n_campaigns"] = len(self._sets)
             f.attrs.create("campaign_ndraws",
                            np.array(ndraw_per, dtype=np.int64))
+            _write_selection_provenance(
+                f, source_class=source_class,
+                nsbh_mass_threshold=self._sets[0]._nsbh_mass_threshold,
+                n_before=n_before_total, n_after=n_after_total,
+                far_columns=far_columns_union, far_threshold=far_threshold)
 
             for name, arr in [
                 ("m1det", data["m1det"]), ("m2det", data["m2det"]),

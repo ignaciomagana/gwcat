@@ -43,7 +43,8 @@ import h5py
 
 from .cosmology import (make_cosmology, uniform_source_frame_prob,
                         PLANCK15, O4_FALLBACK)
-from .source_class import normalize_source_class
+from .source_class import (normalize_source_class, classify_by_mass,
+                          DEFAULT_NSBH_MASS_THRESHOLD)
 
 # --------------------------------------------------------------------------
 # Parameter sets
@@ -121,7 +122,9 @@ O3_WAVEFORM_PRIORITY = ["C01:IMRPhenomXPHM", "C01:SEOBNRv4PHM"]
 
 @dataclass
 class IngestConfig:
-    nsbh_mass_threshold: float = 3.0      # Msun, source-frame, for classification
+    # Msun, source-frame, for classification.  Shared with injection selection
+    # via gwcat.source_class.DEFAULT_NSBH_MASS_THRESHOLD so the two cannot drift.
+    nsbh_mass_threshold: float = DEFAULT_NSBH_MASS_THRESHOLD
     o4_waveform_priority: list = field(default_factory=lambda: list(O4_WAVEFORM_PRIORITY))
     o3_waveform_priority: list = field(default_factory=lambda: list(O3_WAVEFORM_PRIORITY))
     o3_default_cosmo: tuple = (PLANCK15.H0.value, PLANCK15.Om0)   # used when no analytic
@@ -450,13 +453,14 @@ def inspect(path: str, cfg: Optional[IngestConfig] = None):
 # Build the store
 # --------------------------------------------------------------------------
 def _classify(m1_src, m2_src, thr):
-    if not np.isfinite(m1_src) or not np.isfinite(m2_src):
-        return "unknown"
-    if m1_src >= thr and m2_src >= thr:
-        return "BBH"
-    if m1_src >= thr and m2_src < thr:
-        return "NSBH"
-    return "BNS"
+    """Legacy PE-event classifier.
+
+    Thin wrapper over the shared mass-threshold classifier
+    (:func:`gwcat.source_class.classify_by_mass`) so PE-event and injection
+    classification apply identical thresholds and cannot drift apart.  Returns
+    the legacy compact labels ``"BBH"``/``"NSBH"``/``"BNS"``/``"unknown"``.
+    """
+    return classify_by_mass(m1_src, m2_src, thr)
 
 
 def _observing_run_from_name(name: str) -> str:

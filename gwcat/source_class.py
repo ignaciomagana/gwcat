@@ -35,6 +35,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence, Set, Union
 
+import numpy as np
+
 # ── Canonical class labels ───────────────────────────────────────────────────
 BBH = "BBH"
 NSBH = "NSBH"
@@ -73,6 +75,66 @@ _FILTER_MAP = {
     "cbc": frozenset({BBH, NSBH, BNS, MASSGAP, UNKNOWN}),
     "all": frozenset(SOURCE_CLASSES),
 }
+
+
+#: Default source-frame mass threshold (Msun) separating a NS component from a
+#: BH component.  This is the SINGLE source of truth shared by PE-event
+#: classification (``gwcat.ingest._classify``) and injection selection
+#: (``gwcat.selection``), so the two classification paths cannot drift apart.
+DEFAULT_NSBH_MASS_THRESHOLD = 3.0
+
+
+def classify_by_mass(m1_source, m2_source,
+                     thr: float = DEFAULT_NSBH_MASS_THRESHOLD):
+    """Classify a compact binary from its source-frame component masses.
+
+    This is the shared mass-threshold classifier.  It is used both to label
+    ingested PE events (via :func:`gwcat.ingest._classify`) and to filter
+    selection injections by injected mass (:mod:`gwcat.selection`), guaranteeing
+    the two paths apply *identical* thresholds and can never diverge.
+
+    A component with source-frame mass ``>= thr`` is treated as a black hole and
+    ``< thr`` as a neutron star.  With the mass-ordering convention m1 >= m2:
+
+        m1 >= thr and m2 >= thr  -> ``"BBH"``
+        m1 >= thr and m2 <  thr  -> ``"NSBH"``
+        otherwise (m1 < thr)     -> ``"BNS"``
+
+    Non-finite masses yield ``"unknown"``.  These are the *legacy* compact labels
+    (note the lowercase ``"unknown"``); run them through
+    :func:`normalize_source_class` for the canonical form.
+
+    Scalar inputs return a ``str``; array-like inputs return an object
+    ``numpy.ndarray`` of the same shape.
+    """
+    scalar = np.ndim(m1_source) == 0 and np.ndim(m2_source) == 0
+    m1 = np.atleast_1d(np.asarray(m1_source, dtype=float))
+    m2 = np.atleast_1d(np.asarray(m2_source, dtype=float))
+    m1b, m2b = np.broadcast_arrays(m1, m2)
+    out = np.full(m1b.shape, "unknown", dtype=object)
+    finite = np.isfinite(m1b) & np.isfinite(m2b)
+    bbh = finite & (m1b >= thr) & (m2b >= thr)
+    nsbh = finite & (m1b >= thr) & (m2b < thr)
+    bns = finite & ~bbh & ~nsbh
+    out[bbh] = "BBH"
+    out[nsbh] = "NSBH"
+    out[bns] = "BNS"
+    if scalar:
+        return str(out.reshape(-1)[0])
+    return out
+
+
+def canonical_classes_from_mass(m1_source, m2_source,
+                                thr: float = DEFAULT_NSBH_MASS_THRESHOLD):
+    """Vectorised canonical source-class labels from source-frame masses.
+
+    Thin convenience wrapper around :func:`classify_by_mass` that maps the legacy
+    compact labels onto the canonical labels (:data:`SOURCE_CLASSES`).  Returns a
+    string object ndarray suitable for :func:`numpy.isin` against the class set
+    returned by :func:`resolve_filter_classes`.
+    """
+    labels = classify_by_mass(m1_source, m2_source, thr)
+    return np.array([normalize_source_class(x) for x in np.atleast_1d(labels)])
 
 
 def _compact_key(label) -> str:
