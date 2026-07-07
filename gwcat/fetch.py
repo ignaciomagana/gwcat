@@ -30,67 +30,30 @@ import time
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence
 from urllib.parse import urlencode
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError
 
-# ---------------------------------------------------------------------------
-# File filters — decide which files in a Zenodo record are PE cosmo samples
-# ---------------------------------------------------------------------------
-# Each filter returns True for files we WANT.
-# The O3 releases (GWTC-2.1, GWTC-3) ship separate cosmo / nocosmo files.
-# The O4 releases (GWTC-4.1, GWTC-5) ship a single combined file per event.
-# In both cases we must exclude PESummaryTable, skymaps, notebooks, tarballs.
-
-_JUNK_SUFFIXES = (".tar.gz", ".tar", ".ipynb", ".txt", ".md", ".fits", ".json")
-_JUNK_SUBSTRINGS = ("PESummaryTable", "Skymap", "skymap", "Archived_Skymaps")
-
-
-def _is_junk(fn: str) -> bool:
-    """True for non-PE files that live alongside PE samples in the record."""
-    if any(fn.endswith(s) for s in _JUNK_SUFFIXES):
-        return True
-    if any(sub in fn for sub in _JUNK_SUBSTRINGS):
-        return True
-    return False
-
-
-def _has_event_name(fn: str) -> bool:
-    """True if the filename contains a GW event identifier."""
-    return bool(re.search(r"GW\d{6}", fn))
-
-
-def _is_gwtc21_cosmo(fn: str) -> bool:
-    """GWTC-2.1: per-event cosmo files only (reject nocosmo)."""
-    return ("GWTC2p1" in fn
-            and fn.endswith("_cosmo.h5")
-            and _has_event_name(fn)
-            and "nocosmo" not in fn)
-
-
-def _is_gwtc3_cosmo(fn: str) -> bool:
-    """GWTC-3: per-event cosmo files only (reject nocosmo)."""
-    return ("GWTC3" in fn
-            and fn.endswith("_cosmo.h5")
-            and _has_event_name(fn)
-            and "nocosmo" not in fn)
-
-
-def _is_o4_pe(fn: str) -> bool:
-    """GWTC-4.1 / GWTC-5: combined per-event HDF5.
-    No cosmo/nocosmo split in O4 — just one file per event.
-    """
-    if not fn.endswith(".hdf5"):
-        return False
-    if _is_junk(fn):
-        return False
-    return _has_event_name(fn)
-
+from .manifests import (
+    ManifestValidationError,
+    ReleaseManifest,
+    get_manifest,
+    list_injection_manifests,
+    list_release_manifests,
+)
 
 # ---------------------------------------------------------------------------
-# Release registry
+# Release registry — built from declarative manifests (PR 7)
 # ---------------------------------------------------------------------------
+# Release/injection metadata (Zenodo record IDs, per-release file-name
+# filters, descriptions, observing runs) used to be hardcoded here as Python
+# dicts.  It now lives in YAML manifests bundled under gwcat/manifests/
+# (releases/*.yaml, injections/*.yaml) and is loaded via gwcat.manifests.
+# Adding a new release requires only a new manifest file — see
+# gwcat.manifests for the schema and gwcat.manifests.get_manifest for how
+# user-supplied manifest paths are also accepted.
+#
 # record_ids  : pinned version records (one per Zenodo deposit).
 #               GWTC-5 is split across two Zenodo deposits.
 # concept_ids : version-agnostic record IDs; resolve_latest() follows
@@ -98,98 +61,77 @@ def _is_o4_pe(fn: str) -> bool:
 
 @dataclass
 class ReleaseInfo:
-    """Metadata for one GWTC PE data release on Zenodo."""
+    """Metadata for one release registered for fetch_catalog.
+
+    Built from a ``gwcat.manifests.ReleaseManifest`` (see ``_release_info_from_manifest``);
+    ``file_filter`` is the bound ``ProductSpec.matches`` of that manifest's single
+    product.
+    """
     record_ids: List[int]
     concept_ids: List[Optional[int]]
-    file_filter: callable
+    file_filter: Callable[[str], bool]
     description: str
     observing_run: str
+    manifest: Optional[ReleaseManifest] = field(default=None, repr=False)
 
 
-RELEASES: Dict[str, ReleaseInfo] = {
-    "GWTC-2.1": ReleaseInfo(
-        record_ids=[6513631],
-        concept_ids=[5117702],
-        file_filter=_is_gwtc21_cosmo,
-        description="O1+O2+O3a cosmo PE samples (GWTC-2.1 v2)",
-        observing_run="O1+O2+O3a",
-    ),
-    "GWTC-3": ReleaseInfo(
-        record_ids=[8177023],
-        concept_ids=[5546662],
-        file_filter=_is_gwtc3_cosmo,
-        description="O3b cosmo PE samples (GWTC-3 v2, Oct 2023 update)",
-        observing_run="O3b",
-    ),
-    "GWTC-4.1": ReleaseInfo(
-        record_ids=[20275769],
-        concept_ids=[20275768],
-        file_filter=_is_o4_pe,
-        description="O4a PE samples (GWTC-4.1, supersedes GWTC-4.0)",
-        observing_run="O4a",
-    ),
-    "GWTC-5": ReleaseInfo(
-        record_ids=[20348005, 20348006],         # Part 1, Part 2
-        concept_ids=[20276105, 20291739],
-        file_filter=_is_o4_pe,
-        description="O4b PE samples (GWTC-5.0, split across two Zenodo records)",
-        observing_run="O4b",
-    ),
-}
+def _primary_product(manifest: ReleaseManifest):
+    """Return the single product spec fetch.py should use to select files.
 
-# Convenience alias: "GWTC-4" → "GWTC-4.1"
-RELEASES["GWTC-4"] = RELEASES["GWTC-4.1"]
-
-
-# ---------------------------------------------------------------------------
-# Injection / selection function records
-# ---------------------------------------------------------------------------
-def _is_injection_hdf(fn: str) -> bool:
-    """Select injection HDF files, exclude docs/PSDs/tarballs."""
-    if not (fn.endswith(".hdf") or fn.endswith(".hdf5")):
-        return False
-    if _is_junk(fn):
-        return False
-    return True
-
-
-def _is_o3_bbhpop_full(fn: str) -> bool:
-    """Select only the full-O3 BBH injection file (not O3a/O3b GPS-time splits).
-
-    Full file:       endo3_bbhpop-LIGO-T2100113-v12.hdf5           (3 dashes)
-    GPS-split files: endo3_bbhpop-LIGO-T2100113-v12-<gps>-<dur>.hdf5 (5 dashes)
+    fetch.py currently downloads exactly one product family per release
+    (PE samples, or one injection set); manifests with more than one
+    product need a future fetch.py extension to disambiguate.
     """
-    return (fn.startswith("endo3_bbhpop")
-            and fn.endswith(".hdf5")
-            and fn.count("-") == 3)  # exactly: endo3_bbhpop-LIGO-T2100113-v12
+    if len(manifest.products) != 1:
+        raise ManifestValidationError(
+            f"{manifest.source_path}: fetch.py expects exactly one product "
+            f"per manifest, found {sorted(manifest.products)}"
+        )
+    return next(iter(manifest.products.values()))
 
 
-INJECTION_RELEASES: Dict[str, ReleaseInfo] = {
-    "injections-O1O2O3O4": ReleaseInfo(
-        record_ids=[19500052],
-        concept_ids=[None],
-        file_filter=_is_injection_hdf,
-        description="Cumulative O1+O2+O3+O4a+O4b search sensitivity (GWTC-5.0)",
-        observing_run="O1-O4b",
-    ),
-    "injections-O4ab": ReleaseInfo(
-        record_ids=[19500064],
-        concept_ids=[None],
-        file_filter=_is_injection_hdf,
-        description="O4a+O4b-only search sensitivity (GWTC-5.0)",
-        observing_run="O4a+O4b",
-    ),
-    "injections-O3-BBH": ReleaseInfo(
-        record_ids=[7890437],
-        concept_ids=[None],
-        file_filter=_is_o3_bbhpop_full,
-        description="O3 BBH search sensitivity (GWTC-3, full O1+O2+O3)",
-        observing_run="O1+O2+O3",
-    ),
-}
+def _release_info_from_manifest(manifest: ReleaseManifest) -> ReleaseInfo:
+    product = _primary_product(manifest)
+    return ReleaseInfo(
+        record_ids=list(manifest.record_ids),
+        concept_ids=list(manifest.concept_ids),
+        file_filter=product.matches,
+        description=manifest.description,
+        observing_run=manifest.observing_run,
+        manifest=manifest,
+    )
 
-# Merge injection records into RELEASES so fetch_catalog finds everything
+
+def _build_registry(names: List[str]) -> Dict[str, ReleaseInfo]:
+    """Build a {name: ReleaseInfo} registry from bundled manifest names,
+    also registering each manifest's declared aliases (e.g. "GWTC-4")."""
+    registry: Dict[str, ReleaseInfo] = {}
+    for name in names:
+        manifest = get_manifest(name)
+        info = _release_info_from_manifest(manifest)
+        registry[name] = info
+        for alias in manifest.aliases:
+            registry[alias] = info
+    return registry
+
+
+#: PE data releases only (GWTC-2.1, GWTC-3, GWTC-4.1 [+ "GWTC-4" alias], GWTC-5).
+RELEASES: Dict[str, ReleaseInfo] = _build_registry(list_release_manifests())
+
+#: Injection/selection-function releases only.
+INJECTION_RELEASES: Dict[str, ReleaseInfo] = _build_registry(list_injection_manifests())
+
+# Merge injection records into RELEASES so fetch_catalog finds everything.
 RELEASES.update(INJECTION_RELEASES)
+
+#: Registry keys that are aliases of another key (e.g. "GWTC-4" -> "GWTC-4.1"),
+#: hidden from CLI help / error listings so each release is only shown once.
+_ALIAS_NAMES = {
+    alias
+    for info in RELEASES.values()
+    if info.manifest is not None
+    for alias in info.manifest.aliases
+}
 
 ZENODO_API = "https://zenodo.org/api/records"
 
@@ -364,7 +306,7 @@ def fetch_catalog(
         Paths to the downloaded PE files, sorted.
     """
     if catalog not in RELEASES:
-        available = sorted(k for k in RELEASES if k != "GWTC-4")  # hide alias
+        available = sorted(k for k in RELEASES if k not in _ALIAS_NAMES)
         raise ValueError(
             f"Unknown catalog {catalog!r}. Available: {available}"
         )
@@ -631,8 +573,8 @@ def fetch_event_table_gwosc(
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-_AVAILABLE = sorted(k for k in RELEASES if k != "GWTC-4")  # hide alias in help
-_PE_CATALOGS = ["GWTC-2.1", "GWTC-3", "GWTC-4.1", "GWTC-5"]
+_AVAILABLE = sorted(k for k in RELEASES if k not in _ALIAS_NAMES)  # hide aliases
+_PE_CATALOGS = list_release_manifests()
 
 def _cli():
     import argparse

@@ -1,0 +1,28 @@
+# Tiny synthetic release manifest used by tests/test_manifest_loading.py to
+# prove that a user-supplied manifest file (not bundled with the package)
+# loads and produces a fetchable file filter with zero code changes.
+release: GWTC-FAKE
+observing_runs: [O-test]
+description: "Tiny fake release for offline manifest-loading tests."
+
+records:
+  - provider: zenodo
+    record_id: 999999
+    concept_id: 999998
+
+products:
+  pe_samples:
+    file_patterns: ["*_cosmo.h5"]
+    require_event_name: true
+    exclude_patterns: ["*nocosmo*"]
+    expected_event_count: 2
+    sample_set_policy: preferred
+
+metadata:
+  source_class_reference: release_table
+  far_available_online: false
+  preferred_waveform_source: manifest
+
+validation:
+  require_checksums: false
+  allow_missing_far: true

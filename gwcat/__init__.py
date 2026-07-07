@@ -24,6 +24,8 @@ from .source_class import (SOURCE_CLASSES, SourceClassMeta,
 from .schema import (PARAMETER_GROUPS, EXPORT_REQUIREMENTS, DARKSIRENS_REQUIRED,
                     MissingParameterError, required_params)
 from .waveform_policy import WAVEFORM_POLICIES, resolve_policy
+from .manifests import (list_releases, get_manifest, validate_manifest,
+                        ManifestValidationError)
 
 # fetch has optional deps (requests, tqdm); import lazily
 def fetch_and_build(*args, **kwargs):
@@ -47,5 +49,7 @@ __all__ = [
     "MissingParameterError", "required_params",
     "WAVEFORM_POLICIES", "resolve_policy",
     "fetch_and_build", "fetch_catalog",
+    "list_releases", "get_manifest", "validate_manifest",
+    "ManifestValidationError",
     "__version__",
 ]

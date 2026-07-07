@@ -1,0 +1,35 @@
+# Declarative manifest for GWTC-5.
+#
+# Ported verbatim from the pre-PR7 hardcoded registry in gwcat/fetch.py
+# (RELEASES["GWTC-5"] + _is_o4_pe file filter).  GWTC-5 is split across two
+# Zenodo deposits (Part 1, Part 2); both are listed under `records`.
+release: GWTC-5
+observing_runs: [O4b]
+description: "O4b PE samples (GWTC-5.0, split across two Zenodo records)"
+
+records:
+  - provider: zenodo
+    record_id: 20348005
+    concept_id: 20276105
+  - provider: zenodo
+    record_id: 20348006
+    concept_id: 20291739
+
+products:
+  pe_samples:
+    # O4 releases ship one combined file per event (no cosmo/nocosmo split).
+    file_patterns: ["*.hdf5"]
+    suffix: ".hdf5"
+    exclude_junk: true
+    require_event_name: true
+    expected_event_count: null
+    sample_set_policy: null
+
+metadata:
+  source_class_reference: release_table
+  far_available_online: true
+  preferred_waveform_source: manifest
+
+validation:
+  require_checksums: true
+  allow_missing_far: true

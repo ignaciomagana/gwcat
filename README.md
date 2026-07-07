@@ -276,6 +276,50 @@ fetch_catalog("injections-O4ab")                  # O4a+b (Zenodo 19500064)
 fetch_catalog("injections-O1O2O3O4")              # cumulative O1–O4b (Zenodo 19500052)
 ```
 
+### Release manifests (`gwcat.manifests`)
+
+Everything `fetch_catalog` needs to know about a release — Zenodo record/concept
+IDs, the per-release file-name filter, description, observing run(s) — is
+declarative data, not Python: it lives in YAML manifests bundled under
+`gwcat/manifests/releases/*.yaml` (PE data releases) and
+`gwcat/manifests/injections/*.yaml` (injection/selection sets). `fetch.py`
+builds `RELEASES`/`INJECTION_RELEASES` from these manifests at import time; it
+contains no per-release data of its own.
+
+```python
+from gwcat.manifests import list_releases, get_manifest
+
+list_releases()                    # every bundled release + injection manifest name
+manifest = get_manifest("GWTC-5")  # -> ReleaseManifest
+manifest.record_ids                # [20348005, 20348006]
+manifest.observing_run             # "O4b"
+manifest.products["pe_samples"].matches("IGWN-GWTC5-v1-GW240601_000000.hdf5")  # True
+```
+
+#### Adding a new release
+
+Adding a new release requires **only a new manifest file** — no changes to
+`fetch.py` or any other downloader code:
+
+1. Drop a new YAML file into `gwcat/manifests/releases/` (or `injections/`
+   for a selection-function product), following the schema documented in
+   `gwcat/manifests/__init__.py` (release, observing_runs, description,
+   records, products, metadata, validation).
+2. `fetch_catalog("your-new-release")` will pick it up automatically.
+
+`get_manifest()` also accepts a filesystem path to a YAML file directly, so a
+manifest can be tried out (or used permanently) without adding it to the
+bundled package at all:
+
+```python
+get_manifest("/path/to/my_release_manifest.yaml")
+```
+
+Manifests are validated on load; `validate_manifest()` raises a
+`ManifestValidationError` naming the offending file and field for anything
+missing or malformed (required top-level fields, record IDs, product file
+filters, metadata/validation blocks).
+
 ### `fetch_bbh_list` / `BBH_ALL` — BBH event list
 
 ```python
@@ -291,6 +335,10 @@ is the LVK's standard BBH classification boundary. NSBH/BNS events are
 excluded automatically without any manual exclusion list.
 
 ## Zenodo records
+
+These tables mirror the bundled manifests under `gwcat/manifests/releases/`
+and `gwcat/manifests/injections/` (see "Release manifests" above) — the
+manifests are the source of truth; update them first when a record changes.
 
 ### PE samples
 

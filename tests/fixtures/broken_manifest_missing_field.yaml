@@ -1,0 +1,19 @@
+# Deliberately broken manifest (missing the required `records` field) used by
+# tests/test_manifest_loading.py to check that validation fails loudly and
+# names the file and field.
+release: GWTC-BROKEN
+observing_runs: [O-test]
+description: "Broken manifest missing the 'records' field."
+
+products:
+  pe_samples:
+    file_patterns: ["*.h5"]
+
+metadata:
+  source_class_reference: release_table
+  far_available_online: false
+  preferred_waveform_source: manifest
+
+validation:
+  require_checksums: false
+  allow_missing_far: true

@@ -1,0 +1,32 @@
+# Declarative manifest for GWTC-3.
+#
+# Ported verbatim from the pre-PR7 hardcoded registry in gwcat/fetch.py
+# (RELEASES["GWTC-3"] + _is_gwtc3_cosmo file filter).
+release: GWTC-3
+observing_runs: [O3b]
+description: "O3b cosmo PE samples (GWTC-3 v2, Oct 2023 update)"
+
+records:
+  - provider: zenodo
+    record_id: 8177023
+    concept_id: 5546662
+
+products:
+  pe_samples:
+    # GWTC-3 ships separate cosmo / nocosmo files per event; keep cosmo only.
+    file_patterns: ["*_cosmo.h5"]
+    contains_all: ["GWTC3"]
+    suffix: "_cosmo.h5"
+    exclude_patterns: ["*nocosmo*"]
+    require_event_name: true
+    expected_event_count: null
+    sample_set_policy: null
+
+metadata:
+  source_class_reference: release_table
+  far_available_online: true
+  preferred_waveform_source: manifest
+
+validation:
+  require_checksums: true
+  allow_missing_far: true
