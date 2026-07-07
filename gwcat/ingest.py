@@ -266,15 +266,17 @@ def _waveform_family(approximant: str) -> str:
 
 
 def _sample_set_meta(analysis: str, preferred_label: str, ranked, path: str,
-                     sample_sets) -> dict:
+                     sample_sets, provenance: Optional[dict] = None) -> dict:
     """Per-row sample-set provenance for one ingested analysis label.
 
     ``is_preferred`` marks the label the default (single-set) heuristic would
     have chosen, and ``priority_rank`` is its index in :func:`rank_analyses`, so
     the ``preferred`` waveform policy can reproduce that choice downstream.
-    ``record_id`` / ``file_checksum`` default to "" here (populated by declarative
-    manifests in a later PR).
+    ``record_id`` / ``file_checksum`` default to "" unless ``provenance`` (a
+    ``{"record_id":..., "file_checksum":...}`` dict keyed by the source file's
+    basename -- see ``build_store(file_provenance=...)``, PR 8) supplies them.
     """
+    provenance = provenance or {}
     approximant = analysis.split(":", 1)[1] if ":" in analysis else analysis
     is_mixed = 1.0 if "mixed" in analysis.lower() else 0.0
     is_preferred = 1.0 if analysis == preferred_label else 0.0
@@ -293,9 +295,9 @@ def _sample_set_meta(analysis: str, preferred_label: str, ranked, path: str,
         waveform=_waveform_family(approximant),
         approximant=approximant,
         calibration_model="",
-        record_id="",
+        record_id=str(provenance.get("record_id", "")),
         file_name=os.path.basename(path),
-        file_checksum="",
+        file_checksum=str(provenance.get("file_checksum", "")),
         is_mixed=is_mixed,
         is_preferred=is_preferred,
         priority_rank=rank,
@@ -505,19 +507,28 @@ def _sky_area_90(ra_samples, dec_samples, nside=64):
     return n_pix_90 * pix_area_deg2
 
 
-def _resolve_event_table(event_table):
+def _resolve_event_table(event_table, cache_dir=None, offline=None):
     """Resolve the event_table argument for build_store / merge_store.
 
-    None (default) → auto-fetch FAR/p_astro from GWOSC.
+    None (default) → auto-fetch FAR/p_astro from GWOSC (or from cache_dir when
+                      offline=True / GWCAT_OFFLINE is set -- see gwcat.fetch_cache;
+                      a cache miss in offline mode raises, it is not swallowed).
     {}             → skip (no network call).
-    dict           → use as-is.
+    dict           → use as-is (e.g. from gwcat.event_metadata.assemble_event_metadata).
     """
     if event_table is not None:
         return event_table
+    from .fetch_cache import is_offline
+    from .fetch import fetch_event_table_gwosc
+    if is_offline(offline):
+        print(f"Reading FAR/p_astro from offline metadata cache under "
+              f"{cache_dir} ...")
+        table = fetch_event_table_gwosc(cache_dir=cache_dir, offline=True)
+        print(f"  got {len(table)} events from cache")
+        return table
     try:
-        from .fetch import fetch_event_table_gwosc
         print("Fetching FAR/p_astro from GWOSC ...")
-        table = fetch_event_table_gwosc()
+        table = fetch_event_table_gwosc(cache_dir=cache_dir)
         print(f"  got {len(table)} events from GWOSC")
         return table
     except Exception as e:
@@ -530,7 +541,8 @@ def _resolve_event_table(event_table):
 
 def build_store(paths, out_path, params=None, extra_params=None,
                 cfg: Optional[IngestConfig] = None, event_table=None,
-                sample_sets="preferred"):
+                sample_sets="preferred", file_provenance: Optional[dict] = None,
+                cache_dir=None, offline: Optional[bool] = None):
     """Ingest a list of cosmo-file paths into a single concatenated store.
 
     params       : column list to store (default DEFAULT_PARAMS).
@@ -539,6 +551,11 @@ def build_store(paths, out_path, params=None, extra_params=None,
                    which are NOT in per-event PE files.
                    None (default) → auto-fetch from GWOSC.
                    Pass {} to skip.
+                   An entry may also carry ``source_class`` (overrides the
+                   mass-threshold classification) and/or ``metadata_source``
+                   (overrides the "event_table"/"pe_file_only" default label,
+                   e.g. with the richer "online+user_override" string that
+                   ``gwcat.event_metadata.assemble_event_metadata`` produces).
     sample_sets  : which posterior sample set(s) to ingest per PE file (PR 6).
                    "preferred" (default) keeps exactly one sample set per event
                    (the historical Mixed/priority heuristic).  "all" ingests
@@ -548,12 +565,23 @@ def build_store(paths, out_path, params=None, extra_params=None,
                    ingests exactly those.  Sample-set provenance is recorded in
                    the meta/ columns (sample_set_name, waveform, approximant,
                    is_mixed, is_preferred, priority_rank, ...).
+    file_provenance : {file_basename: {"record_id":.., "file_checksum":..}}, optional
+                   (PR 8) Populates the per-row ``record_id`` / ``file_checksum``
+                   meta columns for the file each row was ingested from.  See
+                   ``gwcat.fetch.fetch_catalog(provenance=...)``.  Default None
+                   leaves both columns "" as before this PR.
+    cache_dir, offline : optional
+                   Only consulted when event_table is None (auto-fetch).  See
+                   gwcat.fetch_cache; None/unset leaves auto-fetch behavior
+                   unchanged from before PR 8.
     """
     cfg = cfg or IngestConfig()
     params = list(params or DEFAULT_PARAMS)
     if extra_params:
         params += [p for p in extra_params if p not in params]
-    event_table = _resolve_event_table(event_table)
+    event_table = _resolve_event_table(event_table, cache_dir=cache_dir,
+                                       offline=offline)
+    file_provenance = file_provenance or {}
 
     records = []   # per row: (name, n_samples, {param: array}) -- union schema
     offsets = [0]
@@ -569,6 +597,7 @@ def build_store(paths, out_path, params=None, extra_params=None,
         ranked = rank_analyses(analyses, prefix, cfg)
         labels = select_analyses(analyses, prefix, cfg, sample_sets)
         et = event_table.get(name, {})
+        prov = file_provenance.get(os.path.basename(path), {})
 
         for analysis in labels:
             s = samples_dict[analysis]
@@ -614,7 +643,25 @@ def build_store(paths, out_path, params=None, extra_params=None,
             # p_astro / component probabilities come from the event table when
             # present; otherwise stay NaN (explicit absence).
             p_astro = float(et.get("p_astro", et.get("pastro", np.nan)))
-            metadata_source = "event_table" if et else "pe_file_only"
+            # metadata_source: an assembled event_table (PR 8, see
+            # gwcat.event_metadata.assemble_event_metadata) may supply a richer
+            # provenance string (e.g. "online+user_override", "absent") directly;
+            # fall back to the historical binary label when it does not.
+            metadata_source = et.get("metadata_source") or (
+                "event_table" if et else "pe_file_only")
+            # source_class: a user override (PR 8) takes precedence over the
+            # mass-threshold classification; source_class_method/_reference
+            # record which happened.
+            override_source_class = et.get("source_class")
+            if override_source_class:
+                source_class_val = normalize_source_class(override_source_class)
+                source_class_method = "user_override"
+                source_class_reference = "user_override_file"
+            else:
+                source_class_val = normalize_source_class(compact)
+                source_class_method = "mass_threshold"
+                source_class_reference = (
+                    f"m2_source<{cfg.nsbh_mass_threshold}Msun -> NS component")
 
             names.append(name)
             offsets.append(offsets[-1] + n)
@@ -625,10 +672,9 @@ def build_store(paths, out_path, params=None, extra_params=None,
             meta["mass_prior_kind"].append("uniform_detector_frame")
             meta["compact_type"].append(compact)
             # canonical source-class metadata (parallel to legacy compact_type)
-            meta["source_class"].append(normalize_source_class(compact))
-            meta["source_class_method"].append("mass_threshold")
-            meta["source_class_reference"].append(
-                f"m2_source<{cfg.nsbh_mass_threshold}Msun -> NS component")
+            meta["source_class"].append(source_class_val)
+            meta["source_class_method"].append(source_class_method)
+            meta["source_class_reference"].append(source_class_reference)
             meta["release"].append(catalog)
             meta["observing_run"].append(_observing_run_from_name(name))
             meta["metadata_source"].append(metadata_source)
@@ -657,7 +703,7 @@ def build_store(paths, out_path, params=None, extra_params=None,
                 meta["sky_area_90"].append(np.nan)
             # ── Sample-set / waveform contract (PR 6) ──────────────────────
             ss = _sample_set_meta(analysis, preferred_label, ranked, path,
-                                  sample_sets)
+                                  sample_sets, provenance=prov)
             for k, val in ss.items():
                 meta[k].append(val)
             print(f"[{catalog}] {name}: {n} samp, sample_set={analysis}, "
@@ -923,7 +969,9 @@ def merge_stores(store_a, store_b, out_path, cfg: Optional[IngestConfig] = None,
 # --------------------------------------------------------------------------
 def merge_store(existing_path: str, new_paths, out_path: str = None,
                 cfg: Optional[IngestConfig] = None, event_table=None,
-                extra_params=None, sample_sets="preferred"):
+                extra_params=None, sample_sets="preferred",
+                file_provenance: Optional[dict] = None, cache_dir=None,
+                offline: Optional[bool] = None):
     """Append new events to an existing store without re-ingesting everything.
 
     Schema-preserving (PR 5): the merged store holds the UNION of parameters.
@@ -939,7 +987,7 @@ def merge_store(existing_path: str, new_paths, out_path: str = None,
         Paths to new PE files to add.
     out_path : str or None
         Output path.  None → overwrite existing_path (via a temp file for safety).
-    cfg, event_table, extra_params :
+    cfg, event_table, extra_params, file_provenance, cache_dir, offline :
         Same as build_store.  event_table=None auto-fetches from GWOSC.
 
     Returns
@@ -949,7 +997,8 @@ def merge_store(existing_path: str, new_paths, out_path: str = None,
     import shutil, tempfile
 
     cfg = cfg or IngestConfig()
-    event_table = _resolve_event_table(event_table)
+    event_table = _resolve_event_table(event_table, cache_dir=cache_dir,
+                                       offline=offline)
     out_path = out_path or existing_path
 
     old = _read_store(existing_path)
@@ -968,7 +1017,8 @@ def merge_store(existing_path: str, new_paths, out_path: str = None,
     try:
         tmp_new = os.path.join(tmpdir, "new.h5")
         build_store(new_paths, tmp_new, params=candidates, cfg=cfg,
-                    event_table=event_table, sample_sets=sample_sets)
+                    event_table=event_table, sample_sets=sample_sets,
+                    file_provenance=file_provenance)
 
         tmp_merged = os.path.join(tmpdir, "merged.h5")
         merge_stores(existing_path, tmp_new, tmp_merged, cfg=cfg,

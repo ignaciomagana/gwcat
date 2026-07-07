@@ -18,6 +18,29 @@ By default the fetcher resolves each Zenodo concept DOI to its latest version,
 so you always get the most recent release without editing record IDs.
 
 Requires: pip install gwcat[fetch]   (requests + tqdm)
+
+This module deliberately keeps two separate concerns apart (PR 8):
+
+  * **FILE discovery/download** (Zenodo) -- "which files exist in a release,
+    and how do I get them onto disk": :func:`list_files`, :func:`resolve_latest`,
+    :func:`download_file`, :func:`fetch_catalog`, :func:`fetch_and_build`.
+  * **EVENT-METADATA discovery** (GWOSC) -- "what does the public event
+    catalog say about FAR/p_astro/BBH membership for named events, which
+    online metadata cannot be assumed complete for": :func:`fetch_bbh_names_gwosc`,
+    :func:`fetch_event_table_gwosc`.
+
+Neither path calls into the other.  Merging online metadata with manifest
+defaults / user overrides, and recording per-field provenance, is a further
+layer on top of the raw GWOSC calls here -- see :mod:`gwcat.event_metadata`.
+
+Both discovery paths support the same local-cache / offline-mode contract
+(see :mod:`gwcat.fetch_cache`): pass ``cache_dir=...`` to persist the raw
+online response under ``<cache_dir>/metadata/`` (with a fetch timestamp), and
+``offline=True`` (or set ``GWCAT_OFFLINE=1``) to force reading that cache
+instead of making any network call -- raising a clear error naming the
+missing cache file if it was never populated.  Neither argument changes
+default (``cache_dir=None, offline=None/False``) behavior: no cache_dir means
+no caching side effect, exactly as before this PR.
 """
 from __future__ import annotations
 
@@ -30,11 +53,12 @@ import time
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, Union
 from urllib.parse import urlencode
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError
 
+from . import fetch_cache
 from .manifests import (
     ManifestValidationError,
     ReleaseManifest,
@@ -137,7 +161,7 @@ ZENODO_API = "https://zenodo.org/api/records"
 
 
 # ---------------------------------------------------------------------------
-# Zenodo API helpers (stdlib only — no requests needed for metadata queries)
+# FILE DISCOVERY (Zenodo) — stdlib only, no requests needed for metadata queries
 # ---------------------------------------------------------------------------
 def _zenodo_get(url: str, timeout: int = 30) -> dict:
     """GET a Zenodo API endpoint and return parsed JSON."""
@@ -156,9 +180,44 @@ def _zenodo_get(url: str, timeout: int = 30) -> dict:
     raise RuntimeError(f"Zenodo API failed after retries: {url}")
 
 
-def list_files(record_id: int) -> List[dict]:
-    """Return the file list for a Zenodo record."""
-    data = _zenodo_get(f"{ZENODO_API}/{record_id}")
+def list_files(
+    record_id: int,
+    cache_dir: Optional[Union[str, Path]] = None,
+    offline: Optional[bool] = None,
+) -> List[dict]:
+    """Return the file list for a Zenodo record.
+
+    Parameters
+    ----------
+    record_id : int
+        Zenodo record ID.
+    cache_dir : str or Path, optional
+        When given, the raw Zenodo record JSON response is written to
+        ``<cache_dir>/metadata/zenodo_<record_id>.json`` (with a fetch
+        timestamp) after a live fetch.  ``None`` (default) disables caching
+        entirely -- no cache file is written and behavior is unchanged from
+        before PR 8.
+    offline : bool, optional
+        If true (or ``GWCAT_OFFLINE`` is set and ``offline`` is not passed),
+        read the cached response from ``cache_dir`` instead of making a
+        network call.  Raises :class:`gwcat.fetch_cache.OfflineCacheMissError`
+        naming the missing cache file if it was never populated; requires
+        ``cache_dir``.
+    """
+    offline_mode = fetch_cache.is_offline(offline)
+    key = fetch_cache.zenodo_cache_key(record_id)
+    if offline_mode:
+        if cache_dir is None:
+            raise fetch_cache.OfflineCacheMissError(
+                f"list_files(record_id={record_id}, offline=True) requires "
+                "cache_dir to locate the previously cached Zenodo response."
+            )
+        data = fetch_cache.read_metadata_cache(cache_dir, key)
+    else:
+        data = _zenodo_get(f"{ZENODO_API}/{record_id}")
+        if cache_dir is not None:
+            fetch_cache.write_metadata_cache(cache_dir, key, data)
+
     files = data.get("files", [])
     if not files:
         raise RuntimeError(
@@ -179,10 +238,24 @@ def resolve_latest(concept_id: int) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Download helpers
+# FILE DISCOVERY (Zenodo) — download helpers
 # ---------------------------------------------------------------------------
 def _md5(path: str) -> str:
     h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _sha256(path: str) -> str:
+    """sha256 of a local file, used for download-provenance wiring (PR 8).
+
+    Distinct from :func:`_md5`, which verifies against the checksum Zenodo
+    publishes for a file; this is the hash recorded into the store's per-row
+    ``file_checksum`` meta column via ``build_store(file_provenance=...)``.
+    """
+    h = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
@@ -280,6 +353,9 @@ def fetch_catalog(
     resolve: bool = True,
     show_progress: bool = True,
     dry_run: bool = False,
+    cache_dir: Optional[Union[str, Path]] = None,
+    offline: Optional[bool] = None,
+    provenance: Optional[Dict[str, dict]] = None,
 ) -> List[str]:
     """Download PE files for one GWTC catalog release.
 
@@ -295,10 +371,29 @@ def fetch_catalog(
     resolve : bool
         If True (default), query Zenodo for the latest version of each
         concept DOI.  Set False to use pinned records without network.
+        Ignored (treated as False) when ``offline`` is true, since resolving
+        the latest version always requires a network call.
     show_progress : bool
         Show tqdm progress bars during download.
     dry_run : bool
         List files that would be downloaded without actually downloading.
+    cache_dir : str or Path, optional
+        Passed to :func:`list_files` to cache/read the raw Zenodo file-listing
+        response (see :mod:`gwcat.fetch_cache`).  ``None`` (default) disables
+        caching -- unchanged, byte-identical default behavior.
+    offline : bool, optional
+        If true (or ``GWCAT_OFFLINE`` is set), never make a network call:
+        file listings come from ``cache_dir`` (required in that case) and
+        every file must already exist locally under ``data_dir`` with a
+        matching checksum -- a missing/mismatched local file raises a clear
+        error instead of downloading it.
+    provenance : dict, optional
+        If given, populated in place as ``{file_name: {"record_id": str,
+        "file_checksum": sha256_hex}}`` for every file this call resolves
+        (downloaded or already cached on disk).  Pass the same dict on to
+        ``build_store(..., file_provenance=provenance)`` to populate the
+        store's per-row ``record_id`` / ``file_checksum`` meta columns.  Never
+        populated automatically -- opt in only.
 
     Returns
     -------
@@ -311,18 +406,40 @@ def fetch_catalog(
             f"Unknown catalog {catalog!r}. Available: {available}"
         )
 
+    offline_mode = fetch_cache.is_offline(offline)
+    if offline_mode and cache_dir is None:
+        raise fetch_cache.OfflineCacheMissError(
+            f"fetch_catalog({catalog!r}, offline=True) requires cache_dir "
+            "pointing at a previously populated metadata cache."
+        )
+
     info = RELEASES[catalog]
-    rids = record_ids or (
-        _resolve_record_ids(info, catalog) if resolve else list(info.record_ids)
-    )
+    if offline_mode:
+        # Resolving the latest version always requires a network call;
+        # offline mode uses the pinned/explicit record IDs unconditionally.
+        rids = record_ids or list(info.record_ids)
+    else:
+        rids = record_ids or (
+            _resolve_record_ids(info, catalog) if resolve else list(info.record_ids)
+        )
 
     dest_dir = Path(data_dir) / catalog.replace(".", "p")  # GWTC-4.1 → GWTC-4p1
     all_paths = []
 
+    # Only pass the new cache/offline kwargs through when actually requested,
+    # so a caller (or test) that monkeypatches list_files with the pre-PR8
+    # single-argument signature ``list_files(record_id)`` keeps working
+    # unchanged in the (byte-identical) default case.
+    list_kwargs = {}
+    if cache_dir is not None:
+        list_kwargs["cache_dir"] = cache_dir
+    if offline_mode:
+        list_kwargs["offline"] = offline_mode
+
     for part_idx, rid in enumerate(rids, 1):
         part_label = f" part {part_idx}/{len(rids)}" if len(rids) > 1 else ""
         print(f"[{catalog}{part_label}] querying Zenodo record {rid} ...")
-        all_files = list_files(rid)
+        all_files = list_files(rid, **list_kwargs)
         pe_files = [f for f in all_files if info.file_filter(f["key"])]
         rejected = [f["key"] for f in all_files if not info.file_filter(f["key"])]
 
@@ -351,13 +468,26 @@ def fetch_catalog(
             dest = str(dest_dir / fname)
             url = _download_url_for(f)
             md5 = _checksum_for(f)
-            if os.path.exists(dest) and md5 and _md5(dest) == md5:
+            cached_ok = os.path.exists(dest) and md5 and _md5(dest) == md5
+            if cached_ok:
                 print(f"  [{i}/{len(pe_files)}] {fname} (cached)")
+            elif offline_mode:
+                raise fetch_cache.OfflineCacheMissError(
+                    f"Offline mode: {dest} is missing or does not match the "
+                    f"expected checksum, and network downloads are disabled. "
+                    "Populate data_dir by running once online, or pass "
+                    "offline=False."
+                )
             else:
                 print(f"  [{i}/{len(pe_files)}] {fname}")
                 download_file(url, dest, expected_md5=md5,
                               show_progress=show_progress)
             all_paths.append(dest)
+            if provenance is not None:
+                provenance[fname] = {
+                    "record_id": str(rid),
+                    "file_checksum": _sha256(dest),
+                }
 
     if not dry_run:
         print(f"[{catalog}] done: {len(all_paths)} files in {dest_dir}")
@@ -376,6 +506,9 @@ def fetch_and_build(
     show_progress: bool = True,
     ingest_cfg=None,
     extra_params: Optional[list] = None,
+    cache_dir: Optional[Union[str, Path]] = None,
+    offline: Optional[bool] = None,
+    provenance: Optional[Dict[str, dict]] = None,
 ) -> str:
     """Fetch PE files from Zenodo and build the gwcat store.
 
@@ -387,6 +520,15 @@ def fetch_and_build(
         See fetch_catalog and build_store.
     ingest_cfg : IngestConfig, optional
     extra_params : list, optional
+    cache_dir, offline : optional
+        Forwarded to :func:`fetch_catalog` (file listings) and to
+        ``build_store``'s ``event_table`` auto-fetch (GWOSC).  ``None``/unset
+        (the defaults) leave behavior unchanged from before PR 8.
+    provenance : dict, optional
+        If given, populated in place across all fetched catalogs as
+        ``{file_name: {"record_id", "file_checksum"}}`` and forwarded to
+        ``build_store(file_provenance=...)``.  Not populated unless passed in
+        (opt-in; avoids hashing every downloaded file by default).
 
     Returns
     -------
@@ -398,7 +540,8 @@ def fetch_and_build(
     all_paths = []
     for cat in catalogs:
         paths = fetch_catalog(cat, data_dir=data_dir, resolve=resolve,
-                              show_progress=show_progress)
+                              show_progress=show_progress, cache_dir=cache_dir,
+                              offline=offline, provenance=provenance)
         all_paths.extend(paths)
 
     if not all_paths:
@@ -406,10 +549,17 @@ def fetch_and_build(
 
     print(f"\n--- Building store from {len(all_paths)} files ---")
     build_store(all_paths, out, cfg=cfg, event_table=event_table,
-                extra_params=extra_params)
+                extra_params=extra_params, cache_dir=cache_dir, offline=offline,
+                file_provenance=provenance)
     return out
 
 
+# ---------------------------------------------------------------------------
+# EVENT-METADATA DISCOVERY (GWOSC) — separate from Zenodo file discovery
+# above: nothing in this section touches Zenodo, and nothing above touches
+# GWOSC.  See the module docstring and gwcat.event_metadata for how callers
+# combine this raw metadata with manifest defaults / user overrides.
+# ---------------------------------------------------------------------------
 _GWOSC_BBH_EXPECTED_NAMES = 259
 _GWOSC_KNOWN_NON_BBH = {
     # BNS / NSBH / mass-gap candidates that may appear in broad GWOSC
@@ -470,6 +620,8 @@ def fetch_bbh_names_gwosc(
     m2_min: float = 3.0,
     verbose: bool = True,
     timeout: int = 30,
+    cache_dir: Optional[Union[str, Path]] = None,
+    offline: Optional[bool] = None,
 ) -> list[str]:
     """Return BBH event names from the paginated GWOSC v2 event API.
 
@@ -478,29 +630,56 @@ def fetch_bbh_names_gwosc(
     Events are kept only when the returned default PE parameters contain
     ``mass_2_source`` (or the legacy alias ``m2_source``) above the threshold.
     Known BNS/NSBH events are explicitly removed as a safety guard.
+
+    cache_dir / offline : see :mod:`gwcat.fetch_cache`.  ``None``/unset (the
+    defaults) disable caching/offline-mode entirely -- unchanged, byte-identical
+    default behavior.  When caching, every raw page of the paginated response is
+    written under one cache key so an offline replay reconstructs the exact same
+    ``names`` set via the same per-event filter logic.
     """
-    query = urlencode(
-        {
-            "include-default-parameters": "true",
-            "lastver": "true",
-            "min-mass-2-source": m2_min,
-            "pagesize": 100,
-        }
-    )
-    url = f"https://gwosc.org/api/v2/event-versions?{query}"
+    offline_mode = fetch_cache.is_offline(offline)
+    key = fetch_cache.gwosc_cache_key(f"bbh_names_m2min_{m2_min}")
+
+    if offline_mode:
+        if cache_dir is None:
+            raise fetch_cache.OfflineCacheMissError(
+                "fetch_bbh_names_gwosc(offline=True) requires cache_dir to "
+                "locate the previously cached GWOSC response."
+            )
+        cached = fetch_cache.read_metadata_cache(cache_dir, key)
+        pages = cached["pages"]
+    else:
+        query = urlencode(
+            {
+                "include-default-parameters": "true",
+                "lastver": "true",
+                "min-mass-2-source": m2_min,
+                "pagesize": 100,
+            }
+        )
+        url = f"https://gwosc.org/api/v2/event-versions?{query}"
+        pages = []
+        page = 0
+        seen_urls: set[str] = set()
+
+        while url:
+            if url in seen_urls:
+                raise RuntimeError(f"GWOSC pagination loop detected at {url}")
+            seen_urls.add(url)
+            page += 1
+            if verbose:
+                print(f"fetch_bbh_names_gwosc: fetching page {page}: {url}")
+
+            data = _gwosc_json(url, timeout=timeout)
+            pages.append(data)
+            url = data.get("next")
+
+        if cache_dir is not None:
+            fetch_cache.write_metadata_cache(
+                cache_dir, key, {"m2_min": m2_min, "pages": pages})
+
     names: set[str] = set()
-    page = 0
-    seen_urls: set[str] = set()
-
-    while url:
-        if url in seen_urls:
-            raise RuntimeError(f"GWOSC pagination loop detected at {url}")
-        seen_urls.add(url)
-        page += 1
-        if verbose:
-            print(f"fetch_bbh_names_gwosc: fetching page {page}: {url}")
-
-        data = _gwosc_json(url, timeout=timeout)
+    for data in pages:
         for event in data.get("results", []):
             if not isinstance(event, dict):
                 continue
@@ -515,8 +694,6 @@ def fetch_bbh_names_gwosc(
             if m2_source is None or m2_source <= m2_min:
                 continue
             names.add(name)
-
-        url = data.get("next")
 
     result = sorted(names)
     if verbose:
@@ -533,39 +710,77 @@ def fetch_bbh_names_gwosc(
         )
     return result
 
-# ---------------------------------------------------------------------------
-# Helpers: FAR / p_astro from GWOSC event API
-# ---------------------------------------------------------------------------
+
+def _parse_gwosc_event_table_page(data: dict, table: dict) -> None:
+    """Merge one raw GWOSC event-API page's events into ``table`` in place.
+
+    Factored out so the live-fetch and offline-cache-replay code paths in
+    :func:`fetch_event_table_gwosc` share identical parsing logic -- caching
+    can never silently drift from what a live call would have computed.
+    """
+    events = data.get("events", {})
+    for name, info in events.items():
+        clean = re.sub(r"-v\d+$", "", name)
+        far = pastro = float("nan")
+        params = info.get("parameters", {})
+        for _key, pset in params.items():
+            if isinstance(pset, dict):
+                if "far" in pset and pset["far"] is not None:
+                    far = float(pset["far"])
+                if "p_astro" in pset and pset["p_astro"] is not None:
+                    pastro = float(pset["p_astro"])
+        table[clean] = {"far": far, "pastro": pastro}
+
+
 def fetch_event_table_gwosc(
     catalog_tag: str = "GWTC",
     timeout: int = 30,
+    cache_dir: Optional[Union[str, Path]] = None,
+    offline: Optional[bool] = None,
 ) -> dict:
     """Fetch FAR and p_astro from the GWOSC event API.
 
-    Returns {event_name: {'far': float, 'pastro': float}}.
+    Returns {event_name: {'far': float, 'pastro': float}}.  FAR/p_astro are
+    genuinely absent from some public GWOSC entries; missing values come back
+    as NaN (never fabricated), which is what lets
+    ``gwcat.ingest.build_store`` record ``far_available=False`` explicitly.
+
     catalog_tag : "GWTC" (cumulative), "GWTC-2.1-confident", etc.
+    cache_dir / offline : see :mod:`gwcat.fetch_cache`.  ``None``/unset (the
+    defaults) disable caching/offline-mode entirely -- unchanged, byte-identical
+    default behavior.
     """
+    offline_mode = fetch_cache.is_offline(offline)
+    key = fetch_cache.gwosc_cache_key(f"event_table_{catalog_tag}")
+
+    if offline_mode:
+        if cache_dir is None:
+            raise fetch_cache.OfflineCacheMissError(
+                "fetch_event_table_gwosc(offline=True) requires cache_dir to "
+                "locate the previously cached GWOSC response."
+            )
+        cached = fetch_cache.read_metadata_cache(cache_dir, key)
+        table: dict = {}
+        for page in cached["pages"]:
+            _parse_gwosc_event_table_page(page, table)
+        return table
+
     base = f"https://gwosc.org/eventapi/json/{catalog_tag}/"
     table = {}
+    pages = []
     url = base
 
     while url:
         req = Request(url, headers={"Accept": "application/json"})
         with urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode())
-        events = data.get("events", {})
-        for name, info in events.items():
-            clean = re.sub(r"-v\d+$", "", name)
-            far = pastro = float("nan")
-            params = info.get("parameters", {})
-            for _key, pset in params.items():
-                if isinstance(pset, dict):
-                    if "far" in pset and pset["far"] is not None:
-                        far = float(pset["far"])
-                    if "p_astro" in pset and pset["p_astro"] is not None:
-                        pastro = float(pset["p_astro"])
-            table[clean] = {"far": far, "pastro": pastro}
+        pages.append(data)
+        _parse_gwosc_event_table_page(data, table)
         url = data.get("links", {}).get("next")
+
+    if cache_dir is not None:
+        fetch_cache.write_metadata_cache(
+            cache_dir, key, {"catalog_tag": catalog_tag, "pages": pages})
 
     return table
 
@@ -612,6 +827,14 @@ def _cli():
                     help="Disable progress bars.")
     ap.add_argument("--record-ids", type=int, nargs="+", default=None,
                     help="Override Zenodo record ID(s) (only with a single --catalog).")
+    ap.add_argument("--cache-dir", default=None, metavar="DIR",
+                    help="Cache raw Zenodo/GWOSC metadata responses under DIR "
+                         "(see gwcat.fetch_cache). Omit to disable caching.")
+    ap.add_argument("--offline", action="store_true",
+                    help="Never touch the network: read file listings and "
+                         "event metadata from --cache-dir (required), and "
+                         "require every file to already exist locally. Same "
+                         "as setting GWCAT_OFFLINE=1.")
 
     args = ap.parse_args()
 
@@ -629,6 +852,9 @@ def _cli():
 
     show_progress = not args.no_progress
     resolve = not args.no_resolve
+    # None (not False) when --offline is absent, so GWCAT_OFFLINE can still
+    # activate offline mode; the flag only ever turns it on explicitly.
+    offline = True if args.offline else None
 
     all_paths = []
     pe_paths = []          # only PE files go to build_store
@@ -637,7 +863,8 @@ def _cli():
         paths = fetch_catalog(
             cat, data_dir=args.data_dir, record_ids=rids,
             resolve=resolve, show_progress=show_progress,
-            dry_run=args.dry_run,
+            dry_run=args.dry_run, cache_dir=args.cache_dir,
+            offline=offline,
         )
         all_paths.extend(paths)
         if not cat.startswith("injections"):
@@ -656,7 +883,8 @@ def _cli():
 
         from .ingest import build_store
         print(f"\n--- Building store from {len(pe_paths)} PE files ---")
-        build_store(pe_paths, args.out, event_table=event_table)
+        build_store(pe_paths, args.out, event_table=event_table,
+                    cache_dir=args.cache_dir, offline=offline)
     else:
         print(f"\nDownloaded {len(all_paths)} files to {args.data_dir}/")
         if pe_paths:

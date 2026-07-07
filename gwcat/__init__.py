@@ -26,6 +26,8 @@ from .schema import (PARAMETER_GROUPS, EXPORT_REQUIREMENTS, DARKSIRENS_REQUIRED,
 from .waveform_policy import WAVEFORM_POLICIES, resolve_policy
 from .manifests import (list_releases, get_manifest, validate_manifest,
                         ManifestValidationError)
+from .event_metadata import (assemble_event_metadata, metadata_diagnostics,
+                            load_user_overrides)
 
 # fetch has optional deps (requests, tqdm); import lazily
 def fetch_and_build(*args, **kwargs):
@@ -51,5 +53,6 @@ __all__ = [
     "fetch_and_build", "fetch_catalog",
     "list_releases", "get_manifest", "validate_manifest",
     "ManifestValidationError",
+    "assemble_event_metadata", "metadata_diagnostics", "load_user_overrides",
     "__version__",
 ]

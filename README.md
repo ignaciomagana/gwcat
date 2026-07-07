@@ -334,6 +334,70 @@ refresh_bbh_list()         # print O4b event names to populate BBH_O4B
 is the LVK's standard BBH classification boundary. NSBH/BNS events are
 excluded automatically without any manual exclusion list.
 
+### Offline mode & metadata provenance
+
+`gwcat.fetch` keeps two concerns separate: **file discovery/download** from
+Zenodo (`list_files`, `fetch_catalog`) and **event-metadata discovery** from
+GWOSC (`fetch_event_table_gwosc`, `fetch_bbh_names_gwosc`) — see the
+`gwcat/fetch.py` module docstring. Both support the same local-cache /
+offline-mode contract:
+
+```python
+from gwcat.fetch import fetch_catalog, fetch_event_table_gwosc
+
+# Populate the cache while online (writes raw JSON responses, with a fetch
+# timestamp, under <cache_dir>/metadata/).
+fetch_catalog("GWTC-5", data_dir="./GWTC", cache_dir="./GWTC/.cache")
+fetch_event_table_gwosc(cache_dir="./GWTC/.cache")
+
+# Later, fully offline: read ONLY the cache, never touch the network.
+fetch_catalog("GWTC-5", data_dir="./GWTC", cache_dir="./GWTC/.cache", offline=True)
+fetch_event_table_gwosc(cache_dir="./GWTC/.cache", offline=True)
+```
+
+Set `GWCAT_OFFLINE=1` (or `gwcat-fetch --offline --cache-dir ...`) to force
+offline mode without threading `offline=True` through every call. A cache
+miss in offline mode raises `gwcat.fetch_cache.OfflineCacheMissError` naming
+the exact missing file — it never silently falls back to a network call.
+Omitting `cache_dir`/`offline` entirely (the default) is byte-identical to
+pre-existing behavior: no cache is written, nothing changes.
+
+**Metadata assembly + diagnostics** (`gwcat.event_metadata`) layers online
+GWOSC metadata, an optional user-override file, and manifest defaults into the
+`event_table` dict `build_store` consumes, and records where every field came
+from:
+
+```python
+from gwcat.event_metadata import (assemble_event_metadata, load_user_overrides,
+                                  metadata_diagnostics)
+from gwcat.fetch import fetch_event_table_gwosc
+
+online = fetch_event_table_gwosc()
+overrides = load_user_overrides("my_overrides.yaml")   # or .csv
+
+event_table, diagnostics = assemble_event_metadata(
+    event_names, online_table=online, user_overrides=overrides)
+build_store(paths, "store.h5", event_table=event_table)
+```
+
+`diagnostics` is a plain, JSON-serializable
+`{event_name: {field: {"value": ..., "source": ...}}}` dict — `source` is one
+of `"user_override"`, `"online"`, `"manifest"`, or `"absent"` — the raw
+ingredient a future validation-summary report can consume. A user-override
+YAML/CSV file maps `event_name -> {far, p_astro, source_class, ...}`; override
+values win over online metadata, and the store's `metadata_source` column
+reflects the mix (e.g. `"online+user_override"`, or `"absent"` when nothing
+was found at all). FAR genuinely missing for an event is a fully supported,
+non-crashing path end to end: `assemble_event_metadata` records
+`far: absent`, and the resulting store has `far_available=False` for that
+event.
+
+`fetch_catalog(provenance={})` populates a `{file_name: {record_id,
+file_checksum}}` mapping (sha256, computed once per downloaded/verified file)
+that `build_store(file_provenance=...)` uses to fill the per-row `record_id` /
+`file_checksum` meta columns — both opt-in and both `""` by default, as
+before.
+
 ## Zenodo records
 
 These tables mirror the bundled manifests under `gwcat/manifests/releases/`
