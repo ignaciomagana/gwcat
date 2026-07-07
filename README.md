@@ -374,6 +374,49 @@ A downstream consumer verifies the two files agree by checking
 `spin_prior_mode` matches and that `chi_eff_prior_applied_to_p_pe` equals
 `chi_eff_prior_applied_to_pdraw`.
 
+### Cosmology convention (per-event cosmology contract)
+
+The cosmology used to infer source-frame masses and redshifts can differ by
+release or sample set, so `GWCatalog.to_darksirens` handles it **per event**:
+
+- **`cosmology=None` (default, per-event mode):** each event independently uses
+  **its own** stored PE cosmology (`meta/dL_prior_H0` / `meta/dL_prior_Om0`) for
+  the dL→z inversion and source-frame masses. This is correct for
+  mixed-release selections whose events were analysed under different
+  cosmologies. If any selected event has a missing (`NaN`) or absent stored
+  cosmology, the export **fails loudly and names the events** — pass an explicit
+  override instead.
+- **`cosmology=(H0, Om0)` (override mode):** that single cosmology is applied to
+  **all** events, `cosmology_override_used=True` is recorded, and the override
+  H0/Om0 are written to the output attrs.
+
+```python
+cat.to_darksirens("gw.h5")                        # per-event PE cosmology (default)
+cat.to_darksirens("gw.h5", cosmology=(67.74, 0.3089))   # one override for all events
+```
+
+Cosmology provenance written to every PE export:
+
+| Attribute | Meaning |
+|---|---|
+| `cosmology_mode` | `per-event` or `override` |
+| `cosmology_override_used` | `True` iff a `cosmology=(H0,Om0)` override was passed |
+| `cosmology_per_event_varies` | `True` iff the exported events span >1 cosmology |
+| `cosmology_H0_per_event` / `cosmology_Om0_per_event` | per-event arrays aligned with `event_names` |
+| `pe_cosmology_H0` / `pe_cosmology_Om0` | scalar (override, or first event) for legacy consumers |
+| `source_frame_under_recorded_cosmology` | `True`: source masses/redshift use the recorded cosmology |
+
+The dL→z inverter (`gwcat.cosmology.z_of_dL`) also **never silently clips**
+samples beyond its interpolation range: distances past `dL(z=zmax)` extend the
+grid (with a warning) instead of being pinned to `zmax`.
+
+> **Migration note.** Earlier versions took the **first** selected event's
+> cosmology and applied it to every event. For selections whose events share
+> one cosmology (the common case, including all bundled tests) the output is
+> byte-identical. For mixed-cosmology selections the numerical output now
+> differs — that difference is the bug fix, and it is recorded in the provenance
+> attrs above.
+
 ## Design
 
 - **Store layout**: concatenated 1-D columns + integer `offsets` index.

@@ -353,8 +353,29 @@ class GWCatalog:
             Default ``"include"`` (Mode A) is byte-identical to prior behavior.
             Any other value raises ``ValueError``.
         cosmology : tuple (H0, Om0) or None
-            Cosmology for z_max cut and stored source masses / redshift.
-            None → read per-event PE cosmology from the store metadata.
+            Cosmology used for the z_max cut, the dL→z inversion, and the
+            stored source masses / redshift.
+
+            * ``None`` (default, "per-event" mode): EACH event independently
+              uses its OWN stored PE cosmology (``meta/dL_prior_H0`` /
+              ``meta/dL_prior_Om0``).  This is the scientifically correct
+              behavior for mixed-release selections whose events were analysed
+              under different cosmologies.  If any selected event has a missing
+              (NaN) or absent per-event cosmology, the export fails loudly and
+              names the offending events; pass an explicit override instead.
+            * ``(H0, Om0)`` ("override" mode): that single cosmology is applied
+              to ALL events, ``cosmology_override_used=True`` is recorded, and
+              the override parameters are written into the output attrs.
+
+            .. note:: Migration.  Earlier versions took the FIRST selected
+               event's cosmology and applied it to every event's z_of_dL and
+               source-frame masses.  For selections whose events share one
+               cosmology (the common case, including all bundled tests) the
+               output is byte-identical.  For mixed-cosmology selections the
+               numerical output now differs -- that difference is the bug fix.
+               Provenance is recorded in the output attrs ``cosmology_mode``,
+               ``cosmology_per_event_varies``, ``cosmology_H0_per_event`` and
+               ``cosmology_Om0_per_event``.
         z_max : float or None
             Per-sample redshift cut.  Samples above z_max are dropped BEFORE
             resampling to nsamp.  Requires cosmology or stored redshift.
@@ -395,23 +416,67 @@ class GWCatalog:
         per = sub.get(need, per_event=True)
         rng = np.random.default_rng(seed)
 
-        # Resolve cosmology for z computation
+        # ── Resolve cosmology: per-event (default) or a single override ─────
+        # cosmology=None  -> each event uses ITS OWN stored PE cosmology
+        #                    (meta/dL_prior_H0, meta/dL_prior_Om0).
+        # cosmology=(H0,Om0) -> that single override is applied to EVERY event.
+        # The first selected event's cosmology is kept as the scalar
+        # pe_cosmology_H0/Om0 for backward compatibility, but the authoritative
+        # record in per-event mode is the per-event array written to attrs.
+        sel_idx = np.asarray(sub._sel)
+        have_cosmo_cols = ("dL_prior_H0" in sub.meta
+                           and "dL_prior_Om0" in sub.meta)
         if cosmology is not None:
-            _cosmo = make_cosmology(*cosmology)
-            pe_H0, pe_Om0 = float(cosmology[0]), float(cosmology[1])
+            cosmology_mode = "override"
+            override_H0, override_Om0 = float(cosmology[0]), float(cosmology[1])
+            per_event_H0 = np.full(sub.n_events, override_H0, dtype=float)
+            per_event_Om0 = np.full(sub.n_events, override_Om0, dtype=float)
+            pe_H0, pe_Om0 = override_H0, override_Om0
         else:
-            # Use per-event PE cosmology (take first event's; they should agree)
-            pe_H0 = float(sub.meta["dL_prior_H0"][sub._sel[0]])
-            pe_Om0 = float(sub.meta["dL_prior_Om0"][sub._sel[0]])
-            _cosmo = make_cosmology(pe_H0, pe_Om0)
+            cosmology_mode = "per-event"
+            if not have_cosmo_cols:
+                raise ValueError(
+                    "cosmology=None requires a per-event PE cosmology in the "
+                    "store (meta/dL_prior_H0 and meta/dL_prior_Om0), but those "
+                    "columns are absent. Pass an explicit cosmology=(H0, Om0) "
+                    "override to apply one cosmology to all events.")
+            per_event_H0 = np.asarray(sub.meta["dL_prior_H0"],
+                                      dtype=float)[sel_idx]
+            per_event_Om0 = np.asarray(sub.meta["dL_prior_Om0"],
+                                       dtype=float)[sel_idx]
+            bad = ~(np.isfinite(per_event_H0) & np.isfinite(per_event_Om0))
+            if bad.any():
+                bad_names = sorted(np.asarray(sub.event_names)[bad].tolist())
+                raise ValueError(
+                    f"cosmology=None but {int(bad.sum())} selected event(s) "
+                    f"have no stored PE cosmology (dL_prior_H0/dL_prior_Om0 is "
+                    f"NaN): {bad_names}. Pass an explicit cosmology=(H0, Om0) "
+                    f"override to apply one cosmology to all events.")
+            pe_H0 = float(per_event_H0[0]) if sub.n_events else float("nan")
+            pe_Om0 = float(per_event_Om0[0]) if sub.n_events else float("nan")
+
+        # Per-event cosmology objects, built once per unique (H0, Om0) pair.
+        _cosmo_cache: dict = {}
+
+        def _cosmo_for(e):
+            key = (per_event_H0[e], per_event_Om0[e])
+            c = _cosmo_cache.get(key)
+            if c is None:
+                c = make_cosmology(*key)
+                _cosmo_cache[key] = c
+            return c
 
         cols = {k: [] for k in ["m1det", "m2det", "dL", "ra", "dec",
                                 "chieff", "p_pe", "redshift", "m1src", "m2src"]}
         kept = []
+        kept_H0, kept_Om0 = [], []
         for e in range(sub.n_events):
             n = len(per["luminosity_distance"][e])
             if n == 0:
                 continue
+
+            # This event's own PE cosmology (or the single override).
+            cosmo_e = _cosmo_for(e)
 
             dL_e = per["luminosity_distance"][e]
             m1_e = per["mass_1"][e]
@@ -419,7 +484,7 @@ class GWCatalog:
 
             # Per-sample z_max cut
             if z_max is not None:
-                z_e = z_of_dL(dL_e, _cosmo)
+                z_e = z_of_dL(dL_e, cosmo_e)
                 keep = z_e <= z_max
                 if not keep.any():
                     continue
@@ -449,8 +514,8 @@ class GWCatalog:
             # Jacobian: uniform detector-frame component-mass prior
             p_pe = m1 * p_dL
 
-            # Redshift and source masses under the PE cosmology
-            z = z_of_dL(dL, _cosmo)
+            # Redshift and source masses under THIS event's PE cosmology
+            z = z_of_dL(dL, cosmo_e)
 
             cols["m1det"].append(m1)
             cols["m2det"].append(m2)
@@ -463,10 +528,18 @@ class GWCatalog:
             cols["m1src"].append(m1 / (1 + z))
             cols["m2src"].append(m2 / (1 + z))
             kept.append(sub.event_names[e])
+            kept_H0.append(float(per_event_H0[e]))
+            kept_Om0.append(float(per_event_Om0[e]))
 
         nobs = len(kept)
         data = {k: np.concatenate(v) if v else np.array([])
                 for k, v in cols.items()}
+
+        # Whether the events actually written span more than one cosmology.
+        kept_H0_arr = np.asarray(kept_H0, dtype=float)
+        kept_Om0_arr = np.asarray(kept_Om0, dtype=float)
+        cosmology_per_event_varies = bool(
+            nobs > 1 and (np.ptp(kept_H0_arr) > 0 or np.ptp(kept_Om0_arr) > 0))
 
         # Apply the 1-D chi_eff prior to p_pe (Mode A default: "include").
         # In "exclude" mode the exported p_pe carries no chi_eff prior factor
@@ -500,10 +573,25 @@ class GWCatalog:
             f.attrs["mass_jacobian_applied"] = True
             # The distance prior p_dL_pe is a FACTOR of p_pe, not removed.
             f.attrs["distance_prior_removed"] = False
+            # ── Cosmology contract provenance (PR 4) ───────────────────────
+            # cosmology_mode: "per-event" (each event's own stored PE cosmology)
+            #                 or "override" (one user cosmology applied to all).
+            f.attrs["cosmology_mode"] = cosmology_mode
             f.attrs["cosmology_override_used"] = bool(cosmology is not None)
+            # Source-frame masses / redshift were computed under the cosmology
+            # recorded here (per-event array below, or the override scalars).
+            f.attrs["source_frame_under_recorded_cosmology"] = True
+            f.attrs["cosmology_per_event_varies"] = bool(
+                cosmology_per_event_varies)
+            # Per-event cosmology actually used, aligned with event_names.
+            f.attrs["cosmology_H0_per_event"] = kept_H0_arr
+            f.attrs["cosmology_Om0_per_event"] = kept_Om0_arr
             # Legacy flag, kept for backward compat; consistent with the mode.
             f.attrs["chi_eff_in_p_pe"] = bool(chi_eff_included)
             f.attrs["chi_eff_amax"] = float(amax)
+            # Scalar PE cosmology: the override, or the first kept event's
+            # cosmology in per-event mode (authoritative record is the
+            # per-event array above when cosmology_per_event_varies=True).
             f.attrs["pe_cosmology_H0"] = pe_H0
             f.attrs["pe_cosmology_Om0"] = pe_Om0
             # --- Source-class / FAR-policy provenance (PR 2) ---
@@ -526,8 +614,12 @@ class GWCatalog:
                        "redshift", "m1src", "m2src"]:
                 f.create_dataset(k, data=data[k], compression="gzip",
                                  shuffle=False)
+        if cosmology_mode == "per-event" and cosmology_per_event_varies:
+            cosmo_desc = "cosmology=per-event (varies across events)"
+        else:
+            cosmo_desc = f"H0={pe_H0}, Om0={pe_Om0} ({cosmology_mode})"
         print(f"Wrote {out_path}: nobs={nobs}, nsamp={nsamp}, "
-              f"H0={pe_H0}, Om0={pe_Om0}, compact_type={compact_type}")
+              f"{cosmo_desc}, compact_type={compact_type}")
         return out_path
 
     def _to_darksirens_format(self, *args, **kwargs):
