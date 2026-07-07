@@ -53,5 +53,11 @@ Repository = "https://github.com/ignaciomagana/gwcat"
 [tool.setuptools.packages.find]
 include = ["gwcat*"]
 
+[tool.setuptools.package-data]
+gwcat = [
+    "data/event_lists/*.txt",
+    "data/event_lists/*.yaml",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

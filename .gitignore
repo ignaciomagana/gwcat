@@ -1,6 +1,8 @@
-# my folders
-data/
+# my folders (top-level raw-download cache only; keep bundled package data)
+/data/
 working/
+!gwcat/data/
+!gwcat/data/**
 
 #other
 .vscode/

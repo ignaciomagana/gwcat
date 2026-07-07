@@ -1,0 +1,56 @@
+# Provenance for the bundled BBH event lists.
+#
+# These plain-text lists were previously hardcoded as Python literals in
+# gwcat/bbh_allowed_names.py.  They are the reproducible/offline fallback used
+# when the live GWOSC query is unavailable.  Source class is NOT inferred from
+# these lists alone at selection time (see gwcat/source_class.py); they only
+# seed the BBH whitelist helpers.
+#
+# format: one GWOSC event name per line; blank lines and #-comments ignored.
+
+schema_version: "1.0"
+
+lists:
+  bbh_o1o2.txt:
+    observing_runs: [O1, O2]
+    source: "GWTC-1 confident BBH detections."
+    reference: "arXiv:1811.12907 (GWTC-1)"
+    count: 10
+  bbh_o3a.txt:
+    observing_runs: [O3a]
+    source: "GWTC-2.1 / GWTC-3 population data-release BBH/mass-gap sample."
+    reference: "arXiv:2108.01045 (GWTC-2.1), arXiv:2111.03606 (GWTC-3)"
+    filtered_by: non_bbh_exclusions.txt
+    count: 37
+  bbh_o3b.txt:
+    observing_runs: [O3b]
+    source: "GWTC-3 population data-release BBH/mass-gap sample."
+    reference: "arXiv:2111.03606 (GWTC-3)"
+    filtered_by: non_bbh_exclusions.txt
+    count: 23
+  bbh_o4a.txt:
+    observing_runs: [O4a]
+    source: "GWTC-4.1 population data release Event_list/GWTC4.1_BBH.txt."
+    reference: "GWTC-4.1 population data release"
+    filtered_by: non_bbh_exclusions.txt
+    count: 86
+  bbh_o4b.txt:
+    observing_runs: [O4b]
+    source: "GWTC-5.0 population data release Event_list/GWTC5_BBH.txt."
+    reference: "arXiv:2605.27225 (GWTC-5.0, submitted 26 May 2026)"
+    filtered_by: non_bbh_exclusions.txt
+    count: 104
+
+exclusions:
+  non_bbh_exclusions.txt:
+    purpose: >
+      Names that must never be admitted to the BBH whitelist: established
+      BNS/NSBH events and low-mass/mass-gap systems that can appear in broad
+      PE/cache manifests but are outside the BBH-only selection mode.
+    reference: "GWTC-1..GWTC-5.0 event tables"
+
+# Aggregate expectations validated by
+# gwcat.bbh_allowed_names.validate_bbh_allowed_names().
+expected:
+  bbh_all_total: 259
+  o4b_non_excluded: 103
