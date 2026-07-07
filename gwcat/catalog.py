@@ -307,27 +307,51 @@ class GWCatalog:
     def to_darksirens(self, out_path, compact_type=None, nsamp=4096,
                       far_max=None, pastro_min=None, z_max=None,
                       seed=0, replace="auto", cosmology=None, amax=0.99,
+                      spin_prior_mode="include",
                       allowed_names=None,
                       allowed_names_authoritative=True,
                       source_class=None, event_list=None,
                       allow_missing_far=False, require_far=False):
         """Write an HDF5 consumable by darksirens.gw.utils.load_gw_samples.
 
-        p_pe convention
-        ---------------
-        load_gw_samples expects p_pe in the (m1det, q, dL) basis.  It then
-        multiplies by the 1-D chi_eff prior and normalises per event.
+        p_pe convention (spin-prior contract)
+        -------------------------------------
+        p_pe is the PE prior in the (m1det, q, dL[, chi_eff]) basis that
+        darksirens.gw.utils.load_gw_samples divides out per event.
 
         For a uniform detector-frame component-mass prior the (m1det, q)-basis
-        density carries a Jacobian |dm2det/dq| = m1det, so:
+        density carries a Jacobian |dm2det/dq| = m1det, so the mass-Jacobian
+        contribution is:
 
-            p_pe = m1det * p_dL_pe          (chi_eff EXCLUDED; loader adds it)
+            p_pe = m1det * p_dL_pe
 
         This is the ONLY place the mass Jacobian is applied. The store keeps the
-        mass-prior-agnostic p_dL_pe.
+        mass-prior-agnostic p_dL_pe, and the distance prior p_dL_pe remains a
+        FACTOR of p_pe (it is not divided out).
+
+        The 1-D chi_eff prior is governed by ``spin_prior_mode`` (Mode A is the
+        default):
+
+        * ``"include"`` (default): the 1-D isotropic chi_eff prior is multiplied
+          into p_pe here, so the exported p_pe already contains it.  Downstream
+          (darksirens) MUST NOT multiply the chi_eff prior again — doing so
+          double-counts it.  Recorded as ``chi_eff_prior_applied_to_p_pe=True``
+          and the legacy ``chi_eff_in_p_pe=True``.
+        * ``"exclude"``: p_pe carries NO chi_eff prior factor (only the mass
+          Jacobian and the distance prior).  Downstream MUST apply the 1-D
+          chi_eff prior itself.  Recorded as
+          ``chi_eff_prior_applied_to_p_pe=False``.
+
+        ``"passthrough"`` is intentionally NOT offered: the store never bakes a
+        spin prior into p_dL_pe, so "no spin-prior manipulation" is byte-for-byte
+        identical to ``"exclude"`` (there is nothing distinct to pass through).
 
         Parameters
         ----------
+        spin_prior_mode : {"include", "exclude"}
+            Whether the exported p_pe contains the 1-D chi_eff prior factor.
+            Default ``"include"`` (Mode A) is byte-identical to prior behavior.
+            Any other value raises ``ValueError``.
         cosmology : tuple (H0, Om0) or None
             Cosmology for z_max cut and stored source masses / redshift.
             None → read per-event PE cosmology from the store metadata.
@@ -353,6 +377,13 @@ class GWCatalog:
             HDF5 provenance attributes ``far_policy``, ``allow_missing_far``,
             ``require_far``, and ``n_events_missing_far``.
         """
+        valid_spin_modes = ("include", "exclude")
+        if spin_prior_mode not in valid_spin_modes:
+            raise ValueError(
+                f"spin_prior_mode={spin_prior_mode!r} is invalid; choose one "
+                f"of {valid_spin_modes}. 'passthrough' is not offered because "
+                f"the store keeps a spin-prior-agnostic p_dL_pe, so 'exclude' "
+                f"already means 'no chi_eff prior applied'.")
         sub = self.select(compact_type=compact_type, far_max=far_max,
                           pastro_min=pastro_min, allowed_names=allowed_names,
                           allowed_names_authoritative=allowed_names_authoritative,
@@ -437,8 +468,10 @@ class GWCatalog:
         data = {k: np.concatenate(v) if v else np.array([])
                 for k, v in cols.items()}
 
-        # Apply 1-D chi_eff prior to p_pe
-        if data["chieff"].size > 0:
+        # Apply the 1-D chi_eff prior to p_pe (Mode A default: "include").
+        # In "exclude" mode the exported p_pe carries no chi_eff prior factor
+        # and darksirens must apply it downstream.
+        if spin_prior_mode == "include" and data["chieff"].size > 0:
             from .spin import chi_eff_prior_logprob
             logp_chi = chi_eff_prior_logprob(data["chieff"], data["m1src"],
                                              data["m2src"], amax=amax)
@@ -460,7 +493,16 @@ class GWCatalog:
             f.attrs["compact_type"] = ("" if compact_type is None
                                        else str(compact_type))
             f.attrs["mass_prior_basis"] = "uniform_detector_frame"
-            f.attrs["chi_eff_in_p_pe"] = True
+            # ── Spin-prior contract provenance (PR 3) ──────────────────────
+            chi_eff_included = (spin_prior_mode == "include")
+            f.attrs["spin_prior_mode"] = spin_prior_mode
+            f.attrs["chi_eff_prior_applied_to_p_pe"] = bool(chi_eff_included)
+            f.attrs["mass_jacobian_applied"] = True
+            # The distance prior p_dL_pe is a FACTOR of p_pe, not removed.
+            f.attrs["distance_prior_removed"] = False
+            f.attrs["cosmology_override_used"] = bool(cosmology is not None)
+            # Legacy flag, kept for backward compat; consistent with the mode.
+            f.attrs["chi_eff_in_p_pe"] = bool(chi_eff_included)
             f.attrs["chi_eff_amax"] = float(amax)
             f.attrs["pe_cosmology_H0"] = pe_H0
             f.attrs["pe_cosmology_Om0"] = pe_Om0
