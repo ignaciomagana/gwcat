@@ -1,0 +1,33 @@
+# Declarative manifest for GWTC-4.1.
+#
+# Ported verbatim from the pre-PR7 hardcoded registry in gwcat/fetch.py
+# (RELEASES["GWTC-4.1"] + _is_o4_pe file filter).  "GWTC-4" is kept as an
+# alias, matching the pre-PR7 `RELEASES["GWTC-4"] = RELEASES["GWTC-4.1"]`.
+release: GWTC-4.1
+aliases: [GWTC-4]
+observing_runs: [O4a]
+description: "O4a PE samples (GWTC-4.1, supersedes GWTC-4.0)"
+
+records:
+  - provider: zenodo
+    record_id: 20275769
+    concept_id: 20275768
+
+products:
+  pe_samples:
+    # O4 releases ship one combined file per event (no cosmo/nocosmo split).
+    file_patterns: ["*.hdf5"]
+    suffix: ".hdf5"
+    exclude_junk: true
+    require_event_name: true
+    expected_event_count: null
+    sample_set_policy: null
+
+metadata:
+  source_class_reference: release_table
+  far_available_online: true
+  preferred_waveform_source: manifest
+
+validation:
+  require_checksums: true
+  allow_missing_far: true

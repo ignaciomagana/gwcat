@@ -1,0 +1,33 @@
+# Declarative manifest for the O3 BBH injection/selection set.
+#
+# Ported verbatim from the pre-PR7 hardcoded registry in gwcat/fetch.py
+# (INJECTION_RELEASES["injections-O3-BBH"] + _is_o3_bbhpop_full file filter).
+release: injections-O3-BBH
+observing_runs: [O1, O2, O3]
+description: "O3 BBH search sensitivity (GWTC-3, full O1+O2+O3)"
+
+records:
+  - provider: zenodo
+    record_id: 7890437
+    concept_id: null
+
+products:
+  injections:
+    # Select only the full-O3 BBH file (3 dashes), not the O3a/O3b GPS-time
+    # splits (5 dashes): endo3_bbhpop-LIGO-T2100113-v12.hdf5 vs
+    # endo3_bbhpop-LIGO-T2100113-v12-<gps>-<dur>.hdf5.
+    file_patterns: ["endo3_bbhpop*.hdf5"]
+    prefix: endo3_bbhpop
+    suffix: ".hdf5"
+    dash_count: 3
+    expected_event_count: null
+    sample_set_policy: null
+
+metadata:
+  source_class_reference: not_applicable
+  far_available_online: false
+  preferred_waveform_source: manifest
+
+validation:
+  require_checksums: true
+  allow_missing_far: true

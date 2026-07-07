@@ -23,6 +23,7 @@ dependencies = [
     "numpy>=1.22",
     "h5py>=3.6",
     "astropy>=5.0",
+    "pyyaml>=5.1",
 ]
 
 [project.optional-dependencies]
@@ -57,6 +58,8 @@ include = ["gwcat*"]
 gwcat = [
     "data/event_lists/*.txt",
     "data/event_lists/*.yaml",
+    "manifests/releases/*.yaml",
+    "manifests/injections/*.yaml",
 ]
 
 [tool.pytest.ini_options]

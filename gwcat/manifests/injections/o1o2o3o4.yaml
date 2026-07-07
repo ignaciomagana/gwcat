@@ -1,0 +1,31 @@
+# Declarative manifest for the cumulative O1-O4b injection/selection set.
+#
+# Ported verbatim from the pre-PR7 hardcoded registry in gwcat/fetch.py
+# (INJECTION_RELEASES["injections-O1O2O3O4"] + _is_injection_hdf file filter).
+release: injections-O1O2O3O4
+observing_runs: [O1, O2, O3, O4a, O4b]
+# The pre-PR7 code used the dash-range display string "O1-O4b" (not the
+# "+"-joined form used by the other releases); preserve it exactly.
+observing_run_label: "O1-O4b"
+description: "Cumulative O1+O2+O3+O4a+O4b search sensitivity (GWTC-5.0)"
+
+records:
+  - provider: zenodo
+    record_id: 19500052
+    concept_id: null
+
+products:
+  injections:
+    file_patterns: ["*.hdf", "*.hdf5"]
+    exclude_junk: true
+    expected_event_count: null
+    sample_set_policy: null
+
+metadata:
+  source_class_reference: not_applicable
+  far_available_online: false
+  preferred_waveform_source: manifest
+
+validation:
+  require_checksums: true
+  allow_missing_far: true
