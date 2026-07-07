@@ -424,9 +424,72 @@ grid (with a warning) instead of being pinned to `zmax`.
 > differs — that difference is the bug fix, and it is recorded in the provenance
 > attrs above.
 
+### Waveform / sample-set policy (schema 1.2)
+
+A single event can have **multiple posterior sample sets** — e.g. an
+`IMRPhenomXPHM` analysis, a `SEOBNRv5PHM` analysis, and a combined `Mixed` set.
+gwcat never collapses them without recording what happened.
+
+**Ingest.** `build_store` picks one sample set per event by default
+(`sample_sets="preferred"`: the `Mixed`/priority heuristic, unchanged from
+before). Pass `sample_sets="all"` to ingest **every** analysis of each PE file
+as a separate row, or a list of analysis labels to ingest specific ones. Event
+identity stays `event_name`; uniqueness is `(event_name, sample_set_name)`. Each
+row records its sample-set provenance in `meta/` columns: `sample_set_name`,
+`waveform` (family), `approximant`, `calibration_model`, `is_mixed`,
+`is_preferred`, `priority_rank`, `selection_reason`, `file_name`,
+`file_checksum`, `record_id`. (`available_parameters`/`sample_count` are **not**
+stored — they are already derivable from the availability mask and the offsets
+index.)
+
+```python
+build_store(paths, "store.h5")                      # one sample set per event
+build_store(paths, "store.h5", sample_sets="all")   # every analysis, one row each
+```
+
+**Selection / export.** `GWCatalog.select` and `to_darksirens` take a
+`waveform_policy=` (and `approximant=`) argument that resolves **which** sample
+set represents each event. Except for `all`, the result is guaranteed to hold
+exactly one sample set per event.
+
+| `waveform_policy` | Behavior |
+|---|---|
+| `preferred` (default) | Pick by `is_preferred`, then smallest `priority_rank`. |
+| `mixed-first` | Prefer an `is_mixed` set; else fall back to `preferred`. |
+| `strict-approximant` | Require `approximant=...` for **every** event; **fail loudly** naming events that lack it. |
+| `all` | Keep every sample set; the output is explicitly **not** homogeneous. |
+
+```python
+cat.to_darksirens("gw.h5")                                   # preferred (default)
+cat.to_darksirens("gw.h5", waveform_policy="mixed-first")
+cat.to_darksirens("gw.h5", waveform_policy="strict-approximant",
+                  approximant="IMRPhenomXPHM")               # fails if any event lacks it
+cat.to_darksirens("gw.h5", waveform_policy="all")            # one event × many sample sets
+```
+
+The default `preferred` is a **no-op** for a single-sample-set store (one row
+per event, no sample-set columns), so existing stores and exports are unchanged.
+Every resolution records a per-row `selection_reason`, and every export writes
+the policy provenance:
+
+| Attribute | Meaning |
+|---|---|
+| `waveform_policy` | The policy applied. |
+| `approximant` | The requested approximant (`""` if none). |
+| `homogeneous_sample_sets` | `False` iff any event contributes >1 written sample set (only under `all`). |
+| `sample_set_name_per_event` / `sample_set_approximant_per_event` | Per-written-row chosen sets, aligned with `event_names`. |
+| `sample_set_selection_reason` | Why each row was kept under the active policy. |
+
+> **Schema 1.2.** A store written with sample-set metadata advertises
+> `schema_version = "1.2"`. Older stores (1.0/1.1, no sample-set columns) load as
+> single-sample-set-per-event and any waveform policy is a no-op.
+
 ## Design
 
-- **Store layout**: concatenated 1-D columns + integer `offsets` index.
+- **Store layout**: concatenated 1-D columns + integer `offsets` index. Each
+  row is one `(event, sample_set)` pair; a single-sample-set event is one row,
+  exactly as before. Schema versions: 1.0 (no availability mask), 1.1 (adds the
+  `avail/mask`), 1.2 (adds the per-row sample-set/waveform meta columns).
 - **Union parameter schema** (schema 1.1): ingest and merge store the *union*
   of parameters across events, not the intersection. A parameter present for
   only some events is kept as a full column, NaN-filled for the events that lack
