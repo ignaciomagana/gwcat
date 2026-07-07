@@ -546,7 +546,9 @@ def _resolve_event_table(event_table, cache_dir=None, offline=None):
 def build_store(paths, out_path, params=None, extra_params=None,
                 cfg: Optional[IngestConfig] = None, event_table=None,
                 sample_sets="preferred", file_provenance: Optional[dict] = None,
-                cache_dir=None, offline: Optional[bool] = None):
+                cache_dir=None, offline: Optional[bool] = None,
+                write_summary: bool = False,
+                summary_context: Optional[dict] = None):
     """Ingest a list of cosmo-file paths into a single concatenated store.
 
     params       : column list to store (default DEFAULT_PARAMS).
@@ -578,6 +580,18 @@ def build_store(paths, out_path, params=None, extra_params=None,
                    Only consulted when event_table is None (auto-fetch).  See
                    gwcat.fetch_cache; None/unset leaves auto-fetch behavior
                    unchanged from before PR 8.
+    write_summary : bool, default False
+                   (PR 10) When True, write ``<out_path>.validation_summary.json``
+                   and ``.md`` next to ``out_path`` (see
+                   :mod:`gwcat.validation_summary`).  Opt-in at the library level;
+                   the unified ``gwcat ingest`` CLI turns this on by default
+                   (``--no-summary`` to disable).  Default False keeps
+                   ``build_store`` byte-identical (no extra files written) for
+                   every existing caller.
+    summary_context : dict, optional
+                   Extra fields merged into the written summary (e.g. a release
+                   manifest name/version a caller already knows about). Never
+                   populated automatically.
     """
     cfg = cfg or IngestConfig()
     params = list(params or DEFAULT_PARAMS)
@@ -721,6 +735,31 @@ def build_store(paths, out_path, params=None, extra_params=None,
     _write_store(out_path, union_params, columns, offsets, names, avail, meta, cfg)
     print(f"\nWrote {out_path}: {len(names)} events, "
           f"{offsets[-1]} total samples, params={union_params}")
+
+    if write_summary:
+        # Re-open what was just written as a fresh, unfiltered GWCatalog: reads
+        # only index/meta/avail (cheap), never the (potentially large) sample
+        # arrays. summarize_catalog is the single, honest source of counting
+        # logic shared with `gwcat inspect` and the darksirens-export summary.
+        from .catalog import GWCatalog
+        from .validation_summary import summarize_catalog, write_validation_summary
+        cat = GWCatalog(out_path)
+        summary = summarize_catalog(cat)
+        summary.update({
+            "kind": "ingest",
+            "output_path": str(out_path),
+            "n_files_provided": len(paths),
+            "n_rows_ingested": len(names),
+            "n_unique_events_ingested": len(set(names)),
+            "sample_sets_mode": (sample_sets if isinstance(sample_sets, str)
+                                 else "explicit_list"),
+        })
+        if file_provenance:
+            summary["source_file_checksums"] = file_provenance
+        if summary_context:
+            summary.update(summary_context)
+        write_validation_summary(out_path, summary)
+
     return out_path
 
 
@@ -1034,8 +1073,30 @@ def merge_store(existing_path: str, new_paths, out_path: str = None,
     return out_path
 
 
-def _cli():
+def _cli(argv=None, _deprecated: bool = True, default_write_summary: bool = False):
+    """Ingest CLI. Also the implementation behind the unified ``gwcat ingest``
+    subcommand (PR 10), which calls this with ``_deprecated=False,
+    default_write_summary=True`` so any flag added here is picked up by both
+    surfaces automatically -- no separate argument list to keep in sync.
+
+    argv : list of str, optional
+        Parsed instead of ``sys.argv[1:]`` when given (lets ``gwcat.cli``
+        delegate its ``ingest`` subcommand's remaining args here directly).
+    _deprecated : bool
+        When True (the default, used by the standalone ``gwcat-ingest``
+        console script), print a one-line pointer to ``gwcat ingest`` on
+        stderr before continuing with unchanged behavior.
+    default_write_summary : bool
+        Whether ``--out`` writes get a validation summary by default
+        (``--no-summary`` always disables it regardless). False for the
+        deprecated standalone script (unchanged side effects); the unified
+        CLI passes True.
+    """
     import argparse
+    import sys as _sys
+    if _deprecated:
+        print("gwcat-ingest is deprecated; use `gwcat ingest` instead "
+              "(same options; see `gwcat ingest --help`).", file=_sys.stderr)
     ap = argparse.ArgumentParser(description="Ingest GWTC cosmo files -> store.h5")
     ap.add_argument("--inspect", metavar="FILE", help="probe one file and exit")
     ap.add_argument("--glob", action="append", default=[],
@@ -1043,7 +1104,25 @@ def _cli():
     ap.add_argument("--out", default="store.h5")
     ap.add_argument("--no-event-table", action="store_true",
                     help="Skip auto-fetching FAR/p_astro from GWOSC.")
-    a = ap.parse_args()
+    ap.add_argument("--sample-sets", default="preferred", metavar="POLICY",
+                    help="Which posterior sample set(s) to ingest per PE file "
+                         "(PR 6): 'preferred' (default), 'all', or a "
+                         "comma-separated list of analysis labels.")
+    ap.add_argument("--cache-dir", default=None, metavar="DIR",
+                    help="Cache/read the auto-fetched GWOSC event table under "
+                         "DIR (see gwcat.fetch_cache). Omit to disable caching.")
+    ap.add_argument("--offline", action="store_true",
+                    help="Never touch the network for the auto-fetched event "
+                         "table; read it from --cache-dir instead (same as "
+                         "GWCAT_OFFLINE=1).")
+    ap.add_argument("--file-provenance", default=None, metavar="JSON_FILE",
+                    help="Path to a JSON file of "
+                         "{file_basename: {record_id, file_checksum}} (PR 8) "
+                         "populating the per-row provenance meta columns.")
+    ap.add_argument("--no-summary", action="store_true",
+                    help="Skip writing validation_summary.json/.md next to "
+                         "--out.")
+    a = ap.parse_args(argv)
     if a.inspect:
         inspect(a.inspect)
         return
@@ -1053,7 +1132,22 @@ def _cli():
     if not paths:
         ap.error("no files matched; pass --glob or --inspect")
     event_table = {} if a.no_event_table else None
-    build_store(paths, a.out, event_table=event_table)
+
+    sample_sets = a.sample_sets
+    if sample_sets not in ("preferred", "all"):
+        sample_sets = [s.strip() for s in sample_sets.split(",") if s.strip()]
+
+    file_provenance = None
+    if a.file_provenance:
+        with open(a.file_provenance) as f:
+            file_provenance = json.load(f)
+
+    offline = True if a.offline else None
+    write_summary = default_write_summary and not a.no_summary
+
+    build_store(paths, a.out, event_table=event_table, sample_sets=sample_sets,
+                cache_dir=a.cache_dir, offline=offline,
+                file_provenance=file_provenance, write_summary=write_summary)
 
 
 if __name__ == "__main__":

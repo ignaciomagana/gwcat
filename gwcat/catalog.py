@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import warnings
+from typing import Optional
 
 import numpy as np
 import h5py
@@ -402,7 +403,9 @@ class GWCatalog:
                       allowed_names_authoritative=True,
                       source_class=None, event_list=None,
                       allow_missing_far=False, require_far=False,
-                      waveform_policy="preferred", approximant=None):
+                      waveform_policy="preferred", approximant=None,
+                      write_summary: bool = False,
+                      summary_context: Optional[dict] = None):
         """Write an HDF5 consumable by darksirens.gw.utils.load_gw_samples.
 
         p_pe convention (spin-prior contract)
@@ -502,6 +505,14 @@ class GWCatalog:
             homogeneous.
         approximant : str or None
             Required approximant for ``waveform_policy="strict-approximant"``.
+        write_summary : bool, default False
+            (PR 10) When True, write ``<out_path>.validation_summary.json`` and
+            ``.md`` next to ``out_path`` (see :mod:`gwcat.validation_summary`).
+            Opt-in at the library level; the unified ``gwcat export-darksirens``
+            CLI turns this on by default (``--no-summary`` to disable).
+        summary_context : dict, optional
+            Extra fields merged into the written summary. Never populated
+            automatically.
         """
         valid_spin_modes = ("include", "exclude")
         if spin_prior_mode not in valid_spin_modes:
@@ -762,6 +773,51 @@ class GWCatalog:
                        "redshift", "m1src", "m2src"]:
                 f.create_dataset(k, data=data[k], compression="gzip",
                                  shuffle=False)
+
+        if write_summary:
+            # Generic diagnostics over the post-select() population (`sub`,
+            # i.e. events considered for export after metadata + waveform-policy
+            # cuts) via the same honest counting logic `gwcat inspect` and
+            # ingest's write_summary use, overlaid with export-specific
+            # provenance already computed above. `n_events_exported`/`nobs` can
+            # be slightly smaller than `n_events_considered` when the per-event
+            # z_max cut or replace=False drops an event entirely inside the
+            # sampling loop above.
+            from .validation_summary import summarize_catalog, write_validation_summary
+            summary = summarize_catalog(sub)
+            summary.update({
+                "kind": "darksirens_export",
+                "output_path": str(out_path),
+                "n_events_considered": int(sub.n_events),
+                "n_events_exported": int(nobs),
+                "n_events_skipped_after_selection": int(sub.n_events - nobs),
+                "event_names_exported": [str(k) for k in kept],
+                "nsamp_per_event": int(nsamp),
+                "source_class_filter": (None if source_class is None
+                                        else str(source_class)),
+                "event_list_filter": (
+                    None if event_list is None
+                    else (str(event_list)
+                          if isinstance(event_list, (str, bytes))
+                          else "custom_sequence")),
+                "far_policy": getattr(sub, "_far_policy", "none"),
+                "allow_missing_far": bool(allow_missing_far),
+                "require_far": bool(require_far),
+                "n_events_missing_far": int(getattr(sub, "_n_missing_far", 0)),
+                "spin_prior_mode": spin_prior_mode,
+                "chi_eff_prior_applied_to_p_pe": bool(chi_eff_included),
+                "cosmology_mode": cosmology_mode,
+                "cosmology_override_used": bool(cosmology is not None),
+                "cosmology_per_event_varies": bool(cosmology_per_event_varies),
+                "waveform_policy": str(waveform_policy),
+                "approximant": None if approximant is None else str(approximant),
+                "homogeneous_sample_sets": bool(
+                    len(set(str(k) for k in kept)) == len(kept)),
+            })
+            if summary_context:
+                summary.update(summary_context)
+            write_validation_summary(out_path, summary)
+
         if cosmology_mode == "per-event" and cosmology_per_event_varies:
             cosmo_desc = "cosmology=per-event (varies across events)"
         else:

@@ -44,6 +44,7 @@ dev = [
 ]
 
 [project.scripts]
+gwcat = "gwcat.cli:main"
 gwcat-ingest = "gwcat.ingest:_cli"
 gwcat-fetch = "gwcat.fetch:_cli"
 
