@@ -9,7 +9,8 @@ Or all at once:
   gwcat.fetch.fetch_and_build(["GWTC-2.1", "GWTC-3", "GWTC-4.1", "GWTC-5"], out="store.h5")
 
 The (m1det, q, dL)-basis mass Jacobian is applied ONLY in
-GWCatalog._to_darksirens_format; the store stays mass-prior-agnostic.
+GWCatalog.to_darksirens; the store stays mass-prior-agnostic.
+(_to_darksirens_format is a deprecated alias kept for compatibility.)
 """
 __version__ = "0.1.0"
 

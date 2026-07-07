@@ -2,7 +2,7 @@
 
 Everything here is mass-prior-agnostic. We only ever deal with the marginal
 distance prior p(dL | cosmo). The (m1det, q, dL)-basis mass Jacobian is applied
-elsewhere (exclusively in GWCatalog._to_darksirens_format).
+elsewhere (exclusively in GWCatalog.to_darksirens).
 
 The cosmo files (GWTC-2.1/3 *cosmo.h5 and the O4 combined files) use a
 luminosity-distance prior that is uniform in comoving volume and source-frame
