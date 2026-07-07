@@ -59,6 +59,12 @@ class GWCatalog:
         self._n_missing_far = 0
         self._selection_source_class = None
         self._selection_event_list = None
+        # Waveform / sample-set policy provenance (PR 6).  Defaults describe a
+        # fresh view with no policy applied yet: one row per event, homogeneous.
+        self._waveform_policy = "preferred"
+        self._waveform_approximant = None
+        self._selection_reasons = None
+        self._homogeneous_sample_sets = True
 
     # ---- selection (operates on metadata only; cheap) --------------------
     @property
@@ -105,7 +111,8 @@ class GWCatalog:
                snr_min=None, z_max=None, m1_src_range=None, m2_src_range=None,
                sky_area_max=None, names=None, allowed_names=None,
                allowed_names_authoritative=True, source_class=None,
-               event_list=None, allow_missing_far=False, require_far=False):
+               event_list=None, allow_missing_far=False, require_far=False,
+               waveform_policy="preferred", approximant=None):
         """Return a filtered view of the catalog (no sample copy).
 
         Source-class / event-list / FAR options (PR 2)
@@ -123,6 +130,23 @@ class GWCatalog:
             (``far_available=False``).  ``require_far=True`` fails loudly;
             ``allow_missing_far=True`` keeps the event, warns, and records the
             absence; the default drops missing-FAR events (legacy behavior).
+
+        Waveform / sample-set policy (PR 6)
+        -----------------------------------
+        waveform_policy : {"preferred", "mixed-first", "strict-approximant", \
+"all"}
+            Resolve which sample set represents each event AFTER the metadata
+            cuts above.  Guarantees one sample set per event unless
+            ``"all"``.  ``"preferred"`` (default) uses the ``is_preferred`` /
+            ``priority_rank`` meta columns; ``"mixed-first"`` prefers an
+            ``is_mixed`` set; ``"strict-approximant"`` requires ``approximant``
+            for every event (failing loudly otherwise); ``"all"`` keeps every
+            sample set.  For a single-sample-set store (one row per event, no
+            sample-set columns) every policy is a no-op.  See
+            :mod:`gwcat.waveform_policy`.
+        approximant : str or None
+            Required approximant for ``waveform_policy="strict-approximant"``;
+            matched against each row's ``approximant`` or ``waveform`` family.
         """
         import warnings
         if require_far and allow_missing_far:
@@ -238,11 +262,24 @@ class GWCatalog:
                               "event_table at ingest to use these cuts.")
 
         sel = np.nonzero(m & np.isin(np.arange(len(self.names)), self._sel))[0]
-        result = GWCatalog(self.path, _sel=sel)
+
+        # ── Waveform / sample-set policy resolution (PR 6) ────────────────────
+        # Collapse the metadata-selected rows to one sample set per event
+        # (unless waveform_policy="all").  A no-op for single-sample-set stores.
+        from .waveform_policy import resolve_policy
+        kept, reasons, homogeneous = resolve_policy(
+            self.names, sel, self.meta, policy=waveform_policy,
+            approximant=approximant)
+
+        result = GWCatalog(self.path, _sel=kept)
         result._far_policy = far_policy
         result._n_missing_far = n_missing_far
         result._selection_source_class = source_class
         result._selection_event_list = event_list
+        result._waveform_policy = waveform_policy
+        result._waveform_approximant = approximant
+        result._selection_reasons = np.asarray(reasons, dtype=object)
+        result._homogeneous_sample_sets = bool(homogeneous)
         return result
 
     # ---- sample access ---------------------------------------------------
@@ -364,7 +401,8 @@ class GWCatalog:
                       allowed_names=None,
                       allowed_names_authoritative=True,
                       source_class=None, event_list=None,
-                      allow_missing_far=False, require_far=False):
+                      allow_missing_far=False, require_far=False,
+                      waveform_policy="preferred", approximant=None):
         """Write an HDF5 consumable by darksirens.gw.utils.load_gw_samples.
 
         p_pe convention (spin-prior contract)
@@ -450,6 +488,20 @@ class GWCatalog:
             Missing-FAR policy for the ``far_max`` cut; recorded in the output
             HDF5 provenance attributes ``far_policy``, ``allow_missing_far``,
             ``require_far``, and ``n_events_missing_far``.
+        waveform_policy : {"preferred", "mixed-first", "strict-approximant", \
+"all"}
+            Which sample set represents each event (PR 6).  Guarantees one
+            sample set per event unless ``"all"``.  Default ``"preferred"`` is a
+            no-op for single-sample-set stores, so existing exports are
+            unchanged.  ``"strict-approximant"`` fails loudly (naming the events)
+            when ``approximant`` is unavailable for one.  See :meth:`select` and
+            :mod:`gwcat.waveform_policy`.  The chosen policy, the per-event
+            chosen ``sample_set_name`` / ``approximant`` arrays, and a
+            ``homogeneous_sample_sets`` boolean are written to the output attrs
+            so a multi-waveform (``"all"``) file is never presented as
+            homogeneous.
+        approximant : str or None
+            Required approximant for ``waveform_policy="strict-approximant"``.
         """
         valid_spin_modes = ("include", "exclude")
         if spin_prior_mode not in valid_spin_modes:
@@ -463,7 +515,9 @@ class GWCatalog:
                           allowed_names_authoritative=allowed_names_authoritative,
                           source_class=source_class, event_list=event_list,
                           allow_missing_far=allow_missing_far,
-                          require_far=require_far)
+                          require_far=require_far,
+                          waveform_policy=waveform_policy,
+                          approximant=approximant)
         from .schema import DARKSIRENS_REQUIRED
         need = list(DARKSIRENS_REQUIRED)
         # Required-parameter contract (PR 5): fail loudly -- naming the missing
@@ -528,6 +582,18 @@ class GWCatalog:
                                 "chieff", "p_pe", "redshift", "m1src", "m2src"]}
         kept = []
         kept_H0, kept_Om0 = [], []
+        # Per-written-row sample-set provenance (PR 6), aligned with ``kept``.
+        kept_ss_name, kept_ss_approx, kept_ss_reason = [], [], []
+
+        def _ss_meta(row, field):
+            v = sub.meta.get(field)
+            if v is None:
+                return ""
+            x = v[int(row)]
+            return x.decode() if isinstance(x, (bytes, bytearray)) else str(x)
+
+        sel_rows = np.asarray(sub._sel)
+        reasons_arr = getattr(sub, "_selection_reasons", None)
         for e in range(sub.n_events):
             n = len(per["luminosity_distance"][e])
             if n == 0:
@@ -588,6 +654,12 @@ class GWCatalog:
             kept.append(sub.event_names[e])
             kept_H0.append(float(per_event_H0[e]))
             kept_Om0.append(float(per_event_Om0[e]))
+            row = sel_rows[e]
+            kept_ss_name.append(_ss_meta(row, "sample_set_name"))
+            kept_ss_approx.append(_ss_meta(row, "approximant"))
+            kept_ss_reason.append(
+                str(reasons_arr[e]) if reasons_arr is not None
+                and e < len(reasons_arr) else "")
 
         nobs = len(kept)
         data = {k: np.concatenate(v) if v else np.array([])
@@ -664,6 +736,24 @@ class GWCatalog:
             f.attrs["require_far"] = bool(require_far)
             f.attrs["n_events_missing_far"] = int(
                 getattr(sub, "_n_missing_far", 0))
+            # --- Waveform / sample-set provenance (PR 6) ---
+            # homogeneous_sample_sets is honest about the WRITTEN file: False iff
+            # any event contributes more than one sample-set row (only possible
+            # under waveform_policy="all").  A multi-waveform file is thus never
+            # advertised as homogeneous.
+            f.attrs["waveform_policy"] = str(waveform_policy)
+            f.attrs["approximant"] = "" if approximant is None else str(approximant)
+            f.attrs["homogeneous_sample_sets"] = bool(
+                len(set(str(k) for k in kept)) == len(kept))
+            f.attrs.create("sample_set_name_per_event",
+                           np.array([str(x) for x in kept_ss_name],
+                                    dtype=h5py.string_dtype()))
+            f.attrs.create("sample_set_approximant_per_event",
+                           np.array([str(x) for x in kept_ss_approx],
+                                    dtype=h5py.string_dtype()))
+            f.attrs.create("sample_set_selection_reason",
+                           np.array([str(x) for x in kept_ss_reason],
+                                    dtype=h5py.string_dtype()))
             f.attrs.create("event_names",
                            np.array([str(k) for k in kept],
                                     dtype=h5py.string_dtype()))

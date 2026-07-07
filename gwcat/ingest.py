@@ -91,6 +91,26 @@ META_STR_FIELDS = [
     "source_class_reference", "metadata_source",
 ]
 
+# ── Sample-set / waveform contract (PR 6) ────────────────────────────────────
+# Per-ROW sample-set provenance.  Each (event, sample_set) pair is one row of
+# the ragged store, so these are ordinary meta columns aligned with the rows;
+# uniqueness is (event_name, sample_set_name).  Explicit-absence defaults follow
+# the PR-2 pattern: NaN for the float flags, "" for the strings.  ``release``
+# and ``catalog`` already exist above; the rest are new here.
+#   floats  -> is_mixed, is_preferred (0.0/1.0 flags), priority_rank
+#   strings -> sample_set_name, waveform (family), approximant,
+#              calibration_model, selection_reason, file_name, file_checksum,
+#              record_id
+# available_parameters / sample_count are intentionally NOT stored: they are
+# already derivable from the availability mask (avail/mask) and the offsets
+# index, respectively (see GWCatalog.param_available / nsamp_per_event).
+SAMPLE_SET_FLOAT_FIELDS = ["is_mixed", "is_preferred", "priority_rank"]
+SAMPLE_SET_STR_FIELDS = ["sample_set_name", "waveform", "approximant",
+                         "calibration_model", "selection_reason",
+                         "file_name", "file_checksum", "record_id"]
+META_FLOAT_FIELDS += SAMPLE_SET_FLOAT_FIELDS
+META_STR_FIELDS += SAMPLE_SET_STR_FIELDS
+
 # Default waveform priority when no Mixed set exists (O4b/GWTC-5 events).
 O4_WAVEFORM_PRIORITY = [
     "C00:IMRPhenomXPHM-SpinTaylor", "C00:SEOBNRv5PHM",
@@ -151,6 +171,14 @@ def _read_event_pesummary(path: str):
 
 
 def select_analysis(analyses, prefix: str, cfg: IngestConfig):
+    """Pick the single preferred analysis label for one PE file.
+
+    This is the historical one-sample-set-per-event heuristic (kept as the
+    default): prefer the combined ``{prefix}:Mixed`` set; else walk the
+    configured waveform-priority list; else fall back to the first analysis
+    carrying the file's prefix.  :func:`select_analyses` builds on it to support
+    ingesting several sample sets per event.
+    """
     mixed = f"{prefix}:Mixed"
     if mixed in analyses:
         return mixed
@@ -163,6 +191,116 @@ def select_analysis(analyses, prefix: str, cfg: IngestConfig):
         if a.startswith(prefix):
             return a
     raise RuntimeError(f"No usable analysis among {analyses}")
+
+
+def rank_analyses(analyses, prefix: str, cfg: IngestConfig):
+    """Order the prefix's analyses by ingest preference (most preferred first).
+
+    ``{prefix}:Mixed`` (if present) ranks first, then the configured
+    waveform-priority list in order, then any remaining prefixed analyses in
+    their original order.  The index into this list becomes each sample set's
+    ``priority_rank``; the first element is what :func:`select_analysis` returns.
+    """
+    prefixed = [a for a in analyses if a.startswith(prefix)]
+    priority = cfg.o3_waveform_priority if prefix == "C01" else cfg.o4_waveform_priority
+    ordered = []
+    mixed = f"{prefix}:Mixed"
+    if mixed in prefixed:
+        ordered.append(mixed)
+    for a in priority:
+        if a in prefixed and a not in ordered:
+            ordered.append(a)
+    for a in prefixed:
+        if a not in ordered:
+            ordered.append(a)
+    return ordered
+
+
+def select_analyses(analyses, prefix: str, cfg: IngestConfig,
+                    sample_sets="preferred"):
+    """Return the list of analysis labels to ingest for one PE file.
+
+    Parameters
+    ----------
+    sample_sets : {"preferred", "all"} or list of str
+        * ``"preferred"`` (default): exactly the single label
+          :func:`select_analysis` picks -- the historical one-row-per-event
+          behavior.
+        * ``"all"``: every analysis carrying the file's prefix, each ingested as
+          a separate sample-set row (uniqueness is ``(event_name,
+          sample_set_name)``).
+        * a list/tuple of labels: exactly those labels (each validated to be
+          present in the file's analyses).
+    """
+    if isinstance(sample_sets, str):
+        if sample_sets == "preferred":
+            return [select_analysis(analyses, prefix, cfg)]
+        if sample_sets == "all":
+            ordered = rank_analyses(analyses, prefix, cfg)
+            if not ordered:
+                raise RuntimeError(f"No usable analysis among {analyses}")
+            return ordered
+        raise ValueError(
+            f"sample_sets={sample_sets!r} is invalid; use 'preferred', 'all', "
+            f"or a list of analysis labels.")
+    wanted = list(sample_sets)
+    missing = [a for a in wanted if a not in analyses]
+    if missing:
+        raise ValueError(
+            f"sample_sets={wanted}: label(s) {missing} not present in the "
+            f"file's analyses {list(analyses)}.")
+    return wanted
+
+
+def _waveform_family(approximant: str) -> str:
+    """Coarse waveform family from an approximant/analysis token.
+
+    ``'IMRPhenomXPHM-SpinTaylor' -> 'IMRPhenomXPHM'``;
+    ``'SEOBNRv5PHM' -> 'SEOBNRv5PHM'``; ``'Mixed' -> 'Mixed'``.  Splits off a
+    trailing configuration suffix after the first ``'-'`` so a
+    ``strict-approximant`` request on the bare family still matches.
+    """
+    if not approximant:
+        return ""
+    return approximant.split("-", 1)[0]
+
+
+def _sample_set_meta(analysis: str, preferred_label: str, ranked, path: str,
+                     sample_sets) -> dict:
+    """Per-row sample-set provenance for one ingested analysis label.
+
+    ``is_preferred`` marks the label the default (single-set) heuristic would
+    have chosen, and ``priority_rank`` is its index in :func:`rank_analyses`, so
+    the ``preferred`` waveform policy can reproduce that choice downstream.
+    ``record_id`` / ``file_checksum`` default to "" here (populated by declarative
+    manifests in a later PR).
+    """
+    approximant = analysis.split(":", 1)[1] if ":" in analysis else analysis
+    is_mixed = 1.0 if "mixed" in analysis.lower() else 0.0
+    is_preferred = 1.0 if analysis == preferred_label else 0.0
+    try:
+        rank = float(list(ranked).index(analysis))
+    except ValueError:
+        rank = np.nan
+    if is_preferred:
+        reason = "preferred_mixed" if is_mixed else "preferred_priority"
+    elif isinstance(sample_sets, str) and sample_sets == "all":
+        reason = "ingested_all"
+    else:
+        reason = "ingested_explicit"
+    return dict(
+        sample_set_name=analysis,
+        waveform=_waveform_family(approximant),
+        approximant=approximant,
+        calibration_model="",
+        record_id="",
+        file_name=os.path.basename(path),
+        file_checksum="",
+        is_mixed=is_mixed,
+        is_preferred=is_preferred,
+        priority_rank=rank,
+        selection_reason=reason,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -275,6 +413,7 @@ def inspect(path: str, cfg: Optional[IngestConfig] = None):
     data, samples_dict, analyses, priors = _read_event_pesummary(path)
     prefix = _prefix_for(analyses)
     analysis = select_analysis(analyses, prefix, cfg)
+    ranked = rank_analyses(analyses, prefix, cfg)
     s = samples_dict[analysis]
     dL = np.asarray(s["luminosity_distance"], float)
     H0, Om0, dmin, dmax, src = resolve_dL_prior(catalog, analysis, analyses,
@@ -288,6 +427,10 @@ def inspect(path: str, cfg: Optional[IngestConfig] = None):
     info = {
         "file": os.path.basename(path), "catalog": catalog,
         "analyses": analyses, "analysis_used": analysis,
+        # Sample-set contract (PR 6): what "sample_sets='all'" would ingest,
+        # ranked most-preferred first, and the single "preferred" default.
+        "sample_sets_available": ranked,
+        "preferred_sample_set": analysis,
         "n_samples": int(dL.size),
         "f_ref": f_ref,
         "dL_prior": {"H0": H0, "Om0": Om0, "min": dmin, "max": dmax, "source": src},
@@ -386,7 +529,8 @@ def _resolve_event_table(event_table):
 
 
 def build_store(paths, out_path, params=None, extra_params=None,
-                cfg: Optional[IngestConfig] = None, event_table=None):
+                cfg: Optional[IngestConfig] = None, event_table=None,
+                sample_sets="preferred"):
     """Ingest a list of cosmo-file paths into a single concatenated store.
 
     params       : column list to store (default DEFAULT_PARAMS).
@@ -395,6 +539,15 @@ def build_store(paths, out_path, params=None, extra_params=None,
                    which are NOT in per-event PE files.
                    None (default) → auto-fetch from GWOSC.
                    Pass {} to skip.
+    sample_sets  : which posterior sample set(s) to ingest per PE file (PR 6).
+                   "preferred" (default) keeps exactly one sample set per event
+                   (the historical Mixed/priority heuristic).  "all" ingests
+                   every analysis carrying the file's prefix as a SEPARATE row
+                   (event identity stays event_name; uniqueness is
+                   (event_name, sample_set_name)).  A list of analysis labels
+                   ingests exactly those.  Sample-set provenance is recorded in
+                   the meta/ columns (sample_set_name, waveform, approximant,
+                   is_mixed, is_preferred, priority_rank, ...).
     """
     cfg = cfg or IngestConfig()
     params = list(params or DEFAULT_PARAMS)
@@ -402,7 +555,7 @@ def build_store(paths, out_path, params=None, extra_params=None,
         params += [p for p in extra_params if p not in params]
     event_table = _resolve_event_table(event_table)
 
-    records = []   # per event: (name, n_samples, {param: array}) -- union schema
+    records = []   # per row: (name, n_samples, {param: array}) -- union schema
     offsets = [0]
     names, meta = [], {k: [] for k in META_FLOAT_FIELDS + META_STR_FIELDS}
 
@@ -411,88 +564,104 @@ def build_store(paths, out_path, params=None, extra_params=None,
         name = event_name_from_path(path)
         data, samples_dict, analyses, priors = _read_event_pesummary(path)
         prefix = _prefix_for(analyses)
-        analysis = select_analysis(analyses, prefix, cfg)
-        s = samples_dict[analysis]
-
-        n = len(np.asarray(s["luminosity_distance"]))
-        # Union schema: keep EVERY candidate parameter this event actually has.
-        # Parameters a given event lacks are NaN-filled for that event's slice
-        # later; we never drop a whole column just because one event lacks it.
-        rec = {p: np.asarray(s[p], dtype=np.float64) for p in params if p in s}
-
-        dL = np.asarray(s["luminosity_distance"], float)
-        H0, Om0, dmin, dmax, src = resolve_dL_prior(catalog, analysis, analyses,
-                                                    priors, dL, cfg)
-        if cfg.validate_prior:
-            v = validate_prior_against_samples(priors, [analysis] + analyses,
-                                               H0, Om0, dmin, dmax)
-            if v and v["ks"] > 0.05:
-                warnings.warn(f"{name}: prior KS={v['ks']:.3f} > 0.05 "
-                              f"(assumed cosmology may be wrong)")
-        # distance prior evaluated per sample, stored mass-prior-agnostic
-        p_dL = uniform_source_frame_prob(dL, make_cosmology(H0, Om0), dmin, dmax)
-        rec["p_dL_pe"] = p_dL
-        records.append((name, n, rec))
-
-        # metadata
-        m1s = float(np.median(s["mass_1_source"])) if "mass_1_source" in s else np.nan
-        m2s = float(np.median(s["mass_2_source"])) if "mass_2_source" in s else np.nan
-        snr = (float(np.median(s["network_optimal_snr"]))
-               if "network_optimal_snr" in s else np.nan)
-        f_ref = _read_f_ref(data, analysis)
+        # Sample-set contract (PR 6): one or more analyses per file, each a row.
+        preferred_label = select_analysis(analyses, prefix, cfg)
+        ranked = rank_analyses(analyses, prefix, cfg)
+        labels = select_analyses(analyses, prefix, cfg, sample_sets)
         et = event_table.get(name, {})
 
-        # ── Source-class contract ──────────────────────────────────────────
-        compact = _classify(m1s, m2s, cfg.nsbh_mass_threshold)
-        far_val = float(et.get("far", np.nan))
-        # far_available is an explicit state: True only when a finite FAR was
-        # actually supplied by the event table (public metadata may omit it).
-        far_available = 1.0 if np.isfinite(far_val) else 0.0
-        # p_astro / component probabilities come from the event table when
-        # present; otherwise stay NaN (explicit absence).
-        p_astro = float(et.get("p_astro", et.get("pastro", np.nan)))
-        metadata_source = "event_table" if et else "pe_file_only"
+        for analysis in labels:
+            s = samples_dict[analysis]
 
-        names.append(name)
-        offsets.append(offsets[-1] + n)
-        meta["name"].append(name)
-        meta["catalog"].append(catalog)
-        meta["analysis_used"].append(analysis)
-        meta["dL_prior_source"].append(src)
-        meta["mass_prior_kind"].append("uniform_detector_frame")  # validated below
-        meta["compact_type"].append(compact)
-        # canonical source-class metadata (parallel to legacy compact_type)
-        meta["source_class"].append(normalize_source_class(compact))
-        meta["source_class_method"].append("mass_threshold")
-        meta["source_class_reference"].append(
-            f"m2_source<{cfg.nsbh_mass_threshold}Msun -> NS component")
-        meta["release"].append(catalog)
-        meta["observing_run"].append(_observing_run_from_name(name))
-        meta["metadata_source"].append(metadata_source)
-        meta["far_available"].append(far_available)
-        meta["p_astro"].append(p_astro)
-        meta["p_bbh"].append(float(et.get("p_bbh", np.nan)))
-        meta["p_nsbh"].append(float(et.get("p_nsbh", np.nan)))
-        meta["p_bns"].append(float(et.get("p_bns", np.nan)))
-        meta["p_terr"].append(float(et.get("p_terr", np.nan)))
-        meta["far"].append(far_val)
-        meta["pastro"].append(float(et.get("pastro", np.nan)))
-        meta["snr_med"].append(snr)
-        meta["m1_src_med"].append(m1s)
-        meta["m2_src_med"].append(m2s)
-        meta["dL_prior_H0"].append(float(H0))
-        meta["dL_prior_Om0"].append(float(Om0))
-        meta["dL_prior_min"].append(float(dmin))
-        meta["dL_prior_max"].append(float(dmax))
-        meta["f_ref"].append(float(f_ref) if f_ref else np.nan)
-        meta["nsamp_original"].append(float(n))
-        # Sky area (optional; requires healpy)
-        if "ra" in s and "dec" in s:
-            meta["sky_area_90"].append(
-                _sky_area_90(np.asarray(s["ra"]), np.asarray(s["dec"])))
-        else:
-            meta["sky_area_90"].append(np.nan)
-        print(f"[{catalog}] {name}: {n} samp, analysis={analysis}, prior={src}")
+            n = len(np.asarray(s["luminosity_distance"]))
+            # Union schema: keep EVERY candidate parameter this event actually
+            # has.  Parameters a given event lacks are NaN-filled for that
+            # event's slice later; we never drop a whole column because one
+            # event lacks it.
+            rec = {p: np.asarray(s[p], dtype=np.float64) for p in params if p in s}
+
+            dL = np.asarray(s["luminosity_distance"], float)
+            H0, Om0, dmin, dmax, src = resolve_dL_prior(
+                catalog, analysis, analyses, priors, dL, cfg)
+            if cfg.validate_prior:
+                v = validate_prior_against_samples(priors, [analysis] + analyses,
+                                                   H0, Om0, dmin, dmax)
+                if v and v["ks"] > 0.05:
+                    warnings.warn(f"{name}: prior KS={v['ks']:.3f} > 0.05 "
+                                  f"(assumed cosmology may be wrong)")
+            # distance prior evaluated per sample, stored mass-prior-agnostic
+            p_dL = uniform_source_frame_prob(dL, make_cosmology(H0, Om0),
+                                             dmin, dmax)
+            rec["p_dL_pe"] = p_dL
+            records.append((name, n, rec))
+
+            # metadata
+            m1s = (float(np.median(s["mass_1_source"]))
+                   if "mass_1_source" in s else np.nan)
+            m2s = (float(np.median(s["mass_2_source"]))
+                   if "mass_2_source" in s else np.nan)
+            snr = (float(np.median(s["network_optimal_snr"]))
+                   if "network_optimal_snr" in s else np.nan)
+            f_ref = _read_f_ref(data, analysis)
+
+            # ── Source-class contract ──────────────────────────────────────
+            compact = _classify(m1s, m2s, cfg.nsbh_mass_threshold)
+            far_val = float(et.get("far", np.nan))
+            # far_available is an explicit state: True only when a finite FAR
+            # was actually supplied by the event table (public metadata may omit
+            # it).
+            far_available = 1.0 if np.isfinite(far_val) else 0.0
+            # p_astro / component probabilities come from the event table when
+            # present; otherwise stay NaN (explicit absence).
+            p_astro = float(et.get("p_astro", et.get("pastro", np.nan)))
+            metadata_source = "event_table" if et else "pe_file_only"
+
+            names.append(name)
+            offsets.append(offsets[-1] + n)
+            meta["name"].append(name)
+            meta["catalog"].append(catalog)
+            meta["analysis_used"].append(analysis)
+            meta["dL_prior_source"].append(src)
+            meta["mass_prior_kind"].append("uniform_detector_frame")
+            meta["compact_type"].append(compact)
+            # canonical source-class metadata (parallel to legacy compact_type)
+            meta["source_class"].append(normalize_source_class(compact))
+            meta["source_class_method"].append("mass_threshold")
+            meta["source_class_reference"].append(
+                f"m2_source<{cfg.nsbh_mass_threshold}Msun -> NS component")
+            meta["release"].append(catalog)
+            meta["observing_run"].append(_observing_run_from_name(name))
+            meta["metadata_source"].append(metadata_source)
+            meta["far_available"].append(far_available)
+            meta["p_astro"].append(p_astro)
+            meta["p_bbh"].append(float(et.get("p_bbh", np.nan)))
+            meta["p_nsbh"].append(float(et.get("p_nsbh", np.nan)))
+            meta["p_bns"].append(float(et.get("p_bns", np.nan)))
+            meta["p_terr"].append(float(et.get("p_terr", np.nan)))
+            meta["far"].append(far_val)
+            meta["pastro"].append(float(et.get("pastro", np.nan)))
+            meta["snr_med"].append(snr)
+            meta["m1_src_med"].append(m1s)
+            meta["m2_src_med"].append(m2s)
+            meta["dL_prior_H0"].append(float(H0))
+            meta["dL_prior_Om0"].append(float(Om0))
+            meta["dL_prior_min"].append(float(dmin))
+            meta["dL_prior_max"].append(float(dmax))
+            meta["f_ref"].append(float(f_ref) if f_ref else np.nan)
+            meta["nsamp_original"].append(float(n))
+            # Sky area (optional; requires healpy)
+            if "ra" in s and "dec" in s:
+                meta["sky_area_90"].append(
+                    _sky_area_90(np.asarray(s["ra"]), np.asarray(s["dec"])))
+            else:
+                meta["sky_area_90"].append(np.nan)
+            # ── Sample-set / waveform contract (PR 6) ──────────────────────
+            ss = _sample_set_meta(analysis, preferred_label, ranked, path,
+                                  sample_sets)
+            for k, val in ss.items():
+                meta[k].append(val)
+            print(f"[{catalog}] {name}: {n} samp, sample_set={analysis}, "
+                  f"prior={src}")
 
     # Assemble the UNION of parameters across events, NaN-filling event slices
     # where a parameter is absent, and build the per-event availability mask.
@@ -564,12 +733,18 @@ def _read_f_ref(data, analysis):
     return None
 
 
-#: Schema version written by build_store/merge since PR 5.  1.1 adds the
-#: ``avail/mask`` availability dataset on top of the 1.0 layout.  Stores written
-#: as "1.0" (or with no version) have no mask; readers treat every stored column
-#: as available for every event (see :meth:`GWCatalog.__init__`), which is exact
-#: for legacy stores because the old intersection ingest guaranteed it.
+#: Schema version written by build_store/merge.  1.1 adds the ``avail/mask``
+#: availability dataset on top of the 1.0 layout.  Stores written as "1.0" (or
+#: with no version) have no mask; readers treat every stored column as available
+#: for every event (see :meth:`GWCatalog.__init__`), which is exact for legacy
+#: stores because the old intersection ingest guaranteed it.
 SCHEMA_VERSION = "1.1"
+
+#: 1.2 adds the per-row sample-set/waveform meta columns (PR 6) on top of 1.1.
+#: A store is written as 1.2 when any sample-set column is present; otherwise it
+#: stays 1.1.  Stores predating 1.2 have no sample-set columns and load as
+#: single-sample-set-per-event, so waveform-policy resolution is a no-op.
+SCHEMA_VERSION_SAMPLESETS = "1.2"
 
 
 def _write_store(out_path, stored_params, columns, offsets, names, avail, meta,
@@ -582,8 +757,13 @@ def _write_store(out_path, stored_params, columns, offsets, names, avail, meta,
     """
     dt_str = h5py.string_dtype(encoding="utf-8")
     avail = np.asarray(avail, dtype=bool)
+    # Bump the schema version to 1.2 only when sample-set columns are present,
+    # so a store with none still advertises 1.1 and loads unchanged.
+    has_sampleset = any(k in meta for k in
+                        SAMPLE_SET_STR_FIELDS + SAMPLE_SET_FLOAT_FIELDS)
+    schema_version = SCHEMA_VERSION_SAMPLESETS if has_sampleset else SCHEMA_VERSION
     with h5py.File(out_path, "w") as f:
-        f.attrs["schema_version"] = SCHEMA_VERSION
+        f.attrs["schema_version"] = schema_version
         f.attrs.create("param_names",
                        np.array(stored_params, dtype=h5py.string_dtype()))
         f.attrs["n_events"] = len(names)
@@ -743,7 +923,7 @@ def merge_stores(store_a, store_b, out_path, cfg: Optional[IngestConfig] = None,
 # --------------------------------------------------------------------------
 def merge_store(existing_path: str, new_paths, out_path: str = None,
                 cfg: Optional[IngestConfig] = None, event_table=None,
-                extra_params=None):
+                extra_params=None, sample_sets="preferred"):
     """Append new events to an existing store without re-ingesting everything.
 
     Schema-preserving (PR 5): the merged store holds the UNION of parameters.
@@ -788,7 +968,7 @@ def merge_store(existing_path: str, new_paths, out_path: str = None,
     try:
         tmp_new = os.path.join(tmpdir, "new.h5")
         build_store(new_paths, tmp_new, params=candidates, cfg=cfg,
-                    event_table=event_table)
+                    event_table=event_table, sample_sets=sample_sets)
 
         tmp_merged = os.path.join(tmpdir, "merged.h5")
         merge_stores(existing_path, tmp_new, tmp_merged, cfg=cfg,
