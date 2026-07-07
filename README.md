@@ -311,34 +311,68 @@ injections, making it harder to combine consistently.
 ## darksirens integration
 
 ```
-gwcat                             darksirens
-─────                             ──────────
- store.h5                             │
-   │                                  │
-   ├─ to_darksirens()          ──→  load_gw_samples()
-   │   allowed_names filter          × p_chieff (gwdistributions)
-   │   p_pe = m1det × p_dL_pe        normalise per event
-   │   + redshift, m1src, m2src      ↓ use PE cosmology
-   │   + PE cosmology metadata        │
-   │                                  │
-   ├─ CombinedSelectionSet       ─→  load_selection_samples()
-   │   .to_darksirens()              × p_chieff (gwdistributions)
-   │   O3 + O4 campaigns            no format branching
-   │   Essick et al. reweighting     │
-   │   6D spin removed               │
-   │   Jacobian + time applied       │
-   │   FAR cut applied               │
-   │                                  ▼
-   ├─ validate_export() ──────────  catch mismatches before MCMC
-   │                                  │
-   └──────────────────────────────  H₀ posterior
+gwcat                              darksirens
+─────                              ──────────
+ store.h5                              │
+   │                                   │
+   ├─ to_darksirens()           ──→  load_gw_samples()
+   │   allowed_names filter           reads p_pe as-is (do NOT × p_chieff)
+   │   p_pe = m1det × p_dL_pe         normalise per event
+   │           × p_chieff  ← Mode A   ↓ use PE cosmology
+   │   + redshift, m1src, m2src        │
+   │   + PE cosmology metadata         │
+   │                                   │
+   ├─ CombinedSelectionSet        ─→  load_selection_samples()
+   │   .to_darksirens()               reads pdraw as-is (do NOT × p_chieff)
+   │   O3 + O4 campaigns             no format branching
+   │   Essick et al. reweighting      │
+   │   6D spin removed,               │
+   │   then × p_chieff  ← Mode A      │
+   │   Jacobian + time applied        │
+   │   FAR cut applied                │
+   │                                   ▼
+   ├─ validate_export() ───────────  catch mismatches before MCMC
+   │                                   │
+   └───────────────────────────────  H₀ posterior
 ```
-
-The 1-D chi_eff spin-prior swap lives exclusively in darksirens (via
-gwdistributions).  gwcat stays spin-prior-agnostic.
 
 Source-frame masses and the PE cosmology travel with both export files, so
 darksirens never hardcodes a cosmology for the dL→z conversion.
+
+### Prior convention (spin-prior contract)
+
+**Mode A is the default.** gwcat includes the 1-D isotropic chi_eff prior in
+*both* exported weights: `p_pe` (PE export) and `pdraw` (selection export).
+This is the historical behavior and is byte-for-byte unchanged.
+
+- **What downstream (darksirens) must do in the default (`include`) mode:**
+  read `p_pe` / `pdraw` as-is. **Do NOT** multiply the chi_eff prior again —
+  it is already baked in. Doing so double-counts the spin prior.
+- **How to get the chi_eff prior OUT of `p_pe`:** pass
+  `spin_prior_mode="exclude"` to `GWCatalog.to_darksirens(...)`. The exported
+  `p_pe` then carries only the mass Jacobian and distance prior, and downstream
+  **must** apply the 1-D chi_eff prior itself (exactly once).
+- **`passthrough` is intentionally not offered:** the store keeps a
+  spin-prior-agnostic `p_dL_pe`, so "no spin-prior manipulation" is identical to
+  `exclude` — there is nothing distinct to pass through.
+
+Every export records the contract in HDF5 attributes so it is impossible to
+miss and so PE and selection files can be cross-checked:
+
+| Attribute | PE export | Selection export |
+|---|---|---|
+| `spin_prior_mode` | `include` / `exclude` | `include` (fixed) |
+| `chi_eff_prior_applied_to_p_pe` | ✓ | — |
+| `chi_eff_prior_applied_to_pdraw` | — | ✓ |
+| `mass_jacobian_applied` | ✓ (`True`) | ✓ (`True`) |
+| `distance_prior_removed` | ✓ (`False`) | ✓ (`False`) |
+| `cosmology_override_used` | ✓ | ✓ |
+| `chi_eff_in_p_pe` (legacy) | ✓ | — |
+| `chi_eff_swap_applied` (legacy) | — | ✓ (`True`) |
+
+A downstream consumer verifies the two files agree by checking
+`spin_prior_mode` matches and that `chi_eff_prior_applied_to_p_pe` equals
+`chi_eff_prior_applied_to_pdraw`.
 
 ## Design
 

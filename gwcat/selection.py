@@ -18,8 +18,16 @@ the multi-campaign VT estimator in Essick et al. (2023):
   ndraw = N_O3 + N_O4
   pdraw_i *= N_k / ndraw  for injection i from campaign k
 
-The 1-D chi_eff spin-prior swap is NOT applied here — darksirens handles it
-via gwdistributions.  This keeps gwcat spin-prior-agnostic.
+Spin-prior contract (Mode A, matching the PE export)
+----------------------------------------------------
+On load, the injection spin-draw distribution is removed from the draw PDF
+(step 3 above).  On export (``to_darksirens``), it is REPLACED by the 1-D
+isotropic chi_eff prior — the "chi_eff swap" — so the exported ``pdraw``
+already contains the 1-D chi_eff prior.  This is recorded as
+``chi_eff_swap_applied=True``, ``chi_eff_prior_applied_to_pdraw=True``, and
+``spin_prior_mode="include"``, consistent with the PE export's ``p_pe``.
+Downstream (darksirens) MUST NOT multiply the chi_eff prior again — doing so
+double-counts it.
 
 Usage:
     from gwcat.selection import SelectionSet, CombinedSelectionSet
@@ -106,6 +114,8 @@ class SelectionSet:
         self.path = path
         self.H0 = H0 or PLANCK15.H0.value
         self.Om0 = Om0 or PLANCK15.Om0
+        # Whether the caller supplied a non-default reference cosmology.
+        self._cosmology_override = (H0 is not None) or (Om0 is not None)
         self._loaded = False
 
     # ------------------------------------------------------------------
@@ -400,8 +410,13 @@ class SelectionSet:
                       amax: float = 0.99):
         """Write a pre-processed selection file for darksirens.
 
-        Applies the 1-D chi_eff spin-prior swap (chi_eff_swap_applied=True).
-        darksirens reads the result directly — no gwdistributions needed.
+        Applies the 1-D chi_eff spin-prior swap: the injection spin-draw
+        distribution removed at load time is replaced by the 1-D isotropic
+        chi_eff prior, so the exported ``pdraw`` already contains it
+        (``chi_eff_swap_applied=True``, ``chi_eff_prior_applied_to_pdraw=True``,
+        ``spin_prior_mode="include"``).  This matches the PE export's Mode A
+        contract: darksirens reads the result directly and MUST NOT multiply the
+        chi_eff prior again — no gwdistributions needed.
 
         Parameters
         ----------
@@ -437,6 +452,16 @@ class SelectionSet:
             f.attrs["cosmology_Om0"] = float(self.Om0)
             f.attrs["chi_eff_swap_applied"] = True
             f.attrs["chi_eff_amax"] = float(amax)
+            # ── Spin-prior contract provenance (PR 3) ──────────────────────
+            # Selection export always applies the chi_eff swap (Mode A); the
+            # naming mirrors the PE export so downstream can cross-check the two.
+            f.attrs["spin_prior_mode"] = "include"
+            f.attrs["chi_eff_prior_applied_to_pdraw"] = True
+            f.attrs["mass_jacobian_applied"] = True
+            # pdraw is the injection draw density in the (m1det,q,dL) basis; no
+            # distance PRIOR is removed (injections have a draw distribution).
+            f.attrs["distance_prior_removed"] = False
+            f.attrs["cosmology_override_used"] = bool(self._cosmology_override)
 
             for name, arr in [
                 ("m1det", self._m1det[det]), ("m2det", self._m2det[det]),
@@ -591,6 +616,14 @@ class CombinedSelectionSet:
             f.attrs["cosmology_Om0"] = float(self._sets[0].Om0)
             f.attrs["chi_eff_swap_applied"] = True
             f.attrs["chi_eff_amax"] = float(amax)
+            # ── Spin-prior contract provenance (PR 3) ──────────────────────
+            f.attrs["spin_prior_mode"] = "include"
+            f.attrs["chi_eff_prior_applied_to_pdraw"] = True
+            f.attrs["mass_jacobian_applied"] = True
+            f.attrs["distance_prior_removed"] = False
+            f.attrs["cosmology_override_used"] = bool(
+                any(getattr(s, "_cosmology_override", False)
+                    for s in self._sets))
             f.attrs["n_campaigns"] = len(self._sets)
             f.attrs.create("campaign_ndraws",
                            np.array(ndraw_per, dtype=np.int64))
