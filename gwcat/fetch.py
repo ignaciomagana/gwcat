@@ -862,6 +862,12 @@ def _cli(
                     help="Disable progress bars.")
     ap.add_argument("--record-ids", type=int, nargs="+", default=None,
                     help="Override Zenodo record ID(s) (only with a single --catalog).")
+    ap.add_argument("--write-file-provenance", action="store_true",
+                    help="Hash fetched PE files, pass their provenance into "
+                         "the store, and write provenance JSON (opt-in).")
+    ap.add_argument("--file-provenance", default=None, metavar="PATH",
+                    help="Write fetched-file provenance JSON to PATH. This "
+                         "implies --write-file-provenance.")
     ap.add_argument("--cache-dir", default=None, metavar="DIR",
                     help="Cache raw Zenodo/GWOSC metadata responses under DIR "
                          "(see gwcat.fetch_cache). Omit to disable caching.")
@@ -895,23 +901,40 @@ def _cli(
     # None (not False) when --offline is absent, so GWCAT_OFFLINE can still
     # activate offline mode; the flag only ever turns it on explicitly.
     offline = True if args.offline else None
+    provenance = ({}
+                  if args.write_file_provenance or args.file_provenance
+                  else None)
 
     all_paths = []
     pe_paths = []          # only PE files go to build_store
     for cat in catalogs:
         rids = args.record_ids if (len(catalogs) == 1 and args.record_ids) else None
-        paths = fetch_catalog(
-            cat, data_dir=args.data_dir, record_ids=rids,
-            resolve=resolve, show_progress=show_progress,
-            dry_run=args.dry_run, cache_dir=args.cache_dir,
-            offline=offline,
-        )
+        fetch_kwargs = {
+            "data_dir": args.data_dir,
+            "record_ids": rids,
+            "resolve": resolve,
+            "show_progress": show_progress,
+            "dry_run": args.dry_run,
+            "cache_dir": args.cache_dir,
+            "offline": offline,
+        }
+        if provenance is not None:
+            fetch_kwargs["provenance"] = provenance
+        paths = fetch_catalog(cat, **fetch_kwargs)
         all_paths.extend(paths)
         if not cat.startswith("injections"):
             pe_paths.extend(paths)
 
     if args.dry_run:
         return
+
+    provenance_path = args.file_provenance
+    if provenance is not None and provenance_path is None and args.out:
+        provenance_path = f"{args.out}.file_provenance.json"
+    if provenance is not None and provenance_path is not None:
+        with open(provenance_path, "w") as f:
+            json.dump(provenance, f, indent=2)
+            f.write("\n")
 
     if args.out:
         if not pe_paths:
@@ -965,6 +988,8 @@ def _cli(
             "offline": offline,
             "write_summary": write_summary,
         }
+        if provenance is not None:
+            build_kwargs["file_provenance"] = provenance
         if summary_context is not None:
             build_kwargs["summary_context"] = summary_context
         build_store(pe_paths, args.out, **build_kwargs)
