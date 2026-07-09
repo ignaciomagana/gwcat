@@ -693,8 +693,9 @@ def build_store(paths, out_path, params=None, extra_params=None,
             meta["source_class"].append(source_class_val)
             meta["source_class_method"].append(source_class_method)
             meta["source_class_reference"].append(source_class_reference)
-            meta["release"].append(catalog)
-            meta["observing_run"].append(_observing_run_from_name(name))
+            meta["release"].append(str(et.get("release", catalog)))
+            meta["observing_run"].append(
+                str(et.get("observing_run", _observing_run_from_name(name))))
             meta["metadata_source"].append(metadata_source)
             meta["far_available"].append(far_available)
             meta["p_astro"].append(p_astro)
@@ -1116,6 +1117,13 @@ def _cli(
     ap.add_argument("--out", default="store.h5")
     ap.add_argument("--no-event-table", action="store_true",
                     help="Skip auto-fetching FAR/p_astro from GWOSC.")
+    ap.add_argument("--metadata-overrides", default=None, metavar="PATH",
+                    help="YAML/CSV event-metadata overrides. Values take "
+                         "precedence over GWOSC metadata.")
+    ap.add_argument("--metadata-diagnostics", default=None, metavar="PATH",
+                    help="Write per-event metadata provenance diagnostics as "
+                         "JSON. With --metadata-overrides, defaults to "
+                         "<out>.metadata_diagnostics.json.")
     ap.add_argument("--sample-sets", default="preferred", metavar="POLICY",
                     help="Which posterior sample set(s) to ingest per PE file "
                          "(PR 6): 'preferred' (default), 'all', or a "
@@ -1143,8 +1151,6 @@ def _cli(
         paths += sorted(glob.glob(g))
     if not paths:
         ap.error("no files matched; pass --glob or --inspect")
-    event_table = {} if a.no_event_table else None
-
     sample_sets = a.sample_sets
     if sample_sets not in ("preferred", "all"):
         sample_sets = [s.strip() for s in sample_sets.split(",") if s.strip()]
@@ -1157,9 +1163,52 @@ def _cli(
     offline = True if a.offline else None
     write_summary = default_write_summary and not a.no_summary
 
-    build_store(paths, a.out, event_table=event_table, sample_sets=sample_sets,
-                cache_dir=a.cache_dir, offline=offline,
-                file_provenance=file_provenance, write_summary=write_summary)
+    event_table = {} if a.no_event_table else None
+    summary_context = None
+    if a.metadata_overrides or a.metadata_diagnostics:
+        from .event_metadata import assemble_event_metadata, load_user_overrides
+        from .fetch import fetch_event_table_gwosc
+
+        overrides = (load_user_overrides(a.metadata_overrides)
+                     if a.metadata_overrides else {})
+        online_table = {}
+        if not a.no_event_table:
+            online_table = fetch_event_table_gwosc(
+                cache_dir=a.cache_dir, offline=offline)
+
+        event_names = list(dict.fromkeys(event_name_from_path(p) for p in paths))
+        event_table, diagnostics = assemble_event_metadata(
+            event_names,
+            online_table=online_table,
+            user_overrides=overrides,
+        )
+
+        diagnostics_path = a.metadata_diagnostics
+        if a.metadata_overrides and diagnostics_path is None:
+            diagnostics_path = f"{a.out}.metadata_diagnostics.json"
+        if diagnostics_path is not None:
+            with open(diagnostics_path, "w") as f:
+                json.dump(diagnostics, f, indent=2)
+                f.write("\n")
+
+        if a.metadata_overrides:
+            summary_context = {
+                "metadata_overrides_path": str(a.metadata_overrides),
+                "metadata_diagnostics_path": str(diagnostics_path),
+                "n_metadata_overrides": len(overrides),
+            }
+
+    build_store(
+        paths,
+        a.out,
+        event_table=event_table,
+        sample_sets=sample_sets,
+        cache_dir=a.cache_dir,
+        offline=offline,
+        file_provenance=file_provenance,
+        write_summary=write_summary,
+        summary_context=summary_context,
+    )
 
 
 if __name__ == "__main__":

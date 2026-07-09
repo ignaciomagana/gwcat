@@ -851,6 +851,13 @@ def _cli(
                     help="List files without downloading.")
     ap.add_argument("--no-event-table", action="store_true",
                     help="Skip auto-fetching FAR/p_astro from GWOSC during build.")
+    ap.add_argument("--metadata-overrides", default=None, metavar="PATH",
+                    help="YAML/CSV event-metadata overrides used when --out "
+                         "builds a store. Values take precedence over GWOSC.")
+    ap.add_argument("--metadata-diagnostics", default=None, metavar="PATH",
+                    help="Write per-event metadata provenance diagnostics as "
+                         "JSON. With --metadata-overrides, defaults to "
+                         "<out>.metadata_diagnostics.json.")
     ap.add_argument("--no-progress", action="store_true",
                     help="Disable progress bars.")
     ap.add_argument("--record-ids", type=int, nargs="+", default=None,
@@ -880,6 +887,8 @@ def _cli(
             ap.error(f"Unknown catalog {c!r}. Available: {_AVAILABLE}")
     if args.record_ids and len(catalogs) != 1:
         ap.error("--record-ids requires exactly one --catalog")
+    if (args.metadata_overrides or args.metadata_diagnostics) and not args.out:
+        ap.error("--metadata-overrides/--metadata-diagnostics require --out")
 
     show_progress = not args.no_progress
     resolve = not args.no_resolve
@@ -908,16 +917,57 @@ def _cli(
         if not pe_paths:
             print("No PE files to ingest (only injection files downloaded).")
             return
-        # event_table=None lets build_store auto-fetch from GWOSC;
-        # event_table={} skips the fetch.
-        event_table = {} if args.no_event_table else None
+        from .ingest import build_store, event_name_from_path
 
-        from .ingest import build_store
+        event_table = {} if args.no_event_table else None
+        summary_context = None
+        if args.metadata_overrides or args.metadata_diagnostics:
+            from .event_metadata import (
+                assemble_event_metadata,
+                load_user_overrides,
+            )
+
+            overrides = (load_user_overrides(args.metadata_overrides)
+                         if args.metadata_overrides else {})
+            online_table = {}
+            if not args.no_event_table:
+                online_table = fetch_event_table_gwosc(
+                    cache_dir=args.cache_dir, offline=offline)
+
+            event_names = list(dict.fromkeys(
+                event_name_from_path(path) for path in pe_paths))
+            event_table, diagnostics = assemble_event_metadata(
+                event_names,
+                online_table=online_table,
+                user_overrides=overrides,
+            )
+
+            diagnostics_path = args.metadata_diagnostics
+            if args.metadata_overrides and diagnostics_path is None:
+                diagnostics_path = f"{args.out}.metadata_diagnostics.json"
+            if diagnostics_path is not None:
+                with open(diagnostics_path, "w") as f:
+                    json.dump(diagnostics, f, indent=2)
+                    f.write("\n")
+
+            if args.metadata_overrides:
+                summary_context = {
+                    "metadata_overrides_path": str(args.metadata_overrides),
+                    "metadata_diagnostics_path": str(diagnostics_path),
+                    "n_metadata_overrides": len(overrides),
+                }
+
         print(f"\n--- Building store from {len(pe_paths)} PE files ---")
         write_summary = default_write_summary and not args.no_summary
-        build_store(pe_paths, args.out, event_table=event_table,
-                    cache_dir=args.cache_dir, offline=offline,
-                    write_summary=write_summary)
+        build_kwargs = {
+            "event_table": event_table,
+            "cache_dir": args.cache_dir,
+            "offline": offline,
+            "write_summary": write_summary,
+        }
+        if summary_context is not None:
+            build_kwargs["summary_context"] = summary_context
+        build_store(pe_paths, args.out, **build_kwargs)
     else:
         print(f"\nDownloaded {len(all_paths)} files to {args.data_dir}/")
         if pe_paths:

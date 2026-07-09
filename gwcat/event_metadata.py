@@ -4,7 +4,7 @@ This module is the "layered metadata system" the handoff's Online Data
 Strategy calls for, applied specifically to the per-event scalar fields that
 :func:`gwcat.ingest.build_store` reads out of its ``event_table`` argument
 (``far``, ``pastro``/``p_astro``, ``p_bbh``, ``p_nsbh``, ``p_bns``, ``p_terr``,
-``source_class``):
+``source_class``, ``release``, ``observing_run``):
 
     1. online metadata     (e.g. gwcat.fetch.fetch_event_table_gwosc)
     2. manifest defaults    (declarative, release-level fallback values)
@@ -56,12 +56,13 @@ __all__ = [
 #: mirror the historical event_table keys from
 #: :func:`gwcat.fetch.fetch_event_table_gwosc`; ``p_astro``/``p_bbh``/``p_nsbh``/
 #: ``p_bns``/``p_terr`` mirror the source-class-contract meta columns;
-#: ``source_class`` is the one field ``gwcat.ingest.build_store`` will honor as
-#: an explicit override (see its ``et.get("source_class")`` check) instead of
-#: always deriving it from the PE mass posteriors.
+#: ``source_class`` overrides the class derived from the PE mass posteriors;
+#: ``release`` and ``observing_run`` override the coarse values inferred from
+#: the input file/event name.  Appending these fields preserves the established
+#: ordering of the original diagnostics fields.
 DEFAULT_METADATA_FIELDS: Tuple[str, ...] = (
     "far", "pastro", "p_astro", "p_bbh", "p_nsbh", "p_bns", "p_terr",
-    "source_class",
+    "source_class", "release", "observing_run",
 )
 
 _SOURCES_ABSENT = "absent"
