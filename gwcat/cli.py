@@ -178,6 +178,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_val.add_argument("--strict", action="store_true",
                        help="Raise on the first internal-consistency failure "
                             "(cross-file contract checks always raise).")
+    p_val.add_argument("--json", action="store_true",
+                       help="Print machine-readable JSON and suppress the "
+                            "human validation trace.")
 
     return parser
 
@@ -299,12 +302,42 @@ def _cmd_validate(args) -> int:
     from .catalog import validate_export
 
     try:
-        results = validate_export(args.pe_path, args.selection_path,
-                                  strict=args.strict)
+        if args.json:
+            import io
+            from contextlib import redirect_stdout
+
+            with redirect_stdout(io.StringIO()):
+                results = validate_export(
+                    args.pe_path,
+                    args.selection_path,
+                    strict=args.strict,
+                )
+        else:
+            results = validate_export(
+                args.pe_path,
+                args.selection_path,
+                strict=args.strict,
+            )
     except (ValueError, AssertionError) as e:
-        print(f"validate: FAILED: {e}", file=sys.stderr)
+        if args.json:
+            print(json.dumps({
+                "ok": False,
+                "error": str(e),
+                "checks": {},
+            }, indent=2))
+        else:
+            print(f"validate: FAILED: {e}", file=sys.stderr)
         return 1
-    return 0 if all(results.values()) else 1
+
+    ok = all(results.values())
+    if args.json:
+        payload = results if ok else {
+            "ok": False,
+            "error": "one or more validation checks failed",
+            "checks": results,
+        }
+        print(json.dumps(payload, indent=2))
+    return 0 if ok else 1
 
 
 # ---------------------------------------------------------------------------

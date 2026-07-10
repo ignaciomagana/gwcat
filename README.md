@@ -157,10 +157,14 @@ gwcat fetch --catalog injections-O4ab                 # O4a+b injection set
 gwcat fetch --catalog all                             # PE + all injection sets
 gwcat fetch --catalog GWTC-5 --dry-run                # preview files
 gwcat fetch --no-resolve                              # skip concept DOI resolution
+gwcat fetch --out store.h5 --metadata-overrides metadata_overrides.yaml
+gwcat fetch --out store.h5 --write-file-provenance    # opt-in sha256 + JSON
 
 gwcat ingest --glob "./GWTC/GWTC5/*.h5" --out store.h5              # raw PE files -> store.h5
 gwcat ingest --glob "./GWTC/GWTC5/*.h5" --out store.h5 \
              --sample-sets all --cache-dir ./cache                   # PR6/PR8 options
+gwcat ingest --glob "./GWTC/GWTC5/*.h5" --out store.h5 \
+             --metadata-overrides metadata_overrides.yaml
 
 gwcat inspect store.h5                                # events, sample sets, params,
                                                        # availability, source classes
@@ -176,14 +180,20 @@ gwcat selection --injections inj_o3.hdf inj_o4.hdf \
     --H0 67.74 --Om0 0.3089
 
 gwcat validate gw_bbh.h5 selection_bbh.h5             # exit 0 iff every check passes
+gwcat validate gw_bbh.h5 selection_bbh.h5 --json      # machine-readable result
 ```
 
 Run `gwcat --help` / `gwcat <subcommand> --help` for the full flag reference.
+In particular, `gwcat fetch --help` and `gwcat ingest --help` identify their
+usage as the unified commands (not the deprecated standalone script names).
 See `examples/bbh_workflow.md` and `examples/all_cbc_workflow.md` for the
 complete full-data command sequences, and `examples/tutorial_fake_data.md` +
 `examples/make_fake_store.py` for a fully offline walkthrough on synthetic
 data (`make → inspect → export-darksirens → selection → validate`) that
 mirrors what `tests/test_cli.py` drives end-to-end.
+
+For the current architecture, scientific contracts, and recommended real-data
+commands, see [`docs/codex_gpt56_sol_handoff.md`](docs/codex_gpt56_sol_handoff.md).
 
 The standalone `gwcat-fetch` / `gwcat-ingest` scripts still work unchanged
 (same flags, same behavior) but are deprecated: they print a one-line pointer
@@ -499,20 +509,25 @@ build_store(paths, "store.h5", event_table=event_table)
 `diagnostics` is a plain, JSON-serializable
 `{event_name: {field: {"value": ..., "source": ...}}}` dict — `source` is one
 of `"user_override"`, `"online"`, `"manifest"`, or `"absent"` — the raw
-ingredient a future validation-summary report can consume. A user-override
-YAML/CSV file maps `event_name -> {far, p_astro, source_class, ...}`; override
-values win over online metadata, and the store's `metadata_source` column
-reflects the mix (e.g. `"online+user_override"`, or `"absent"` when nothing
-was found at all). FAR genuinely missing for an event is a fully supported,
-non-crashing path end to end: `assemble_event_metadata` records
-`far: absent`, and the resulting store has `far_available=False` for that
-event.
+provenance record written by the CLI. Pass `--metadata-overrides FILE` to
+`gwcat ingest` or to `gwcat fetch --out ...`; YAML and CSV are accepted. The
+CLI writes `<out>.metadata_diagnostics.json` by default (override with
+`--metadata-diagnostics PATH`) and records the override/diagnostics paths plus
+the loaded override count in the validation summary. Override files map
+`event_name -> {far, p_astro, source_class, observing_run, ...}`; their values
+win over online metadata, and the store's `metadata_source` column reflects
+the mix (e.g. `"online+user_override"`, or `"absent"` when nothing was found at
+all). FAR genuinely missing for an event is a fully supported, non-crashing
+path end to end: `assemble_event_metadata` records `far: absent`, and the
+resulting store has `far_available=False` for that event.
 
 `fetch_catalog(provenance={})` populates a `{file_name: {record_id,
 file_checksum}}` mapping (sha256, computed once per downloaded/verified file)
 that `build_store(file_provenance=...)` uses to fill the per-row `record_id` /
 `file_checksum` meta columns — both opt-in and both `""` by default, as
-before.
+before. `gwcat fetch --write-file-provenance --out store.h5` wires this through
+and writes `store.h5.file_provenance.json`; `--file-provenance PATH` selects a
+different path and implies collection. Dry runs never write provenance files.
 
 ## Zenodo records
 
