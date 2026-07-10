@@ -791,7 +791,12 @@ def fetch_event_table_gwosc(
 _AVAILABLE = sorted(k for k in RELEASES if k not in _ALIAS_NAMES)  # hide aliases
 _PE_CATALOGS = list_release_manifests()
 
-def _cli(argv=None, _deprecated: bool = True, default_write_summary: bool = False):
+def _cli(
+    argv=None,
+    _deprecated: bool = True,
+    default_write_summary: bool = False,
+    prog: Optional[str] = None,
+):
     """Fetch CLI. Also the implementation behind the unified ``gwcat fetch``
     subcommand (PR 10), which calls this with ``_deprecated=False,
     default_write_summary=True`` so every flag defined here is automatically
@@ -807,6 +812,10 @@ def _cli(argv=None, _deprecated: bool = True, default_write_summary: bool = Fals
         Whether a ``--out`` build gets a validation summary by default
         (``--no-summary`` always disables it). False for the deprecated
         standalone script; the unified CLI passes True.
+    prog : str, optional
+        Program identity shown by argparse.  The standalone entry point keeps
+        ``gwcat-fetch``; the unified dispatcher supplies ``gwcat fetch`` (or
+        the name of a future replacement entry point).
     """
     import argparse
     if _deprecated:
@@ -814,7 +823,7 @@ def _cli(argv=None, _deprecated: bool = True, default_write_summary: bool = Fals
               "(same options; see `gwcat fetch --help`).", file=sys.stderr)
 
     ap = argparse.ArgumentParser(
-        prog="gwcat-fetch",
+        prog=prog or "gwcat-fetch",
         description="Download GWTC PE samples and injection sets from Zenodo, "
                     "and optionally build the gwcat store.",
         formatter_class=argparse.RawDescriptionHelpFormatter,

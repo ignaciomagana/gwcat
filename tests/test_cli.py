@@ -354,6 +354,17 @@ def test_main_unknown_command_exits_nonzero():
         main(["bogus-command"])
 
 
+@pytest.mark.parametrize("command", ["fetch", "ingest"])
+def test_delegated_help_uses_unified_program_name(command, capsys):
+    with pytest.raises(SystemExit) as exc:
+        main([command, "--help"])
+
+    assert exc.value.code == 0
+    captured = capsys.readouterr()
+    assert f"usage: gwcat {command}" in captured.out
+    assert "deprecated" not in captured.err
+
+
 # ==========================================================================
 # Deprecated gwcat-ingest / gwcat-fetch wrappers still work + warn
 # ==========================================================================

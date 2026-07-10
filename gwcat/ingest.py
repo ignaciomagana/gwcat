@@ -1073,7 +1073,12 @@ def merge_store(existing_path: str, new_paths, out_path: str = None,
     return out_path
 
 
-def _cli(argv=None, _deprecated: bool = True, default_write_summary: bool = False):
+def _cli(
+    argv=None,
+    _deprecated: bool = True,
+    default_write_summary: bool = False,
+    prog: Optional[str] = None,
+):
     """Ingest CLI. Also the implementation behind the unified ``gwcat ingest``
     subcommand (PR 10), which calls this with ``_deprecated=False,
     default_write_summary=True`` so any flag added here is picked up by both
@@ -1091,13 +1096,20 @@ def _cli(argv=None, _deprecated: bool = True, default_write_summary: bool = Fals
         (``--no-summary`` always disables it regardless). False for the
         deprecated standalone script (unchanged side effects); the unified
         CLI passes True.
+    prog : str, optional
+        Program identity shown by argparse.  The standalone entry point keeps
+        ``gwcat-ingest``; the unified dispatcher supplies ``gwcat ingest`` (or
+        the name of a future replacement entry point).
     """
     import argparse
     import sys as _sys
     if _deprecated:
         print("gwcat-ingest is deprecated; use `gwcat ingest` instead "
               "(same options; see `gwcat ingest --help`).", file=_sys.stderr)
-    ap = argparse.ArgumentParser(description="Ingest GWTC cosmo files -> store.h5")
+    ap = argparse.ArgumentParser(
+        prog=prog or "gwcat-ingest",
+        description="Ingest GWTC cosmo files -> store.h5",
+    )
     ap.add_argument("--inspect", metavar="FILE", help="probe one file and exit")
     ap.add_argument("--glob", action="append", default=[],
                     help="glob of cosmo files (repeatable, one per catalog dir)")

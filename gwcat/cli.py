@@ -47,10 +47,24 @@ import os
 import sys
 from typing import Optional, Sequence
 
+def _invoked_program_name() -> str:
+    """Return the console entry-point name, with a stable library-call default.
+
+    Normal console scripts still derive their identity from ``sys.argv[0]`` so
+    a future renamed entry point remains automatic.  Test runners and
+    ``python -m gwcat.cli`` are implementation details, not useful CLI names;
+    direct calls to :func:`main` from those surfaces use ``gwcat``.
+    """
+    name = os.path.basename(sys.argv[0])
+    if (not name or name in {"pytest", "py.test", "cli.py", "__main__.py"}
+            or name.startswith("python")):
+        return "gwcat"
+    return name
+
+
 #: Program name for argparse usage/help text -- derived from how the script
-#: was actually invoked (``gwcat``, or a future renamed entry point), never
-#: hardcoded.
-PROG = os.path.basename(sys.argv[0]) or "gwcat"
+#: was actually invoked (``gwcat``, or a future renamed entry point).
+PROG = _invoked_program_name()
 
 
 # ---------------------------------------------------------------------------
@@ -307,11 +321,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if argv and argv[0] == "fetch":
         from .fetch import _cli as fetch_cli
         return fetch_cli(argv=argv[1:], _deprecated=False,
-                         default_write_summary=True) or 0
+                         default_write_summary=True,
+                         prog=f"{PROG} fetch") or 0
     if argv and argv[0] == "ingest":
         from .ingest import _cli as ingest_cli
         return ingest_cli(argv=argv[1:], _deprecated=False,
-                          default_write_summary=True) or 0
+                          default_write_summary=True,
+                          prog=f"{PROG} ingest") or 0
 
     parser = build_parser()
     args = parser.parse_args(argv)
