@@ -1,14 +1,14 @@
-# Names that must never be admitted to the BBH whitelist.
-# Established BNS/NSBH events and low-mass/mass-gap systems.
+# Names that must never be admitted to the GWTC-5 BBH population whitelist.
+# Established BNS/NSBH events outside the bundled 259-event population sample.
+# GW190814_211039 is intentionally retained as a mass-gap population event.
 # Format: event_name  # optional note
 GW170817  # BNS (GWTC-1)
 GW190425  # BNS short-form, if seen in filenames
 GW190425_232155  # BNS (GWTC-2.1)
 GW190426_152155  # NSBH candidate (GWTC-2.1)
-GW190814  # NSBH / mass-gap candidate (GWTC-2.1)
 GW190917_114630  # NSBH candidate (GWTC-2.1)
 GW200105_162426  # NSBH (GWTC-3)
 GW200115_042309  # NSBH (GWTC-3)
 GW230518_125908  # NSBH (GWTC-4.1)
-GW230529_181500  # NSBH / mass-gap event (GWTC-4.1)
-GW240525_031210  # excluded to keep static O4b BBH sample aligned with 103-event target
+GW230529_181500  # NSBH / mass-gap event outside the BBH population sample
+GW240525_031210  # excluded to keep the static O4b sample aligned with 103 events
