@@ -1,20 +1,25 @@
-# Provenance for the bundled BBH event lists.
+# Provenance for the bundled GWTC-5 BBH population event lists.
 #
 # These plain-text lists were previously hardcoded as Python literals in
-# gwcat/bbh_allowed_names.py.  They are the reproducible/offline fallback used
-# when the live GWOSC query is unavailable.  Source class is NOT inferred from
-# these lists alone at selection time (see gwcat/source_class.py); they only
-# seed the BBH whitelist helpers.
+# gwcat/bbh_allowed_names.py. They are the reproducible/offline population
+# membership used when live GWOSC metadata are unavailable. Event names use
+# the canonical timestamped form stored in the public PE files whenever one is
+# available.
 #
-# format: one GWOSC event name per line; blank lines and #-comments ignored.
+# The list is authoritative for population membership. It is not equivalent to
+# reapplying the generic source-mass classifier to PE medians: in particular,
+# GW190814_211039 is intentionally retained as a mass-gap population event.
+#
+# format: one canonical event name per line; blank lines and #-comments ignored.
 
-schema_version: "1.0"
+schema_version: "1.1"
 
 lists:
   bbh_o1o2.txt:
     observing_runs: [O1, O2]
     source: "GWTC-1 confident BBH detections."
     reference: "arXiv:1811.12907 (GWTC-1)"
+    naming: "canonical timestamped PE/store names"
     count: 10
   bbh_o3a.txt:
     observing_runs: [O3a]
@@ -44,10 +49,10 @@ lists:
 exclusions:
   non_bbh_exclusions.txt:
     purpose: >
-      Names that must never be admitted to the BBH whitelist: established
-      BNS/NSBH events and low-mass/mass-gap systems that can appear in broad
-      PE/cache manifests but are outside the BBH-only selection mode.
-    reference: "GWTC-1..GWTC-5.0 event tables"
+      Names outside the authoritative 259-event GWTC-5 BBH/mass-gap
+      population sample. GW190814_211039 is deliberately retained even when a
+      generic source-mass classifier labels it NSBH or mass-gap.
+    reference: "GWTC-1..GWTC-5.0 population event tables"
 
 # Aggregate expectations validated by
 # gwcat.bbh_allowed_names.validate_bbh_allowed_names().
