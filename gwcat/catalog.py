@@ -841,6 +841,33 @@ class GWCatalog:
         )
         return self.to_darksirens(*args, **kwargs)
 
+    # ---- versioned export (PR 3): build a product, look up a writer ----------
+    def export(self, out_path, format="gwcat2", spin_basis="chieff",
+               write_summary=False, summary_context=None, **builder_kwargs):
+        """Export via the versioned :mod:`gwcat.export` pipeline.
+
+        Thin dispatch: build a PE :class:`~gwcat.export.product.ExportProduct`
+        (which owns ALL the physics -- selection, cosmology, resampling, the
+        mass Jacobian and spin prior), look up the ``(format, "pe")`` writer,
+        and serialize.  For ``format="gwcat2", spin_basis="chieff"`` the arrays
+        are byte-identical to :meth:`to_darksirens` with the same kwargs; the
+        file carries ``format_version="gwcat-pe-2.0"``.  Unlike
+        :meth:`to_darksirens`, the mass Jacobian is applied in the builder, not
+        here -- this method never touches sample arrays.
+
+        ``**builder_kwargs`` are forwarded to
+        :func:`gwcat.export.build_pe_product` (``nsamp``, ``seed``, ``far_max``,
+        ``pastro_min``, ``z_max``, ``replace``, ``cosmology``, ``amax``,
+        ``allowed_names``, ``source_class``, ``event_list``, ``far`` policy
+        flags, ``waveform_policy``, ``approximant``).
+        """
+        from .export import build_pe_product, get_exporter
+        product = build_pe_product(self, spin_basis=spin_basis,
+                                   **builder_kwargs)
+        writer = get_exporter(format, "pe")
+        return writer(product, out_path, write_summary=write_summary,
+                      summary_context=summary_context)
+
     # ---- diagnostics ---------------------------------------------------------
     @property
     def nsamp_per_event(self):
