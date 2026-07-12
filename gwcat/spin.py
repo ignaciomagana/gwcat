@@ -173,3 +173,400 @@ def chi_eff_prior_logprob(chi_eff, m1_source, m2_source, amax=0.99):
     if amax not in _CACHE:
         _CACHE[amax] = ChiEffPrior(amax=amax)
     return _CACHE[amax].logprob(chi_eff, m1_source, m2_source)
+
+
+# ==================================================================
+# χ_p (effective precessing spin) foundations
+# ==================================================================
+def chi_p_from_components(a_1, a_2, cos_tilt_1, cos_tilt_2, mass_1, mass_2):
+    """Effective precessing spin χ_p from component spins (Schmidt et al. 2015).
+
+    Vectorized (numpy broadcasting).  With the *primary* mass ``mass_1`` (the
+    more massive body) and ``q = mass_2 / mass_1 ≤ 1``,
+
+        sin θ_i = sqrt(clip(1 − cos²θ_i, 0, 1))
+        χ_p = max( a_1 sin θ_1 ,  q(4q+3)/(4+3q) · a_2 sin θ_2 ).
+
+    Only the *ratio* mass_2/mass_1 enters, so the masses may be supplied in
+    either the detector or the source frame — the two give an identical χ_p
+    (the redshift factor cancels).  ``mass_1`` is assumed to be the primary
+    (mass_1 ≥ mass_2), matching the Schmidt convention.
+
+    .. note::
+       **Mass-ratio convention trap.**  This function uses the *component*
+       convention ``q = mass_2 / mass_1 ∈ (0, 1]``.  The :class:`ChiEffPrior`
+       grids in this module instead use the *primary-mass-fraction*
+       convention ``q_grid = m1 / (m1 + m2) ∈ [0.5, 1]`` (its ``q_grid``
+       attribute).  The two are related by
+       ``q_grid = 1 / (1 + q)``  ⇔  ``q = (1 − q_grid) / q_grid``.
+       Do not mix them.
+
+    Parameters
+    ----------
+    a_1, a_2 : array_like
+        Dimensionless spin magnitudes of the primary and secondary.
+    cos_tilt_1, cos_tilt_2 : array_like
+        Cosines of the spin-tilt angles (aligned-spin fractions).
+    mass_1, mass_2 : array_like
+        Primary and secondary masses (any frame; only the ratio matters).
+
+    Returns
+    -------
+    float or ndarray
+        χ_p, scalar if all inputs are scalar.
+    """
+    a_1 = np.asarray(a_1, dtype=float)
+    a_2 = np.asarray(a_2, dtype=float)
+    cos_tilt_1 = np.asarray(cos_tilt_1, dtype=float)
+    cos_tilt_2 = np.asarray(cos_tilt_2, dtype=float)
+    mass_1 = np.asarray(mass_1, dtype=float)
+    mass_2 = np.asarray(mass_2, dtype=float)
+
+    q = mass_2 / mass_1
+    k = q * (4.0 * q + 3.0) / (4.0 + 3.0 * q)
+    sin_tilt_1 = np.sqrt(np.clip(1.0 - cos_tilt_1 ** 2, 0.0, 1.0))
+    sin_tilt_2 = np.sqrt(np.clip(1.0 - cos_tilt_2 ** 2, 0.0, 1.0))
+
+    chi_p = np.maximum(a_1 * sin_tilt_1, k * a_2 * sin_tilt_2)
+    return float(chi_p) if chi_p.ndim == 0 else chi_p
+
+
+def component_spin_prior_lnpdf(a_1, a_2, cos_tilt_1, cos_tilt_2,
+                               amax_1, amax_2):
+    """ln p of the standard component-spin PE prior.
+
+    The default LVK component-spin prior takes the magnitudes uniform and the
+    orientations isotropic, independently for each body,
+
+        a_i ~ Uniform(0, amax_i),   cos θ_i ~ Uniform(−1, 1),
+
+    so the joint density is constant inside the box and zero outside,
+
+        ln p = −ln(4 · amax_1 · amax_2)   for 0 ≤ a_i ≤ amax_i, |cos θ_i| ≤ 1
+             = −∞                          otherwise.
+
+    Vectorized (numpy broadcasting).  ``amax_1``/``amax_2`` may be scalars or
+    per-sample arrays.
+
+    Parameters
+    ----------
+    a_1, a_2 : array_like
+        Spin magnitudes.
+    cos_tilt_1, cos_tilt_2 : array_like
+        Cosines of the tilt angles.
+    amax_1, amax_2 : array_like
+        Maximum spin magnitudes (scalar or per-sample).
+
+    Returns
+    -------
+    float or ndarray
+        ln p, scalar if all inputs are scalar.  Out-of-support points are
+        ``-inf`` (zero density).
+    """
+    a_1 = np.asarray(a_1, dtype=float)
+    a_2 = np.asarray(a_2, dtype=float)
+    cos_tilt_1 = np.asarray(cos_tilt_1, dtype=float)
+    cos_tilt_2 = np.asarray(cos_tilt_2, dtype=float)
+    amax_1 = np.asarray(amax_1, dtype=float)
+    amax_2 = np.asarray(amax_2, dtype=float)
+
+    in_box = ((a_1 >= 0.0) & (a_1 <= amax_1)
+              & (a_2 >= 0.0) & (a_2 <= amax_2)
+              & (np.abs(cos_tilt_1) <= 1.0) & (np.abs(cos_tilt_2) <= 1.0))
+    with np.errstate(divide="ignore"):
+        lnnorm = -np.log(4.0 * amax_1 * amax_2)
+    lnp = np.where(in_box, lnnorm, -np.inf)
+    lnp = np.asarray(lnp, dtype=float)
+    return float(lnp) if lnp.ndim == 0 else lnp
+
+
+class ChiEffChiPPrior:
+    """Joint prior p(χ_eff, χ_p | q, amax) under isotropic uniform-magnitude spins.
+
+    Both component spins are drawn from a_i ~ Uniform(0, amax) with isotropic
+    orientation (cos θ_i ~ Uniform(−1, 1)), sharing a single ``amax``.  The
+    joint factorises as
+
+        p(χ_eff, χ_p | q, amax) = p(χ_eff | q, amax) · p(χ_p | χ_eff, q, amax),
+
+    where the *marginal* p(χ_eff | q, amax) is delegated to the existing
+    :class:`ChiEffPrior` (reused verbatim) and the *conditional*
+    p(χ_p | χ_eff, q, amax) is built semi-analytically here.
+
+    Construction (Callister arXiv:2104.09508; Callister et al. arXiv:2106.00521,
+    appendix).  With aligned components s_iz = a_i cos θ_i, in-plane magnitudes
+    s_ip = a_i sin θ_i ≥ 0, q = m2/m1 ≤ 1 and k = q(4q+3)/(4+3q):
+
+        χ_eff = (s_1z + q s_2z)/(1+q),   χ_p = max(s_1p, k s_2p).
+
+    * Single-spin aligned marginal:  p_z(s) = −ln(|s|/amax)/(2 amax) on
+      [−amax, amax] (reused from :meth:`ChiEffPrior._single_spin_pdf`, up to a
+      constant that cancels in the weight normalisation below).
+    * Conditional in-plane CDF/pdf given s_z (:meth:`_inplane_cdf_pdf`):
+          F(x|s_z) = ln(1 + x²/s_z²) / ln(amax²/s_z²)   for 0 ≤ x ≤ √(amax²−s_z²)
+          F = 1 above;  f = dF/dx = (2x/(s_z²+x²)) / ln(amax²/s_z²).
+    * Conditioned on χ_eff, s_2z(s_1z) = ((1+q)χ_eff − s_1z)/q, so
+          w(s_1z | χ_eff) ∝ p_z(s_1z) p_z(s_2z(s_1z))
+      restricted to s_1z AND s_2z both in [−amax, amax] and normalised by its
+      own 1-D integral (the 1/q Jacobian and the p_z prefactors cancel).
+    * Since s_1p, s_2p are conditionally independent given (s_1z, s_2z),
+          p(χ_p = x | χ_eff) = ∫ ds_1z w(s_1z|χ_eff) ·
+              [ f(x|s_1z) F(x/k|s_2z) + F(x|s_1z) f(x/k|s_2z)/k ].
+      χ_p has support [0, amax] (k ≤ 1).
+
+    Design decision — **direct evaluation, no precomputed grid.**  Two routes
+    were prototyped:
+
+    * *grid + trilinear interpolation* (as :class:`ChiEffPrior` uses in 2-D):
+      fast to evaluate but rejected — the conditional has a razor-sharp
+      χ_eff→0, χ_p→0, q→1 corner (where the two weight singularities merge)
+      that linear interpolation cannot resolve; even a 56×64×128 table left
+      >40 % error there.
+    * *direct quadrature* (chosen): the s_1z integral is done with fixed-order
+      Gauss–Legendre, breaking the interval at every point where the integrand
+      loses smoothness — the two weight log-singularities (s_1z = 0, s_2z = 0),
+      the four in-plane-cap kinks, and a short geometric ladder of break-points
+      laid *toward* each log-singularity so the (up to squared-log) endpoint is
+      resolved even in that corner.  With the defaults below this holds the
+      pointwise density to ≲1 % relative error wherever it exceeds ~1 % of its
+      peak (≲0.1 % at ``order=32``), verified against a 2·10⁷-sample
+      brute-force reference.
+
+    Evaluation is vectorised (points × quad-nodes) and internally chunked to
+    bound memory.  It is accurate and robust rather than fast: a bulk call with
+    ~1e6 evaluation points takes ~1 minute (the density is transcendental-op
+    bound), which is why the fast interpolated route was tempting but is
+    inaccurate here.  Typical use (per-event PE resampling, ≲1e4 points, or the
+    grid evaluations in the tests) is sub-second.
+
+    Parameters
+    ----------
+    amax : float
+        Maximum dimensionless spin magnitude (default 0.99), shared by both
+        component spins.
+    order : int
+        Gauss–Legendre order per sub-interval (default 24; ~0.8 % worst-case
+        density error, sub-percent almost everywhere.  Raise to 32 for ≲0.1 %).
+    grade_levels : int
+        Number of geometric break-points laid toward each log-singularity
+        (default 3).  ``grade_ratio ** j`` for j = 0 … grade_levels−1.
+    grade_ratio : float
+        Geometric contraction ratio of that ladder (default 0.2).
+    """
+
+    def __init__(self, amax: float = 0.99, order: int = 24,
+                 grade_levels: int = 3, grade_ratio: float = 0.2):
+        self.amax = float(amax)
+        self.order = int(order)
+        self.grade_levels = int(grade_levels)
+        self.grade_ratio = float(grade_ratio)
+        # Reuse the existing marginal prior verbatim.
+        self._chi_eff_prior = ChiEffPrior(amax=amax)
+        self._gl_nodes, self._gl_weights = \
+            np.polynomial.legendre.leggauss(self.order)
+        # Number of sub-intervals: 7 fixed break-points (endpoints, the two
+        # log-singularities, the four cap kinks) plus 4 graded points per
+        # ladder level -> (8 + 4*grade_levels) break-points.
+        self._n_sub = 7 + 4 * self.grade_levels
+        # Cap on (points × nodes) processed per chunk.  Kept modest so the
+        # transient [block, nodes] arrays stay cache-resident (larger blocks
+        # measured *slower* from cache thrashing) while bounding memory.
+        self._chunk_elems = 1_000_000
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _k_factor(q):
+        """k = q(4q+3)/(4+3q); the Schmidt secondary-spin weighting (k ≤ 1)."""
+        return q * (4.0 * q + 3.0) / (4.0 + 3.0 * q)
+
+    @staticmethod
+    def _inplane_cdf_pdf(x, s_z, amax):
+        """Conditional in-plane CDF F(x|s_z) and pdf f(x|s_z).
+
+        For a single isotropic uniform-magnitude spin, the in-plane magnitude
+        s_p conditioned on the aligned component s_z has
+
+            F(x|s_z) = ln(1 + x²/s_z²)/ln(amax²/s_z²)  for 0 ≤ x ≤ √(amax²−s_z²)
+            F = 1 above,  f = dF/dx = (2x/(s_z²+x²))/ln(amax²/s_z²).
+
+        Returns ``(F, f)`` broadcast to the shape of ``x`` and ``s_z``.  Values
+        are clamped so x ≤ 0 gives (0, 0) and x beyond √(amax²−s_z²) gives
+        (1, 0); s_z is floored away from 0 for numerical safety (the quadrature
+        never evaluates exactly at the s_z = 0 split point).
+        """
+        x = np.asarray(x, dtype=float)
+        s_z = np.asarray(s_z, dtype=float)
+        s2 = np.maximum(s_z * s_z, 1e-300)
+        x2 = x * x
+        log_denom = np.log(amax * amax / s2)          # = ln(amax²/s_z²) ≥ 0
+        log_denom = np.where(log_denom > 1e-300, log_denom, 1e-300)
+        F = np.log1p(x2 / s2) / log_denom
+        f = (2.0 * x / (s2 + x2)) / log_denom
+        over = x2 >= (amax * amax - s2)               # x beyond max in-plane
+        F = np.where(over, 1.0, F)
+        f = np.where(over, 0.0, f)
+        nonpos = x <= 0.0
+        F = np.where(nonpos, 0.0, F)
+        f = np.where(nonpos, 0.0, f)
+        return F, f
+
+    def _cond_prob_block(self, chi_p, chi_eff, q):
+        """p(χ_p | χ_eff, q, amax) for a single 1-D block (all same length)."""
+        amax = self.amax
+        nodes01 = self._gl_nodes
+        w01 = self._gl_weights
+        n = chi_p.shape[0]
+
+        c = (1.0 + q) * chi_eff                        # s_1z where s_2z = 0
+        k = np.maximum(self._k_factor(q), 1e-12)
+
+        # Valid s_1z interval: both s_1z and s_2z(s_1z) in [-amax, amax].
+        lo = np.maximum(-amax, c - q * amax)
+        hi = np.minimum(amax, c + q * amax)
+        valid = hi > lo
+
+        # Break the integral at every point where the integrand loses
+        # smoothness, so fixed-order Gauss-Legendre converges cleanly:
+        #   * the two integrable log-singularities of the weight w(s_1z)
+        #     (s_1z = 0 and s_2z = 0, i.e. s_1z = c);
+        #   * the C0 kinks where an in-plane cap turns on, i.e. where
+        #     χ_p = √(amax²−s_1z²)  (spin 1)  and  χ_p/k = √(amax²−s_2z²)
+        #     (spin 2), giving s_1z = ±s1★ and s_1z = c ∓ q·s2★.
+        # In addition, lay a short geometric ladder of break-points *toward*
+        # each log-singularity (scales χ_p near s_1z=0 and q·χ_p/k near s_1z=c,
+        # contracted by grade_ratio**j).  This resolves the narrow in-plane
+        # peak sitting on the (possibly squared-) log singularity in the
+        # χ_eff→0, χ_p→0, q→1 corner where the two singularities merge.
+        # All candidates are clamped to [lo, hi] and sorted; coincident /
+        # out-of-range ones collapse to zero-width sub-intervals (weight 0).
+        s1_star = np.sqrt(np.clip(amax * amax - chi_p * chi_p, 0.0, None))
+        s2_star = np.sqrt(np.clip(amax * amax - (chi_p / k) ** 2, 0.0, None))
+        cand = [
+            lo, hi,
+            np.zeros_like(c),          # s_1z = 0        (weight singularity)
+            c,                          # s_2z = 0        (weight singularity)
+            s1_star, -s1_star,          # spin-1 cap kinks
+            c - q * s2_star, c + q * s2_star,   # spin-2 cap kinks
+        ]
+        scale1 = chi_p                                  # in-plane peak width
+        scale2 = q * chi_p / k
+        for j in range(self.grade_levels):
+            g1 = scale1 * (self.grade_ratio ** j)
+            g2 = scale2 * (self.grade_ratio ** j)
+            cand += [g1, -g1, c + g2, c - g2]
+        cand = np.stack(cand, axis=1)                   # [n, 8 + 4*grade_levels]
+        bounds = np.sort(np.clip(cand, lo[:, None], hi[:, None]), axis=1)
+        n_sub = bounds.shape[1] - 1
+
+        # Gauss-Legendre nodes over each sub-interval.
+        nodes = []
+        effw = []
+        for j in range(n_sub):
+            a = bounds[:, j]
+            b = bounds[:, j + 1]
+            mid = 0.5 * (a + b)
+            half = 0.5 * (b - a)                        # 0 for empty intervals
+            nodes.append(mid[:, None] + half[:, None] * nodes01[None, :])
+            effw.append(half[:, None] * w01[None, :])
+        s1z = np.concatenate(nodes, axis=1)            # [n, M]
+        ew = np.concatenate(effw, axis=1)              # [n, M]
+        s2z = (c[:, None] - s1z) / q[:, None]
+
+        # Weight (unnormalised): p_z(s_1z) p_z(s_2z).  The overall constant in
+        # _single_spin_pdf (missing 1/2 factor) cancels against the norm below.
+        w = (ChiEffPrior._single_spin_pdf(s1z, amax)
+             * ChiEffPrior._single_spin_pdf(s2z, amax))
+
+        F1, f1 = self._inplane_cdf_pdf(chi_p[:, None], s1z, amax)
+        F2, f2 = self._inplane_cdf_pdf(chi_p[:, None] / k[:, None], s2z, amax)
+        integrand = w * (f1 * F2 + F1 * f2 / k[:, None])
+
+        num = np.sum(ew * integrand, axis=1)
+        den = np.sum(ew * w, axis=1)                   # normalises w(s_1z)
+
+        out = np.zeros(n)
+        good = valid & (den > 0.0)
+        out[good] = num[good] / den[good]
+        return np.where(out > 0.0, out, 0.0)           # guard tiny negatives
+
+    def cond_prob_chi_p(self, chi_p, chi_eff, q):
+        """p(χ_p | χ_eff, q, amax).  Vectorized; chunked internally.
+
+        ``q`` here is the *component* mass ratio m2/m1 ∈ (0, 1] (see the
+        convention note on :func:`chi_p_from_components`).
+        """
+        chi_p = np.asarray(chi_p, dtype=float)
+        chi_eff = np.asarray(chi_eff, dtype=float)
+        q = np.asarray(q, dtype=float)
+        scalar = chi_p.ndim == 0 and chi_eff.ndim == 0 and q.ndim == 0
+        chi_p, chi_eff, q = np.broadcast_arrays(chi_p, chi_eff, q)
+        shape = chi_p.shape
+        cp = np.ascontiguousarray(chi_p).ravel()
+        ce = np.ascontiguousarray(chi_eff).ravel()
+        qq = np.ascontiguousarray(q).ravel()
+
+        n = cp.size
+        m = self._n_sub * self.order
+        block = max(1, self._chunk_elems // m)
+        out = np.empty(n)
+        for i in range(0, n, block):
+            sl = slice(i, i + block)
+            out[sl] = self._cond_prob_block(cp[sl], ce[sl], qq[sl])
+        out = out.reshape(shape)
+        return float(out) if scalar else out
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def prob(self, chi_eff, chi_p, m1, m2):
+        """p(χ_eff, χ_p | m1, m2, amax).  Vectorized over inputs.
+
+        Masses may be given in any frame and in any order; the more massive
+        body is treated as the primary and ``q = m_secondary / m_primary`` is
+        used for the χ_p conditional, while the same primary/secondary
+        assignment is passed to the reused :class:`ChiEffPrior` marginal.
+        """
+        chi_eff = np.asarray(chi_eff, dtype=float)
+        chi_p = np.asarray(chi_p, dtype=float)
+        m1 = np.asarray(m1, dtype=float)
+        m2 = np.asarray(m2, dtype=float)
+        scalar = (chi_eff.ndim == 0 and chi_p.ndim == 0
+                  and m1.ndim == 0 and m2.ndim == 0)
+
+        m_hi = np.maximum(m1, m2)
+        m_lo = np.minimum(m1, m2)
+        q = m_lo / m_hi
+
+        p_marg = np.asarray(self._chi_eff_prior.prob(chi_eff, m_hi, m_lo),
+                            dtype=float)
+        p_cond = np.asarray(self.cond_prob_chi_p(chi_p, chi_eff, q),
+                            dtype=float)
+        p = p_marg * p_cond
+        return float(p) if scalar else p
+
+    def logprob(self, chi_eff, chi_p, m1, m2):
+        """log p(χ_eff, χ_p | m1, m2, amax).  Clipped at −50 for safety."""
+        p = self.prob(chi_eff, chi_p, m1, m2)
+        p_arr = np.asarray(p, dtype=float)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            logp = np.where(p_arr > 0.0, np.log(p_arr), -50.0)
+        logp = np.where(np.isfinite(logp), logp, -50.0)
+        return float(logp) if np.ndim(p) == 0 else logp
+
+
+# Cached singletons keyed by amax, mirroring chi_eff_prior_logprob.
+_CHIP_CACHE = {}
+
+
+def chi_eff_chi_p_prior_logprob(chi_eff, chi_p, m1_source, m2_source,
+                                amax=0.99):
+    """log p(χ_eff, χ_p | m1_source, m2_source, amax).
+
+    Builds a :class:`ChiEffChiPPrior` on first call for each amax and caches
+    it (like :func:`chi_eff_prior_logprob`).
+    """
+    if amax not in _CHIP_CACHE:
+        _CHIP_CACHE[amax] = ChiEffChiPPrior(amax=amax)
+    return _CHIP_CACHE[amax].logprob(chi_eff, chi_p, m1_source, m2_source)

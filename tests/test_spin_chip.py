@@ -1,0 +1,256 @@
+"""Tests for the chi_p (effective precessing spin) foundations in gwcat.spin.
+
+Covers the three additions:
+
+  * ``chi_p_from_components`` -- Schmidt et al. (2015) chi_p from component
+    spins (hand cases, broadcasting, mass-frame invariance);
+  * ``component_spin_prior_lnpdf`` -- ln pdf of the standard uniform-magnitude /
+    isotropic component-spin PE prior;
+  * ``ChiEffChiPPrior`` / ``chi_eff_chi_p_prior_logprob`` -- the joint prior
+    p(chi_eff, chi_p | q, amax), validated by Monte Carlo against the analytic
+    density, plus conditional-normalisation, marginal-consistency and
+    boundary-robustness checks.
+
+All tests are self-contained (numpy only, no network / no fixtures).
+"""
+import numpy as np
+import pytest
+
+from gwcat.spin import (
+    ChiEffPrior,
+    ChiEffChiPPrior,
+    chi_eff_chi_p_prior_logprob,
+    chi_p_from_components,
+    component_spin_prior_lnpdf,
+)
+
+_trapz = getattr(np, "trapezoid", getattr(np, "trapz", None))
+
+
+# ==================================================================
+# Helpers: Monte-Carlo draws of (chi_eff, chi_p)
+# ==================================================================
+def _draw_chi_eff_chi_p(q, amax, n, seed=0):
+    """Draw (chi_eff, chi_p) under isotropic uniform-magnitude component spins.
+
+    m1 (primary) = 1, m2 = q so that mass_2/mass_1 = q.
+    """
+    rng = np.random.default_rng(seed)
+    a1 = rng.uniform(0.0, amax, n)
+    a2 = rng.uniform(0.0, amax, n)
+    c1 = rng.uniform(-1.0, 1.0, n)
+    c2 = rng.uniform(-1.0, 1.0, n)
+    s1z = a1 * c1
+    s2z = a2 * c2
+    chi_eff = (s1z + q * s2z) / (1.0 + q)
+    # Reuse the module function for chi_p (also exercises it on big arrays).
+    chi_p = chi_p_from_components(a1, a2, c1, c2, np.ones(n), np.full(n, q))
+    return chi_eff, chi_p
+
+
+# ==================================================================
+# 1. chi_p_from_components
+# ==================================================================
+def test_chi_p_scalar_hand_cases():
+    # Aligned spins (cos_tilt = 1 -> sin_tilt = 0) => chi_p = 0.
+    assert chi_p_from_components(0.9, 0.9, 1.0, 1.0, 30.0, 25.0) == 0.0
+    assert chi_p_from_components(0.9, 0.9, -1.0, -1.0, 30.0, 25.0) == 0.0
+
+    # q = 1 -> k = 1 -> chi_p = max(a1 sin1, a2 sin2).
+    # spin1 fully in-plane (cos1=0 => sin1=1), spin2 aligned (sin2=0).
+    assert chi_p_from_components(0.8, 0.5, 0.0, 1.0, 30.0, 30.0) == pytest.approx(0.8)
+    # both in-plane, secondary larger but k=1 -> max picks 0.6.
+    assert chi_p_from_components(0.4, 0.6, 0.0, 0.0, 30.0, 30.0) == pytest.approx(0.6)
+
+
+def test_chi_p_secondary_branch_and_k():
+    # q = 0.5 -> k = 0.5*(2+3)/(4+1.5) = 2.5/5.5.
+    q = 0.5
+    k = q * (4.0 * q + 3.0) / (4.0 + 3.0 * q)
+    # spin1 aligned (no in-plane), spin2 in-plane -> chi_p = k * a2 * sin2.
+    val = chi_p_from_components(0.7, 0.9, 1.0, 0.0, 40.0, 20.0)
+    assert val == pytest.approx(k * 0.9)
+    # sanity: k < 1 strictly for q < 1.
+    assert 0.0 < k < 1.0
+
+
+def test_chi_p_broadcasting():
+    a1 = np.array([0.5, 0.8, 0.2])
+    a2 = np.array([0.9, 0.1, 0.7])
+    c1 = np.array([0.0, 1.0, 0.5])
+    c2 = np.array([0.0, 0.0, -0.5])
+    m1 = np.array([30.0, 40.0, 50.0])
+    m2 = np.array([30.0, 20.0, 10.0])
+    out = chi_p_from_components(a1, a2, c1, c2, m1, m2)
+    assert out.shape == (3,)
+    # elementwise reconstruction
+    for i in range(3):
+        exp = chi_p_from_components(a1[i], a2[i], c1[i], c2[i], m1[i], m2[i])
+        assert out[i] == pytest.approx(exp)
+
+
+def test_chi_p_mass_frame_invariance():
+    """Detector-frame and source-frame masses give an identical chi_p, since
+    only the ratio enters (the redshift factor cancels)."""
+    z = 1.7
+    src = chi_p_from_components(0.6, 0.4, 0.3, -0.2, 35.0, 21.0)
+    det = chi_p_from_components(0.6, 0.4, 0.3, -0.2, 35.0 * (1 + z), 21.0 * (1 + z))
+    assert det == pytest.approx(src, rel=0, abs=0)
+
+
+# ==================================================================
+# 2. component_spin_prior_lnpdf
+# ==================================================================
+def test_component_prior_in_range_value():
+    amax1, amax2 = 0.99, 0.5
+    val = component_spin_prior_lnpdf(0.3, 0.2, 0.1, -0.4, amax1, amax2)
+    assert val == pytest.approx(-np.log(4.0 * amax1 * amax2))
+
+
+def test_component_prior_out_of_range():
+    # a > amax, |cos| > 1, a < 0 all give -inf.
+    assert component_spin_prior_lnpdf(1.5, 0.2, 0.1, 0.1, 0.99, 0.99) == -np.inf
+    assert component_spin_prior_lnpdf(0.3, 0.2, 1.5, 0.1, 0.99, 0.99) == -np.inf
+    assert component_spin_prior_lnpdf(-0.1, 0.2, 0.1, 0.1, 0.99, 0.99) == -np.inf
+
+
+def test_component_prior_array_and_scalar_amax():
+    a1 = np.array([0.1, 0.6, 0.95])
+    a2 = np.array([0.1, 0.2, 0.30])
+    c1 = np.array([0.0, 0.5, -1.0])
+    c2 = np.array([0.0, -0.5, 1.0])
+    # per-sample amax arrays
+    amax1 = np.array([0.99, 0.5, 0.99])
+    amax2 = np.array([0.99, 0.99, 0.2])
+    out = component_spin_prior_lnpdf(a1, a2, c1, c2, amax1, amax2)
+    assert out.shape == (3,)
+    # sample 1: a2=0.2 > amax2=0.99? no; a1=0.6<=0.5? NO -> out of range
+    assert out[1] == -np.inf
+    # sample 2: a2=0.30 > amax2=0.2 -> out of range
+    assert out[2] == -np.inf
+    # sample 0: in range
+    assert out[0] == pytest.approx(-np.log(4.0 * 0.99 * 0.99))
+
+    # scalar amax broadcasts against arrays
+    out2 = component_spin_prior_lnpdf(a1, a2, c1, c2, 0.99, 0.99)
+    assert np.all(np.isfinite(out2))
+    assert np.allclose(out2, -np.log(4.0 * 0.99 * 0.99))
+
+
+def test_component_prior_is_normalised():
+    """The exp of the lnpdf integrates to 1 over the (a1,a2,cos1,cos2) box."""
+    amax1, amax2 = 0.99, 0.7
+    lnp = component_spin_prior_lnpdf(0.5, 0.5, 0.0, 0.0, amax1, amax2)
+    dens = np.exp(lnp)
+    volume = amax1 * amax2 * 2.0 * 2.0  # a in [0,amax], cos in [-1,1]
+    assert dens * volume == pytest.approx(1.0)
+
+
+# ==================================================================
+# 3. ChiEffChiPPrior: conditional normalisation (exact quadrature)
+# ==================================================================
+@pytest.mark.parametrize("q,amax", [(1.0, 0.99), (0.5, 0.99), (0.3, 0.998)])
+def test_conditional_normalisation(q, amax):
+    """int p(chi_p | chi_eff, q, amax) dchi_p = 1 for several chi_eff."""
+    prior = ChiEffChiPPrior(amax=amax)
+    xs = np.linspace(0.0, amax, 4000)
+    for chi_eff in [0.0, 0.2 * amax, 0.5 * amax, 0.8 * amax]:
+        p = prior.cond_prob_chi_p(xs, chi_eff, q)
+        integral = _trapz(p, xs)
+        assert integral == pytest.approx(1.0, abs=2e-3)
+
+
+# ==================================================================
+# 4. ChiEffChiPPrior: marginal consistency with ChiEffPrior
+# ==================================================================
+@pytest.mark.parametrize("q,amax", [(1.0, 0.99), (0.6, 0.99), (0.3, 0.99)])
+def test_marginal_consistency(q, amax):
+    """int p(chi_eff, chi_p) dchi_p ~= ChiEffPrior.p(chi_eff) (both are the
+    marginal; the reused ChiEffPrior is itself grid-interpolated, hence ~1-2%)."""
+    joint = ChiEffChiPPrior(amax=amax)
+    marg = ChiEffPrior(amax=amax)
+    m1, m2 = 1.0, q                      # mass_2/mass_1 = q
+    xp = np.linspace(0.0, amax, 2000)
+    for chi_eff in [0.0, 0.15, 0.35, 0.6]:
+        dens = np.exp(joint.logprob(chi_eff, xp, m1, m2))
+        integrated = _trapz(dens, xp)
+        expected = marg.prob(chi_eff, m1, m2)
+        assert integrated == pytest.approx(expected, rel=2e-2)
+
+
+# ==================================================================
+# 5. ChiEffChiPPrior: Monte-Carlo validation of the JOINT density
+# ==================================================================
+@pytest.mark.parametrize("q,amax", [(1.0, 0.99), (0.5, 0.99), (0.8, 0.4), (0.3, 0.998)])
+def test_joint_density_monte_carlo(q, amax):
+    """2-D histogram of MC-drawn (chi_eff, chi_p) must match the analytic joint
+    density (bin-averaged prediction) in well-populated bins."""
+    n = 2_500_000
+    chi_eff, chi_p = _draw_chi_eff_chi_p(q, amax, n, seed=12345)
+
+    nb = 34
+    ce_edges = np.linspace(-amax, amax, nb + 1)
+    cp_edges = np.linspace(0.0, amax, nb + 1)
+    counts, _, _ = np.histogram2d(chi_eff, chi_p, bins=[ce_edges, cp_edges])
+    area = (ce_edges[1] - ce_edges[0]) * (cp_edges[1] - cp_edges[0])
+    hist = counts / (n * area)                   # empirical density
+
+    # Bin-averaged analytic prediction via a 3x3 sub-grid per bin, to remove
+    # curvature bias vs the (bin-averaged) histogram.
+    m1, m2 = 1.0, q
+    sub = np.array([1.0, 3.0, 5.0]) / 6.0
+    ce_c = ce_edges[:-1][:, None] + np.diff(ce_edges)[:, None] * sub[None, :]
+    cp_c = cp_edges[:-1][:, None] + np.diff(cp_edges)[:, None] * sub[None, :]
+    # build [nb, nb] averaged prediction
+    pred = np.zeros((nb, nb))
+    for a in range(3):
+        for b in range(3):
+            CE, CP = np.meshgrid(ce_c[:, a], cp_c[:, b], indexing="ij")
+            pred += np.exp(chi_eff_chi_p_prior_logprob(
+                CE.ravel(), CP.ravel(), m1, m2, amax=amax)).reshape(nb, nb)
+    pred /= 9.0
+
+    # Only judge well-populated bins (MC noise ~ 1/sqrt(count)).
+    well = counts > 1500
+    assert well.sum() > 30                        # enough bins to be meaningful
+    rel = np.abs(pred[well] - hist[well]) / hist[well]
+    # Robust to Poisson noise: median small, tail bounded.
+    assert np.median(rel) < 0.05
+    assert np.percentile(rel, 90) < 0.15
+
+
+# ==================================================================
+# 6. Boundary robustness: chi_p -> 0 and edges give finite/clipped logprob
+# ==================================================================
+def test_chi_p_zero_and_boundary_finite():
+    prior = ChiEffChiPPrior(amax=0.99)
+    # chi_p exactly 0 and tiny, various chi_eff incl. near +/- amax.
+    chi_eff = np.array([0.0, 0.0, 0.5, -0.5, 0.985, -0.985, 0.0])
+    chi_p = np.array([0.0, 1e-9, 0.0, 1e-6, 0.0, 0.5, 0.99])
+    lp = prior.logprob(chi_eff, chi_p, 1.0, 0.8)
+    assert np.all(np.isfinite(lp))               # never NaN / -inf
+    assert np.all(lp >= -50.0 - 1e-9)            # clipped floor is -50
+
+
+def test_logprob_scalar_and_array_shapes():
+    prior = ChiEffChiPPrior(amax=0.99)
+    s = prior.logprob(0.1, 0.3, 30.0, 25.0)
+    assert np.isscalar(s) or np.ndim(s) == 0
+    v = prior.logprob(np.array([0.1, 0.2]), np.array([0.3, 0.4]), 30.0, 25.0)
+    assert v.shape == (2,)
+
+
+def test_module_cache_reuse():
+    """Repeated module-level calls reuse a cached instance per amax."""
+    from gwcat import spin as _spin
+    a = chi_eff_chi_p_prior_logprob(0.1, 0.2, 30.0, 25.0, amax=0.99)
+    b = chi_eff_chi_p_prior_logprob(0.1, 0.2, 30.0, 25.0, amax=0.99)
+    assert a == pytest.approx(b)
+    assert 0.99 in _spin._CHIP_CACHE
+
+
+def test_out_of_support_chi_p_is_clipped():
+    """chi_p beyond amax (unreachable) -> density 0 -> logprob clipped to -50."""
+    prior = ChiEffChiPPrior(amax=0.99)
+    lp = prior.logprob(0.0, 1.2, 1.0, 1.0)      # chi_p=1.2 > amax
+    assert lp == pytest.approx(-50.0)
