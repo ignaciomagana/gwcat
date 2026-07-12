@@ -566,3 +566,30 @@ def test_combined_component_spin_arrays(tmp_path):
     assert len(comb.spin_meta) == 2
     assert comb.spin_meta[0]["spin_format"] == "endo3_factored"
     assert comb.spin_meta[1]["spin_format"] == "o4_factored"
+
+
+def test_events_file_without_sky_position_loads(tmp_path):
+    """Semianalytic O1/O2 mixture rows carry no ra/dec: the reader NaN-fills
+    and flags availability instead of failing (real files: mixture-semi_o1_o2-*)."""
+    path = tmp_path / "nosky.hdf"
+    write_o4_full(path, n=50, seed=3)
+    import h5py
+    with h5py.File(path, "r+") as f:
+        ev = f["events"]
+        if isinstance(ev, h5py.Dataset):
+            keep = [n for n in ev.dtype.names
+                    if n not in ("right_ascension", "declination")]
+            sub = np.zeros(ev.shape, dtype=[(n, ev.dtype[n]) for n in keep])
+            for n in keep:
+                sub[n] = ev[n]
+            del f["events"]
+            f.create_dataset("events", data=sub)
+        else:
+            for n in ("right_ascension", "declination"):
+                if n in ev:
+                    del ev[n]
+    s = SelectionSet(str(path))
+    s._load()
+    assert s._sky_position_available is False
+    assert np.all(~np.isfinite(s._ra)) and np.all(~np.isfinite(s._dec))
+    assert np.isfinite(s.component_pdraw()).all()

@@ -249,6 +249,9 @@ class SelectionSet:
         self._chi_p = None
         self._ln_spin_component = None
         self._weights = None
+        # False only for 'events' files without drawn sky positions (the
+        # semianalytic O1/O2 rows of the cumulative mixtures) — see _read_events.
+        self._sky_position_available = True
         self._spin_meta = {
             "spin_format": None,
             "amax_detected": None,
@@ -299,8 +302,18 @@ class SelectionSet:
         m1src = _h5_read_field(ev, "mass1_source")
         m2src = _h5_read_field(ev, "mass2_source")
         dL = _h5_read_field(ev, "luminosity_distance")
-        ra = _h5_read_field(ev, "right_ascension")
-        dec = _h5_read_field(ev, "declination")
+        # Sky position is absent for semianalytic O1/O2 rows in the cumulative
+        # mixture files ("mixture-semi_o1_o2-*"): those estimates do not track
+        # the detector duty cycle, so no ra/dec was drawn (see the release
+        # docs).  NaN-fill and record availability instead of failing to load.
+        if _h5_has_field(ev, "right_ascension"):
+            ra = _h5_read_field(ev, "right_ascension")
+            dec = _h5_read_field(ev, "declination")
+            self._sky_position_available = True
+        else:
+            ra = np.full(m1src.shape, np.nan)
+            dec = np.full(m1src.shape, np.nan)
+            self._sky_position_available = False
 
         z, _ = _h5_first_field(ev, ["z", "redshift"])
         if _h5_has_field(ev, "mass1_detector"):

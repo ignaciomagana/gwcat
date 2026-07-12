@@ -373,6 +373,12 @@ def build_selection_product(sets, *, spin_basis="component", far_threshold=1.0,
             dtype=bool),
         "injected_spin_checks": json.dumps(
             [_json_checks(s.spin_meta.get("checks", {})) for s in set_list]),
+        # False for campaigns whose rows carry no drawn sky position (the
+        # semianalytic O1/O2 entries of the cumulative mixtures); their
+        # exported ra/dec are NaN.
+        "sky_position_available": np.array(
+            [bool(getattr(s, "_sky_position_available", True))
+             for s in set_list], dtype=bool),
         "component_columns_emitted": bool(extras_available),
     })
 
