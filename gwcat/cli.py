@@ -144,6 +144,56 @@ def build_parser() -> argparse.ArgumentParser:
                           help="Skip writing validation_summary.json/.md "
                                "next to --out.")
 
+    # -- export (versioned registry: gwcat2 PE format) -------------------
+    p_export2 = sub.add_parser(
+        "export",
+        help="Export products via the versioned export registry "
+             "(gwcat2 'gwcat-pe-2.0' PE format).")
+    xsub = p_export2.add_subparsers(dest="export_command", required=True)
+
+    p_pe = xsub.add_parser(
+        "pe",
+        help="Export a gwcat2 PE file from a store.h5 "
+             "(build_pe_product + registered writer).")
+    p_pe.add_argument("store", help="Path to a store.h5.")
+    p_pe.add_argument("--out", required=True, metavar="OUT.h5")
+    p_pe.add_argument("--format", default="gwcat2",
+                      help="Registered export format (default: gwcat2).")
+    p_pe.add_argument("--spin-basis", default="chieff",
+                      choices=["chieff", "component", "chieff_chip"],
+                      help="Spin basis (only 'chieff' is implemented).")
+    p_pe.add_argument("--source-class", default=None,
+                      help="bbh / nsbh / bns / massgap / cbc, or a "
+                           "canonical class name.")
+    p_pe.add_argument("--waveform-policy", default="preferred",
+                      choices=list(WAVEFORM_POLICIES))
+    p_pe.add_argument("--approximant", default=None,
+                      help="Required with "
+                           "--waveform-policy=strict-approximant.")
+    p_pe.add_argument("--cosmology", default=None, metavar="H0,Om0",
+                      help="Override cosmology applied to every exported "
+                           "event. Omit (default) to use each event's own "
+                           "stored PE cosmology.")
+    p_pe.add_argument("--event-list", default=None, metavar="FILE",
+                      help="Restrict to a user event-list file (one name "
+                           "per line, '#' comments allowed).")
+    p_pe.add_argument("--far-max", type=float, default=None, metavar="FAR_YR")
+    pe_far_group = p_pe.add_mutually_exclusive_group()
+    pe_far_group.add_argument("--allow-missing-far", action="store_true")
+    pe_far_group.add_argument("--require-far", action="store_true")
+    p_pe.add_argument("--pastro-min", type=float, default=None)
+    p_pe.add_argument("--nsamp", type=int, default=4096)
+    p_pe.add_argument("--seed", type=int, default=0)
+    p_pe.add_argument("--z-max", type=float, default=None)
+    p_pe.add_argument("--amax", type=float, default=0.99)
+    p_pe.add_argument("--no-summary", action="store_true",
+                      help="Skip writing validation_summary.json/.md "
+                           "next to --out.")
+
+    xsub.add_parser(
+        "list-formats",
+        help="List the registered (format, kind) export writers.")
+
     # -- selection -------------------------------------------------------
     p_sel = sub.add_parser(
         "selection",
@@ -274,6 +324,53 @@ def _cmd_export_darksirens(args) -> int:
     return 0
 
 
+def _cmd_export(args) -> int:
+    if args.export_command == "pe":
+        return _cmd_export_pe(args)
+    if args.export_command == "list-formats":
+        return _cmd_export_list_formats(args)
+    return 2  # pragma: no cover -- argparse requires a valid subcommand
+
+
+def _cmd_export_pe(args) -> int:
+    from .catalog import GWCatalog
+
+    cosmology = _parse_cosmology(args.cosmology)
+    cat = GWCatalog(args.store)
+    cat.export(
+        args.out,
+        format=args.format,
+        spin_basis=args.spin_basis,
+        write_summary=not args.no_summary,
+        source_class=_parse_source_class(args.source_class),
+        waveform_policy=args.waveform_policy,
+        approximant=args.approximant,
+        cosmology=cosmology,
+        event_list=args.event_list,
+        far_max=args.far_max,
+        allow_missing_far=args.allow_missing_far,
+        require_far=args.require_far,
+        pastro_min=args.pastro_min,
+        nsamp=args.nsamp,
+        seed=args.seed,
+        z_max=args.z_max,
+        amax=args.amax,
+    )
+    return 0
+
+
+def _cmd_export_list_formats(args) -> int:
+    from .export import list_formats
+
+    formats = list_formats()
+    if not formats:
+        print("(no export formats registered)")
+        return 0
+    for name, kind in formats:
+        print(f"{name}\t{kind}")
+    return 0
+
+
 def _cmd_selection(args) -> int:
     from .selection import SelectionSet, CombinedSelectionSet
 
@@ -336,6 +433,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return _cmd_inspect(args)
     if args.command == "export-darksirens":
         return _cmd_export_darksirens(args)
+    if args.command == "export":
+        return _cmd_export(args)
     if args.command == "selection":
         return _cmd_selection(args)
     if args.command == "validate":

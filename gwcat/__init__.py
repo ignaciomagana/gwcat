@@ -28,6 +28,12 @@ from .manifests import (list_releases, get_manifest, validate_manifest,
                         ManifestValidationError)
 from .event_metadata import (assemble_event_metadata, metadata_diagnostics,
                             load_user_overrides)
+# Re-export the versioned-export builder/registry API. Deliberately NOT the
+# top-level `export()` function: binding that name here would shadow the
+# `gwcat.export` submodule so `gwcat.export.export(...)` would break. Call it
+# as `gwcat.export.export(...)` or `from gwcat.export import export`.
+from .export import (build_pe_product, ExportProduct,
+                    register_exporter, get_exporter, list_formats)
 
 # fetch has optional deps (requests, tqdm); import lazily
 def fetch_and_build(*args, **kwargs):
@@ -54,5 +60,7 @@ __all__ = [
     "list_releases", "get_manifest", "validate_manifest",
     "ManifestValidationError",
     "assemble_event_metadata", "metadata_diagnostics", "load_user_overrides",
+    "build_pe_product", "ExportProduct",
+    "register_exporter", "get_exporter", "list_formats",
     "__version__",
 ]
