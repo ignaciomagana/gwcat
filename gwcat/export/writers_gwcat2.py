@@ -18,6 +18,12 @@ from .registry import register_exporter
 _PE_DATASETS = ["ra", "dec", "m1det", "m2det", "chieff", "dL", "p_pe",
                 "redshift", "m1src", "m2src"]
 
+#: The legacy selection datasets, in the order the v1 exporter writes them,
+#: followed by the additive component-spin columns.
+_SELECTION_DATASETS = ["m1det", "m2det", "dL", "chieff", "ra", "dec",
+                       "m1src", "m2src", "redshift", "pdraw",
+                       "a1", "a2", "cost1", "cost2", "chip"]
+
 
 @register_exporter("gwcat2", kind="pe")
 def write_pe_gwcat2(product, out_path, *, write_summary: bool = False,
@@ -81,6 +87,71 @@ def write_pe_gwcat2(product, out_path, *, write_summary: bool = False,
             if k not in written:
                 f.create_dataset(k, data=arr, compression="gzip",
                                  shuffle=False)
+
+    if write_summary:
+        from ..validation_summary import write_validation_summary
+        summary = dict(product.summary)
+        summary["output_path"] = str(out_path)
+        if summary_context:
+            summary.update(summary_context)
+        write_validation_summary(out_path, summary)
+
+    return str(out_path)
+
+
+@register_exporter("gwcat2", kind="selection")
+def write_selection_gwcat2(product, out_path, *, write_summary: bool = False,
+                           summary_context: Optional[dict] = None):
+    """Serialize a selection :class:`ExportProduct` as ``gwcat-selection-2.0``.
+
+    Owns ONLY serialization: gzip-compressed datasets (legacy order first, then
+    any extra spin columns), ``product.attrs`` verbatim, and
+    ``format_version="gwcat-selection-2.0"``.  All physics -- the detection cut,
+    source-class subsetting, the per-basis spin factor and the Essick fractions
+    -- is upstream in :func:`gwcat.export.selection_builder.build_selection_product`.
+
+    Parameters
+    ----------
+    product : gwcat.export.product.ExportProduct
+        A ``kind="selection"`` product from ``build_selection_product``.
+    out_path : str or path-like
+        Destination HDF5 path.
+    write_summary : bool, default False
+        When True, also write ``<out_path>.validation_summary.json`` (+ ``.md``)
+        next to ``out_path`` from ``product.summary`` (the legacy selection
+        exporter's behavior, via :mod:`gwcat.validation_summary`).
+    summary_context : dict, optional
+        Extra fields merged into the written summary (last, so they win).
+
+    Returns
+    -------
+    str
+        ``str(out_path)``.
+    """
+    if product.kind != "selection":
+        raise ValueError(
+            f"write_selection_gwcat2 expects a kind='selection' product, got "
+            f"kind={product.kind!r}.")
+
+    with h5py.File(out_path, "w") as f:
+        # Provenance attrs, verbatim from the builder.
+        for k, v in product.attrs.items():
+            f.attrs[k] = v
+
+        # Format version is the writer's, never the builder's.
+        f.attrs["format_version"] = "gwcat-selection-2.0"
+
+        # Datasets (gzip, like the legacy selection exporter).  Legacy order
+        # first (stable), then any extra columns a basis added.
+        written = set()
+        for k in _SELECTION_DATASETS:
+            if k in product.columns:
+                f.create_dataset(k, data=product.columns[k],
+                                 compression="gzip")
+                written.add(k)
+        for k, arr in product.columns.items():
+            if k not in written:
+                f.create_dataset(k, data=arr, compression="gzip")
 
     if write_summary:
         from ..validation_summary import write_validation_summary
