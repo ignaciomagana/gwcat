@@ -22,6 +22,7 @@ from .product import ExportProduct
 from .registry import register_exporter, get_exporter, list_formats
 from .pe_builder import build_pe_product
 from .selection_builder import build_selection_product, SpinBasisError
+from .validate import validate_export_v2
 
 # Import writer modules for their registration side effects (module-level
 # @register_exporter decorators populate the registry).
@@ -33,6 +34,7 @@ __all__ = [
     "build_selection_product",
     "SpinBasisError",
     "ExportProduct",
+    "validate_export_v2",
     "register_exporter",
     "get_exporter",
     "list_formats",

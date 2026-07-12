@@ -609,6 +609,89 @@ A downstream consumer verifies the two files agree by checking
 `spin_prior_mode` matches and that `chi_eff_prior_applied_to_p_pe` equals
 `chi_eff_prior_applied_to_pdraw`.
 
+## Spin bases and gwcat-2.0 exports
+
+The versioned `gwcat.export` pipeline writes `format_version="gwcat-pe-2.0"` PE
+files and `format_version="gwcat-selection-2.0"` selection files in one of three
+**spin bases**. A basis fixes *which spin coordinates are exported* and *which
+spin prior is divided out of the exported weights* (`p_pe` on the PE side,
+`pdraw` on the selection side). Pick a PE basis and its matching selection basis
+— they must agree, and `gwcat validate` refuses a mismatched pair.
+
+| Basis | Exported spin columns | Prior divided out | Use when |
+|---|---|---|---|
+| `chieff` | `chieff` | 1-D isotropic `chi_eff` prior (the legacy swap) | You want a **legacy-compatible** file: `p_pe`/`pdraw` are byte-for-byte identical to `to_darksirens` for the same arguments. |
+| `component` | `chieff`, `a1`, `a2`, `cost1`, `cost2`, `chip` | flat component-spin prior `1/(4·amax₁·amax₂)` | You want the **exact** per-injection component spin draw retained for **any** injection format, including cumulative **mixtures**. |
+| `chieff_chip` | `chieff`, `chip` (+ `a1`,`a2`,`cost1`,`cost2` when available) | joint analytic `(chi_eff, chi_p)` prior | You want the **2-D analytic** joint prior. Valid **only** for a single uniform-magnitude / isotropic injection draw; a cumulative mixture is refused with `SpinBasisError`. |
+
+### Component-basis draw conversion per injection format
+
+The `component` basis reconstructs the exact per-injection draw density in the
+`(m1det, q, dL, a₁, a₂, cosθ₁, cosθ₂)` basis directly from each file's stored
+draw quantities. The magnitude/angle conversion depends on how the campaign
+recorded its spin draw:
+
+| Format | File contents | log-density conversion applied |
+|---|---|---|
+| **A — endo3 linear** | `sampling_pdf` (linear), Cartesian spins | `ln p += 2·ln(2π) + 2·ln a₁ + 2·ln a₂`  (i.e. `× (2π)²·a₁²·a₂²`) |
+| **B — O4 factored** | `lnpdraw_*` mag + polar-angle densities | `ln p += lnpdraw_mag₁ + lnpdraw_polar₁ − ln sinθ₁ + lnpdraw_mag₂ + lnpdraw_polar₂ − ln sinθ₂` |
+| **C — cumulative mixture** | joint `lnpdraw_…` (polar **or** cartesian key) | `ln p += 2·ln(2π) + 2·ln a₁ + 2·ln a₂`  (Cartesian → magnitude/isotropic-angle Jacobian) |
+
+In every case the common mass/redshift/distance factors
+(`× m1det / (1+z)² / (ddL/dz) / weights`) are then applied, exactly as the
+legacy selection exporter does. The `chieff` basis reuses these same columns for
+free, so it also emits `a1/a2/cost1/cost2/chip` whenever the campaign carries
+them.
+
+### PE-side priors
+
+- **`component`** — `p_pe = m1det · p_dL_pe / (4·amax₁·amax₂)`, with a flat
+  component-spin prior. The per-event `amax₁`/`amax₂` are resolved from the
+  store's PE spin-prior metadata (`spin_amax_1`/`spin_amax_2`), falling back to
+  `--amax-fallback` (default `0.99`) with a warning for older stores; the
+  resolved values are recorded in `spin_amax_1_per_event`/`spin_amax_2_per_event`.
+- **`chieff`** — the 1-D isotropic `chi_eff` analytic prior (`gwcat.spin`) at
+  `--amax` (default `0.99`), applied exactly as in `to_darksirens`.
+- **`chieff_chip`** — the joint `(chi_eff, chi_p)` analytic prior at the event's
+  `amax₁`; a per-event `amax₁ ≠ amax₂` warns and uses `amax₁`
+  (`spin_amax_mismatch_events`).
+
+### Example commands
+
+```bash
+# PE export (component basis) from a store.h5
+gwcat export pe store.h5 --out gw_bbh.h5 --spin-basis component --source-class bbh
+
+# Selection export (component basis) — one or more injection files, combined
+gwcat export selection O3.hdf O4.hdf --out selection_bbh.h5 \
+      --spin-basis component --source-class bbh --far-threshold 1.0
+
+# chieff_chip needs a single uniform-isotropic draw per campaign; a mixture
+# is refused with SpinBasisError (use --spin-basis component instead).
+gwcat export pe store.h5 --out gw_cc.h5 --spin-basis chieff_chip
+
+# Validate — auto-detects the format_version and dispatches to the right
+# validator (gwcat-2.0 files -> validate_export_v2; gwcat-1.0 files -> the v1
+# validator). A mixed v1/v2 pair is rejected with a clear message.
+gwcat validate gw_bbh.h5 selection_bbh.h5
+```
+
+`gwcat validate` checks each file internally (format version, required datasets
+per basis, `p_pe`/`pdraw` finite/positive, `nobs·nsamp` and `ndraw > n_detected`
+consistency, physical spin ranges) and **cross-validates the pair**: the two
+`spin_basis` values must match (naming both on mismatch), the cosmology and
+source-class filters must agree (same tolerances as the v1 validator), and — for
+`chieff_chip` — the PE prior `amax` and the injected-draw detected `amax` are
+**recorded and warned-about but NOT required to be equal** (they are different
+quantities: the PE side divides out its posterior's spin prior, the selection
+side swaps the injected draw density; forcing them to match would be wrong).
+
+> **The 1.0 formats are frozen.** `GWCatalog.to_darksirens()`, the
+> `SelectionSet`/`CombinedSelectionSet` `to_darksirens()` exporters, and their
+> `gwcat-1.0` / `gwcat-selection-1.0` outputs are unchanged and remain the
+> supported path for current darksirens runs. The gwcat-2.0 exports live
+> alongside them; the darksirens migration to the 2.0 formats comes later.
+
 ### Cosmology convention (per-event cosmology contract)
 
 The cosmology used to infer source-frame masses and redshifts can differ by
