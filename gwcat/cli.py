@@ -467,12 +467,59 @@ def _cmd_selection(args) -> int:
     return 0
 
 
+#: format_version prefixes that route to each validator generation.
+_V1_FORMATS = ("gwcat-1.0", "gwcat-selection-1.0")
+_V2_FORMATS = ("gwcat-pe-2.0", "gwcat-selection-2.0")
+
+
+def _read_format_version(path: str) -> Optional[str]:
+    """Return a file's ``format_version`` attr (decoded), or ``None``."""
+    import h5py
+
+    with h5py.File(path, "r") as f:
+        v = f.attrs.get("format_version")
+    if isinstance(v, bytes):
+        v = v.decode()
+    return None if v is None else str(v)
+
+
+def _validator_generation(version: Optional[str]) -> str:
+    """Map a ``format_version`` to ``"v1"`` / ``"v2"`` / ``"unknown"``."""
+    if version in _V1_FORMATS:
+        return "v1"
+    if version in _V2_FORMATS:
+        return "v2"
+    return "unknown"
+
+
 def _cmd_validate(args) -> int:
-    from .catalog import validate_export
+    # Auto-detect the export generation from format_version and dispatch to the
+    # matching validator. v1 files (gwcat-1.0 / gwcat-selection-1.0) go to the
+    # frozen gwcat.catalog.validate_export unchanged; v2 files (gwcat-pe-2.0 /
+    # gwcat-selection-2.0) go to gwcat.export.validate_export_v2. A mixed v1/v2
+    # pair is rejected with a clear message.
+    pe_gen = _validator_generation(_read_format_version(args.pe_path))
+    sel_gen = None
+    if args.selection_path is not None:
+        sel_gen = _validator_generation(_read_format_version(args.selection_path))
+        if {pe_gen, sel_gen} == {"v1", "v2"}:
+            print(f"validate: FAILED: mixed export generations -- PE is {pe_gen} "
+                  f"but selection is {sel_gen}. Validate a v1 PE file against a "
+                  f"v1 selection file (gwcat-1.0 / gwcat-selection-1.0) or a v2 "
+                  f"PE file against a v2 selection file (gwcat-pe-2.0 / "
+                  f"gwcat-selection-2.0); the two generations cannot be paired.",
+                  file=sys.stderr)
+            return 1
+
+    generation = "v2" if pe_gen == "v2" else "v1"
+    if generation == "v2":
+        from .export import validate_export_v2 as validator
+    else:
+        from .catalog import validate_export as validator
 
     try:
-        results = validate_export(args.pe_path, args.selection_path,
-                                  strict=args.strict)
+        results = validator(args.pe_path, args.selection_path,
+                            strict=args.strict)
     except (ValueError, AssertionError) as e:
         print(f"validate: FAILED: {e}", file=sys.stderr)
         return 1

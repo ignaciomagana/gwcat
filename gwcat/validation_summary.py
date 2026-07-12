@@ -43,6 +43,7 @@ __all__ = [
     "package_version",
     "value_counts",
     "summarize_catalog",
+    "v2_export_summary_additions",
     "render_markdown",
     "write_validation_summary",
 ]
@@ -224,6 +225,125 @@ def summarize_catalog(cat) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# gwcat-2.0 export summary enrichment (additive; v1 summaries unchanged)
+# ---------------------------------------------------------------------------
+#: The two v2 export ``format_version`` values whose summaries get enriched.
+_V2_PE_FORMAT = "gwcat-pe-2.0"
+_V2_SELECTION_FORMAT = "gwcat-selection-2.0"
+
+
+def _decode(v: Any) -> Any:
+    return v.decode() if isinstance(v, (bytes, bytearray)) else v
+
+
+def _summarize_amax(arr) -> Optional[Dict[str, Any]]:
+    """Summarize a per-event/per-campaign spin-amax array as min/max/uniques.
+
+    Returns ``None`` for an empty/all-NaN array so the caller can omit the
+    field entirely rather than emit a meaningless placeholder.
+    """
+    a = np.asarray(arr, dtype=float).ravel()
+    finite = a[np.isfinite(a)]
+    if finite.size == 0:
+        return None
+    uniques = sorted({round(float(x), 6) for x in finite})
+    return {
+        "min": float(finite.min()),
+        "max": float(finite.max()),
+        "unique_values": uniques,
+    }
+
+
+def v2_export_summary_additions(out_path) -> Dict[str, Any]:
+    """Additive validation-summary fields for a gwcat-2.0 export file.
+
+    Reads the just-written ``gwcat-pe-2.0`` / ``gwcat-selection-2.0`` HDF5 file's
+    provenance attrs and returns the spin-basis / per-basis prior-provenance /
+    injected-spin fields the v2 summaries should carry.  Returns ``{}`` for any
+    non-v2 file (v1 darksirens / v1 selection / ingest store.h5), a missing
+    file, or any read error -- so v1 summaries and non-HDF5 summary writes are
+    left completely unchanged.
+
+    This deliberately reads the file (rather than the builder's summary feed) so
+    the enrichment is fully self-contained in this module: the writer serializes
+    the file first, then hands its path to :func:`write_validation_summary`,
+    which is where these fields are merged in (additively; existing keys win).
+    """
+    import os
+    if not out_path or not os.path.exists(str(out_path)):
+        return {}
+    try:
+        import h5py
+        with h5py.File(str(out_path), "r") as f:
+            attrs = {k: _decode(f.attrs[k]) for k in f.attrs}
+    except Exception:
+        return {}
+
+    fmt = attrs.get("format_version")
+    if fmt == _V2_PE_FORMAT:
+        return _v2_pe_additions(attrs)
+    if fmt == _V2_SELECTION_FORMAT:
+        return _v2_selection_additions(attrs)
+    return {}
+
+
+def _v2_pe_additions(attrs: Dict[str, Any]) -> Dict[str, Any]:
+    basis = attrs.get("spin_basis")
+    out: Dict[str, Any] = {"spin_basis": basis}
+    provenance: Dict[str, Any] = {}
+    amax: Dict[str, Any] = {}
+    if basis == "chieff":
+        provenance["chi_eff_prior_applied_to_p_pe"] = bool(
+            attrs.get("chi_eff_prior_applied_to_p_pe", False))
+        if "chi_eff_amax" in attrs:
+            amax["chi_eff_amax"] = float(attrs["chi_eff_amax"])
+    elif basis == "component":
+        provenance["component_spin_prior_applied_to_p_pe"] = bool(
+            attrs.get("component_spin_prior_applied_to_p_pe", False))
+        for key, label in (("spin_amax_1_per_event", "spin_amax_1"),
+                           ("spin_amax_2_per_event", "spin_amax_2")):
+            s = _summarize_amax(attrs.get(key, []))
+            if s is not None:
+                amax[label] = s
+    elif basis == "chieff_chip":
+        provenance["chi_eff_chi_p_prior_applied_to_p_pe"] = bool(
+            attrs.get("chi_eff_chi_p_prior_applied_to_p_pe", False))
+        s = _summarize_amax(attrs.get("chi_eff_chi_p_amax_per_event", []))
+        if s is not None:
+            amax["chi_eff_chi_p_amax_per_event"] = s
+    if provenance:
+        out["spin_prior_provenance"] = provenance
+    if amax:
+        out["spin_amax_summary"] = amax
+    return out
+
+
+def _v2_selection_additions(attrs: Dict[str, Any]) -> Dict[str, Any]:
+    import json as _json
+    out: Dict[str, Any] = {"spin_basis": attrs.get("spin_basis")}
+    fmt = attrs.get("injected_spin_format")
+    if fmt is not None:
+        out["injected_spin_format"] = [_decode(x) for x in np.asarray(fmt).ravel()]
+    uni = attrs.get("injected_spin_uniform_isotropic")
+    if uni is not None:
+        out["injected_spin_uniform_isotropic"] = [
+            bool(x) for x in np.asarray(uni).ravel()]
+    amax_det = attrs.get("injected_spin_amax_detected")
+    if amax_det is not None:
+        out["injected_spin_amax_detected"] = np.asarray(
+            amax_det, dtype=float).tolist()
+    checks = attrs.get("injected_spin_checks")
+    if checks is not None:
+        try:
+            out["injected_spin_checks"] = _json.loads(_decode(checks))
+        except Exception:
+            out["injected_spin_checks"] = _decode(checks)
+    if "pdraw_state" in attrs:
+        out["pdraw_state"] = _decode(attrs["pdraw_state"])
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Rendering + writing
 # ---------------------------------------------------------------------------
 def _render_field(key: str, value: Any) -> str:
@@ -270,8 +390,21 @@ def write_validation_summary(
     Both files serialize the SAME ``summary`` dict -- the ``.md`` is a
     human-rendering of the ``.json``, never a separately computed summary.
     Returns ``(json_path, md_path_or_None)``.
+
+    For a gwcat-2.0 export (``out_path`` is a ``gwcat-pe-2.0`` /
+    ``gwcat-selection-2.0`` file), the summary is enriched *additively* with the
+    spin-basis / prior-provenance / injected-spin fields read back from that
+    file (see :func:`v2_export_summary_additions`).  The enrichment never
+    overrides a field the caller already supplied, and is a no-op for v1 exports,
+    ingest stores, and non-HDF5 summary writes, so those summaries are unchanged.
     """
     out_path = str(out_path)
+
+    additions = v2_export_summary_additions(out_path)
+    if additions:
+        # Additive only: caller-supplied fields win over the reconstructed ones.
+        summary = {**additions, **summary}
+
     json_path = out_path + ".validation_summary.json"
     with open(json_path, "w") as f:
         json.dump(summary, f, indent=2, default=_json_default)
