@@ -77,9 +77,47 @@ def params_in_groups(groups: Iterable[str]) -> List[str]:
 DARKSIRENS_REQUIRED = ("mass_1", "mass_2", "luminosity_distance", "ra", "dec",
                        "chi_eff", "p_dL_pe")
 
-#: export name -> ordered tuple of REQUIRED parameters.
+# ── Spin-basis PE exports (PR 6) ─────────────────────────────────────────────
+# The versioned gwcat2 PE export supports three spin bases; each declares its
+# required parameters here (keyed ``"gwcat2_pe:<basis>"``).
+#
+# ``component`` needs the component spins ``a_1``/``a_2`` on top of the
+# darksirens set; ``chi_eff`` is KEPT required (unlike the bare ingredient tuple
+# in the handoff) so the exported ``chieff`` column is always present -- a
+# deliberate simplification documented in :mod:`gwcat.export.pe_builder`.  Its
+# tilt requirement (``cos_tilt_i`` OR ``tilt_i``) is an *alternative* group,
+# expressed via :func:`check_required_alternatives` rather than a flat required
+# list (either member satisfies it, per event).
+COMPONENT_REQUIRED = ("mass_1", "mass_2", "luminosity_distance", "ra", "dec",
+                      "chi_eff", "a_1", "a_2", "p_dL_pe")
+
+#: Component-basis tilt alternatives: each group is satisfied per event if ANY
+#: member (a stored *and available* parameter) is present.
+COMPONENT_TILT_ALTERNATIVES = (
+    ("cos_tilt_1", "tilt_1"),
+    ("cos_tilt_2", "tilt_2"),
+)
+
+#: chieff_chip-basis chi_p requirement: ONE group whose alternatives are either
+#: the stored ``chi_p`` itself, or a full ingredient set from which
+#: ``chi_p_from_components`` can derive it at export.  An alternative that is a
+#: tuple names params that must ALL be present+available together.
+CHIEFF_CHIP_CHIP_ALTERNATIVES = (
+    (
+        "chi_p",
+        ("a_1", "a_2", "cos_tilt_1", "cos_tilt_2"),
+        ("a_1", "a_2", "tilt_1", "tilt_2"),
+    ),
+)
+
+#: export name -> ordered tuple of REQUIRED parameters.  (Alternative groups --
+#: the tilt/chi_p "any-of" requirements -- are enforced separately by the
+#: builder via :func:`check_required_alternatives`.)
 EXPORT_REQUIREMENTS = {
     "darksirens": DARKSIRENS_REQUIRED,
+    "gwcat2_pe:chieff": DARKSIRENS_REQUIRED,
+    "gwcat2_pe:component": COMPONENT_REQUIRED,
+    "gwcat2_pe:chieff_chip": DARKSIRENS_REQUIRED,
 }
 
 
@@ -156,3 +194,68 @@ def check_required(required: Sequence[str], store_params: Sequence[str],
             + ". Those parameters were not available for those events at "
               "ingest; drop the events, choose a different export, or re-ingest "
               "with the parameter present.")
+
+
+def _describe_alternative(alt) -> str:
+    """Human-readable description of a single alternative (str or tuple)."""
+    if isinstance(alt, str):
+        return alt
+    alt = tuple(alt)
+    if len(alt) == 1:
+        return alt[0]
+    return "(" + " and ".join(alt) + ")"
+
+
+def check_required_alternatives(alternative_groups, store_params, avail,
+                                event_names, sel_idx, param_index,
+                                export: str = "export") -> None:
+    """Raise :class:`MissingParameterError` if, for any *alternative group*, no
+    alternative is satisfied for some selected event.
+
+    This is the "any-of" companion to :func:`check_required` (which it does NOT
+    modify): use it for requirements like "``cos_tilt_1`` OR ``tilt_1``" or
+    "``chi_p`` OR its ingredient set".
+
+    Parameters
+    ----------
+    alternative_groups : sequence of groups
+        Each *group* is a tuple of *alternatives*; the group is satisfied for an
+        event when ANY of its alternatives is.  An alternative is either a
+        single parameter name (``str``) or a tuple of names that must ALL be
+        present+available together (an "and" bundle).  Example::
+
+            (("cos_tilt_1", "tilt_1"), ("cos_tilt_2", "tilt_2"))     # two groups
+            (("chi_p", ("a_1", "a_2", "cos_tilt_1", "cos_tilt_2")),) # one group
+
+    store_params, avail, event_names, sel_idx, param_index, export
+        As in :func:`check_required`.
+    """
+    import numpy as np
+
+    sel = np.asarray(sel_idx)
+    if sel.size == 0:
+        return
+
+    problems = []
+    for group in alternative_groups:
+        alts = list(group)
+        satisfied = np.zeros(sel.size, dtype=bool)
+        for alt in alts:
+            names = (alt,) if isinstance(alt, str) else tuple(alt)
+            if all(p in param_index for p in names):
+                cols = [avail[sel, param_index[p]] for p in names]
+                alt_ok = (np.logical_and.reduce(cols) if cols
+                          else np.ones(sel.size, dtype=bool))
+            else:
+                alt_ok = np.zeros(sel.size, dtype=bool)
+            satisfied |= alt_ok
+        if not satisfied.all():
+            bad = sorted(np.asarray(event_names)[sel][~satisfied].tolist())
+            desc = " or ".join(_describe_alternative(a) for a in alts)
+            problems.append(f"[{desc}] for event(s) {bad}")
+    if problems:
+        raise MissingParameterError(
+            f"{export} requires at least one of each alternative group, but no "
+            f"alternative is present+available for some selected events: "
+            + "; ".join(problems)
+            + ". Provide one alternative per group (or drop the events).")

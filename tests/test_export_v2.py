@@ -321,13 +321,18 @@ def test_registration_and_lookup_roundtrip():
 
 
 # ==========================================================================
-# NotImplemented / type errors
+# Missing-spin-columns / type errors
 # ==========================================================================
 @pytest.mark.parametrize("basis", ["component", "chieff_chip"])
-def test_unimplemented_spin_basis_raises(tmp_path, basis):
+def test_spin_basis_requires_spin_columns(tmp_path, basis):
+    """The component / chieff_chip bases (implemented in PR 6) fail loudly on a
+    store that carries no spin columns -- the darksirens fixture store has no
+    a_1/a_2/tilt/chi_p -- naming the missing parameters."""
+    from gwcat.schema import MissingParameterError
+
     store = _build_store(tmp_path)
     cat = GWCatalog(store)
-    with pytest.raises(NotImplementedError, match=basis):
+    with pytest.raises(MissingParameterError):
         build_pe_product(cat, spin_basis=basis, nsamp=8,
                          cosmology=(67.74, 0.3089))
 

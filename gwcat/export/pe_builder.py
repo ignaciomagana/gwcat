@@ -1,9 +1,11 @@
-"""PE (posterior-sample) export builder for the versioned pipeline (PR 3).
+"""PE (posterior-sample) export builder for the versioned pipeline (PR 3 / PR 6).
 
 :func:`build_pe_product` reproduces -- for the ``spin_basis="chieff"`` case --
 the arrays and provenance of the legacy :meth:`gwcat.catalog.GWCatalog.to_darksirens`
 EXACTLY for identical keyword arguments, and returns them as an
-:class:`gwcat.export.product.ExportProduct` instead of writing a file.
+:class:`gwcat.export.product.ExportProduct` instead of writing a file.  PR 6 adds
+the ``"component"`` and ``"chieff_chip"`` spin bases on top of the SAME shared
+selection/resampling scaffold.
 
 Parity contract (why the loop below is a near-verbatim copy of the legacy
 exporter's, not a call into it)
@@ -27,11 +29,37 @@ bit-for-bit identical it mirrors, in order:
   * the same concatenation order.
 
 The only spin-basis-specific step -- the output columns plus the ``p_pe`` spin
-factor -- is isolated in :func:`_apply_chieff_basis` so future bases
-(``"component"``, ``"chieff_chip"``) slot in without touching the shared
-selection/resampling scaffold.
+factor -- is isolated in :func:`_apply_chieff_basis` (and, for PR 6, in
+:func:`_apply_component_basis` / :func:`_apply_chieff_chip_basis`), so the shared
+scaffold is untouched.  Extra per-sample columns the new bases need
+(``a_1``/``a_2``/``cos_tilt_i``/``chi_p``) are fetched and resampled ONLY for
+the non-chieff bases: the chieff path never fetches them, so the rng stream and
+therefore the chieff parity is preserved exactly.
+
+Design decisions (PR 6)
+-----------------------
+* **component basis -- ``chi_eff`` kept required.**  The handoff's bare
+  ingredient tuple omits ``chi_eff``, but the component export still writes the
+  legacy 10 columns (including ``chieff``).  Rather than make ``chi_eff``
+  optional-but-conditional, it is KEPT required (see
+  :data:`gwcat.schema.COMPONENT_REQUIRED`) so the ``chieff`` column is always
+  present -- a deliberate, documented simplification.
+* **component p_pe.**  ``p_pe = m1det * p_dL_pe / (4 * amax_1 * amax_2)`` with
+  the event's own ``amax`` (a per-event *constant* that nonetheless varies event
+  to event, so it multiplies ``p_pe`` explicitly).  No chi_eff factor.
+* **chieff_chip p_pe.**  ``p_pe = m1det * p_dL_pe * exp(clip(joint_lnprob, -50,
+  None))`` where ``joint_lnprob = chi_eff_chi_p_prior_logprob(chieff, chip,
+  m1src, m2src, amax=amax_1)`` -- the SAME source-frame mass convention the
+  chieff basis uses for its 1-D chi_eff prior.  ``amax`` is the event's
+  ``amax_1``; a per-event ``amax_1 != amax_2`` warns (the joint prior assumes a
+  single amax) and is recorded in ``spin_amax_mismatch_events``.
+* **chieff_chip output columns.**  Always ``chip`` on top of the legacy 10; the
+  raw ``a1``/``a2``/``cost1``/``cost2`` are added only when available for EVERY
+  kept event (so the output stays rectangular).
 """
 from __future__ import annotations
+
+import warnings
 
 import numpy as np
 
@@ -42,13 +70,29 @@ from .product import ExportProduct
 _CHIEFF_COLUMNS = ["ra", "dec", "m1det", "m2det", "chieff", "dL", "p_pe",
                    "redshift", "m1src", "m2src"]
 
-#: Spin bases planned for the v2 builder; only "chieff" is implemented here.
+#: Spin bases the v2 builder implements.
 _KNOWN_SPIN_BASES = ("chieff", "component", "chieff_chip")
+
+#: Per-sample store columns the non-chieff bases may need (fetched only then).
+_EXTRA_SAMPLE_CANDIDATES = ("a_1", "a_2", "cos_tilt_1", "cos_tilt_2",
+                            "tilt_1", "tilt_2", "chi_p")
+
+
+def _group_available_all(sub, *members):
+    """True if, for every selected event, at least one of ``members`` (a store
+    parameter that is present AND available) is available."""
+    if sub.n_events == 0:
+        return True
+    ok = np.zeros(sub.n_events, dtype=bool)
+    for p in members:
+        ok |= sub.param_available(p)
+    return bool(ok.all())
 
 
 def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
                      far_max=None, pastro_min=None, z_max=None,
                      replace="auto", cosmology=None, amax=0.99,
+                     amax_fallback=0.99,
                      allowed_names=None, allowed_names_authoritative=True,
                      source_class=None, event_list=None,
                      allow_missing_far=False, require_far=False,
@@ -60,23 +104,31 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
     module docstring for the parity contract).  ``format_version`` is NOT set
     here -- it belongs to the writer.
 
-    Only ``spin_basis="chieff"`` is implemented in this PR; ``"component"`` and
-    ``"chieff_chip"`` raise :class:`NotImplementedError`.
+    The ``"component"`` and ``"chieff_chip"`` bases add spin-basis-specific
+    output columns and ``p_pe`` factors (see the module docstring).  ``amax`` is
+    only used by the chieff basis; the new bases read a per-event ``amax`` from
+    the store meta (``spin_amax_1``/``spin_amax_2``), falling back to
+    ``amax_fallback`` (with a warning) when it is NaN (old stores).
     """
-    if spin_basis != "chieff":
-        if spin_basis in _KNOWN_SPIN_BASES:
-            raise NotImplementedError(
-                f"spin_basis={spin_basis!r} is not implemented yet; only "
-                f"'chieff' is available in this release. The 'component' and "
-                f"'chieff_chip' bases land in a follow-up PR.")
+    if spin_basis not in _KNOWN_SPIN_BASES:
         raise ValueError(
             f"unknown spin_basis={spin_basis!r}; known bases are "
             f"{list(_KNOWN_SPIN_BASES)}.")
 
+    need_extras = spin_basis != "chieff"
+
     # chieff basis ALWAYS uses "include" semantics: the 1-D chi_eff prior is
-    # multiplied into p_pe here (Mode A), matching the legacy default.
-    spin_prior_mode = "include"
-    chi_eff_included = True
+    # multiplied into p_pe here (Mode A), matching the legacy default.  The
+    # non-chieff bases carry their own spin factors (see their apply helpers).
+    if spin_basis == "chieff":
+        spin_prior_mode = "include"
+        chi_eff_included = True
+    elif spin_basis == "component":
+        spin_prior_mode = "component_flat"
+        chi_eff_included = False
+    else:  # chieff_chip
+        spin_prior_mode = "chieff_chip_joint"
+        chi_eff_included = True
 
     # ── Event selection: mirror the legacy exporter's select() call ─────────
     # compact_type is fixed to None (the builder does not expose it); every
@@ -90,11 +142,35 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
                      waveform_policy=waveform_policy,
                      approximant=approximant)
 
-    from ..schema import DARKSIRENS_REQUIRED
-    need = list(DARKSIRENS_REQUIRED)
-    sub._require_params(need, export="gwcat2 PE export")
+    # ── Required-parameter checks (per basis) ───────────────────────────────
+    from ..schema import (DARKSIRENS_REQUIRED, COMPONENT_REQUIRED,
+                          COMPONENT_TILT_ALTERNATIVES,
+                          CHIEFF_CHIP_CHIP_ALTERNATIVES)
+    if spin_basis == "chieff":
+        need = list(DARKSIRENS_REQUIRED)
+        sub._require_params(need, export="gwcat2 PE export")
+    elif spin_basis == "component":
+        need = list(COMPONENT_REQUIRED)
+        sub._require_params(need, export="gwcat2 PE export (component basis)")
+        sub._require_alternatives(
+            COMPONENT_TILT_ALTERNATIVES,
+            export="gwcat2 PE export (component basis)")
+    else:  # chieff_chip
+        need = list(DARKSIRENS_REQUIRED)
+        sub._require_params(need, export="gwcat2 PE export (chieff_chip basis)")
+        sub._require_alternatives(
+            CHIEFF_CHIP_CHIP_ALTERNATIVES,
+            export="gwcat2 PE export (chieff_chip basis)")
+
     per = sub.get(need, per_event=True)
     rng = np.random.default_rng(seed)
+
+    # Extra per-sample columns (fetched ONLY for non-chieff bases so the chieff
+    # rng stream / parity is untouched).
+    extra_params = ([p for p in _EXTRA_SAMPLE_CANDIDATES
+                     if p in sub._param_index] if need_extras else [])
+    per_extra = (sub.get(extra_params, per_event=True)
+                 if extra_params else {})
 
     # ── Resolve cosmology: per-event (default) or a single override ─────────
     sel_idx = np.asarray(sub._sel)
@@ -144,12 +220,49 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
     kept_H0, kept_Om0 = [], []
     kept_ss_name, kept_ss_approx, kept_ss_reason = [], [], []
 
-    def _ss_meta(row, field):
-        v = sub.meta.get(field)
-        if v is None:
-            return ""
-        x = v[int(row)]
-        return x.decode() if isinstance(x, (bytes, bytearray)) else str(x)
+    # ── Non-chieff spin scaffolding (empty / unused for chieff) ─────────────
+    # Per-event spin amax from the store meta (aligned with selected events).
+    if need_extras:
+        def _meta_sel(name, dtype=float):
+            v = sub.meta.get(name)
+            if v is None:
+                return None
+            return np.asarray(v, dtype=dtype)[sel_idx]
+
+        sel_amax1 = _meta_sel("spin_amax_1")
+        sel_amax2 = _meta_sel("spin_amax_2")
+        raw_kind = sub.meta.get("spin_prior_kind")
+        sel_kind = (np.asarray(raw_kind)[sel_idx] if raw_kind is not None
+                    else None)
+
+        avail_a1 = sub.param_available("a_1")
+        avail_a2 = sub.param_available("a_2")
+        avail_cos1 = sub.param_available("cos_tilt_1")
+        avail_cos2 = sub.param_available("cos_tilt_2")
+        avail_tilt1 = sub.param_available("tilt_1")
+        avail_tilt2 = sub.param_available("tilt_2")
+        avail_chip = sub.param_available("chi_p")
+
+        # Whether the raw component columns are available for EVERY selected
+        # event (=> a rectangular output is possible).
+        emit_extras = (_group_available_all(sub, "a_1")
+                       and _group_available_all(sub, "a_2")
+                       and _group_available_all(sub, "cos_tilt_1", "tilt_1")
+                       and _group_available_all(sub, "cos_tilt_2", "tilt_2"))
+
+        kept_amax1, kept_amax2 = [], []
+        a1_list, a2_list, cost1_list, cost2_list, chip_list = [], [], [], [], []
+        chip_src_list = []
+        fallback_events, unrecognized_events, mismatch_events = [], [], []
+
+    def _resolve_cost(e, avail_cos, avail_tilt, cos_name, tilt_name):
+        """cos_tilt samples for event ``e`` (idx_orig applied by caller):
+        prefer the stored cos_tilt, else cos(stored tilt), else None."""
+        if avail_cos[e]:
+            return per_extra[cos_name][e]
+        if avail_tilt[e]:
+            return np.cos(per_extra[tilt_name][e])
+        return None
 
     sel_rows = np.asarray(sub._sel)
     reasons_arr = getattr(sub, "_selection_reasons", None)
@@ -180,7 +293,6 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
         n_kept = len(idx_map)
         rep = (n_kept < nsamp) if replace == "auto" else bool(replace)
         if n_kept < nsamp and not rep:
-            import warnings
             warnings.warn(f"Event {sub.event_names[e]}: only {n_kept} samples "
                           f"after z_max cut, but replace=False and nsamp={nsamp}. "
                           f"Skipping.")
@@ -213,11 +325,75 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
         kept_H0.append(float(per_event_H0[e]))
         kept_Om0.append(float(per_event_Om0[e]))
         row = sel_rows[e]
-        kept_ss_name.append(_ss_meta(row, "sample_set_name"))
-        kept_ss_approx.append(_ss_meta(row, "approximant"))
+        kept_ss_name.append(_ss_meta(sub, row, "sample_set_name"))
+        kept_ss_approx.append(_ss_meta(sub, row, "approximant"))
         kept_ss_reason.append(
             str(reasons_arr[e]) if reasons_arr is not None
             and e < len(reasons_arr) else "")
+
+        # ── Non-chieff per-event spin columns + amax resolution ─────────────
+        if need_extras:
+            name = sub.event_names[e]
+
+            # Resolve per-event amax (NaN -> fallback, recorded).
+            a1max = (float(sel_amax1[e]) if sel_amax1 is not None
+                     else float("nan"))
+            a2max = (float(sel_amax2[e]) if sel_amax2 is not None
+                     else float("nan"))
+            used_fallback = False
+            if not np.isfinite(a1max):
+                a1max = float(amax_fallback)
+                used_fallback = True
+            if not np.isfinite(a2max):
+                a2max = float(amax_fallback)
+                used_fallback = True
+            if used_fallback:
+                fallback_events.append(str(name))
+            kept_amax1.append(a1max)
+            kept_amax2.append(a2max)
+            if spin_basis == "chieff_chip" and a1max != a2max:
+                mismatch_events.append(str(name))
+
+            # spin_prior_kind provenance (flat/joint assumption may not hold).
+            if sel_kind is not None:
+                k = str(sel_kind[e])
+                if k and k not in ("uniform_magnitude_isotropic",
+                                   "assumed_default"):
+                    unrecognized_events.append(str(name))
+
+            # Component pieces for this event (None where unavailable).
+            a1_e = (per_extra["a_1"][e][idx_orig]
+                    if avail_a1[e] else None)
+            a2_e = (per_extra["a_2"][e][idx_orig]
+                    if avail_a2[e] else None)
+            cost1_full = _resolve_cost(e, avail_cos1, avail_tilt1,
+                                       "cos_tilt_1", "tilt_1")
+            cost2_full = _resolve_cost(e, avail_cos2, avail_tilt2,
+                                       "cos_tilt_2", "tilt_2")
+            cost1_e = None if cost1_full is None else cost1_full[idx_orig]
+            cost2_e = None if cost2_full is None else cost2_full[idx_orig]
+
+            # chip: prefer the stored chi_p, else derive from ingredients.
+            if avail_chip[e]:
+                chip_e = per_extra["chi_p"][e][idx_orig]
+                chip_src = "file"
+            elif (a1_e is not None and a2_e is not None
+                  and cost1_e is not None and cost2_e is not None):
+                from ..spin import chi_p_from_components
+                chip_e = chi_p_from_components(a1_e, a2_e, cost1_e, cost2_e,
+                                               m1, m2)
+                chip_src = "derived"
+            else:  # pragma: no cover - guarded by requirement checks
+                chip_e = None
+                chip_src = ""
+            chip_list.append(chip_e)
+            chip_src_list.append(chip_src)
+
+            if emit_extras:
+                a1_list.append(a1_e)
+                a2_list.append(a2_e)
+                cost1_list.append(cost1_e)
+                cost2_list.append(cost2_e)
 
     nobs = len(kept)
     data = {k: np.concatenate(v) if v else np.array([])
@@ -228,8 +404,72 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
     cosmology_per_event_varies = bool(
         nobs > 1 and (np.ptp(kept_H0_arr) > 0 or np.ptp(kept_Om0_arr) > 0))
 
+    import h5py
+    _str = h5py.string_dtype()
+
     # ── Spin-basis-specific step (columns + p_pe spin factor) ───────────────
-    columns = _apply_chieff_basis(data, amax=amax)
+    spin_attrs: dict = {}
+    if spin_basis == "chieff":
+        columns = _apply_chieff_basis(data, amax=amax)
+    else:
+        amax1_arr = np.asarray(kept_amax1, dtype=float)
+        amax2_arr = np.asarray(kept_amax2, dtype=float)
+        amax1_ps = (np.repeat(amax1_arr, nsamp) if nobs else np.array([]))
+        amax2_ps = (np.repeat(amax2_arr, nsamp) if nobs else np.array([]))
+        chip = (np.concatenate(chip_list) if chip_list else np.array([]))
+        extras = None
+        if emit_extras and nobs:
+            extras = {
+                "a1": np.concatenate(a1_list),
+                "a2": np.concatenate(a2_list),
+                "cost1": np.concatenate(cost1_list),
+                "cost2": np.concatenate(cost2_list),
+            }
+        elif emit_extras:  # nobs == 0
+            extras = {k: np.array([]) for k in ("a1", "a2", "cost1", "cost2")}
+
+        if spin_basis == "component":
+            columns = _apply_component_basis(data, amax1_ps, amax2_ps,
+                                             chip, extras)
+        else:  # chieff_chip
+            columns = _apply_chieff_chip_basis(data, amax1_ps, chip, extras)
+
+        # Emit warnings once (after the loop).
+        if fallback_events:
+            warnings.warn(
+                f"spin_basis={spin_basis!r}: {len(fallback_events)} event(s) "
+                f"have no stored spin amax (spin_amax_1/2 NaN); using "
+                f"amax_fallback={amax_fallback}: {fallback_events}")
+        if unrecognized_events:
+            warnings.warn(
+                f"spin_basis={spin_basis!r}: {len(unrecognized_events)} "
+                f"event(s) have spin_prior_kind != "
+                f"'uniform_magnitude_isotropic' (the flat/joint spin-prior "
+                f"assumption may not hold): {unrecognized_events}")
+        if spin_basis == "chieff_chip" and mismatch_events:
+            warnings.warn(
+                f"spin_basis='chieff_chip': {len(mismatch_events)} event(s) "
+                f"have spin_amax_1 != spin_amax_2; the joint (chi_eff, chi_p) "
+                f"prior assumes a single amax and uses amax_1: "
+                f"{mismatch_events}")
+
+        # Basis-specific provenance attrs (never written for chieff).
+        spin_attrs = {
+            "spin_amax_1_per_event": amax1_arr,
+            "spin_amax_2_per_event": amax2_arr,
+            "spin_amax_fallback_events": np.array(fallback_events, dtype=_str),
+            "spin_prior_unrecognized_events": np.array(
+                unrecognized_events, dtype=_str),
+            "chi_p_source_per_event": np.array(chip_src_list, dtype=_str),
+            "spin_amax_fallback": float(amax_fallback),
+        }
+        if spin_basis == "component":
+            spin_attrs["component_spin_prior_applied_to_p_pe"] = True
+        else:  # chieff_chip
+            spin_attrs["chi_eff_chi_p_prior_applied_to_p_pe"] = True
+            spin_attrs["chi_eff_chi_p_amax_per_event"] = amax1_arr
+            spin_attrs["spin_amax_mismatch_events"] = np.array(
+                mismatch_events, dtype=_str)
 
     # Sanity check
     expected = nobs * nsamp
@@ -243,15 +483,13 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
     # legacy-compat spin attrs (spin_prior_mode / chi_eff_prior_applied_to_p_pe
     # / chi_eff_in_p_pe) are added by the chieff writer, not here, so a future
     # non-chieff basis never carries them.
-    import h5py
-    _str = h5py.string_dtype()
     attrs = {
         # darksirens core
         "nsamp": int(nsamp),
         "nobs": int(nobs),
         "mock_data": False,
         # spin basis (new in v2)
-        "spin_basis": "chieff",
+        "spin_basis": spin_basis,
         # provenance
         "compact_type": "",
         "mass_prior_basis": "uniform_detector_frame",
@@ -287,6 +525,7 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
             [str(x) for x in kept_ss_reason], dtype=_str),
         "event_names": np.array([str(k) for k in kept], dtype=_str),
     }
+    attrs.update(spin_attrs)
 
     # ── Validation-summary feed (writer fills output_path + summary_context) ─
     from ..validation_summary import summarize_catalog
@@ -298,7 +537,7 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
         "n_events_skipped_after_selection": int(sub.n_events - nobs),
         "event_names_exported": [str(k) for k in kept],
         "nsamp_per_event": int(nsamp),
-        "spin_basis": "chieff",
+        "spin_basis": spin_basis,
         "source_class_filter": (None if source_class is None
                                 else str(source_class)),
         "event_list_filter": (
@@ -321,7 +560,15 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
     })
 
     return ExportProduct(kind="pe", columns=columns, attrs=attrs,
-                         spin_basis="chieff", summary=summary)
+                         spin_basis=spin_basis, summary=summary)
+
+
+def _ss_meta(sub, row, field):
+    v = sub.meta.get(field)
+    if v is None:
+        return ""
+    x = v[int(row)]
+    return x.decode() if isinstance(x, (bytes, bytearray)) else str(x)
 
 
 def _apply_chieff_basis(data, *, amax):
@@ -353,3 +600,77 @@ def _apply_chieff_basis(data, *, amax):
         "m1src": data["m1src"],
         "m2src": data["m2src"],
     }
+
+
+def _apply_component_basis(data, amax1_ps, amax2_ps, chip, extras):
+    """component-basis output columns + the flat component-spin prior on p_pe.
+
+    ``p_pe = m1det * p_dL_pe / (4 * amax_1 * amax_2)`` with the per-sample
+    (per-event-constant) spin amax; NO chi_eff factor.  Emits the legacy 10
+    columns plus ``a1``/``a2``/``cost1``/``cost2``/``chip``.
+    """
+    p_pe = data["p_pe"]
+    if p_pe.size > 0:
+        p_pe = p_pe / (4.0 * amax1_ps * amax2_ps)
+    out = {
+        "ra": data["ra"],
+        "dec": data["dec"],
+        "m1det": data["m1det"],
+        "m2det": data["m2det"],
+        "chieff": data["chieff"],
+        "dL": data["dL"],
+        "p_pe": p_pe,
+        "redshift": data["redshift"],
+        "m1src": data["m1src"],
+        "m2src": data["m2src"],
+        "chip": chip,
+    }
+    if extras is not None:
+        out["a1"] = extras["a1"]
+        out["a2"] = extras["a2"]
+        out["cost1"] = extras["cost1"]
+        out["cost2"] = extras["cost2"]
+    return out
+
+
+def _apply_chieff_chip_basis(data, amax1_ps, chip, extras):
+    """chieff_chip-basis output columns + the joint (chi_eff, chi_p) prior on p_pe.
+
+    ``p_pe = m1det * p_dL_pe * exp(clip(joint_lnprob, -50, None))`` where
+    ``joint_lnprob = chi_eff_chi_p_prior_logprob(chieff, chip, m1src, m2src,
+    amax=amax_1)`` -- the SAME source-frame mass convention the chieff basis
+    uses.  The joint prior takes a scalar ``amax``, so the (per-event-constant)
+    ``amax_1`` array is grouped by unique value.  Emits the legacy 10 columns
+    plus ``chip`` (and ``a1``/``a2``/``cost1``/``cost2`` when available).
+    """
+    p_pe = data["p_pe"]
+    if p_pe.size > 0:
+        from ..spin import chi_eff_chi_p_prior_logprob
+        logp = np.empty(p_pe.shape, dtype=float)
+        for a in np.unique(amax1_ps):
+            m = amax1_ps == a
+            lp = chi_eff_chi_p_prior_logprob(
+                data["chieff"][m], chip[m], data["m1src"][m], data["m2src"][m],
+                amax=float(a))
+            logp[m] = np.asarray(lp, dtype=float)
+        safe_logp = np.clip(logp, a_min=-50.0, a_max=None)
+        p_pe = p_pe * np.exp(safe_logp)
+    out = {
+        "ra": data["ra"],
+        "dec": data["dec"],
+        "m1det": data["m1det"],
+        "m2det": data["m2det"],
+        "chieff": data["chieff"],
+        "dL": data["dL"],
+        "p_pe": p_pe,
+        "redshift": data["redshift"],
+        "m1src": data["m1src"],
+        "m2src": data["m2src"],
+        "chip": chip,
+    }
+    if extras is not None:
+        out["a1"] = extras["a1"]
+        out["a2"] = extras["a2"]
+        out["cost1"] = extras["cost1"]
+        out["cost2"] = extras["cost2"]
+    return out

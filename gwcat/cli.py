@@ -161,7 +161,9 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Registered export format (default: gwcat2).")
     p_pe.add_argument("--spin-basis", default="chieff",
                       choices=["chieff", "component", "chieff_chip"],
-                      help="Spin basis (only 'chieff' is implemented).")
+                      help="Spin basis: 'chieff' (1-D chi_eff prior), "
+                           "'component' (flat component-spin prior), or "
+                           "'chieff_chip' (joint chi_eff/chi_p prior).")
     p_pe.add_argument("--source-class", default=None,
                       help="bbh / nsbh / bns / massgap / cbc, or a "
                            "canonical class name.")
@@ -185,7 +187,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_pe.add_argument("--nsamp", type=int, default=4096)
     p_pe.add_argument("--seed", type=int, default=0)
     p_pe.add_argument("--z-max", type=float, default=None)
-    p_pe.add_argument("--amax", type=float, default=0.99)
+    p_pe.add_argument("--amax", type=float, default=0.99,
+                      help="chieff-basis chi_eff-prior spin amax "
+                           "(ignored by the component / chieff_chip bases, "
+                           "which read a per-event amax from the store).")
+    p_pe.add_argument("--amax-fallback", type=float, default=0.99,
+                      help="component / chieff_chip fallback spin amax for "
+                           "events whose store meta lacks spin_amax_1/2 "
+                           "(NaN); default 0.99.")
     p_pe.add_argument("--no-summary", action="store_true",
                       help="Skip writing validation_summary.json/.md "
                            "next to --out.")
@@ -355,6 +364,7 @@ def _cmd_export_pe(args) -> int:
         seed=args.seed,
         z_max=args.z_max,
         amax=args.amax,
+        amax_fallback=args.amax_fallback,
     )
     return 0
 

@@ -346,6 +346,15 @@ class GWCatalog:
         check_required(need, self.params, self.avail, self.names,
                        np.asarray(self._sel), self._param_index, export=export)
 
+    def _require_alternatives(self, alternative_groups, export="export"):
+        """Fail loudly if, for any alternative group, no alternative is
+        present+available for a selected event (the "any-of" companion to
+        :meth:`_require_params`); naming the alternatives + events."""
+        from .schema import check_required_alternatives
+        check_required_alternatives(alternative_groups, self.params, self.avail,
+                                    self.names, np.asarray(self._sel),
+                                    self._param_index, export=export)
+
     def event(self, name, params=None):
         i = int(np.nonzero(self.names == name)[0][0])
         a, b = self.offsets[i], self.offsets[i + 1]
