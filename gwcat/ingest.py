@@ -64,6 +64,11 @@ EXTRA_DEFAULT_PARAMS = [
     "iota", "cos_theta_jn",
     "spin_1x", "spin_1y", "spin_1z", "spin_2x", "spin_2y", "spin_2z",
     "network_optimal_snr", "network_matched_filter_snr", "log_likelihood",
+    # Derived precession columns (PR 2).  Stored when the file provides them or
+    # when they can be derived at ingest from tilt_i / spin ingredients (see
+    # _derive_spin_columns); appended at the END so the column order stays
+    # stable for stores written before this PR.
+    "cos_tilt_1", "cos_tilt_2",
 ]
 DEFAULT_PARAMS = WAVEFORM_PARAMS + EXTRA_DEFAULT_PARAMS
 
@@ -111,6 +116,25 @@ SAMPLE_SET_STR_FIELDS = ["sample_set_name", "waveform", "approximant",
                          "file_name", "file_checksum", "record_id"]
 META_FLOAT_FIELDS += SAMPLE_SET_FLOAT_FIELDS
 META_STR_FIELDS += SAMPLE_SET_STR_FIELDS
+
+# ── Spin-prior / derived-column provenance (PR 2) ────────────────────────────
+# Per-event spin metadata.  Explicit-absence defaults follow the PR-2 pattern:
+# NaN for the float fields, "" for the strings.
+#   floats  -> spin_amax_1, spin_amax_2 (resolved analytic spin-magnitude prior
+#              bounds), chi_p_def_maxdiff (max |chi_p_file - chi_p_formula| when
+#              both are available; a definition-consistency diagnostic, NaN when
+#              not computable).
+#   strings -> spin_prior_kind ("uniform_magnitude_isotropic" / "unrecognized" /
+#              "assumed_default"), spin_prior_source (which analysis / raw repr
+#              the resolution came from), derived_params (comma-separated list of
+#              sample columns derived at ingest for this event, may be "").
+# Old stores predate these fields; the read/merge paths NaN/""-fill them (see
+# _read_store, which only reads fields present in the file, and merge_stores,
+# which setdefaults every declared field), so those stores remain loadable.
+SPIN_FLOAT_FIELDS = ["spin_amax_1", "spin_amax_2", "chi_p_def_maxdiff"]
+SPIN_STR_FIELDS = ["spin_prior_kind", "spin_prior_source", "derived_params"]
+META_FLOAT_FIELDS += SPIN_FLOAT_FIELDS
+META_STR_FIELDS += SPIN_STR_FIELDS
 
 # Default waveform priority when no Mixed set exists (O4b/GWTC-5 events).
 O4_WAVEFORM_PRIORITY = [
@@ -384,6 +408,193 @@ def resolve_dL_prior(catalog, analysis, analyses, priors, dL_samples, cfg: Inges
     return H0, Om0, dmin, dmax, "default(no_analytic)"
 
 
+# --------------------------------------------------------------------------
+# Spin-prior resolution + derived spin columns  (PR 2)
+# --------------------------------------------------------------------------
+def _parse_analytic_spin(prior_repr):
+    """Parse a bilby spin-prior repr into ``(kind, minimum, maximum)``.
+
+    Handles reprs such as
+    ``"Uniform(minimum=0.0, maximum=0.99, name='a_1', ...)"`` and
+    ``"Sine(name='tilt_1', minimum=0.0, maximum=3.141592653589793, ...)"``.
+    ``kind`` is the leading distribution class name (e.g. ``"Uniform"``,
+    ``"Sine"``); ``minimum`` / ``maximum`` are ``None`` when absent.  Returns
+    ``None`` when the repr carries no recognisable class or bounds.
+    """
+    s = str(prior_repr).strip()
+    m = re.match(r"([A-Za-z_]\w*)\s*\(", s)
+    if not m:
+        return None
+    kind = m.group(1)
+    lo = re.search(rf"minimum\s*=\s*({_NUM})", s)
+    hi = re.search(rf"maximum\s*=\s*({_NUM})", s)
+    lo = float(lo.group(1)) if lo else None
+    hi = float(hi.group(1)) if hi else None
+    if lo is None and hi is None:
+        return None
+    return kind, lo, hi
+
+
+def resolve_spin_prior(analysis, analyses, priors, a1_samples, a2_samples,
+                       fallback_amax=0.99):
+    """Return ``(amax_1, amax_2, kind, source)`` for the spin-magnitude prior.
+
+    Mirrors :func:`resolve_dL_prior`: read the analytic spin priors of the
+    chosen ``analysis``; if that analysis carries no priors group (e.g. an O4
+    ``Mixed`` set) search the sibling ``analyses`` the same way.
+
+    ``kind`` is ``"uniform_magnitude_isotropic"`` only when both ``a_1`` and
+    ``a_2`` parse as ``Uniform(0, amax_i)`` AND the tilt priors parse as
+    ``Sine`` (or are absent).  Otherwise ``kind`` is ``"unrecognized"`` and the
+    raw repr(s) are recorded in ``source``.  When nothing analytic is found
+    anywhere, fall back to ``amax = fallback_amax`` with
+    ``kind = "assumed_default"``.
+
+    Regardless of how the bounds were obtained, ``max(|a_i samples|)`` is checked
+    against ``amax_i * (1 + 1e-3)``; a violation warns and is noted in
+    ``source`` (the parsed ``amax`` is kept, not clamped).
+    """
+    analytic = priors.get("analytic", {}) if isinstance(priors, dict) else {}
+
+    def _node(an):
+        return analytic.get(an) if isinstance(analytic, dict) else None
+
+    def _find(an):
+        node = _node(an)
+        if not node:
+            return None
+        found = {k: node[k] for k in ("a_1", "a_2", "tilt_1", "tilt_2")
+                 if k in node}
+        return found or None
+
+    found = _find(analysis)
+    src_an = analysis
+    if found is None:
+        for an in analyses:            # sibling search (O4 Mixed w/o priors)
+            found = _find(an)
+            if found is not None:
+                src_an = an
+                break
+
+    def _is_uniform_zero(p):
+        return (p is not None and p[0] == "Uniform"
+                and p[1] is not None and abs(p[1]) <= 1e-9
+                and p[2] is not None)
+
+    def _is_sine_or_absent(p):
+        return p is None or p[0] == "Sine"
+
+    if found is None:
+        amax_1 = amax_2 = float(fallback_amax)
+        kind = "assumed_default"
+        source = "default(no_analytic_prior)"
+    else:
+        p_a1 = _parse_analytic_spin(found["a_1"]) if "a_1" in found else None
+        p_a2 = _parse_analytic_spin(found["a_2"]) if "a_2" in found else None
+        p_t1 = _parse_analytic_spin(found["tilt_1"]) if "tilt_1" in found else None
+        p_t2 = _parse_analytic_spin(found["tilt_2"]) if "tilt_2" in found else None
+        a1_ok = _is_uniform_zero(p_a1)
+        a2_ok = _is_uniform_zero(p_a2)
+        tilts_ok = _is_sine_or_absent(p_t1) and _is_sine_or_absent(p_t2)
+        amax_1 = float(p_a1[2]) if a1_ok else float(fallback_amax)
+        amax_2 = float(p_a2[2]) if a2_ok else float(fallback_amax)
+        if a1_ok and a2_ok and tilts_ok:
+            kind = "uniform_magnitude_isotropic"
+            source = f"analytic[{src_an}]"
+        else:
+            kind = "unrecognized"
+            raw = "; ".join(f"{k}={found[k]!r}"
+                            for k in ("a_1", "a_2", "tilt_1", "tilt_2")
+                            if k in found)
+            source = f"analytic[{src_an}]:unrecognized({raw})"
+
+    # Validate the spin samples against the resolved bounds (warn, don't clamp).
+    viol = []
+    for lbl, samp, amax in (("a_1", a1_samples, amax_1),
+                            ("a_2", a2_samples, amax_2)):
+        if samp is not None and np.size(samp):
+            smax = float(np.nanmax(np.abs(np.asarray(samp, float))))
+            if np.isfinite(smax) and smax > amax * (1 + 1e-3):
+                viol.append(f"{lbl}:max={smax:.4g}>amax={amax:.4g}")
+    if viol:
+        warnings.warn("spin prior: samples exceed resolved amax "
+                      f"({'; '.join(viol)}); prior bounds may be wrong")
+        source += " | sample_exceeds_amax(" + "; ".join(viol) + ")"
+
+    return amax_1, amax_2, kind, source
+
+
+def _chi_p_from_samples(a_1, a_2, cos_tilt_1, cos_tilt_2, mass_1, mass_2):
+    """Effective precession spin ``chi_p`` (Schmidt, Ohme & Hannam 2015) from
+    posterior samples.
+
+    ``q = mass_2 / mass_1`` (the mass ratio; either detector or source frame --
+    only the ratio matters).  ``sin_tilt_i = sqrt(1 - cos_tilt_i**2)``::
+
+        chi_p = max(a_1*sin_tilt_1, q*(4q + 3)/(4 + 3q)*a_2*sin_tilt_2)
+
+    NOTE: this duplicates the shared implementation that will land as
+    ``gwcat.spin.chi_p_from_components`` in a parallel PR.  It is kept
+    self-contained here on purpose (no import from ``gwcat.spin``) to avoid a
+    cross-PR dependency; unify the two once both have merged.
+    """
+    a_1 = np.asarray(a_1, float)
+    a_2 = np.asarray(a_2, float)
+    cos_tilt_1 = np.asarray(cos_tilt_1, float)
+    cos_tilt_2 = np.asarray(cos_tilt_2, float)
+    q = np.asarray(mass_2, float) / np.asarray(mass_1, float)
+    sin_1 = np.sqrt(np.clip(1.0 - cos_tilt_1 ** 2, 0.0, None))
+    sin_2 = np.sqrt(np.clip(1.0 - cos_tilt_2 ** 2, 0.0, None))
+    return np.maximum(a_1 * sin_1,
+                      q * (4.0 * q + 3.0) / (4.0 + 3.0 * q) * a_2 * sin_2)
+
+
+def _derive_spin_columns(rec):
+    """Add derived spin sample columns to a per-event ``rec`` dict *in place*.
+
+    Returns ``(derived_names, chi_p_def_maxdiff)``:
+      * ``cos_tilt_i = cos(tilt_i)`` when ``cos_tilt_i`` is absent and
+        ``tilt_i`` is present.
+      * ``chi_p`` (Schmidt 2015, see :func:`_chi_p_from_samples`) when absent but
+        ``a_1``/``a_2``/``cos_tilt_1``/``cos_tilt_2``/``mass_1``/``mass_2`` are
+        all present (``cos_tilt_i`` may itself have just been derived).
+      * ``chi_p_def_maxdiff``: ``max|chi_p_file - chi_p_formula|`` when the file
+        provides ``chi_p`` AND all the ingredients (a definition-consistency
+        diagnostic).  The file's ``chi_p`` is never overwritten; ``NaN`` when the
+        diagnostic is not computable.
+
+    Only the derived columns and the diagnostic are produced here; the caller
+    records ``derived_names`` / ``chi_p_def_maxdiff`` in the per-event meta and
+    the derived columns are marked available in the store's availability mask
+    (they are ordinary columns of ``rec`` from here on).
+    """
+    derived = []
+    for i in (1, 2):
+        ct, ti = f"cos_tilt_{i}", f"tilt_{i}"
+        if ct not in rec and ti in rec:
+            rec[ct] = np.cos(np.asarray(rec[ti], float))
+            derived.append(ct)
+
+    ingredients = ("a_1", "a_2", "cos_tilt_1", "cos_tilt_2", "mass_1", "mass_2")
+    chi_p_formula = None
+    if all(k in rec for k in ingredients):
+        chi_p_formula = _chi_p_from_samples(
+            rec["a_1"], rec["a_2"], rec["cos_tilt_1"], rec["cos_tilt_2"],
+            rec["mass_1"], rec["mass_2"])
+
+    chi_p_def_maxdiff = np.nan
+    if "chi_p" not in rec:
+        if chi_p_formula is not None:
+            rec["chi_p"] = chi_p_formula
+            derived.append("chi_p")
+    elif chi_p_formula is not None:
+        # File provides chi_p: keep it, record only the definition mismatch.
+        chi_p_def_maxdiff = float(np.max(np.abs(
+            np.asarray(rec["chi_p"], float) - chi_p_formula)))
+
+    return derived, chi_p_def_maxdiff
+
+
 def validate_prior_against_samples(priors, analyses_to_try, H0, Om0, dmin, dmax):
     """If prior 'samples' exist (under any of analyses_to_try), check our
     UniformSourceFrame reproduces their dL density. Returns {ks, n, analysis}
@@ -427,6 +638,10 @@ def inspect(path: str, cfg: Optional[IngestConfig] = None):
                                           H0, Om0, dmin, dmax)
            if cfg.validate_prior else None)
     f_ref = _read_f_ref(data, analysis)
+    a1_samp = np.asarray(s["a_1"], float) if "a_1" in s else None
+    a2_samp = np.asarray(s["a_2"], float) if "a_2" in s else None
+    spin_amax_1, spin_amax_2, spin_kind, spin_src = resolve_spin_prior(
+        analysis, analyses, priors, a1_samp, a2_samp)
     avail = [p for p in DEFAULT_PARAMS if p in s]
     missing = [p for p in WAVEFORM_PARAMS if p not in s]
     info = {
@@ -439,6 +654,9 @@ def inspect(path: str, cfg: Optional[IngestConfig] = None):
         "n_samples": int(dL.size),
         "f_ref": f_ref,
         "dL_prior": {"H0": H0, "Om0": Om0, "min": dmin, "max": dmax, "source": src},
+        # Spin-magnitude prior resolution (PR 2).
+        "spin_prior": {"amax_1": spin_amax_1, "amax_2": spin_amax_2,
+                       "kind": spin_kind, "source": spin_src},
         "prior_validation": val,
         "waveform_params_missing": missing,
         "stored_params_available": avail,
@@ -640,6 +858,15 @@ def build_store(paths, out_path, params=None, extra_params=None,
             p_dL = uniform_source_frame_prob(dL, make_cosmology(H0, Om0),
                                              dmin, dmax)
             rec["p_dL_pe"] = p_dL
+            # Derived spin columns (cos_tilt_i, chi_p) + chi_p definition
+            # diagnostic (PR 2).  Additive: only fills columns the file lacks;
+            # never overwrites the file's chi_p.
+            derived_names, chi_p_def_maxdiff = _derive_spin_columns(rec)
+            # Spin-magnitude prior resolution (PR 2), mirroring resolve_dL_prior.
+            a1_samp = np.asarray(s["a_1"], float) if "a_1" in s else None
+            a2_samp = np.asarray(s["a_2"], float) if "a_2" in s else None
+            spin_amax_1, spin_amax_2, spin_kind, spin_src = resolve_spin_prior(
+                analysis, analyses, priors, a1_samp, a2_samp)
             records.append((name, n, rec))
 
             # metadata
@@ -713,6 +940,13 @@ def build_store(paths, out_path, params=None, extra_params=None,
             meta["dL_prior_max"].append(float(dmax))
             meta["f_ref"].append(float(f_ref) if f_ref else np.nan)
             meta["nsamp_original"].append(float(n))
+            # ── Spin-prior / derived-column provenance (PR 2) ───────────────
+            meta["spin_amax_1"].append(float(spin_amax_1))
+            meta["spin_amax_2"].append(float(spin_amax_2))
+            meta["chi_p_def_maxdiff"].append(float(chi_p_def_maxdiff))
+            meta["spin_prior_kind"].append(spin_kind)
+            meta["spin_prior_source"].append(spin_src)
+            meta["derived_params"].append(",".join(derived_names))
             # Sky area (optional; requires healpy)
             if "ra" in s and "dec" in s:
                 meta["sky_area_90"].append(
@@ -729,8 +963,15 @@ def build_store(paths, out_path, params=None, extra_params=None,
 
     # Assemble the UNION of parameters across events, NaN-filling event slices
     # where a parameter is absent, and build the per-event availability mask.
-    union_params, columns, avail = _assemble_union(
-        records, list(params) + ["p_dL_pe"])
+    # Derived spin columns (PR 2) are appended to the candidate list so they are
+    # stored and correctly marked available even when a caller passed a custom
+    # ``params`` that omitted them (a column absent from every rec is dropped by
+    # _assemble_union, so this is harmless when nothing was derived).
+    candidate_params = list(params) + ["p_dL_pe"]
+    for p in ("cos_tilt_1", "cos_tilt_2", "chi_p"):
+        if p not in candidate_params:
+            candidate_params.append(p)
+    union_params, columns, avail = _assemble_union(records, candidate_params)
 
     _write_store(out_path, union_params, columns, offsets, names, avail, meta, cfg)
     print(f"\nWrote {out_path}: {len(names)} events, "
