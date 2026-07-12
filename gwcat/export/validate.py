@@ -255,8 +255,25 @@ def validate_export_v2(pe_path, selection_path=None, strict=False):
                   "injected_spin_uniform_isotropic"):
             _check(f"sel_has_{a}", a in sel_attrs, f"attr {a!r} missing")
 
-        sel_amax = _amax_bound(sel_attrs.get("injected_spin_amax_detected", []),
-                               sel_attrs.get("chi_eff_amax", []))
+        # Magnitude bound for the range checks.  A campaign's detected amax
+        # only bounds its injections when that campaign's draw really is
+        # uniform-isotropic; a non-uniform campaign (e.g. the O4 sets, where
+        # p(a) is not flat) has no meaningful detected amax and its spins can
+        # extend to the physical limit 1.  So use max(detected amax) only when
+        # EVERY campaign is uniform-isotropic with finite detected amax;
+        # otherwise fall back to the physical bound 1.0.
+        iso = np.asarray(
+            sel_attrs.get("injected_spin_uniform_isotropic", [])).ravel()
+        amax_arr = np.asarray(
+            sel_attrs.get("injected_spin_amax_detected", []),
+            dtype=float).ravel()
+        all_iso = iso.size > 0 and bool(np.all(iso.astype(bool)))
+        all_finite = amax_arr.size > 0 and bool(np.all(np.isfinite(amax_arr)))
+        if all_iso and all_finite:
+            sel_amax = _amax_bound(amax_arr,
+                                   sel_attrs.get("chi_eff_amax", []))
+        else:
+            sel_amax = 1.0
         _range_checks(_check, sel_cols, sel_amax, prefix="sel")
 
         # ── Cross-file contract checks (ALWAYS raise on mismatch) ────────────

@@ -269,3 +269,31 @@ def test_pe_chieff_chip_summary_amax_field(tmp_path):
     sj = json.loads(Path(str(out) + ".validation_summary.json").read_text())
     assert "spin_amax_summary" in sj
     assert "chi_eff_chi_p_amax_per_event" in sj["spin_amax_summary"]
+
+
+# ======================================================================
+# 8. Selection magnitude bound: non-uniform-isotropic campaigns fall back
+#    to the physical limit 1.0 (real O4 sets draw non-uniform spins that
+#    extend past any other campaign's detected amax).
+# ======================================================================
+def test_sel_range_bound_physical_for_non_uniform_campaign(tmp_path):
+    pe = _pe_component(tmp_path)
+    sel = _sel(tmp_path)
+    with h5py.File(sel, "r+") as f:
+        # Mark the (single) campaign as non-uniform-isotropic with an
+        # unreliable detected amax, and push one spin past that amax.
+        f.attrs["injected_spin_uniform_isotropic"] = np.array([False])
+        f.attrs["injected_spin_amax_detected"] = np.array([0.75, 0.75])
+        d = f["a1"][:]
+        d[0] = 0.97          # > 0.75*1.001 but physical (< 1)
+        f["a1"][...] = d
+    results = validate_export_v2(str(pe), str(sel))
+    assert results["sel_a1_range"] is True
+
+    # An unphysical magnitude still fails against the 1.0 bound.
+    with h5py.File(sel, "r+") as f:
+        d = f["a1"][:]
+        d[0] = 1.2
+        f["a1"][...] = d
+    results = validate_export_v2(str(pe), str(sel))
+    assert results["sel_a1_range"] is False
