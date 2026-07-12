@@ -173,3 +173,59 @@ def chi_eff_prior_logprob(chi_eff, m1_source, m2_source, amax=0.99):
     if amax not in _CACHE:
         _CACHE[amax] = ChiEffPrior(amax=amax)
     return _CACHE[amax].logprob(chi_eff, m1_source, m2_source)
+
+
+# ==================================================================
+# χ_p (effective precessing spin) foundations
+# ==================================================================
+def chi_p_from_components(a_1, a_2, cos_tilt_1, cos_tilt_2, mass_1, mass_2):
+    """Effective precessing spin χ_p from component spins (Schmidt et al. 2015).
+
+    Vectorized (numpy broadcasting).  With the *primary* mass ``mass_1`` (the
+    more massive body) and ``q = mass_2 / mass_1 ≤ 1``,
+
+        sin θ_i = sqrt(clip(1 − cos²θ_i, 0, 1))
+        χ_p = max( a_1 sin θ_1 ,  q(4q+3)/(4+3q) · a_2 sin θ_2 ).
+
+    Only the *ratio* mass_2/mass_1 enters, so the masses may be supplied in
+    either the detector or the source frame — the two give an identical χ_p
+    (the redshift factor cancels).  ``mass_1`` is assumed to be the primary
+    (mass_1 ≥ mass_2), matching the Schmidt convention.
+
+    .. note::
+       **Mass-ratio convention trap.**  This function uses the *component*
+       convention ``q = mass_2 / mass_1 ∈ (0, 1]``.  The :class:`ChiEffPrior`
+       grids in this module instead use the *primary-mass-fraction*
+       convention ``q_grid = m1 / (m1 + m2) ∈ [0.5, 1]`` (its ``q_grid``
+       attribute).  The two are related by
+       ``q_grid = 1 / (1 + q)``  ⇔  ``q = (1 − q_grid) / q_grid``.
+       Do not mix them.
+
+    Parameters
+    ----------
+    a_1, a_2 : array_like
+        Dimensionless spin magnitudes of the primary and secondary.
+    cos_tilt_1, cos_tilt_2 : array_like
+        Cosines of the spin-tilt angles (aligned-spin fractions).
+    mass_1, mass_2 : array_like
+        Primary and secondary masses (any frame; only the ratio matters).
+
+    Returns
+    -------
+    float or ndarray
+        χ_p, scalar if all inputs are scalar.
+    """
+    a_1 = np.asarray(a_1, dtype=float)
+    a_2 = np.asarray(a_2, dtype=float)
+    cos_tilt_1 = np.asarray(cos_tilt_1, dtype=float)
+    cos_tilt_2 = np.asarray(cos_tilt_2, dtype=float)
+    mass_1 = np.asarray(mass_1, dtype=float)
+    mass_2 = np.asarray(mass_2, dtype=float)
+
+    q = mass_2 / mass_1
+    k = q * (4.0 * q + 3.0) / (4.0 + 3.0 * q)
+    sin_tilt_1 = np.sqrt(np.clip(1.0 - cos_tilt_1 ** 2, 0.0, 1.0))
+    sin_tilt_2 = np.sqrt(np.clip(1.0 - cos_tilt_2 ** 2, 0.0, 1.0))
+
+    chi_p = np.maximum(a_1 * sin_tilt_1, k * a_2 * sin_tilt_2)
+    return float(chi_p) if chi_p.ndim == 0 else chi_p
