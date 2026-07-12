@@ -17,7 +17,8 @@ Parameter groups (see the handoff "Parameter Schema Contract")::
 
     core_intrinsic:  mass_1, mass_2, mass_ratio, chirp_mass
     core_extrinsic:  luminosity_distance, redshift, ra, dec, theta_jn, psi
-    spin:            a_1, a_2, tilt_1, tilt_2, phi_12, phi_jl, chi_eff, chi_p
+    spin:            a_1, a_2, tilt_1, tilt_2, phi_12, phi_jl, chi_eff, chi_p,
+                     cos_tilt_1, cos_tilt_2
     bns_nsbh:        lambda_1, lambda_2, lambda_tilde, delta_lambda_tilde
     diagnostic:      log_likelihood, log_prior, weights
 
@@ -36,7 +37,7 @@ PARAMETER_GROUPS = {
     "core_extrinsic": ("luminosity_distance", "redshift", "ra", "dec",
                        "theta_jn", "psi"),
     "spin": ("a_1", "a_2", "tilt_1", "tilt_2", "phi_12", "phi_jl",
-             "chi_eff", "chi_p"),
+             "chi_eff", "chi_p", "cos_tilt_1", "cos_tilt_2"),
     "bns_nsbh": ("lambda_1", "lambda_2", "lambda_tilde", "delta_lambda_tilde"),
     "diagnostic": ("log_likelihood", "log_prior", "weights"),
 }
