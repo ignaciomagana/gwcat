@@ -53,6 +53,8 @@ import h5py
 from .cosmology import PLANCK15
 from .source_class import (classify_by_mass, normalize_source_class,
                           resolve_filter_classes, DEFAULT_NSBH_MASS_THRESHOLD)
+from . import selection_spin as _sspin
+from .spin import chi_p_from_components
 
 # Human-readable description of what the exported ``pdraw`` represents after all
 # of the code's manipulations (see the module docstring / to_darksirens).  Both
@@ -170,15 +172,39 @@ class SelectionSet:
         Path to an LVK injection HDF file.
     H0, Om0 : float, optional
         Reference cosmology for dL↔z conversion.  Defaults to Planck15.
+    strict_spin_checks : {"warn", "raise", "off"}, optional
+        Policy for the PR4 read-time spin sanity checks (uniform-azimuth,
+        isotropy, uniform-magnitude ``amax`` detection, factored-vs-joint
+        consistency).  ``"warn"`` (default) records the outcome in
+        ``spin_meta["checks"]`` and emits a :class:`UserWarning` on failure,
+        ``"raise"`` raises :class:`ValueError`, ``"off"`` records silently.
+        ``True``/``False`` are accepted as aliases for ``"raise"``/``"off"``.
     """
 
     def __init__(self, path: str, H0: float = None, Om0: float = None,
-                 nsbh_mass_threshold: float = None):
+                 nsbh_mass_threshold: float = None,
+                 strict_spin_checks: str = "warn"):
         self.path = path
         self.H0 = H0 or PLANCK15.H0.value
         self.Om0 = Om0 or PLANCK15.Om0
         # Whether the caller supplied a non-default reference cosmology.
         self._cosmology_override = (H0 is not None) or (Om0 is not None)
+        # PR4 read-time spin checks: "warn" (default) records + emits a warning
+        # on failure, "raise" raises, "off" records silently.  Normalised here
+        # so an invalid value fails loudly at construction.
+        self._strict_spin_checks = _sspin.normalize_strict_mode(strict_spin_checks)
+        # Additive component-basis spin state (populated on load; None until
+        # then / when unobtainable).  See gwcat.selection_spin.
+        self._a1 = self._a2 = self._cost1 = self._cost2 = None
+        self._chi_p = None
+        self._ln_spin_component = None
+        self._weights = None
+        self._spin_meta = {
+            "spin_format": None,
+            "amax_detected": None,
+            "uniform_isotropic": False,
+            "checks": {},
+        }
         # Source-frame NS/BH mass threshold for source-class filtering of
         # injections.  Defaults to the SAME shared constant used by PE-event
         # classification (gwcat.ingest) so injections and events cannot drift.
@@ -238,18 +264,24 @@ class SelectionSet:
 
         # Spin components (cartesian) and chi_eff.  Prefer the release-provided
         # chi_eff if available, otherwise derive it from the z-components.
-        s1x = _h5_read_field(ev, "spin1x")
-        s1y = _h5_read_field(ev, "spin1y")
-        s1z = _h5_read_field(ev, "spin1z")
-        s2x = _h5_read_field(ev, "spin2x")
-        s2y = _h5_read_field(ev, "spin2y")
-        s2z = _h5_read_field(ev, "spin2z")
+        # Cartesian columns are read verbatim when present (byte-identical to
+        # the pre-PR4 loader); Format-C polar-flavour files that ship only polar
+        # spin columns are supported by deriving the cartesian components from
+        # (a, θ, φ) -- see _read_component_spins.
+        s1x, s1y, s1z, s2x, s2y, s2z = self._read_component_spins(ev)
         if _h5_has_field(ev, "chi_eff"):
             chieff = _h5_read_field(ev, "chi_eff")
         else:
             chieff = (m1src * s1z + m2src * s2z) / (m1src + m2src)
 
         weights = _h5_read_field(ev, "weights")
+
+        # Normalised per-spin (magnitude, cosθ), preferring the file's polar
+        # columns when present (exact), else derived from the cartesian
+        # components (a=|s⃗|, cosθ=s_z/a).  Used by the additive component-basis
+        # spin state and by the polar-joint legacy path below.
+        sa1, scost1, sa2, scost2 = self._read_spin_polar(ev, s1x, s1y, s1z,
+                                                         s2x, s2y, s2z)
 
         # Draw probability in source-frame component masses and redshift, with
         # spins removed.  Older/current-development O4 files may contain a
@@ -261,12 +293,22 @@ class SelectionSet:
             "lnpdraw_mass1_source_mass2_source_redshift_"
             "spin1x_spin1y_spin1z_spin2x_spin2y_spin2z"
         )
+        joint_polar = (
+            "lnpdraw_mass1_source_mass2_source_redshift_"
+            "spin1_magnitude_spin1_polar_angle_spin1_azimuthal_angle_"
+            "spin2_magnitude_spin2_polar_angle_spin2_azimuthal_angle"
+        )
         joint_no_spin_names = [
             "lnpdraw_mass1_source_mass2_source_redshift",
             "lnpdraw_mass1_source_mass2_source_z",
         ]
+        # Track the spin format and the joint log density (when present) for the
+        # additive component-basis spin state computed after this chain.
+        spin_fmt = None
+        ln_pdraw_joint = None
         if _h5_has_field(ev, joint_cart):
             ln_pdraw_joint = _h5_read_field(ev, joint_cart)
+            spin_fmt = "joint_cartesian"
 
             # Analytical 6-D isotropic cartesian spin prior:
             #   p(s1x,s1y,s1z,s2x,s2y,s2z)
@@ -281,8 +323,19 @@ class SelectionSet:
             ln_pdraw_spin6d = -np.log(
                 16.0 * np.pi ** 2 * a1 ** 2 * a2 ** 2 * amax ** 2)
             ln_pdraw_no_spin = ln_pdraw_joint - ln_pdraw_spin6d
+        elif _h5_has_field(ev, joint_polar):
+            # Format-C *polar* flavour: one joint log density in polar spin
+            # coordinates.  Subtract the polar-coordinate form of the SAME
+            # assumed prior the cartesian branch uses, chosen so the polar file
+            # and its equivalent cartesian twin yield identical legacy _pdraw
+            # (derivation in gwcat.selection_spin.ln_pdraw_no_spin_from_polar_joint).
+            ln_pdraw_joint = _h5_read_field(ev, joint_polar)
+            spin_fmt = "joint_polar"
+            ln_pdraw_no_spin = _sspin.ln_pdraw_no_spin_from_polar_joint(
+                ln_pdraw_joint, scost1, scost2, amax=0.99)
         elif any(_h5_has_field(ev, name) for name in joint_no_spin_names):
             ln_pdraw_no_spin, _ = _h5_first_field(ev, joint_no_spin_names)
+            spin_fmt = "joint_no_spin"
         elif (_h5_has_field(ev, "lnpdraw_mass1_source")
               and _h5_has_field(ev, "lnpdraw_mass2_source_GIVEN_mass1_source")
               and (_h5_has_field(ev, "lnpdraw_z")
@@ -294,13 +347,14 @@ class SelectionSet:
                 + _h5_read_field(ev, "lnpdraw_mass2_source_GIVEN_mass1_source")
                 + ln_pdraw_z
             )
+            spin_fmt = "o4_factored"
         else:
             lnp_fields = sorted(
                 name for name in _h5_field_names(ev) if name.startswith("lnpdraw"))
             raise RuntimeError(
                 "Could not construct the spin-free O4 draw PDF. Expected either "
-                f"{joint_cart!r}, one of {joint_no_spin_names!r}, or the "
-                "factored public O4 fields "
+                f"{joint_cart!r}, {joint_polar!r}, one of "
+                f"{joint_no_spin_names!r}, or the factored public O4 fields "
                 "'lnpdraw_mass1_source', "
                 "'lnpdraw_mass2_source_GIVEN_mass1_source', and "
                 "'lnpdraw_z'/'lnpdraw_redshift'. Available lnpdraw fields: "
@@ -376,6 +430,155 @@ class SelectionSet:
         self._pdraw = pdraw
         self._ndraw = ndraw
         self._T_yr = T_yr
+        self._weights = weights
+
+        # ── Additive component-basis spin state (PR4) ──────────────────────
+        self._compute_events_spin_state(
+            ev, spin_fmt, ln_pdraw_no_spin, ln_pdraw_joint,
+            sa1, scost1, sa2, scost2, m1src, m2src)
+
+    # ------------------------------------------------------------------
+    # PR4: component-basis spin helpers (events format)
+    # ------------------------------------------------------------------
+    def _read_component_spins(self, ev):
+        """Return ``(s1x,s1y,s1z,s2x,s2y,s2z)`` cartesian spin components.
+
+        Cartesian columns are read verbatim when present (byte-identical to the
+        pre-PR4 loader).  Format-C polar-flavour files that ship only polar spin
+        columns are supported by reconstructing the cartesian components from
+        ``(a, θ, φ)``; the azimuth defaults to zero if absent (only the
+        z-components, which are azimuth-independent, feed chi_eff).
+        """
+        cart = ["spin1x", "spin1y", "spin1z", "spin2x", "spin2y", "spin2z"]
+        if all(_h5_has_field(ev, k) for k in cart):
+            return tuple(_h5_read_field(ev, k) for k in cart)
+        polar = ["spin1_magnitude", "spin1_polar_angle",
+                 "spin2_magnitude", "spin2_polar_angle"]
+        if all(_h5_has_field(ev, k) for k in polar):
+            a1 = _h5_read_field(ev, "spin1_magnitude")
+            th1 = _h5_read_field(ev, "spin1_polar_angle")
+            a2 = _h5_read_field(ev, "spin2_magnitude")
+            th2 = _h5_read_field(ev, "spin2_polar_angle")
+            ph1 = (_h5_read_field(ev, "spin1_azimuthal_angle")
+                   if _h5_has_field(ev, "spin1_azimuthal_angle")
+                   else np.zeros_like(a1))
+            ph2 = (_h5_read_field(ev, "spin2_azimuthal_angle")
+                   if _h5_has_field(ev, "spin2_azimuthal_angle")
+                   else np.zeros_like(a2))
+            s1z = a1 * np.cos(th1)
+            s2z = a2 * np.cos(th2)
+            s1x = a1 * np.sin(th1) * np.cos(ph1)
+            s1y = a1 * np.sin(th1) * np.sin(ph1)
+            s2x = a2 * np.sin(th2) * np.cos(ph2)
+            s2y = a2 * np.sin(th2) * np.sin(ph2)
+            return s1x, s1y, s1z, s2x, s2y, s2z
+        # Neither representation available: re-raise the original clear error.
+        return tuple(_h5_read_field(ev, k) for k in cart)
+
+    def _read_spin_polar(self, ev, s1x, s1y, s1z, s2x, s2y, s2z):
+        """Return ``(a1, cosθ1, a2, cosθ2)`` preferring the file's polar columns.
+
+        When ``spin{i}_magnitude`` / ``spin{i}_polar_angle`` are present they are
+        used exactly (``a=magnitude``, ``cosθ=cos(polar_angle)``); otherwise the
+        values are derived from the cartesian components.
+        """
+        if (_h5_has_field(ev, "spin1_magnitude")
+                and _h5_has_field(ev, "spin1_polar_angle")
+                and _h5_has_field(ev, "spin2_magnitude")
+                and _h5_has_field(ev, "spin2_polar_angle")):
+            sa1 = _h5_read_field(ev, "spin1_magnitude")
+            scost1 = np.cos(_h5_read_field(ev, "spin1_polar_angle"))
+            sa2 = _h5_read_field(ev, "spin2_magnitude")
+            scost2 = np.cos(_h5_read_field(ev, "spin2_polar_angle"))
+            return sa1, scost1, sa2, scost2
+        sa1, scost1 = _sspin.polar_from_cartesian(s1x, s1y, s1z)
+        sa2, scost2 = _sspin.polar_from_cartesian(s2x, s2y, s2z)
+        return sa1, scost1, sa2, scost2
+
+    def _compute_events_spin_state(self, ev, spin_fmt, ln_pdraw_no_spin,
+                                   ln_pdraw_joint, sa1, scost1, sa2, scost2,
+                                   m1src, m2src):
+        """Populate the additive component-basis spin state for events files.
+
+        Sets ``_a1/_a2/_cost1/_cost2``, ``_chi_p`` and ``_ln_spin_component``
+        (the exact log factor with ``pdraw_component = _pdraw *
+        exp(_ln_spin_component)``), plus ``_spin_meta``.  Never alters ``_pdraw``
+        or any legacy state.
+        """
+        mode = self._strict_spin_checks
+        self._a1, self._cost1 = np.asarray(sa1, float), np.asarray(scost1, float)
+        self._a2, self._cost2 = np.asarray(sa2, float), np.asarray(scost2, float)
+
+        # chi_p: use the file field when present (Format B), else the formula.
+        if _h5_has_field(ev, "chi_p"):
+            self._chi_p = _h5_read_field(ev, "chi_p")
+        else:
+            self._chi_p = chi_p_from_components(
+                self._a1, self._a2, self._cost1, self._cost2, m1src, m2src)
+
+        checks = {}
+        amax_detected = None
+        uniform_isotropic = False
+        ln_spin = None
+
+        if spin_fmt == "o4_factored":
+            have_mag = (_h5_has_field(ev, "lnpdraw_spin1_magnitude")
+                        and _h5_has_field(ev, "lnpdraw_spin2_magnitude"))
+            have_polar = (_h5_has_field(ev, "lnpdraw_spin1_polar_angle")
+                          and _h5_has_field(ev, "lnpdraw_spin2_polar_angle"))
+            if have_mag and have_polar:
+                lnp_mag1 = _h5_read_field(ev, "lnpdraw_spin1_magnitude")
+                lnp_mag2 = _h5_read_field(ev, "lnpdraw_spin2_magnitude")
+                lnp_pol1 = _h5_read_field(ev, "lnpdraw_spin1_polar_angle")
+                lnp_pol2 = _h5_read_field(ev, "lnpdraw_spin2_polar_angle")
+                ln_p_comp = _sspin.ln_p_component_factored(
+                    ln_pdraw_no_spin, lnp_mag1, lnp_pol1, lnp_mag2, lnp_pol2,
+                    scost1, scost2)
+                ln_spin = ln_p_comp - ln_pdraw_no_spin
+
+                # amax auto-detection + isotropy.
+                amax1, uni1 = _sspin.detect_uniform_amax_from_lnmag(lnp_mag1)
+                amax2, uni2 = _sspin.detect_uniform_amax_from_lnmag(lnp_mag2)
+                iso1, dev_i1 = _sspin.check_isotropy_polar(lnp_pol1, scost1)
+                iso2, dev_i2 = _sspin.check_isotropy_polar(lnp_pol2, scost2)
+                amax_detected = (amax1, amax2)
+                uniform_isotropic = bool(uni1 and uni2 and iso1 and iso2)
+                checks["magnitude_uniform"] = (bool(uni1), bool(uni2))
+                checks["isotropy_dev"] = (dev_i1, dev_i2)
+                # Azimuth check (records + acts per strict mode).
+                if (_h5_has_field(ev, "lnpdraw_spin1_azimuthal_angle")
+                        and _h5_has_field(ev, "lnpdraw_spin2_azimuthal_angle")):
+                    az1, dev_a1 = _sspin.check_uniform_azimuth(
+                        _h5_read_field(ev, "lnpdraw_spin1_azimuthal_angle"))
+                    az2, dev_a2 = _sspin.check_uniform_azimuth(
+                        _h5_read_field(ev, "lnpdraw_spin2_azimuthal_angle"))
+                    checks["azimuth_uniform"] = (bool(az1), bool(az2))
+                    checks["azimuth_dev"] = (dev_a1, dev_a2)
+                    _sspin.report_check("azimuth_uniform_spin1", az1,
+                                        f"max|lnp_azim+ln2π|={dev_a1:.3e}",
+                                        mode, self.path)
+                    _sspin.report_check("azimuth_uniform_spin2", az2,
+                                        f"max|lnp_azim+ln2π|={dev_a2:.3e}",
+                                        mode, self.path)
+            # else: factored file without spin lnpdraw columns -> component
+            # spin density unobtainable (ln_spin stays None).
+        elif spin_fmt == "joint_cartesian":
+            ln_p_comp = _sspin.ln_p_component_joint_cartesian(
+                ln_pdraw_joint, sa1, sa2)
+            ln_spin = ln_p_comp - ln_pdraw_no_spin
+        elif spin_fmt == "joint_polar":
+            ln_p_comp = _sspin.ln_p_component_joint_polar(
+                ln_pdraw_joint, scost1, scost2)
+            ln_spin = ln_p_comp - ln_pdraw_no_spin
+        # spin_fmt == "joint_no_spin": no spin draw info -> ln_spin None.
+
+        self._ln_spin_component = ln_spin
+        self._spin_meta = {
+            "spin_format": spin_fmt,
+            "amax_detected": amax_detected,
+            "uniform_isotropic": uniform_isotropic,
+            "checks": checks,
+        }
 
     def _read_injections(self, f):
         """Read the O3 'injections/' format (e.g. endo3_bbhpop files).
@@ -422,7 +625,10 @@ class SelectionSet:
 
         # Injection weights (mixture_weight = 1.0 for single-subpop files)
         if "mixture_weight" in inj:
-            pdraw /= np.asarray(inj["mixture_weight"], float)
+            weights = np.asarray(inj["mixture_weight"], float)
+            pdraw /= weights
+        else:
+            weights = np.ones_like(pdraw)
 
         ndraw = int(f.attrs.get("total_generated",
                                 inj.attrs.get("total_generated", 0)))
@@ -460,6 +666,84 @@ class SelectionSet:
         self._pdraw = pdraw
         self._ndraw = ndraw
         self._T_yr = T_yr
+        self._weights = weights
+
+        # ── Additive component-basis spin state (PR4, Format A / endo3) ────
+        self._compute_injections_spin_state(inj, ln_pdraw_no_spin, p_mass, p_z,
+                                             m1src, m2src)
+
+    def _compute_injections_spin_state(self, inj, ln_pdraw_no_spin,
+                                       p_mass, p_z, m1src, m2src):
+        """Populate the additive component-basis spin state for endo3 files.
+
+        Format A stores LINEAR densities with cartesian, isotropic
+        uniform-magnitude spins.  Per spin ``p(a,cosθ) = 2π·a²·p_cart``; the
+        component density follows from the joint ``sampling_pdf`` (or the
+        per-spin cartesian sampling pdfs).  ``_ln_spin_component`` is set to
+        ``None`` when the spin marginal is unobtainable.
+        """
+        mode = self._strict_spin_checks
+
+        cart = ["spin1x", "spin1y", "spin1z", "spin2x", "spin2y", "spin2z"]
+        have_cart = all(k in inj for k in cart)
+        if have_cart:
+            s1x, s1y, s1z = (np.asarray(inj[k], float) for k in cart[:3])
+            s2x, s2y, s2z = (np.asarray(inj[k], float) for k in cart[3:])
+            self._a1, self._cost1 = _sspin.polar_from_cartesian(s1x, s1y, s1z)
+            self._a2, self._cost2 = _sspin.polar_from_cartesian(s2x, s2y, s2z)
+            self._chi_p = chi_p_from_components(
+                self._a1, self._a2, self._cost1, self._cost2, m1src, m2src)
+
+        checks = {}
+        amax_detected = None
+        uniform_isotropic = False
+        ln_spin = None
+
+        spd1_key = "spin1x_spin1y_spin1z_sampling_pdf"
+        spd2_key = "spin2x_spin2y_spin2z_sampling_pdf"
+        have_spin_pdf = spd1_key in inj and spd2_key in inj
+
+        if have_cart and "sampling_pdf" in inj:
+            # Component density straight from the joint sampling_pdf (exact even
+            # for mixtures): ln p_comp = ln(joint) + 2 ln 2π + 2 ln a1 + 2 ln a2.
+            ln_joint = np.log(np.maximum(
+                np.asarray(inj["sampling_pdf"], float), 1e-300))
+            ln_p_comp = _sspin.ln_p_component_joint_cartesian(
+                ln_joint, self._a1, self._a2)
+            ln_spin = ln_p_comp - ln_pdraw_no_spin
+        elif have_cart and have_spin_pdf:
+            # Fall back to the factored per-spin cartesian marginals.
+            spd1 = np.asarray(inj[spd1_key], float)
+            spd2 = np.asarray(inj[spd2_key], float)
+            ln_spin = (_sspin.ln_p_spin_cart_component(spd1, self._a1)
+                       + _sspin.ln_p_spin_cart_component(spd2, self._a2))
+
+        # amax / uniform-isotropic detection from the per-spin cartesian pdfs.
+        if have_cart and have_spin_pdf:
+            spd1 = np.asarray(inj[spd1_key], float)
+            spd2 = np.asarray(inj[spd2_key], float)
+            ms1, uni1 = _sspin.detect_max_spin_cart(spd1, self._a1)
+            ms2, uni2 = _sspin.detect_max_spin_cart(spd2, self._a2)
+            amax_detected = (ms1, ms2)
+            uniform_isotropic = bool(uni1 and uni2)
+            checks["max_spin_uniform"] = (bool(uni1), bool(uni2))
+            # Consistency of the factored product vs the joint sampling_pdf.
+            if "sampling_pdf" in inj:
+                ok, dev = _sspin.check_factored_vs_joint(
+                    np.asarray(inj["sampling_pdf"], float), p_mass, p_z,
+                    spd1, spd2)
+                checks["factored_vs_joint_dev"] = dev
+                _sspin.report_check(
+                    "factored_vs_joint", ok,
+                    f"max rel dev={dev:.3e}", mode, self.path)
+
+        self._ln_spin_component = ln_spin
+        self._spin_meta = {
+            "spin_format": "endo3_factored",
+            "amax_detected": amax_detected,
+            "uniform_isotropic": uniform_isotropic,
+            "checks": checks,
+        }
 
     # ------------------------------------------------------------------
     # Detection cut
@@ -509,6 +793,75 @@ class SelectionSet:
     def detection_efficiency(self, far_threshold: float = 1.0) -> float:
         """Fraction of injections detected at the given FAR threshold."""
         return self.detected_mask(far_threshold).sum() / self.n_injections
+
+    # ── PR4 component-basis spin accessors (additive, read-only) ───────────
+    @property
+    def component_spin_available(self) -> bool:
+        """Whether an exact component-basis spin draw density was recovered.
+
+        ``True`` iff ``_ln_spin_component`` is populated, i.e. the file carried
+        enough spin-draw information for the exact ``(a1,a2,cosθ1,cosθ2)``
+        conversion (all formats except the spin-free joint key and a factored
+        file lacking the per-spin spin lnpdraw columns).
+        """
+        self._load()
+        return self._ln_spin_component is not None
+
+    @property
+    def spin_meta(self) -> dict:
+        """Copy of the component-spin metadata dict (format, amax, checks)."""
+        self._load()
+        return dict(self._spin_meta)
+
+    @property
+    def a1(self):
+        """Primary spin magnitude ``a1`` (None if not derivable)."""
+        self._load()
+        return self._a1
+
+    @property
+    def a2(self):
+        """Secondary spin magnitude ``a2`` (None if not derivable)."""
+        self._load()
+        return self._a2
+
+    @property
+    def cost1(self):
+        """Primary spin tilt cosine ``cosθ1`` (None if not derivable)."""
+        self._load()
+        return self._cost1
+
+    @property
+    def cost2(self):
+        """Secondary spin tilt cosine ``cosθ2`` (None if not derivable)."""
+        self._load()
+        return self._cost2
+
+    @property
+    def chi_p(self):
+        """Effective precessing spin ``χ_p`` (file field or Schmidt formula)."""
+        self._load()
+        return self._chi_p
+
+    @property
+    def ln_spin_component(self):
+        """Log factor s.t. ``pdraw_component = _pdraw * exp(ln_spin_component)``.
+
+        ``None`` when the component-basis spin draw density is unobtainable.
+        """
+        self._load()
+        return self._ln_spin_component
+
+    def component_pdraw(self):
+        """Exact per-year component-basis draw density in (m1det,q,dL,a1,a2,
+        cosθ1,cosθ2), weight-divided.  Requires ``component_spin_available``.
+        """
+        self._load()
+        if self._ln_spin_component is None:
+            raise ValueError(
+                f"Component-basis spin draw density unavailable for {self.path} "
+                f"(spin_format={self._spin_meta.get('spin_format')!r}).")
+        return self._pdraw * np.exp(self._ln_spin_component)
 
     # ------------------------------------------------------------------
     # Export
@@ -697,6 +1050,49 @@ class CombinedSelectionSet:
     def detection_efficiency(self, far_threshold: float = 1.0) -> float:
         n_det = sum(int(s.detected_mask(far_threshold).sum()) for s in self._sets)
         return n_det / self.n_injections
+
+    # ── PR4 per-campaign component-basis spin access ───────────────────────
+    @property
+    def spin_meta(self) -> list:
+        """Per-campaign ``spin_meta`` dicts, in campaign order."""
+        return [s.spin_meta for s in self._sets]
+
+    @property
+    def component_spin_available(self) -> bool:
+        """True iff every campaign carries an exact component-basis spin draw."""
+        return all(s.component_spin_available for s in self._sets)
+
+    def component_spin_arrays(self, far_threshold: float = 1.0,
+                              source_class=None) -> dict:
+        """Concatenated per-campaign spin arrays for the future builder.
+
+        Mirrors the ``keep = detected & source_class`` masking and the
+        campaign ordering of :meth:`to_darksirens` (empty campaigns skipped), so
+        the returned arrays align element-for-element with the combined export's
+        internals.  Each of ``a1, a2, cost1, cost2, chi_p, ln_spin_component`` is
+        a concatenated array, or ``None`` if any contributing campaign lacks it.
+        ``ln_spin_component`` is per-injection and unaffected by the Essick
+        ``N_k/N_total`` reweighting (which only scales ``_pdraw``).
+        """
+        for s in self._sets:
+            s._load()
+        keys = ["a1", "a2", "cost1", "cost2", "chi_p", "ln_spin_component"]
+        attr = {"a1": "_a1", "a2": "_a2", "cost1": "_cost1", "cost2": "_cost2",
+                "chi_p": "_chi_p", "ln_spin_component": "_ln_spin_component"}
+        parts = {k: [] for k in keys}
+        available = {k: True for k in keys}
+        for s in self._sets:
+            keep = s.detected_mask(far_threshold) & s.source_class_mask(source_class)
+            if not keep.any():
+                continue
+            for k in keys:
+                arr = getattr(s, attr[k])
+                if arr is None:
+                    available[k] = False
+                else:
+                    parts[k].append(np.asarray(arr)[keep])
+        return {k: (np.concatenate(parts[k]) if available[k] and parts[k]
+                    else None) for k in keys}
 
     # ------------------------------------------------------------------
     # Export
@@ -890,3 +1286,67 @@ class CombinedSelectionSet:
         print(f"Wrote {out_path}: n_det={n_det_total}, ndraw={ndraw_total}, "
               f"FAR<{far_threshold}, campaigns={len(self._sets)}")
         return out_path
+
+
+# ======================================================================
+# PR4: mixture-flavour cross-check
+# ======================================================================
+def crosscheck_mixture_flavors(path_polar, path_cartesian, rtol=1e-9,
+                               strict_spin_checks="off"):
+    """Cross-check the two "completely equivalent" Format-C mixture flavours.
+
+    Loads the polar-flavour and cartesian-flavour files as
+    :class:`SelectionSet` objects (which share the same underlying draws in the
+    same order) and compares:
+
+    * the exact **component-basis** draw density
+      ``pdraw_component = _pdraw · exp(_ln_spin_component)``, which must agree to
+      ``rtol`` -- this is the key invariance the component conversions must
+      satisfy; and
+    * the **legacy** ``_pdraw``, which the polar-joint subtraction is
+      constructed to make byte-comparable to the cartesian branch.
+
+    Returns a report dict.  Raises :class:`ValueError` if either comparison
+    exceeds ``rtol`` or if a component-basis density is unobtainable.
+    """
+    sp = SelectionSet(path_polar, strict_spin_checks=strict_spin_checks)
+    sc = SelectionSet(path_cartesian, strict_spin_checks=strict_spin_checks)
+    sp._load()
+    sc._load()
+
+    if sp._ln_spin_component is None or sc._ln_spin_component is None:
+        raise ValueError(
+            "crosscheck_mixture_flavors: component-basis spin density "
+            f"unavailable (polar={sp._spin_meta.get('spin_format')!r}, "
+            f"cartesian={sc._spin_meta.get('spin_format')!r}).")
+    if sp._pdraw.shape != sc._pdraw.shape:
+        raise ValueError(
+            "crosscheck_mixture_flavors: flavour files differ in length "
+            f"({sp._pdraw.shape} vs {sc._pdraw.shape}).")
+
+    comp_p = sp.component_pdraw()
+    comp_c = sc.component_pdraw()
+
+    def _max_rel(a, b):
+        denom = np.where(np.abs(b) > 0, np.abs(b), 1.0)
+        return float(np.max(np.abs(a - b) / denom)) if a.size else 0.0
+
+    comp_dev = _max_rel(comp_p, comp_c)
+    legacy_dev = _max_rel(sp._pdraw, sc._pdraw)
+    report = {
+        "n": int(sp._pdraw.size),
+        "component_pdraw_max_rel_dev": comp_dev,
+        "legacy_pdraw_max_rel_dev": legacy_dev,
+        "rtol": float(rtol),
+        "component_pdraw_ok": bool(comp_dev <= rtol),
+        "legacy_pdraw_ok": bool(legacy_dev <= rtol),
+        "spin_format_polar": sp._spin_meta.get("spin_format"),
+        "spin_format_cartesian": sc._spin_meta.get("spin_format"),
+    }
+    if not (report["component_pdraw_ok"] and report["legacy_pdraw_ok"]):
+        raise ValueError(
+            "crosscheck_mixture_flavors mismatch: "
+            f"component_pdraw max rel dev={comp_dev:.3e}, "
+            f"legacy_pdraw max rel dev={legacy_dev:.3e} (rtol={rtol:.1e}). "
+            f"Report: {report}")
+    return report
