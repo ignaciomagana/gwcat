@@ -199,6 +199,45 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Skip writing validation_summary.json/.md "
                            "next to --out.")
 
+    p_xsel = xsub.add_parser(
+        "selection",
+        help="Export a gwcat2 selection file (gwcat-selection-2.0) from one or "
+             "more injection files (build_selection_product + writer).")
+    p_xsel.add_argument("injections", nargs="+", metavar="INJ",
+                        help="One or more LVK injection HDF5 files. More than "
+                             "one is combined (Essick et al. fractions).")
+    p_xsel.add_argument("--out", required=True, metavar="OUT.h5")
+    p_xsel.add_argument("--format", default="gwcat2",
+                        help="Registered export format (default: gwcat2).")
+    p_xsel.add_argument("--spin-basis", default="component",
+                        choices=["component", "chieff", "chieff_chip"],
+                        help="Spin basis: 'component' (exact component-spin "
+                             "draw retained; default), 'chieff' (1-D chi_eff "
+                             "swap, matches the legacy selection export), or "
+                             "'chieff_chip' (joint chi_eff/chi_p prior; "
+                             "single-uniform-isotropic campaigns only).")
+    p_xsel.add_argument("--far-threshold", type=float, default=1.0,
+                        metavar="FAR_YR")
+    p_xsel.add_argument("--source-class", default=None,
+                        help="bbh / nsbh / bns / massgap / cbc, or a canonical "
+                             "class name.")
+    p_xsel.add_argument("--amax", type=float, default=0.99,
+                        help="chieff-basis chi_eff-prior spin amax (ignored by "
+                             "'component'; 'chieff_chip' uses each campaign's "
+                             "detected amax).")
+    p_xsel.add_argument("--snr-threshold", type=float, default=None,
+                        metavar="SNR",
+                        help="Optional OR-branch: detection = far-detected OR "
+                             "(snr > SNR) via the cumulative-mixture "
+                             "semianalytic SNR column. Default: FAR cut only.")
+    p_xsel.add_argument("--H0", type=float, default=None,
+                        help="Reference cosmology (default: Planck15) applied "
+                             "to every injection file.")
+    p_xsel.add_argument("--Om0", type=float, default=None)
+    p_xsel.add_argument("--no-summary", action="store_true",
+                        help="Skip writing validation_summary.json/.md "
+                             "next to --out.")
+
     xsub.add_parser(
         "list-formats",
         help="List the registered (format, kind) export writers.")
@@ -336,6 +375,8 @@ def _cmd_export_darksirens(args) -> int:
 def _cmd_export(args) -> int:
     if args.export_command == "pe":
         return _cmd_export_pe(args)
+    if args.export_command == "selection":
+        return _cmd_export_selection(args)
     if args.export_command == "list-formats":
         return _cmd_export_list_formats(args)
     return 2  # pragma: no cover -- argparse requires a valid subcommand
@@ -365,6 +406,30 @@ def _cmd_export_pe(args) -> int:
         z_max=args.z_max,
         amax=args.amax,
         amax_fallback=args.amax_fallback,
+    )
+    return 0
+
+
+def _cmd_export_selection(args) -> int:
+    from .selection import SelectionSet, CombinedSelectionSet
+
+    kwargs = {}
+    if args.H0 is not None:
+        kwargs["H0"] = args.H0
+    if args.Om0 is not None:
+        kwargs["Om0"] = args.Om0
+
+    sets = [SelectionSet(path, **kwargs) for path in args.injections]
+    target = sets[0] if len(sets) == 1 else CombinedSelectionSet(sets)
+    target.export(
+        args.out,
+        format=args.format,
+        spin_basis=args.spin_basis,
+        write_summary=not args.no_summary,
+        far_threshold=args.far_threshold,
+        source_class=_parse_source_class(args.source_class),
+        amax=args.amax,
+        snr_threshold=args.snr_threshold,
     )
     return 0
 

@@ -21,6 +21,7 @@ from __future__ import annotations
 from .product import ExportProduct
 from .registry import register_exporter, get_exporter, list_formats
 from .pe_builder import build_pe_product
+from .selection_builder import build_selection_product, SpinBasisError
 
 # Import writer modules for their registration side effects (module-level
 # @register_exporter decorators populate the registry).
@@ -29,6 +30,8 @@ from . import writers_gwcat2  # noqa: F401
 __all__ = [
     "export",
     "build_pe_product",
+    "build_selection_product",
+    "SpinBasisError",
     "ExportProduct",
     "register_exporter",
     "get_exporter",
@@ -36,44 +39,50 @@ __all__ = [
 ]
 
 
-def export(obj, out_path, format="gwcat2", spin_basis="chieff",
+def export(obj, out_path, format="gwcat2", spin_basis=None,
            write_summary=False, summary_context=None, **builder_kwargs):
     """Export ``obj`` to ``out_path``, dispatching on the object's type.
 
     Parameters
     ----------
-    obj : gwcat.catalog.GWCatalog
-        The object to export.  Selection objects
+    obj : gwcat.catalog.GWCatalog or selection object
+        A :class:`~gwcat.catalog.GWCatalog` (PE export) or a selection object
         (:class:`~gwcat.selection.SelectionSet` /
-        :class:`~gwcat.selection.CombinedSelectionSet`) are not yet supported
-        and raise :class:`NotImplementedError` (they land in a later PR).
+        :class:`~gwcat.selection.CombinedSelectionSet`).
     out_path : str or path-like
         Destination path.
     format : str, default "gwcat2"
         Registered export format.
-    spin_basis : str, default "chieff"
-        Spin basis for a PE export (only ``"chieff"`` is implemented).
+    spin_basis : str, optional
+        Spin basis.  Defaults to ``"chieff"`` for a PE export and
+        ``"component"`` for a selection export (each type's own default) when
+        left as ``None``.
     write_summary : bool, default False
         Write a validation summary next to ``out_path``.
     summary_context : dict, optional
         Extra fields merged into the validation summary.
     **builder_kwargs
-        Forwarded to :func:`build_pe_product`.
+        Forwarded to the type's builder (:func:`build_pe_product` or
+        :func:`build_selection_product`).
     """
     from ..catalog import GWCatalog
 
     if isinstance(obj, GWCatalog):
-        return obj.export(out_path, format=format, spin_basis=spin_basis,
+        return obj.export(out_path, format=format,
+                          spin_basis="chieff" if spin_basis is None
+                          else spin_basis,
                           write_summary=write_summary,
                           summary_context=summary_context, **builder_kwargs)
 
     from ..selection import SelectionSet, CombinedSelectionSet
     if isinstance(obj, (SelectionSet, CombinedSelectionSet)):
-        raise NotImplementedError(
-            "export() for selection objects (SelectionSet / "
-            "CombinedSelectionSet) is not implemented yet; it lands in a "
-            "follow-up PR. Use SelectionSet.to_darksirens for now.")
+        return obj.export(out_path, format=format,
+                          spin_basis="component" if spin_basis is None
+                          else spin_basis,
+                          write_summary=write_summary,
+                          summary_context=summary_context, **builder_kwargs)
 
     raise TypeError(
         f"export() does not support objects of type "
-        f"{type(obj).__name__!r}; pass a GWCatalog.")
+        f"{type(obj).__name__!r}; pass a GWCatalog or a SelectionSet / "
+        f"CombinedSelectionSet.")

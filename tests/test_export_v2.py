@@ -345,21 +345,19 @@ def test_unknown_spin_basis_raises_value_error(tmp_path):
                          cosmology=(67.74, 0.3089))
 
 
-def test_export_selection_object_not_implemented(tmp_path):
-    """Top-level export() on a selection object raises NotImplementedError."""
+def test_export_selection_object_dispatches(tmp_path):
+    """Top-level export() on a selection object dispatches to the selection
+    builder + writer (PR5), producing a gwcat-selection-2.0 file."""
     from gwcat.selection import SelectionSet
 
-    # A minimal SelectionSet instance is awkward to build; instead assert the
-    # dispatch branch directly with a lightweight stand-in that is an instance
-    # of SelectionSet via __class__ override is brittle -- so build a real one
-    # from a tiny injection file.
     _O4_FIELDS = [
         ("mass1_source", "f8"), ("mass2_source", "f8"),
         ("mass1_detector", "f8"), ("mass2_detector", "f8"),
         ("luminosity_distance", "f8"), ("z", "f8"),
         ("dluminosity_distance_dredshift", "f8"),
         ("right_ascension", "f8"), ("declination", "f8"),
-        ("spin1z", "f8"), ("spin2z", "f8"),
+        ("spin1x", "f8"), ("spin1y", "f8"), ("spin1z", "f8"),
+        ("spin2x", "f8"), ("spin2y", "f8"), ("spin2z", "f8"),
         ("chi_eff", "f8"), ("weights", "f8"),
         ("lnpdraw_mass1_source", "f8"),
         ("lnpdraw_mass2_source_GIVEN_mass1_source", "f8"),
@@ -384,8 +382,14 @@ def test_export_selection_object_not_implemented(tmp_path):
         f.create_dataset("events", data=ev)
 
     sel = SelectionSet(str(inj))
-    with pytest.raises(NotImplementedError, match="selection"):
-        export(sel, str(tmp_path / "out.h5"))
+    # This minimal fixture has no per-spin draw columns, so the default
+    # component basis is unavailable; the chieff basis (1-D chi_eff swap)
+    # needs only chi_eff and works.
+    out = tmp_path / "out.h5"
+    export(sel, str(out), spin_basis="chieff")
+    with h5py.File(out, "r") as f:
+        assert f.attrs["format_version"] == "gwcat-selection-2.0"
+        assert f.attrs["spin_basis"] == "chieff"
 
 
 # ==========================================================================

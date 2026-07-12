@@ -67,6 +67,34 @@ PDRAW_STATE = (
     "weights. Detector-frame masses in Msun, dL in Mpc."
 )
 
+# ── Per-basis pdraw_state strings for the "gwcat-selection-2.0" writer ─────────
+# Each describes truthfully what the exported ``pdraw`` represents in that spin
+# basis.  ``chieff`` reuses the legacy PDRAW_STATE verbatim (the v2 chieff export
+# reproduces the v1 pdraw array exactly).
+PDRAW_STATE_CHIEFF = PDRAW_STATE
+
+PDRAW_STATE_COMPONENT = (
+    "draw_density_in_(m1det,q,dL,a1,a2,cost1,cost2)_basis; the per-injection "
+    "component spin draw (spin magnitudes a_i and tilt cosines cosθ_i, spin "
+    "azimuths marginalised out) is RETAINED exactly -- it is NOT swapped for a "
+    "chi_eff prior; normalised by T_obs and injection weights. Detector-frame "
+    "masses in Msun, dL in Mpc."
+)
+
+PDRAW_STATE_CHIEFF_CHIP = (
+    "draw_density_in_(m1det,q,dL)_basis_with_2D_(chi_eff,chi_p)_prior_included; "
+    "per-injection spin draw removed at load and replaced by the isotropic joint "
+    "(chi_eff, chi_p) prior on export (chi_eff/chi_p swap); normalised by T_obs "
+    "and injection weights. Detector-frame masses in Msun, dL in Mpc."
+)
+
+# pdraw_state keyed by spin basis (used by gwcat.export.selection_builder).
+PDRAW_STATE_BY_BASIS = {
+    "chieff": PDRAW_STATE_CHIEFF,
+    "component": PDRAW_STATE_COMPONENT,
+    "chieff_chip": PDRAW_STATE_CHIEFF_CHIP,
+}
+
 # Note recorded whenever a source-class filter subsets the injections: this is
 # subsetting (Essick et al.), NOT a reweighting, so ndraw is left unchanged.
 SOURCE_CLASS_FILTER_NOTE = (
@@ -111,43 +139,65 @@ def _h5_first_field(table, names, dtype=float):
     )
 
 
+def _selection_provenance_dict(source_class, nsbh_mass_threshold,
+                               n_before, n_after, far_columns, far_threshold):
+    """Return the PR9 pdraw / source-class / significance provenance as a dict.
+
+    Single source of truth for the provenance attrs written by BOTH the frozen
+    v1 :meth:`SelectionSet.to_darksirens` / :meth:`CombinedSelectionSet.to_darksirens`
+    exporters (via :func:`_write_selection_provenance`) and the versioned
+    "gwcat-selection-2.0" selection builder.  Values are plain scalars / numpy
+    arrays (the ``significance_columns`` array already carries the HDF5 string
+    dtype) so either code path can assign them to ``h5py`` attrs directly.
+    Records truthfully what the code did; it changes none of the math.
+    """
+    d = {}
+    # ── pdraw state (v1 default; the v2 builder overrides per spin basis) ───
+    d["pdraw_state"] = PDRAW_STATE
+
+    # ── Source-class filter provenance ─────────────────────────────────────
+    d["source_class_filter"] = (
+        "" if source_class is None
+        else (str(source_class) if isinstance(source_class, (str, bytes))
+              else ",".join(str(x) for x in source_class)))
+    d["source_class_method"] = (
+        "none" if source_class is None else "mass_threshold")
+    d["nsbh_mass_threshold"] = float(nsbh_mass_threshold)
+    d["n_injections_before_filter"] = int(n_before)
+    d["n_injections_after_filter"] = int(n_after)
+    if source_class is not None:
+        d["source_class_filter_note"] = SOURCE_CLASS_FILTER_NOTE
+
+    # ── Search / significance provenance (explicit-absence, per the FAR
+    #    contract): record which columns/pipelines were thresholded, the
+    #    threshold applied, and that no per-injection p_astro was used. ──────
+    cols = [str(c) for c in (far_columns or [])]
+    d["significance_columns"] = np.array(cols, dtype=h5py.string_dtype())
+    d["significance_type"] = "far"
+    d["significance_far_threshold"] = float(far_threshold)
+    d["significance_available"] = bool(len(cols) > 0)
+    # No per-injection p_astro is read/used for thresholding here; record the
+    # absence explicitly rather than pretending it exists.
+    d["p_astro_available"] = False
+    return d
+
+
 def _write_selection_provenance(f, source_class, nsbh_mass_threshold,
                                 n_before, n_after, far_columns, far_threshold):
     """Write the PR9 pdraw / source-class / significance provenance attrs.
 
     Shared by :meth:`SelectionSet.to_darksirens` and
     :meth:`CombinedSelectionSet.to_darksirens` so the two exporters record the
-    same contract in the same way.  Records truthfully what the code did; it
-    changes none of the math.
+    same contract in the same way.  A thin wrapper over
+    :func:`_selection_provenance_dict` (the shared source of truth) that writes
+    each item to ``f.attrs``; assigning the ``significance_columns`` string
+    array via ``f.attrs[...] =`` is byte-equivalent to the previous
+    ``f.attrs.create`` call, so v1 output is unchanged.
     """
-    # ── pdraw state ────────────────────────────────────────────────────────
-    f.attrs["pdraw_state"] = PDRAW_STATE
-
-    # ── Source-class filter provenance ─────────────────────────────────────
-    f.attrs["source_class_filter"] = (
-        "" if source_class is None
-        else (str(source_class) if isinstance(source_class, (str, bytes))
-              else ",".join(str(x) for x in source_class)))
-    f.attrs["source_class_method"] = (
-        "none" if source_class is None else "mass_threshold")
-    f.attrs["nsbh_mass_threshold"] = float(nsbh_mass_threshold)
-    f.attrs["n_injections_before_filter"] = int(n_before)
-    f.attrs["n_injections_after_filter"] = int(n_after)
-    if source_class is not None:
-        f.attrs["source_class_filter_note"] = SOURCE_CLASS_FILTER_NOTE
-
-    # ── Search / significance provenance (explicit-absence, per the FAR
-    #    contract): record which columns/pipelines were thresholded, the
-    #    threshold applied, and that no per-injection p_astro was used. ──────
-    cols = [str(c) for c in (far_columns or [])]
-    f.attrs.create("significance_columns",
-                   np.array(cols, dtype=h5py.string_dtype()))
-    f.attrs["significance_type"] = "far"
-    f.attrs["significance_far_threshold"] = float(far_threshold)
-    f.attrs["significance_available"] = bool(len(cols) > 0)
-    # No per-injection p_astro is read/used for thresholding here; record the
-    # absence explicitly rather than pretending it exists.
-    f.attrs["p_astro_available"] = False
+    for k, v in _selection_provenance_dict(
+            source_class, nsbh_mass_threshold, n_before, n_after,
+            far_columns, far_threshold).items():
+        f.attrs[k] = v
 
 
 def _ddL_dz(z, dL_mpc, H0, Om0):
@@ -1003,6 +1053,30 @@ class SelectionSet:
               f"source_class={source_class}")
         return out_path
 
+    def export(self, out_path, format="gwcat2", spin_basis="component",
+               write_summary=False, summary_context=None, **builder_kwargs):
+        """Export via the versioned :mod:`gwcat.export` pipeline (PR5).
+
+        Thin dispatch mirroring :meth:`gwcat.catalog.GWCatalog.export`: build a
+        selection :class:`~gwcat.export.product.ExportProduct` (which owns all
+        the physics -- detection cut, source-class subsetting, the per-basis
+        spin factor and the Essick fractions), look up the ``(format,
+        "selection")`` writer, and serialize.  The file carries
+        ``format_version="gwcat-selection-2.0"``.
+
+        For ``spin_basis="chieff"`` the exported ``pdraw`` array is
+        byte-identical to :meth:`to_darksirens` with the same kwargs (the
+        legacy 1-D chi_eff swap).  ``**builder_kwargs`` are forwarded to
+        :func:`gwcat.export.build_selection_product` (``far_threshold``,
+        ``source_class``, ``amax``, ``snr_threshold``, ``strict``).
+        """
+        from .export import build_selection_product, get_exporter
+        product = build_selection_product(self, spin_basis=spin_basis,
+                                          **builder_kwargs)
+        writer = get_exporter(format, "selection")
+        return writer(product, out_path, write_summary=write_summary,
+                      summary_context=summary_context)
+
 
 class CombinedSelectionSet:
     """Combine injection sets from multiple observing campaigns.
@@ -1286,6 +1360,22 @@ class CombinedSelectionSet:
         print(f"Wrote {out_path}: n_det={n_det_total}, ndraw={ndraw_total}, "
               f"FAR<{far_threshold}, campaigns={len(self._sets)}")
         return out_path
+
+    def export(self, out_path, format="gwcat2", spin_basis="component",
+               write_summary=False, summary_context=None, **builder_kwargs):
+        """Export the combined campaigns via the versioned pipeline (PR5).
+
+        Thin dispatch to :func:`gwcat.export.build_selection_product` over all
+        campaigns (Essick ``N_k/N_total`` fractions applied per campaign before
+        concatenation, exactly as :meth:`to_darksirens`), then the registered
+        ``(format, "selection")`` writer.  See :meth:`SelectionSet.export`.
+        """
+        from .export import build_selection_product, get_exporter
+        product = build_selection_product(self._sets, spin_basis=spin_basis,
+                                          **builder_kwargs)
+        writer = get_exporter(format, "selection")
+        return writer(product, out_path, write_summary=write_summary,
+                      summary_context=summary_context)
 
 
 # ======================================================================
