@@ -32,16 +32,21 @@ O1O2_CANONICAL = [
 
 
 def test_bundled_population_names_are_canonical_and_stable():
-    validate_bbh_allowed_names(expected_total=259, expected_o4b_count=103)
+    validate_bbh_allowed_names(expected_total=259, expected_o4b_count=104)
     assert BBH_O1O2 == O1O2_CANONICAL
     assert len(BBH_ALL) == 259
     assert all(re.fullmatch(r"GW\d{6}_\d{6}", name) for name in BBH_ALL)
 
 
-def test_gw190814_is_intentionally_retained_by_population_membership():
-    assert "GW190814_211039" in BBH_ALL
-    assert "GW190814" not in NON_BBH_EXCLUSIONS
-    assert "GW190814_211039" not in NON_BBH_EXCLUSIONS
+def test_gw190814_is_excluded_and_gw240525_included():
+    # GW190814_211039 (lower-mass-gap) is outside the GWTC-5 BBH population
+    # sample; GW240525_031210 is a confirmed O4b BBH (official GWTC5_BBH.txt).
+    # These two guard against the compensating-count bug where dropping the real
+    # BBH and keeping the mass-gap event both left the total at 259.
+    assert "GW190814_211039" not in BBH_ALL
+    assert "GW190814_211039" in NON_BBH_EXCLUSIONS
+    assert "GW240525_031210" in BBH_ALL
+    assert "GW240525_031210" not in NON_BBH_EXCLUSIONS
 
 
 def test_historical_short_aliases_resolve_to_timestamped_names():

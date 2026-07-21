@@ -7,9 +7,10 @@ without fuzzy matching and provides a single entry point for selecting the
 bundled 259-event GWTC-5 BBH/mass-gap population sample.
 
 The bundled population list is authoritative membership. It must not be
-intersected with the generic source-mass classifier after name selection:
-``GW190814_211039`` is intentionally retained by the population event list even
-when PE-median classification labels it NSBH or mass-gap.
+intersected with the generic source-mass classifier after name selection: the
+list already encodes the official GWTC-5.0 BBH population membership, including
+borderline BBH that a PE-median mass cut might drop, and excluding the
+``GW190814_211039`` lower-mass-gap system.
 """
 from __future__ import annotations
 
@@ -108,9 +109,9 @@ def resolve_gwtc5_bbh_population_names(
     available_names: Iterable[str],
     *,
     expected_total: int = 259,
-    expected_o4b_count: int = 103,
+    expected_o4b_count: int = 104,
 ) -> tuple[list[str], dict[str, str]]:
-    """Resolve the bundled GWTC-5 BBH/mass-gap population list locally."""
+    """Resolve the bundled GWTC-5 BBH population list locally."""
     validate_bbh_allowed_names(
         expected_total=expected_total,
         expected_o4b_count=expected_o4b_count,
@@ -129,12 +130,12 @@ def select_gwtc5_bbh_population(
     waveform_policy: str = "mixed-first",
     approximant: str | None = None,
 ) -> tuple["GWCatalog", dict[str, str]]:
-    """Select the authoritative 259-event GWTC-5 BBH/mass-gap sample.
+    """Select the authoritative 259-event GWTC-5 BBH sample.
 
     This applies only the bundled event membership and waveform policy. It does
-    not reapply ``source_class='bbh'`` because that would incorrectly remove
-    population members such as ``GW190814_211039`` under the strict generic
-    source-mass classifier.
+    not reapply ``source_class='bbh'`` because the bundled list is already the
+    authoritative population membership; re-running the generic source-mass
+    classifier could drop borderline BBH that the official sample retains.
     """
     resolved, aliases = resolve_gwtc5_bbh_population_names(catalog.names)
     view = catalog.select(

@@ -28,11 +28,12 @@ Usage
 GWTC-5.0 context (arxiv:2605.27225, submitted 26 May 2026)
 -----------------------------------------------------------
 - O4b ran 2024 Apr 10 – 2025 Jan 28
-- 103 non-excluded O4b events are retained by the static/cache BBH sample
-- Combined O1–O4b: 259 BBH/mass-gap events with PE measurements
+- 104 O4b events, the full official Event_list/GWTC5_BBH.txt
+- Combined O1–O4b: 259 BBH events with PE measurements
 - Explicit non-BBH exclusions include BNS/NSBH events such as
   GW190425_232155, GW200105_162426, GW200115_042309,
-  GW230518_125908, and GW230529_181500
+  GW230518_125908, and GW230529_181500, plus the GW190814_211039
+  lower-mass-gap system (excluded from the BBH population sample)
 """
 from __future__ import annotations
 
@@ -114,26 +115,45 @@ KNOWN_NON_BBH_NAMES = NON_BBH_EXCLUSIONS
 
 def validate_bbh_allowed_names(
     expected_total: int = 259,
-    expected_o4b_count: int = 103,
+    expected_o4b_count: int = 104,
 ) -> None:
     """Validate the static BBH whitelist against GWTC-5 expectations.
 
     Checks that the raw static sections have no duplicate names, that the
     combined :data:`BBH_ALL` whitelist contains no explicit non-BBH exclusions,
-    and that the populated O4b/static counts match the expected GWTC-5 sample.
+    that the populated O4b/static counts match the expected GWTC-5 sample, and
+    that the two historically-contested events land on the correct side of the
+    whitelist (a *membership* check, not just a count: two compensating
+    count errors can otherwise pass the totals while corrupting the sample).
 
     Parameters
     ----------
     expected_total : int
         Expected number of events in :data:`BBH_ALL` once O4b is populated.
     expected_o4b_count : int
-        Expected number of non-excluded O4b names in the static/cache sample.
+        Expected number of non-excluded O4b names in the static/cache sample
+        (the full official Event_list/GWTC5_BBH.txt = 104).
 
     Raises
     ------
     AssertionError
         If any whitelist invariant is violated.
     """
+    # Membership invariants that a pure count check cannot catch.  Keep these in
+    # sync with the official GWTC-5.0 population Event_list.
+    MUST_INCLUDE = {"GW240525_031210"}  # confirmed O4b BBH in GWTC5_BBH.txt
+    MUST_EXCLUDE = {"GW190814_211039"}  # lower-mass-gap system, not in the BBH sample
+    bbh_set = set(BBH_ALL)
+    missing_required = sorted(MUST_INCLUDE - bbh_set)
+    if missing_required:
+        raise AssertionError(
+            f"confirmed BBH names missing from BBH_ALL: {missing_required}"
+        )
+    wrongly_present = sorted(MUST_EXCLUDE & bbh_set)
+    if wrongly_present:
+        raise AssertionError(
+            f"non-BBH-population names present in BBH_ALL: {wrongly_present}"
+        )
     grouped_names = BBH_O1O2 + BBH_O3A + BBH_O3B + BBH_O4A + BBH_O4B
     duplicate_grouped = sorted(
         {name for name in grouped_names if grouped_names.count(name) > 1}
