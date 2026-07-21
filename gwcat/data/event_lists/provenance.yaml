@@ -7,8 +7,10 @@
 # available.
 #
 # The list is authoritative for population membership. It is not equivalent to
-# reapplying the generic source-mass classifier to PE medians: in particular,
-# GW190814_211039 is intentionally retained as a mass-gap population event.
+# reapplying the generic source-mass classifier to PE medians. The membership
+# matches the official GWTC-5.0 population Event_list (GWTC5_BBH.txt +
+# GWTC4.1_BBH.txt for O4, plus the GWTC-1/2.1/3 BBH tables for O1-O3), with the
+# GW190814_211039 lower-mass-gap system excluded (arXiv:2605.27225).
 #
 # format: one canonical event name per line; blank lines and #-comments ignored.
 
@@ -23,10 +25,10 @@ lists:
     count: 10
   bbh_o3a.txt:
     observing_runs: [O3a]
-    source: "GWTC-2.1 / GWTC-3 population data-release BBH/mass-gap sample."
+    source: "GWTC-2.1 / GWTC-3 population data-release BBH sample (GW190814_211039 excluded)."
     reference: "arXiv:2108.01045 (GWTC-2.1), arXiv:2111.03606 (GWTC-3)"
     filtered_by: non_bbh_exclusions.txt
-    count: 37
+    count: 36
   bbh_o3b.txt:
     observing_runs: [O3b]
     source: "GWTC-3 population data-release BBH/mass-gap sample."
@@ -49,13 +51,14 @@ lists:
 exclusions:
   non_bbh_exclusions.txt:
     purpose: >
-      Names outside the authoritative 259-event GWTC-5 BBH/mass-gap
-      population sample. GW190814_211039 is deliberately retained even when a
-      generic source-mass classifier labels it NSBH or mass-gap.
+      Names outside the authoritative 259-event GWTC-5 BBH population sample:
+      established BNS/NSBH events plus the GW190814_211039 lower-mass-gap system
+      (excluded from the BBH population analysis). GW240525_031210 is a confirmed
+      O4b BBH in the official GWTC5_BBH.txt and is NOT excluded.
     reference: "GWTC-1..GWTC-5.0 population event tables"
 
 # Aggregate expectations validated by
 # gwcat.bbh_allowed_names.validate_bbh_allowed_names().
 expected:
   bbh_all_total: 259
-  o4b_non_excluded: 103
+  o4b_non_excluded: 104

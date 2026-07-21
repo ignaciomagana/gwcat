@@ -1,14 +1,18 @@
 # Names that must never be admitted to the GWTC-5 BBH population whitelist.
-# Established BNS/NSBH events outside the bundled 259-event population sample.
-# GW190814_211039 is intentionally retained as a mass-gap population event.
+# Established BNS/NSBH events plus the GW190814 lower-mass-gap system, all of
+# which lie outside the authoritative 259-event GWTC-5 BBH population sample.
+# GW190814_211039 is EXCLUDED (its ~2.6 Msun secondary sits in the lower mass
+# gap and is omitted from the GWTC-5 BBH population analysis; see arXiv:2605.27225,
+# consistent with the GWTC-3 treatment). GW240525_031210 is NOT excluded here:
+# it is a confirmed O4b BBH in the official Event_list/GWTC5_BBH.txt.
 # Format: event_name  # optional note
 GW170817  # BNS (GWTC-1)
 GW190425  # BNS short-form, if seen in filenames
 GW190425_232155  # BNS (GWTC-2.1)
 GW190426_152155  # NSBH candidate (GWTC-2.1)
+GW190814_211039  # lower-mass-gap system excluded from the BBH population sample
 GW190917_114630  # NSBH candidate (GWTC-2.1)
 GW200105_162426  # NSBH (GWTC-3)
 GW200115_042309  # NSBH (GWTC-3)
 GW230518_125908  # NSBH (GWTC-4.1)
 GW230529_181500  # NSBH / mass-gap event outside the BBH population sample
-GW240525_031210  # excluded to keep the static O4b sample aligned with 103 events
