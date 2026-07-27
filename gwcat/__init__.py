@@ -19,15 +19,18 @@ from .ingest import (build_store, merge_store, merge_stores, inspect,
                      IngestConfig, DEFAULT_PARAMS)
 from .selection import SelectionSet, CombinedSelectionSet
 from .source_class import (SOURCE_CLASSES, SourceClassMeta,
-                          normalize_source_class, resolve_filter_classes,
-                          load_event_list)
+                           normalize_source_class, resolve_filter_classes,
+                           load_event_list)
+from .population_samples import (resolve_event_name_aliases,
+                                 resolve_gwtc5_bbh_population_names,
+                                 select_gwtc5_bbh_population)
 from .schema import (PARAMETER_GROUPS, EXPORT_REQUIREMENTS, DARKSIRENS_REQUIRED,
-                    MissingParameterError, required_params)
+                     MissingParameterError, required_params)
 from .waveform_policy import WAVEFORM_POLICIES, resolve_policy
 from .manifests import (list_releases, get_manifest, validate_manifest,
-                        ManifestValidationError)
+                         ManifestValidationError)
 from .event_metadata import (assemble_event_metadata, metadata_diagnostics,
-                            load_user_overrides)
+                             load_user_overrides)
 # Re-export the versioned-export builder/registry API. Deliberately NOT the
 # top-level `export()` function: binding that name here would shadow the
 # `gwcat.export` submodule so `gwcat.export.export(...)` would break. Call it
@@ -53,6 +56,8 @@ __all__ = [
     "validate_export",
     "SOURCE_CLASSES", "SourceClassMeta", "normalize_source_class",
     "resolve_filter_classes", "load_event_list",
+    "resolve_event_name_aliases", "resolve_gwtc5_bbh_population_names",
+    "select_gwtc5_bbh_population",
     "PARAMETER_GROUPS", "EXPORT_REQUIREMENTS", "DARKSIRENS_REQUIRED",
     "MissingParameterError", "required_params",
     "WAVEFORM_POLICIES", "resolve_policy",
