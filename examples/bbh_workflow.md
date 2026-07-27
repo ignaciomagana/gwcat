@@ -7,8 +7,10 @@ offline synthetic workflow, see `examples/tutorial_fake_data.md`.
 The public PE directories contain more files than the 259-event GWTC-5
 BBH/mass-gap population sample. Population membership is defined by the bundled
 canonical event list, not by counting raw files and not by reapplying the
-generic source-mass classifier after the name selection. In particular,
-`GW190814_211039` is intentionally retained by the population list.
+generic source-mass classifier after the name selection. As of the whitelist
+fix (#11), `GW190814_211039` is EXCLUDED from the population list and
+`GW240525_031210` is included; the canonical list in the package is the single
+source of truth.
 
 ```bash
 # 1. Download PE files and injection sets.
@@ -42,8 +44,8 @@ for old, new in aliases.items():
 PY
 
 # 5. Export PE samples using authoritative event membership. Do not add
-#    --source-class bbh here: the generic mass classifier would remove
-#    GW190814_211039 from the intended population sample.
+#    --source-class bbh here: membership comes from the canonical list alone,
+#    and reapplying the generic mass classifier could disagree with it.
 gwcat export-darksirens store.h5 \
     --out gw_gwtc5_population.h5 \
     --event-list gwtc5_bbh_population.txt \
