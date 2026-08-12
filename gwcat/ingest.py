@@ -100,6 +100,11 @@ META_FLOAT_FIELDS = [
     # analytic group declares, and the KS of that declared class against the
     # file's own prior samples (NaN when the file carries none).
     "dL_prior_alpha", "dL_prior_sampling_alpha", "dL_prior_ks",
+    # parsed mass-prior bounds (GW-07).  The real releases put the prior on
+    # (chirp_mass, mass_ratio) and record mass_1/mass_2 only as Constraints, so
+    # these are the bounds that actually describe the mass prior.
+    "mass_prior_chirp_min", "mass_prior_chirp_max",
+    "mass_prior_q_min", "mass_prior_q_max",
 ]
 META_STR_FIELDS = [
     "name", "catalog", "analysis_used", "dL_prior_source",
@@ -116,6 +121,11 @@ META_STR_FIELDS = [
     # token ("Planck15_LAL" vs "Planck15" -- matched exactly, never by substring).
     "dL_prior_kind", "dL_prior_sampling_kind", "dL_prior_cosmology_name",
     "dL_prior_release_flavour", "dL_prior_basis",
+    # where f_ref came from, e.g. "meta_data[C01:IMRPhenomXPHM]:sibling" (GW-07).
+    # Spins, tilts and chi_p are all defined AT f_ref, so a borrowed value has to
+    # say whose it is.  mass_prior_source likewise records which analysis's
+    # analytic mass prior was parsed, and whether it was recognised.
+    "f_ref_source", "mass_prior_source",
     # source-class contract
     "release", "observing_run", "source_class", "source_class_method",
     "source_class_reference", "metadata_source",
@@ -137,7 +147,12 @@ META_STR_FIELDS = [
 SAMPLE_SET_FLOAT_FIELDS = ["is_mixed", "is_preferred", "priority_rank"]
 SAMPLE_SET_STR_FIELDS = ["sample_set_name", "waveform", "approximant",
                          "calibration_model", "selection_reason",
-                         "file_name", "file_checksum", "record_id"]
+                         "file_name", "file_checksum", "record_id",
+                         # spin-variant suffix of the label, e.g. "HighSpin" /
+                         # "LowSpinSecondary" / "" (GW-07).  A restricted-spin
+                         # variant is a DIFFERENT prior, so which one was
+                         # ingested has to be on the row.
+                         "spin_variant"]
 META_FLOAT_FIELDS += SAMPLE_SET_FLOAT_FIELDS
 META_STR_FIELDS += SAMPLE_SET_STR_FIELDS
 
@@ -183,6 +198,11 @@ class IngestConfig:
     #: "auto" prefers bilby (the object the LVK PE used) and falls back to
     #: astropy only when bilby is not installed; "bilby"/"astropy" pin it.
     dL_prior_impl: str = "auto"
+    #: Accept an analytic spin prior borrowed from a sibling analysis with a
+    #: DIFFERENT spin variant (GW-07).  Off by default: a LowSpin(Secondary) run
+    #: restricts a_2 to U(0, 0.05) while HighSpin uses U(0, 0.99), so a
+    #: mismatched borrow inflates the secondary's prior support ~20x.
+    spin_prior_allow_variant_mismatch: bool = False
     #: KS threshold above which the file's own prior samples are taken to reject
     #: the parsed distance prior (GW-02).  This compares the SAMPLING class the
     #: file declares against its own prior draws, so exceeding it means the parse
@@ -238,27 +258,103 @@ def _read_event_pesummary(path: str):
     return data, samples_dict, analyses, priors
 
 
+#: Spin-variant suffixes real releases append to an analysis label, most
+#: preferred first.  GWTC-4.1 labels the combined sets ``C00:Mixed:HighSpin`` and
+#: ``C00:Mixed:LowSpinSecondary``; an exact match on ``"C00:Mixed"`` finds
+#: neither.  Preference order matters and is a physics choice: the high-spin
+#: (unrestricted) run is the general-purpose posterior, and the low-spin runs are
+#: restricted-prior variants published alongside it for NSBH/BNS candidates.
+SPIN_VARIANT_PRIORITY = ("HighSpin", "", "LowSpinSecondary", "LowSpin")
+
+
+def _label_parts(label: str):
+    """``"C00:Mixed:HighSpin"`` -> ``("C00", "Mixed", "HighSpin")``."""
+    bits = str(label).split(":")
+    prefix = bits[0] if bits else ""
+    base = bits[1] if len(bits) > 1 else ""
+    variant = ":".join(bits[2:]) if len(bits) > 2 else ""
+    return prefix, base, variant
+
+
+def _variant_rank(variant: str) -> int:
+    """Index of ``variant`` in :data:`SPIN_VARIANT_PRIORITY` (unknown last)."""
+    try:
+        return SPIN_VARIANT_PRIORITY.index(variant)
+    except ValueError:
+        return len(SPIN_VARIANT_PRIORITY)
+
+
+def _spin_variant_token(variant: str) -> str:
+    """The spin-restriction token inside a possibly compound variant.
+
+    GWTC-3 labels NSBH events with compound variants such as
+    ``C01:Mixed:NSBH:HighSpin``, where the spin restriction is only one component.
+    Comparing raw variant strings would treat ``"NSBH:HighSpin"`` and
+    ``"HighSpin"`` as different spin priors when they are the same one.
+    """
+    parts = [p for p in str(variant).split(":") if p]
+    for tok in SPIN_VARIANT_PRIORITY:
+        if tok and tok in parts:
+            return tok
+    return ""
+
+
+def find_mixed_analyses(analyses, prefix: str):
+    """Every combined ("Mixed") set for ``prefix``, best spin variant first.
+
+    Matches ``{prefix}:Mixed`` and any ``{prefix}:Mixed:<variant>``.  The
+    pre-GW-07 code tested ``f"{prefix}:Mixed" in analyses`` exactly, so on a real
+    GWTC-4.1 file offering ``C00:Mixed:HighSpin`` and
+    ``C00:Mixed:LowSpinSecondary`` it found no Mixed set, fell through the
+    waveform-priority list (which lists only unsuffixed labels, so it also
+    missed), and landed on the ``startswith`` last resort -- which returns
+    whatever h5py yields first.  For GW230529_181500 that is
+    ``C00:IMRPhenomNSBH``, an aligned-spin NSBH approximant, chosen over three
+    available Mixed sets, and the reason recorded for it was
+    ``"preferred_priority"``.
+    """
+    cands = []
+    for a in analyses:
+        pfx, base, variant = _label_parts(a)
+        if pfx == prefix and base == "Mixed":
+            cands.append((_variant_rank(variant), a))
+    # stable: ties keep the file's own order
+    return [a for _r, a in sorted(cands, key=lambda t: t[0])]
+
+
+def _priority_matches(analyses, priority):
+    """Priority-list hits, allowing a spin-variant suffix on each entry.
+
+    ``priority`` entries are unsuffixed (``"C00:SEOBNRv5PHM"``), but real labels
+    may carry a variant (``"C00:SEOBNRv5PHM:HighSpin"``).  Matching only exactly
+    is why a suffixed file skipped the whole list.
+    """
+    out = []
+    for want in priority:
+        w_pfx, w_base, _ = _label_parts(want)
+        hits = []
+        for a in analyses:
+            pfx, base, variant = _label_parts(a)
+            if (pfx, base) == (w_pfx, w_base):
+                hits.append((_variant_rank(variant), a))
+        out.extend(a for _r, a in sorted(hits, key=lambda t: t[0]))
+    return out
+
+
 def select_analysis(analyses, prefix: str, cfg: IngestConfig):
     """Pick the single preferred analysis label for one PE file.
 
     This is the historical one-sample-set-per-event heuristic (kept as the
-    default): prefer the combined ``{prefix}:Mixed`` set; else walk the
-    configured waveform-priority list; else fall back to the first analysis
+    default): prefer a combined ``Mixed`` set -- including the spin-variant
+    spellings real releases use, see :func:`find_mixed_analyses` -- else walk the
+    configured waveform-priority list, else fall back to the first analysis
     carrying the file's prefix.  :func:`select_analyses` builds on it to support
     ingesting several sample sets per event.
     """
-    mixed = f"{prefix}:Mixed"
-    if mixed in analyses:
-        return mixed
-    priority = cfg.o3_waveform_priority if prefix == "C01" else cfg.o4_waveform_priority
-    for a in priority:
-        if a in analyses:
-            return a
-    # last resort: first non-meta analysis
-    for a in analyses:
-        if a.startswith(prefix):
-            return a
-    raise RuntimeError(f"No usable analysis among {analyses}")
+    ordered = rank_analyses(analyses, prefix, cfg)
+    if not ordered:
+        raise RuntimeError(f"No usable analysis among {analyses}")
+    return ordered[0]
 
 
 def rank_analyses(analyses, prefix: str, cfg: IngestConfig):
@@ -269,14 +365,16 @@ def rank_analyses(analyses, prefix: str, cfg: IngestConfig):
     their original order.  The index into this list becomes each sample set's
     ``priority_rank``; the first element is what :func:`select_analysis` returns.
     """
-    prefixed = [a for a in analyses if a.startswith(prefix)]
+    prefixed = [a for a in analyses if _label_parts(a)[0] == prefix]
     priority = cfg.o3_waveform_priority if prefix == "C01" else cfg.o4_waveform_priority
     ordered = []
-    mixed = f"{prefix}:Mixed"
-    if mixed in prefixed:
-        ordered.append(mixed)
-    for a in priority:
-        if a in prefixed and a not in ordered:
+    # Every Mixed set first, best spin variant first (GW-07).
+    for a in find_mixed_analyses(prefixed, prefix):
+        if a not in ordered:
+            ordered.append(a)
+    # Then the waveform-priority list, tolerating spin-variant suffixes.
+    for a in _priority_matches(prefixed, priority):
+        if a not in ordered:
             ordered.append(a)
     for a in prefixed:
         if a not in ordered:
@@ -320,21 +418,33 @@ def select_analyses(analyses, prefix: str, cfg: IngestConfig,
     return wanted
 
 
+#: Hyphenated CONFIGURATION suffixes that may be stripped to get a waveform
+#: family.  A whitelist, because a hyphen is also part of real waveform *names*:
+#: splitting on the first ``'-'`` unconditionally maps
+#: ``IMRPhenomPv2-NRTidalv2`` to ``IMRPhenomPv2``, i.e. reports a BBH
+#: approximant for a tidal one, which is a different waveform model and not the
+#: family a ``strict-approximant`` request means (GW-07).
+WAVEFORM_CONFIG_SUFFIXES = ("SpinTaylor",)
+
+
 def _waveform_family(approximant: str) -> str:
     """Coarse waveform family from an approximant/analysis token.
 
-    ``'IMRPhenomXPHM-SpinTaylor' -> 'IMRPhenomXPHM'``;
-    ``'SEOBNRv5PHM' -> 'SEOBNRv5PHM'``; ``'Mixed' -> 'Mixed'``.  Splits off a
-    trailing configuration suffix after the first ``'-'`` so a
-    ``strict-approximant`` request on the bare family still matches.
+    ``'IMRPhenomXPHM-SpinTaylor' -> 'IMRPhenomXPHM'`` (a configuration suffix);
+    ``'IMRPhenomPv2-NRTidalv2' -> 'IMRPhenomPv2-NRTidalv2'`` (part of the name);
+    ``'SEOBNRv5PHM' -> 'SEOBNRv5PHM'``; ``'Mixed' -> 'Mixed'``.
     """
     if not approximant:
         return ""
-    return approximant.split("-", 1)[0]
+    head, sep, tail = approximant.rpartition("-")
+    if sep and tail in WAVEFORM_CONFIG_SUFFIXES:
+        return head
+    return approximant
 
 
 def _sample_set_meta(analysis: str, preferred_label: str, ranked, path: str,
-                     sample_sets, provenance: Optional[dict] = None) -> dict:
+                     sample_sets, provenance: Optional[dict] = None,
+                     priority_labels=()) -> dict:
     """Per-row sample-set provenance for one ingested analysis label.
 
     ``is_preferred`` marks the label the default (single-set) heuristic would
@@ -345,15 +455,31 @@ def _sample_set_meta(analysis: str, preferred_label: str, ranked, path: str,
     basename -- see ``build_store(file_provenance=...)``, PR 8) supplies them.
     """
     provenance = provenance or {}
-    approximant = analysis.split(":", 1)[1] if ":" in analysis else analysis
-    is_mixed = 1.0 if "mixed" in analysis.lower() else 0.0
+    # Split the label properly: "C00:Mixed:HighSpin" is approximant "Mixed" with
+    # spin variant "HighSpin", not an approximant literally called
+    # "Mixed:HighSpin" (which is what split(":", 1)[1] produced).
+    _pfx, approximant, spin_variant = _label_parts(analysis)
+    if not approximant:
+        approximant = analysis
+    is_mixed = 1.0 if approximant.lower() == "mixed" else 0.0
     is_preferred = 1.0 if analysis == preferred_label else 0.0
     try:
         rank = float(list(ranked).index(analysis))
     except ValueError:
         rank = np.nan
     if is_preferred:
-        reason = "preferred_mixed" if is_mixed else "preferred_priority"
+        # Say which rule actually fired.  The pre-GW-07 code reported
+        # "preferred_priority" whenever the label was not a Mixed set -- including
+        # when it came from the startswith LAST RESORT, i.e. "whatever h5py
+        # yielded first". For GW230529_181500 that recorded
+        # selection_reason="preferred_priority" for C00:IMRPhenomNSBH, an
+        # aligned-spin NSBH approximant picked over three available Mixed sets.
+        if is_mixed:
+            reason = "preferred_mixed"
+        elif analysis in tuple(priority_labels):
+            reason = "preferred_priority"
+        else:
+            reason = "preferred_last_resort"
     elif isinstance(sample_sets, str) and sample_sets == "all":
         reason = "ingested_all"
     else:
@@ -362,6 +488,7 @@ def _sample_set_meta(analysis: str, preferred_label: str, ranked, path: str,
         sample_set_name=analysis,
         waveform=_waveform_family(approximant),
         approximant=approximant,
+        spin_variant=spin_variant,
         calibration_model="",
         record_id=str(provenance.get("record_id", "")),
         file_name=os.path.basename(path),
@@ -678,33 +805,125 @@ def _parse_analytic_spin(prior_repr):
     """Parse a bilby spin-prior repr into ``(kind, minimum, maximum)``.
 
     Handles reprs such as
-    ``"Uniform(minimum=0.0, maximum=0.99, name='a_1', ...)"`` and
-    ``"Sine(name='tilt_1', minimum=0.0, maximum=3.141592653589793, ...)"``.
-    ``kind`` is the leading distribution class name (e.g. ``"Uniform"``,
-    ``"Sine"``); ``minimum`` / ``maximum`` are ``None`` when absent.  Returns
-    ``None`` when the repr carries no recognisable class or bounds.
+    ``"Uniform(minimum=0.0, maximum=0.99, name='a_1', ...)"``,
+    ``"Sine(name='tilt_1', minimum=0.0, maximum=3.141592653589793, ...)"`` and
+    the dotted spelling the O4 releases use,
+    ``"bilby.gw.prior.UniformInComponentsChirpMass(minimum=..., ...)"``.
+    ``kind`` is the distribution class name with any module path stripped;
+    ``minimum`` / ``maximum`` are ``None`` when absent.  Returns ``None`` when
+    the repr carries no recognisable class or bounds.
+
+    The class regex is a ``search`` for the first ``Name(``, not a ``match``
+    anchored at the string start: anchoring rejected every dotted repr outright
+    (GW-07).  Bounds are read with :func:`_balanced_arg` so a nested repr's
+    ``minimum=`` cannot be picked up instead.
     """
     s = str(prior_repr).strip()
-    m = re.match(r"([A-Za-z_]\w*)\s*\(", s)
+    m = re.search(r"([A-Za-z_]\w*)\s*\(", s)
     if not m:
         return None
     kind = m.group(1)
-    lo = re.search(rf"minimum\s*=\s*({_NUM})", s)
-    hi = re.search(rf"maximum\s*=\s*({_NUM})", s)
-    lo = float(lo.group(1)) if lo else None
-    hi = float(hi.group(1)) if hi else None
+
+    def _num(key):
+        v = _balanced_arg(s, key)
+        if v is None:
+            return None
+        mm = re.match(rf"^\(?\s*({_NUM})", v)
+        return float(mm.group(1)) if mm else None
+
+    lo = _num("minimum")
+    hi = _num("maximum")
     if lo is None and hi is None:
         return None
     return kind, lo, hi
 
 
+class SpinPriorMismatchError(ValueError):
+    """The only analytic spin prior available belongs to a different spin variant."""
+
+
+#: The analytic mass-prior pair that IS uniform in detector-frame component
+#: masses.  bilby's ``UniformInComponents*`` classes exist precisely to make
+#: sampling in ``(chirp_mass, mass_ratio)`` equivalent to a flat prior in
+#: ``(m1, m2)``, which is the assumption the exported ``p_pe = m1det * p_dL_pe``
+#: Jacobian encodes.  Verified across all four releases.
+_UNIFORM_IN_COMPONENTS = ("UniformInComponentsChirpMass",
+                          "UniformInComponentsMassRatio")
+
+
+@dataclass(frozen=True)
+class ResolvedMassPrior:
+    """The analytic mass prior, parsed rather than assumed (GW-07).
+
+    ``kind == "uniform_detector_frame"`` is the only value that justifies the
+    ``|dm2det/dq| = m1det`` Jacobian applied at export.  Anything else is
+    recorded as ``"unrecognized"`` with the raw reprs in ``source``, so the
+    Jacobian's assumption becomes checkable instead of being stamped as a
+    constant string.
+    """
+    kind: str = "unrecognized"
+    chirp_min: Optional[float] = None
+    chirp_max: Optional[float] = None
+    q_min: Optional[float] = None
+    q_max: Optional[float] = None
+    source: str = ""
+
+
+def resolve_mass_prior(analysis, analyses, priors):
+    """Parse the analytic mass prior for one ingested analysis.
+
+    Searches the chosen analysis then its siblings, exactly as the distance and
+    spin priors do (a combined ``Mixed`` set carries no analytic group of its
+    own).  Real releases record ``mass_1``/``mass_2`` as ``Constraint(1, 1000)``
+    -- a *constraint*, not a prior -- with the actual prior on
+    ``(chirp_mass, mass_ratio)``, so the class of that pair is what decides
+    whether the mass Jacobian is right.
+    """
+    analytic = priors.get("analytic", {}) if isinstance(priors, dict) else {}
+
+    def _find(an):
+        node = analytic.get(an) if isinstance(analytic, dict) else None
+        if not node:
+            return None
+        got = {k: node[k] for k in ("chirp_mass", "mass_ratio") if k in node}
+        return got if len(got) == 2 else None
+
+    found, src_an = _find(analysis), analysis
+    if found is None:
+        for an in analyses:
+            found = _find(an)
+            if found is not None:
+                src_an = an
+                break
+    if found is None:
+        return ResolvedMassPrior(kind="assumed_default",
+                                 source="default(no_analytic_prior)")
+
+    mc = _parse_analytic_spin(found["chirp_mass"])
+    q = _parse_analytic_spin(found["mass_ratio"])
+    kinds = (mc[0] if mc else None, q[0] if q else None)
+    if kinds == _UNIFORM_IN_COMPONENTS:
+        return ResolvedMassPrior(
+            kind="uniform_detector_frame",
+            chirp_min=None if mc[1] is None else float(mc[1]),
+            chirp_max=None if mc[2] is None else float(mc[2]),
+            q_min=None if q[1] is None else float(q[1]),
+            q_max=None if q[2] is None else float(q[2]),
+            source=f"analytic[{src_an}]")
+    raw = "; ".join(f"{k}={str(found[k])[:80]!r}" for k in sorted(found))
+    return ResolvedMassPrior(
+        kind="unrecognized",
+        source=f"analytic[{src_an}]:unrecognized({raw})")
+
+
 def resolve_spin_prior(analysis, analyses, priors, a1_samples, a2_samples,
-                       fallback_amax=0.99):
+                       fallback_amax=0.99, allow_variant_mismatch=False):
     """Return ``(amax_1, amax_2, kind, source)`` for the spin-magnitude prior.
 
     Mirrors :func:`resolve_dL_prior`: read the analytic spin priors of the
     chosen ``analysis``; if that analysis carries no priors group (e.g. an O4
-    ``Mixed`` set) search the sibling ``analyses`` the same way.
+    ``Mixed`` set) search the sibling ``analyses`` -- but only siblings sharing
+    the ingested label's spin variant, see the sibling-search comment below.
 
     ``kind`` is ``"uniform_magnitude_isotropic"`` only when both ``a_1`` and
     ``a_2`` parse as ``Uniform(0, amax_i)`` AND the tilt priors parse as
@@ -733,11 +952,74 @@ def resolve_spin_prior(analysis, analyses, priors, a1_samples, a2_samples,
     found = _find(analysis)
     src_an = analysis
     if found is None:
-        for an in analyses:            # sibling search (O4 Mixed w/o priors)
+        # Sibling search (an O4 Mixed set carries no priors group of its own).
+        #
+        # It must respect the SPIN VARIANT (GW-07).  Borrowing across variants is
+        # a real, large error: a LowSpin(Secondary) run restricts a_2 to
+        # U(0, 0.05) while the HighSpin run uses U(0, 0.99), so a mismatched
+        # borrow inflates the secondary's prior support ~20x.  The pre-GW-07 code
+        # took the first sibling carrying a_1/a_2 in h5py key order, i.e. by
+        # alphabet.
+        #
+        # (Aligned-spin siblings are already skipped for free: they record
+        # chi_1/chi_2 rather than a_1/a_2, so `_find` returns None for them.
+        # Verified on GW230529_181500, whose C00:IMRPhenomNSBH analytic group has
+        # chi_1/chi_2 and no a_1/a_2.)
+        want = _spin_variant_token(_label_parts(analysis)[2])
+        cands = [a for a in analyses if _find(a) is not None]
+        same = [a for a in cands if _spin_variant_token(_label_parts(a)[2]) == want]
+        other = [a for a in cands if a not in same]
+
+        for an in same:
             found = _find(an)
-            if found is not None:
-                src_an = an
-                break
+            src_an = an
+            break
+
+        if found is None and other:
+            if want:
+                # The ingested label DECLARES a spin restriction and only a
+                # different one is on offer.  That is a contradiction, not a
+                # choice: a LowSpin(Secondary) run restricts a_2 to U(0, 0.05)
+                # where HighSpin uses U(0, 0.99), so the borrow would inflate the
+                # secondary's prior support ~20x.
+                msg = (
+                    f"{analysis}: no sibling analysis with spin variant "
+                    f"{want!r} carries an analytic a_1/a_2 prior; the only "
+                    f"candidates declare a different spin restriction "
+                    f"({other}). Borrowing across spin variants inflates a "
+                    f"restricted secondary-spin prior by up to ~20x, so gwcat "
+                    f"refuses. Ingest the matching variant explicitly, or pass "
+                    f"allow_variant_mismatch=True to accept the borrow with a "
+                    f"warning.")
+                if not allow_variant_mismatch:
+                    raise SpinPriorMismatchError(msg)
+                warnings.warn(msg)
+                found, src_an = _find(other[0]), f"{other[0]}:variant_mismatch"
+            else:
+                # The ingested label declares NO spin restriction (a plain
+                # `C01:Mixed`), while every candidate sibling does.  Which one
+                # the combined set corresponds to is not stated in the file, so
+                # this is an assumption rather than a contradiction: take the
+                # best-ranked variant deterministically and record that we
+                # assumed it.  Real case: the GWTC-3 NSBH events
+                # GW191219_163120 / GW200105_162426 / GW200115_042309, whose
+                # `C01:Mixed` set has only `C01:IMRPhenomXPHM:HighSpin` and
+                # `:LowSpin` to borrow from.  HighSpin wins, which is also what
+                # h5py key order happened to give before GW-07 -- so this
+                # deliberately does not move any current number.
+                best = sorted(
+                    other,
+                    key=lambda a: _variant_rank(
+                        _spin_variant_token(_label_parts(a)[2])))[0]
+                tok = _spin_variant_token(_label_parts(best)[2])
+                warnings.warn(
+                    f"{analysis}: the ingested label declares no spin variant "
+                    f"but every sibling carrying an analytic a_1/a_2 prior does "
+                    f"({other}). Assuming the {tok!r} variant ({best}) is the "
+                    f"one the combined set corresponds to; recorded as "
+                    f"variant_assumed in spin_prior_source.")
+                found = _find(best)
+                src_an = f"{best}:variant_assumed({tok})"
 
     def _is_uniform_zero(p):
         return (p is not None and p[0] == "Uniform"
@@ -942,11 +1224,13 @@ def inspect(path: str, cfg: Optional[IngestConfig] = None):
     _, dL_info = dL_prior_prob(dL, kind=res.kind, cosmology=res.cosmology,
                                dmin=res.dmin, dmax=res.dmax, alpha=res.alpha,
                                impl=cfg.dL_prior_impl, return_info=True)
-    f_ref = _read_f_ref(data, analysis)
+    f_ref, f_ref_source = _read_f_ref(data, analysis, analyses)
     a1_samp = np.asarray(s["a_1"], float) if "a_1" in s else None
     a2_samp = np.asarray(s["a_2"], float) if "a_2" in s else None
     spin_amax_1, spin_amax_2, spin_kind, spin_src = resolve_spin_prior(
-        analysis, analyses, priors, a1_samp, a2_samp)
+        analysis, analyses, priors, a1_samp, a2_samp,
+        allow_variant_mismatch=cfg.spin_prior_allow_variant_mismatch)
+    mass_prior = resolve_mass_prior(analysis, analyses, priors)
     avail = [p for p in DEFAULT_PARAMS if p in s]
     missing = [p for p in WAVEFORM_PARAMS if p not in s]
     info = {
@@ -958,6 +1242,7 @@ def inspect(path: str, cfg: Optional[IngestConfig] = None):
         "preferred_sample_set": analysis,
         "n_samples": int(dL.size),
         "f_ref": f_ref,
+        "f_ref_source": f_ref_source,
         "dL_prior": {"H0": res.H0, "Om0": res.Om0, "min": res.dmin,
                      "max": res.dmax, "source": res.source,
                      # GW-02: the effective distribution CLASS, what the file
@@ -975,6 +1260,12 @@ def inspect(path: str, cfg: Optional[IngestConfig] = None):
         # Spin-magnitude prior resolution (PR 2).
         "spin_prior": {"amax_1": spin_amax_1, "amax_2": spin_amax_2,
                        "kind": spin_kind, "source": spin_src},
+        # Parsed mass prior (GW-07): "uniform_detector_frame" is the only value
+        # that justifies the export's |dm2det/dq| = m1det Jacobian.
+        "mass_prior": {"kind": mass_prior.kind, "source": mass_prior.source,
+                       "chirp_min": mass_prior.chirp_min,
+                       "chirp_max": mass_prior.chirp_max,
+                       "q_min": mass_prior.q_min, "q_max": mass_prior.q_max},
         "prior_validation": val,
         "waveform_params_missing": missing,
         "stored_params_available": avail,
@@ -1150,6 +1441,12 @@ def build_store(paths, out_path, params=None, extra_params=None,
         preferred_label = select_analysis(analyses, prefix, cfg)
         ranked = rank_analyses(analyses, prefix, cfg)
         labels = select_analyses(analyses, prefix, cfg, sample_sets)
+        # Which labels the waveform-priority list actually matched, so
+        # selection_reason can distinguish a priority hit from the last resort.
+        priority_labels = _priority_matches(
+            [a for a in analyses if _label_parts(a)[0] == prefix],
+            cfg.o3_waveform_priority if prefix == "C01"
+            else cfg.o4_waveform_priority)
         et = event_table.get(name, {})
         prov = file_provenance.get(os.path.basename(path), {})
         # Whether this release's posteriors are still on the prior its
@@ -1234,7 +1531,8 @@ def build_store(paths, out_path, params=None, extra_params=None,
             a1_samp = np.asarray(s["a_1"], float) if "a_1" in s else None
             a2_samp = np.asarray(s["a_2"], float) if "a_2" in s else None
             spin_amax_1, spin_amax_2, spin_kind, spin_src = resolve_spin_prior(
-                analysis, analyses, priors, a1_samp, a2_samp)
+                analysis, analyses, priors, a1_samp, a2_samp,
+                allow_variant_mismatch=cfg.spin_prior_allow_variant_mismatch)
             records.append((name, n, rec))
 
             # metadata
@@ -1244,7 +1542,7 @@ def build_store(paths, out_path, params=None, extra_params=None,
                    if "mass_2_source" in s else np.nan)
             snr = (float(np.median(s["network_optimal_snr"]))
                    if "network_optimal_snr" in s else np.nan)
-            f_ref = _read_f_ref(data, analysis)
+            f_ref, f_ref_source = _read_f_ref(data, analysis, analyses)
 
             # ── Source-class contract ──────────────────────────────────────
             compact = _classify(m1s, m2s, cfg.nsbh_mass_threshold)
@@ -1282,7 +1580,27 @@ def build_store(paths, out_path, params=None, extra_params=None,
             meta["catalog"].append(catalog)
             meta["analysis_used"].append(analysis)
             meta["dL_prior_source"].append(src)
-            meta["mass_prior_kind"].append("uniform_detector_frame")
+            # Parsed, not stamped (GW-07): the exported p_pe applies an
+            # |dm2det/dq| = m1det Jacobian that is only valid for a prior
+            # uniform in detector-frame component masses, so warn loudly when
+            # the file declares something else instead of asserting it silently.
+            mp = resolve_mass_prior(analysis, analyses, priors)
+            if mp.kind == "unrecognized":
+                warnings.warn(
+                    f"{name} [{analysis}]: the analytic mass prior is not "
+                    f"uniform in detector-frame component masses "
+                    f"({mp.source}); the exported p_pe applies an "
+                    f"|dm2det/dq| = m1det Jacobian that assumes it is.")
+            meta["mass_prior_kind"].append(mp.kind)
+            meta["mass_prior_source"].append(mp.source)
+            meta["mass_prior_chirp_min"].append(
+                np.nan if mp.chirp_min is None else mp.chirp_min)
+            meta["mass_prior_chirp_max"].append(
+                np.nan if mp.chirp_max is None else mp.chirp_max)
+            meta["mass_prior_q_min"].append(
+                np.nan if mp.q_min is None else mp.q_min)
+            meta["mass_prior_q_max"].append(
+                np.nan if mp.q_max is None else mp.q_max)
             meta["compact_type"].append(compact)
             # canonical source-class metadata (parallel to legacy compact_type)
             meta["source_class"].append(source_class_val)
@@ -1322,7 +1640,11 @@ def build_store(paths, out_path, params=None, extra_params=None,
                 else float(res.sampling_alpha))
             meta["dL_prior_ks"].append(
                 np.nan if ks_val is None else float(ks_val))
-            meta["f_ref"].append(float(f_ref) if f_ref else np.nan)
+            # `if f_ref` was also a truthiness bug: a legitimate f_ref of 0.0
+            # would have been stored as NaN.  _read_f_ref already rejects
+            # non-positive values explicitly, so test against None (GW-07).
+            meta["f_ref"].append(np.nan if f_ref is None else float(f_ref))
+            meta["f_ref_source"].append(f_ref_source)
             meta["nsamp_original"].append(float(n))
             # ── Spin-prior / derived-column provenance (PR 2) ───────────────
             meta["spin_amax_1"].append(float(spin_amax_1))
@@ -1339,7 +1661,8 @@ def build_store(paths, out_path, params=None, extra_params=None,
                 meta["sky_area_90"].append(np.nan)
             # ── Sample-set / waveform contract (PR 6) ──────────────────────
             ss = _sample_set_meta(analysis, preferred_label, ranked, path,
-                                  sample_sets, provenance=prov)
+                                  sample_sets, provenance=prov,
+                                  priority_labels=priority_labels)
             for k, val in ss.items():
                 meta[k].append(val)
             print(f"[{catalog}] {name}: {n} samp, sample_set={analysis}, "
@@ -1435,16 +1758,112 @@ def _assemble_union(records, candidate_params):
     return union_params, columns, avail
 
 
-def _read_f_ref(data, analysis):
+_F_REF_KEYS = ("reference-frequency", "reference_frequency", "f_ref")
+
+
+def _coerce_f_ref(val):
+    """A finite positive float from an h5py scalar/1-element array, else None."""
+    try:
+        arr = np.asarray(val, dtype=float).ravel()
+    except (TypeError, ValueError):
+        return None
+    if arr.size != 1 or not np.isfinite(arr[0]) or arr[0] <= 0:
+        return None
+    return float(arr[0])
+
+
+def _f_ref_from_config(data, analysis):
+    """``f_ref`` from the pesummary ``config`` section of one analysis."""
     try:
         cfgd = data.config[analysis] if hasattr(data, "config") else {}
-        for key in ("reference-frequency", "reference_frequency", "f_ref"):
-            for sect in cfgd.values() if isinstance(cfgd, dict) else []:
-                if isinstance(sect, dict) and key in sect:
-                    return float(sect[key])
     except Exception:
-        pass
+        return None
+    if not isinstance(cfgd, dict):
+        return None
+    for key in _F_REF_KEYS:
+        for sect in cfgd.values():
+            if isinstance(sect, dict) and key in sect:
+                got = _coerce_f_ref(sect[key])
+                if got is not None:
+                    return got
     return None
+
+
+def _extra_kwargs_for(data, analysis):
+    """The pesummary ``extra_kwargs`` entry for one analysis label.
+
+    pesummary exposes this as a **list** positionally aligned with
+    ``samples_dict``'s key order (verified against pesummary on the real
+    releases), not as a dict keyed by label; both shapes are accepted so a
+    version change cannot silently return nothing.
+    """
+    ek = getattr(data, "extra_kwargs", None)
+    if isinstance(ek, dict):
+        return ek.get(analysis)
+    if isinstance(ek, (list, tuple)):
+        try:
+            labels = list(data.samples_dict.keys())
+            return ek[labels.index(analysis)]
+        except (AttributeError, ValueError, IndexError, TypeError):
+            return None
+    return None
+
+
+def _f_ref_from_meta_data(data, analysis):
+    """``f_ref`` from the analysis's ``meta_data`` block.
+
+    This is where the real releases actually put it, and the pre-GW-07 code never
+    looked: it read only ``data.config``, which is EMPTY for the combined
+    ``Mixed`` sets, so 175 of 282 rows stored ``f_ref = NaN`` while a sibling's
+    ``meta_data['f_ref']`` sat there with the value.  Verified on GW150914:
+    ``config['C01:Mixed']`` has no sections and its meta_data block has 5 keys
+    and no ``f_ref``, while ``C01:IMRPhenomXPHM`` has
+    ``config = {'config': {'reference-frequency': '20'}}`` and
+    ``meta_data['f_ref'] = 20.0``.
+
+    ``f_ref`` matters because spins, tilts and chi_p are all defined *at* it.
+    """
+    node = _extra_kwargs_for(data, analysis)
+    if isinstance(node, dict):
+        for sub in ("meta_data", "other", "sampler"):
+            inner = node.get(sub)
+            if isinstance(inner, dict):
+                for key in _F_REF_KEYS:
+                    if key in inner:
+                        got = _coerce_f_ref(inner[key])
+                        if got is not None:
+                            return got
+        for key in _F_REF_KEYS:
+            if key in node:
+                got = _coerce_f_ref(node[key])
+                if got is not None:
+                    return got
+    return None
+
+
+def _read_f_ref(data, analysis, analyses=None):
+    """Reference frequency for ``analysis``, searching siblings as a fallback.
+
+    Order: this analysis's ``config``, then its ``meta_data``, then the same two
+    for each sibling analysis.  The sibling fallback is what rescues the combined
+    ``Mixed`` sets, which carry neither a config nor an ``f_ref`` of their own but
+    are built FROM constituent runs that do.  Returns ``(f_ref, source)`` where
+    ``source`` names where it came from ("" when nothing was found).
+    """
+    for getter, tag in ((_f_ref_from_config, "config"),
+                        (_f_ref_from_meta_data, "meta_data")):
+        got = getter(data, analysis)
+        if got is not None:
+            return got, f"{tag}[{analysis}]"
+    for an in (analyses or []):
+        if an == analysis:
+            continue
+        for getter, tag in ((_f_ref_from_config, "config"),
+                            (_f_ref_from_meta_data, "meta_data")):
+            got = getter(data, an)
+            if got is not None:
+                return got, f"{tag}[{an}]:sibling"
+    return None, ""
 
 
 #: Schema version written by build_store/merge.  1.1 adds the ``avail/mask``
