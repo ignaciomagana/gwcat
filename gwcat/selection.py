@@ -209,6 +209,14 @@ def _ddL_dz(z, dL_mpc, H0, Om0):
     return DC + (1 + z) * dH / E
 
 
+#: The spin-magnitude ceiling the cartesian/polar spin-REMOVAL step assumes when
+#: subtracting the analytic injected spin prior.  It is NOT necessarily the amax a
+#: campaign was injected with -- endo3 injects 0.998 -- and the difference leaves a
+#: constant (assumed/injected)^2 factor in the un-normalised pdraw.  See
+#: SelectionSet._check_removal_amax (GW-04).
+ASSUMED_REMOVAL_AMAX = 0.99
+
+
 class SelectionSet:
     """Uniform interface over LVK injection files.
 
@@ -286,6 +294,46 @@ class SelectionSet:
                     "expected 'events/' or 'injections/' group."
                 )
         self._loaded = True
+
+    def _check_removal_amax(self):
+        """Warn when the amax assumed by the spin-REMOVAL step is not the amax
+        the campaign was actually injected with (GW-04).
+
+        The removal subtracts the analytic 6-D cartesian spin prior
+        ``ln p = -ln(16 pi^2 a1^2 a2^2 amax^2)``, whose amax dependence is the
+        constant ``-2 ln(amax)``.  Using the wrong amax therefore leaves a
+        CONSTANT multiplicative error ``(amax_assumed / amax_injected)^2`` in
+        ``pdraw`` -- and pdraw is un-normalised, so that constant scales mu
+        directly.  endo3 injects 0.998 while this step assumed 0.99, i.e. a
+        1.6e-2 error in mu.
+
+        The removal happens while reading the file, before the injected-spin
+        state (and hence the detected amax) is known, so it cannot simply use the
+        right value here.  This makes the discrepancy visible and quantified
+        instead of silent; correcting the constant is deliberately left to the
+        block-based rewrite (GW-19), which resolves the amax before applying any
+        spin factor.
+        """
+        removal = getattr(self, "_removal_amax", None)
+        if removal is None:
+            return None
+        # NB: the private attribute, not the `spin_meta` property -- that one is
+        # lazy and calls _load(), which is what invoked us.
+        detected = (getattr(self, "_spin_meta", None) or {}).get("amax_detected")
+        if detected is None or not all(np.isfinite(a) for a in detected):
+            return None
+        worst = max(float(a) for a in detected)
+        if np.isclose(worst, removal, rtol=1e-9, atol=1e-12):
+            return None
+        factor = (removal / worst) ** 2
+        warnings.warn(
+            f"{self.path}: the spin-removal step subtracted a cartesian spin "
+            f"prior assuming amax={removal}, but this campaign's injected amax "
+            f"is {worst}. The 6-D prior's amax dependence is the constant "
+            f"-2*ln(amax), so pdraw carries a spurious constant factor of "
+            f"{factor:.6f} -- and pdraw is un-normalised, so that scales the "
+            f"selection integral mu by the same factor. Tracked for GW-19.")
+        return factor
 
     def _read_events(self, f):
         """Read the O4 ``events`` format.
@@ -380,7 +428,8 @@ class SelectionSet:
             # with the 1-D chi_eff marginal.
             a1 = np.sqrt(s1x ** 2 + s1y ** 2 + s1z ** 2)
             a2 = np.sqrt(s2x ** 2 + s2y ** 2 + s2z ** 2)
-            amax = 0.99
+            amax = ASSUMED_REMOVAL_AMAX
+            self._removal_amax = float(amax)
             a1 = np.maximum(a1, 1e-30)
             a2 = np.maximum(a2, 1e-30)
             ln_pdraw_spin6d = -np.log(
@@ -395,7 +444,8 @@ class SelectionSet:
             ln_pdraw_joint = _h5_read_field(ev, joint_polar)
             spin_fmt = "joint_polar"
             ln_pdraw_no_spin = _sspin.ln_pdraw_no_spin_from_polar_joint(
-                ln_pdraw_joint, scost1, scost2, amax=0.99)
+                ln_pdraw_joint, scost1, scost2,
+                amax=ASSUMED_REMOVAL_AMAX)
         elif any(_h5_has_field(ev, name) for name in joint_no_spin_names):
             ln_pdraw_no_spin, _ = _h5_first_field(ev, joint_no_spin_names)
             spin_fmt = "joint_no_spin"
@@ -499,6 +549,9 @@ class SelectionSet:
         self._compute_events_spin_state(
             ev, spin_fmt, ln_pdraw_no_spin, ln_pdraw_joint,
             sa1, scost1, sa2, scost2, m1src, m2src)
+        # Now that the injected amax is known, check it against the one the
+        # removal step above had to assume (GW-04).
+        self._removal_amax_factor = self._check_removal_amax()
 
     # ------------------------------------------------------------------
     # PR4: component-basis spin helpers (events format)

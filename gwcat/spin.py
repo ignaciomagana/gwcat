@@ -38,20 +38,38 @@ class ChiEffPrior:
     Parameters
     ----------
     amax : float
-        Maximum dimensionless spin magnitude (default 0.99).
+        Maximum dimensionless spin magnitude of the PRIMARY (default 0.99).
+    amax_2 : float, optional
+        Maximum spin magnitude of the SECONDARY.  Defaults to ``amax`` (the
+        historical single-amax behaviour).  A restricted low-spin secondary is
+        a real configuration -- GWTC-3 NSBH runs use ``a_2 ~ U(0, 0.05)`` where
+        the primary keeps ``U(0, 0.99)`` -- and forcing one shared ``amax``
+        inflated the secondary's prior support ~20x (GW-04).
     nq : int
         Number of mass-ratio grid points (q = m1/(m1+m2) ∈ [0.5, 1]).
     nchi : int
         Number of χ_eff grid points.
     ngrid_conv : int
         Internal convolution grid resolution.
+
+    Notes
+    -----
+    The support of χ_eff is ``|χ_eff| ≤ max(amax_1, amax_2)``: the primary term
+    ``q1·s1z`` reaches ``q1·amax_1`` and the secondary ``q2·s2z`` reaches
+    ``q2·amax_2``, and with ``q1 + q2 = 1`` the sum is bounded by the larger of
+    the two.  :attr:`amax` therefore reports that bound, while ``amax_1`` and
+    ``amax_2`` record the per-body priors the density was built from.
     """
 
     def __init__(self, amax: float = 0.99, nq: int = 200,
-                 nchi: int = 2000, ngrid_conv: int = 4000):
-        self.amax = float(amax)
+                 nchi: int = 2000, ngrid_conv: int = 4000,
+                 amax_2: float = None):
+        self.amax_1 = float(amax)
+        self.amax_2 = self.amax_1 if amax_2 is None else float(amax_2)
+        #: The χ_eff support bound, max(amax_1, amax_2).
+        self.amax = max(self.amax_1, self.amax_2)
         self.q_grid = np.linspace(0.5, 1.0, nq)
-        self.chi_grid = np.linspace(-amax, amax, nchi)
+        self.chi_grid = np.linspace(-self.amax, self.amax, nchi)
         self._ngrid_conv = ngrid_conv
 
         # Build lookup table: table[i, j] = p(chi_grid[j] | q_grid[i], amax)
@@ -87,7 +105,11 @@ class ChiEffPrior:
         return out
 
     def _convolve_at_q(self, q):
-        """Compute p(χ_eff | q) by convolving two scaled single-spin PDFs."""
+        """Compute p(χ_eff | q) by convolving two scaled single-spin PDFs.
+
+        Each body uses ITS OWN ``amax`` (GW-04); when the two are equal this is
+        bit-identical to the previous single-amax construction.
+        """
         amax = self.amax
         ng = self._ngrid_conv
         # Grid for individual X_i = q_i * s_iz; total range is [-amax, amax]
@@ -96,15 +118,15 @@ class ChiEffPrior:
 
         q1, q2 = q, 1.0 - q
 
-        # PDF of X1 = q1 * s1z: p(X1) = (1/q1) * p_s(X1/q1)
+        # PDF of X1 = q1 * s1z: p(X1) = (1/q1) * p_s(X1/q1; amax_1)
         if q1 > 1e-12:
-            p1 = self._single_spin_pdf(x / q1, amax) / q1
+            p1 = self._single_spin_pdf(x / q1, self.amax_1) / q1
         else:
             p1 = np.zeros(ng)
             p1[ng // 2] = 1.0 / dx
 
         if q2 > 1e-12:
-            p2 = self._single_spin_pdf(x / q2, amax) / q2
+            p2 = self._single_spin_pdf(x / q2, self.amax_2) / q2
         else:
             p2 = np.zeros(ng)
             p2[ng // 2] = 1.0 / dx
@@ -135,9 +157,23 @@ class ChiEffPrior:
         CLAMPED to the ``q = 0.5`` edge -- an equal-mass density for an unequal-
         mass system.  The reflection is exact because ``χ_eff`` is symmetric
         under relabelling the two bodies when they share one ``amax``.
+
+        With ``amax_1 != amax_2`` that symmetry is broken -- the bodies have
+        genuinely different priors -- so the reflection is no longer valid and
+        ``m1`` must actually be the primary.  Passing them the other way round
+        raises rather than silently evaluating the wrong body's prior (GW-04).
         """
         m1a = np.asarray(m1, dtype=float)
         m2a = np.asarray(m2, dtype=float)
+        if self.amax_1 != self.amax_2:
+            bad = np.asarray(m2a > m1a)
+            if bad.any():
+                raise ValueError(
+                    f"ChiEffPrior.prob: amax_1={self.amax_1} != "
+                    f"amax_2={self.amax_2}, so the two bodies have different "
+                    f"spin priors and chi_eff is NOT symmetric under swapping "
+                    f"them. {int(np.sum(bad))} input(s) have m2 > m1; pass the "
+                    f"more massive body as m1.")
         q = np.maximum(m1a, m2a) / (m1a + m2a)
         chi = np.asarray(chi_eff, dtype=float)
         scalar = q.ndim == 0 and chi.ndim == 0

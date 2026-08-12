@@ -418,7 +418,13 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
                 fallback_events.append(str(name))
             kept_amax1.append(a1max)
             kept_amax2.append(a2max)
-            if spin_basis == "chieff_chip" and a1max != a2max:
+            # np.isclose, not exact float equality (GW-04): a single injected
+            # ceiling round-trips as 0.9980000000000001 vs 0.9979999999999999
+            # through the numerical amax resolution, so `!=` fired on files with
+            # no real prior asymmetry and buried the case that matters (a genuine
+            # NSBH prior with amax_2 ~ 0.05).
+            if (spin_basis == "chieff_chip"
+                    and not np.isclose(a1max, a2max, rtol=1e-9, atol=1e-12)):
                 mismatch_events.append(str(name))
 
             # spin_prior_kind provenance (flat/joint assumption may not hold).

@@ -146,7 +146,12 @@ def _campaign_chieff_chip_lnfactor(s, keep, amax, strict):
             f"draw is not a single uniform-magnitude distribution); the joint "
             f"(chi_eff, chi_p) prior needs one amax. Use spin_basis='component'.")
     amax_1, amax_2 = float(amax_detected[0]), float(amax_detected[1])
-    if amax_1 != amax_2:
+    # np.isclose, not exact float equality (GW-04): the detected amax comes out
+    # of a numerical fit, so a single injected 0.998 ceiling is recovered as
+    # 0.9980000000000001 vs 0.9979999999999999 and `!=` fired on every real
+    # file -- burying the warning that matters, which is a genuine NSBH prior
+    # with a restricted secondary (amax_2 ~ 0.05).
+    if not np.isclose(amax_1, amax_2, rtol=1e-9, atol=1e-12):
         warnings.warn(
             f"{s.path}: injected spin_amax_1={amax_1} != spin_amax_2={amax_2}; "
             f"the joint (chi_eff, chi_p) prior assumes a single amax and uses "

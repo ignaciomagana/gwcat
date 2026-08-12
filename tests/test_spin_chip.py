@@ -463,3 +463,60 @@ def test_chieff_prior_renormalisation_is_unchanged_by_the_factor():
     for m1, m2 in ((30.0, 25.0), (40.0, 10.0), (30.0, 30.0)):
         p = prior.prob(prior.chi_grid, m1, m2)
         assert trapz(p, prior.chi_grid) == pytest.approx(1.0, rel=2e-3)
+
+
+# ==========================================================================
+# GW-04: independent amax_1 / amax_2
+# ==========================================================================
+def test_equal_amax_is_bit_identical_to_the_single_amax_construction():
+    """The default path must not move: passing amax_2 explicitly equal to amax
+    reproduces the historical table exactly."""
+    from gwcat.spin import ChiEffPrior
+
+    a = ChiEffPrior(amax=0.99, nq=32, nchi=512)
+    b = ChiEffPrior(amax=0.99, amax_2=0.99, nq=32, nchi=512)
+    np.testing.assert_array_equal(a.table, b.table)
+    assert (a.amax_1, a.amax_2, a.amax) == (0.99, 0.99, 0.99)
+
+
+def test_restricted_secondary_amax_changes_the_density():
+    """A low-spin secondary (a_2 ~ U(0, 0.05)) is a genuinely different prior.
+
+    Forcing one shared amax inflated the secondary's support ~20x; the two
+    densities must not agree.
+    """
+    from gwcat.spin import ChiEffPrior
+
+    shared = ChiEffPrior(amax=0.99, nq=48, nchi=1024)
+    split = ChiEffPrior(amax=0.99, amax_2=0.05, nq=48, nchi=1024)
+    assert (split.amax_1, split.amax_2) == (0.99, 0.05)
+    # the chi_eff support bound is max(amax_1, amax_2)
+    assert split.amax == 0.99
+    chi = np.linspace(-0.5, 0.5, 41)
+    assert np.max(np.abs(split.prob(chi, 40.0, 5.0)
+                         - shared.prob(chi, 40.0, 5.0))) > 0.1
+
+
+@pytest.mark.parametrize("amax_2", [0.99, 0.5, 0.05])
+def test_split_amax_prior_still_normalises(amax_2):
+    from gwcat.spin import ChiEffPrior
+
+    prior = ChiEffPrior(amax=0.99, amax_2=amax_2, nq=48, nchi=2048)
+    trapz = getattr(np, "trapezoid", getattr(np, "trapz", None))
+    for m1, m2 in ((30.0, 25.0), (40.0, 5.0)):
+        p = prior.prob(prior.chi_grid, m1, m2)
+        assert trapz(p, prior.chi_grid) == pytest.approx(1.0, rel=5e-3)
+
+
+def test_split_amax_refuses_swapped_masses():
+    """With amax_1 != amax_2 the bodies are distinguishable, so the q -> 1-q
+    reflection is invalid and m1 must really be the primary."""
+    from gwcat.spin import ChiEffPrior
+
+    prior = ChiEffPrior(amax=0.99, amax_2=0.05, nq=32, nchi=512)
+    assert np.isfinite(prior.prob(0.1, 40.0, 5.0))          # ordered: fine
+    with pytest.raises(ValueError, match="more massive body as m1"):
+        prior.prob(0.1, 5.0, 40.0)
+    # a shared amax keeps the reflection, since the bodies are exchangeable
+    sym = ChiEffPrior(amax=0.99, nq=32, nchi=512)
+    assert sym.prob(0.1, 5.0, 40.0) == pytest.approx(sym.prob(0.1, 40.0, 5.0))
