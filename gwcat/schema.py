@@ -142,6 +142,33 @@ def export_requirements_for(space_name: str):
     return tuple(space.store_required)
 
 
+def spaces_supported_by(store_params) -> tuple:
+    """Registered parameter spaces this store has the columns for.
+
+    A store that predates the spin ingest can supply ``chieff`` and ``nospin``
+    and nothing else; saying so turns "a_1 is missing" into an actionable
+    message.
+    """
+    from .params import list_spaces
+
+    have = set(store_params)
+    return tuple(name for name in list_spaces()
+                 if set(export_requirements_for(name)) <= have)
+
+
+def _supported_spaces_hint(store_params) -> str:
+    """The '--parameter-space X would work' half of a missing-parameter error."""
+    try:
+        ok = spaces_supported_by(store_params)
+    except Exception:          # a hint must never mask the real error
+        return ""
+    if not ok:
+        return (" No registered parameter space can be exported from this "
+                "store; re-ingest it.")
+    return (f" Parameter space(s) this store CAN supply: {list(ok)} "
+            f"(pass --parameter-space).")
+
+
 def required_params(export: str) -> List[str]:
     """Return the ordered list of parameters a named export requires."""
     if export not in EXPORT_REQUIREMENTS:
@@ -196,7 +223,8 @@ def check_required(required: Sequence[str], store_params: Sequence[str],
     if absent:
         raise MissingParameterError(
             f"{export} requires parameter(s) {absent} which are not in the "
-            f"store; stored parameters are {list(store_params)}.")
+            f"store; stored parameters are {list(store_params)}."
+            + _supported_spaces_hint(store_params))
 
     sel = np.asarray(sel_idx)
     problems = []

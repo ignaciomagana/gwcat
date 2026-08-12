@@ -887,7 +887,7 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
 
     # ── Validation-summary feed (writer fills output_path + summary_context) ─
     from ..validation_summary import summarize_catalog
-    summary = summarize_catalog(sub)
+    summary = summarize_catalog(sub, parameter_space=spin_basis)
     summary.update({
         "kind": "darksirens_export",
         "n_events_considered": int(sub.n_events),

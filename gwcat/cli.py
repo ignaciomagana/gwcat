@@ -47,6 +47,37 @@ import os
 import sys
 from typing import Optional, Sequence
 
+#: The default parameter space for BOTH `export pe` and `export selection`.
+#:
+#: These used to differ -- PE defaulted to `chieff`, selection to `component` --
+#: so running both with no flags produced a pair that fails the cross-file basis
+#: check by construction. A default that cannot be used with itself is not a
+#: default. `component` is the shared value because it is the exact (bijective)
+#: space, and it is the one the selection side already defaulted to.
+DEFAULT_PARAMETER_SPACE = "component"
+
+
+def _add_space_argument(parser) -> None:
+    """Add ``--parameter-space`` (with ``--spin-basis`` as the legacy alias).
+
+    The choices are generated from :mod:`gwcat.params`, so a space added to the
+    registry is reachable from the CLI without a second edit here.  The list was
+    hardcoded to the three legacy bases, which is why `component_6d`,
+    `cartesian`, `aligned` and `nospin` were registered but unreachable.
+    """
+    from .params import list_spaces
+
+    parser.add_argument("--parameter-space", "--spin-basis",
+                        dest="spin_basis",
+                        default=DEFAULT_PARAMETER_SPACE,
+                        choices=list(list_spaces()),
+                        help=f"Parameter space to export "
+                             f"(default: {DEFAULT_PARAMETER_SPACE}). "
+                             f"--spin-basis is an accepted alias. "
+                             f"Run 'export list-spaces' for what each one "
+                             f"declares.")
+
+
 def _invoked_program_name() -> str:
     """Return the console entry-point name, with a stable library-call default.
 
@@ -159,11 +190,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_pe.add_argument("--out", required=True, metavar="OUT.h5")
     p_pe.add_argument("--format", default="gwcat2",
                       help="Registered export format (default: gwcat2).")
-    p_pe.add_argument("--spin-basis", default="chieff",
-                      choices=["chieff", "component", "chieff_chip"],
-                      help="Spin basis: 'chieff' (1-D chi_eff prior), "
-                           "'component' (flat component-spin prior), or "
-                           "'chieff_chip' (joint chi_eff/chi_p prior).")
+    _add_space_argument(p_pe)
     p_pe.add_argument("--source-class", default=None,
                       help="bbh / nsbh / bns / massgap / cbc, or a "
                            "canonical class name.")
@@ -209,13 +236,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_xsel.add_argument("--out", required=True, metavar="OUT.h5")
     p_xsel.add_argument("--format", default="gwcat2",
                         help="Registered export format (default: gwcat2).")
-    p_xsel.add_argument("--spin-basis", default="component",
-                        choices=["component", "chieff", "chieff_chip"],
-                        help="Spin basis: 'component' (exact component-spin "
-                             "draw retained; default), 'chieff' (1-D chi_eff "
-                             "swap, matches the legacy selection export), or "
-                             "'chieff_chip' (joint chi_eff/chi_p prior; "
-                             "single-uniform-isotropic campaigns only).")
+    _add_space_argument(p_xsel)
     p_xsel.add_argument("--far-threshold", type=float, default=1.0,
                         metavar="FAR_YR")
     p_xsel.add_argument("--source-class", default=None,
@@ -241,6 +262,11 @@ def build_parser() -> argparse.ArgumentParser:
     xsub.add_parser(
         "list-formats",
         help="List the registered (format, kind) export writers.")
+
+    xsub.add_parser(
+        "list-spaces",
+        help="List the registered parameter spaces and what each declares "
+             "(columns, projection vs bijection, exactness).")
 
     # -- selection -------------------------------------------------------
     p_sel = sub.add_parser(
@@ -379,7 +405,40 @@ def _cmd_export(args) -> int:
         return _cmd_export_selection(args)
     if args.export_command == "list-formats":
         return _cmd_export_list_formats(args)
+    if args.export_command == "list-spaces":
+        return _cmd_export_list_spaces(args)
     return 2  # pragma: no cover -- argparse requires a valid subcommand
+
+
+def _cmd_export_list_spaces(args) -> int:
+    """Print each registered space and the declaration that governs its use.
+
+    ``kind`` is the load-bearing column: a *projection* is definable only
+    against a uniform-magnitude/isotropic parent draw and must refuse a campaign
+    that is not one (R1), while a *bijection* is always definable and cancels
+    exactly in the consumer's per-event renormalisation.
+    """
+    from .params import get_space, list_spaces
+
+    rows = []
+    for name in list_spaces():
+        s = get_space(name)
+        rows.append((name, s.spin_block.map_kind,
+                     "yes" if s.is_exact else "no",
+                     ",".join(s.fit_columns),
+                     ",".join(s.advisory_columns) or "-"))
+
+    head = ("space", "kind", "exact", "fit_columns", "advisory")
+    w = [max(len(r[i]) for r in rows + [head]) for i in range(len(head))]
+    print("  ".join(h.ljust(w[i]) for i, h in enumerate(head)))
+    print("  ".join("-" * w[i] for i in range(len(head))))
+    for r in rows:
+        print("  ".join(str(c).ljust(w[i]) for i, c in enumerate(r)))
+    print(f"\ndefault for both 'export pe' and 'export selection': "
+          f"{DEFAULT_PARAMETER_SPACE}")
+    print("advisory columns are written but NOT covered by the density -- "
+          "do not fit them.")
+    return 0
 
 
 def _cmd_export_pe(args) -> int:

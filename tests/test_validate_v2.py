@@ -541,3 +541,45 @@ def test_21_source_class_is_canonical_in_the_hash(tmp_path):
         with h5py.File(out, "r") as f:
             hashes.append(str(f.attrs["contract_hash"]))
     assert len(set(hashes)) == 1, hashes
+
+
+# ======================================================================
+# GW-22b: the no-flags pair must validate, end to end through the CLI
+# ======================================================================
+def test_default_pair_validates(tmp_path):
+    """`export pe` and `export selection` with NO space flag must pair.
+
+    They defaulted to `chieff` and `component` respectively, so this exact
+    sequence -- the one a first-time user runs -- produced two files that fail
+    `xcheck_spin_basis` by construction.
+    """
+    events = [{"name": "GWv0_000001", "amax1": 0.99, "amax2": 0.99},
+              {"name": "GWv0_000002", "amax1": 0.90, "amax2": 0.90}]
+    store, _ = _build_spin_store(tmp_path, events, name="store_default")
+    inj = write_o4_full(tmp_path / "inj_default.hdf", n=60, amax=(0.9, 0.9),
+                        seed=6)
+    pe = tmp_path / "pe_default.h5"
+    sel = tmp_path / "sel_default.h5"
+
+    assert main(["export", "pe", str(store), "--out", str(pe),
+                 "--cosmology", "67.74,0.3089", "--nsamp", "48",
+                 "--seed", "0", "--no-summary"]) == 0
+    assert main(["export", "selection", str(inj), "--out", str(sel),
+                 "--no-summary"]) == 0
+
+    with h5py.File(pe, "r") as f, h5py.File(sel, "r") as g:
+        assert f.attrs["spin_basis"] == g.attrs["spin_basis"]
+
+    results = validate_export_v2(str(pe), str(sel))
+    assert results["xcheck_spin_basis"] is True
+    assert all(results.values()), \
+        f"unexpected failures: {[k for k, v in results.items() if not v]}"
+
+
+def test_the_old_defaults_would_have_failed(tmp_path):
+    """Pins WHY the default changed, so nobody 'restores' the old one."""
+    pe = _pe_component(tmp_path, basis="chieff")     # the old PE default
+    sel = _sel(tmp_path, basis="component")          # the old selection default
+    with pytest.raises(ValueError) as ei:
+        validate_export_v2(str(pe), str(sel))
+    assert "spin_basis" in str(ei.value)

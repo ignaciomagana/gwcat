@@ -114,7 +114,7 @@ def _json_default(o: Any):
 # ---------------------------------------------------------------------------
 # Generic store/catalog diagnostics
 # ---------------------------------------------------------------------------
-def summarize_catalog(cat) -> Dict[str, Any]:
+def summarize_catalog(cat, parameter_space: str = None) -> Dict[str, Any]:
     """Read-only diagnostics for a (possibly already-``select()``ed) GWCatalog.
 
     Parameters
@@ -122,6 +122,17 @@ def summarize_catalog(cat) -> Dict[str, Any]:
     cat : gwcat.catalog.GWCatalog
         Any view -- a fresh, unfiltered catalog over a just-written store
         (ingest context) or the result of ``.select(...)`` (export context).
+    parameter_space : str, optional
+        The space the summary is being written for.  ``missing_required_
+        parameters`` is computed against *that* space's requirements.  Omitted
+        (the ingest context, where no export is in view) it falls back to the
+        legacy ``DARKSIRENS_REQUIRED`` list.
+
+        This mattered: the requirement list was hardcoded to the chi_eff-only
+        set, so a component-basis export -- which needs ``a_1``/``a_2``/the
+        tilts -- reported no missing parameters on a store that could not
+        supply them, and the summary said the export was fine right up until
+        the builder raised.
 
     Returns
     -------
@@ -133,7 +144,8 @@ def summarize_catalog(cat) -> Dict[str, Any]:
         on top of this dict.
     """
     import h5py
-    from .schema import DARKSIRENS_REQUIRED, ALL_GROUP_PARAMS
+    from .schema import DARKSIRENS_REQUIRED, ALL_GROUP_PARAMS, \
+        export_requirements_for
 
     sel = np.asarray(cat._sel)
     names = np.asarray(cat.event_names)
@@ -179,7 +191,11 @@ def summarize_catalog(cat) -> Dict[str, Any]:
                          if p_astro is not None else 0)
 
     stored = list(cat.params)
-    missing_required = [p for p in DARKSIRENS_REQUIRED if p not in stored]
+    if parameter_space is None:
+        required = DARKSIRENS_REQUIRED
+    else:
+        required = export_requirements_for(parameter_space)
+    missing_required = [p for p in required if p not in stored]
     missing_optional = [p for p in ALL_GROUP_PARAMS
                         if p not in stored and p not in missing_required]
 
@@ -208,6 +224,9 @@ def summarize_catalog(cat) -> Dict[str, Any]:
         "n_events": n_events,
         "event_names": names.tolist(),
         "stored_parameters": stored,
+        # Which space the requirement list came from, so a reader can tell a
+        # clean chi_eff summary from a clean component one.
+        "required_for_parameter_space": parameter_space,
         "missing_required_parameters": missing_required,
         "missing_optional_parameters": missing_optional,
         "partial_availability": partial_availability,
@@ -227,9 +246,13 @@ def summarize_catalog(cat) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # gwcat-2.0 export summary enrichment (additive; v1 summaries unchanged)
 # ---------------------------------------------------------------------------
-#: The two v2 export ``format_version`` values whose summaries get enriched.
+#: The v2 export ``format_version`` values whose summaries get enriched.  2.1 is
+#: 2.0 plus the contract attrs, so it enriches identically; listing only 2.0
+#: silently produced a bare summary for every 2.1 file.
 _V2_PE_FORMAT = "gwcat-pe-2.0"
 _V2_SELECTION_FORMAT = "gwcat-selection-2.0"
+_V2_PE_FORMATS = ("gwcat-pe-2.0", "gwcat-pe-2.1")
+_V2_SELECTION_FORMATS = ("gwcat-selection-2.0", "gwcat-selection-2.1")
 
 
 def _decode(v: Any) -> Any:
@@ -280,9 +303,9 @@ def v2_export_summary_additions(out_path) -> Dict[str, Any]:
         return {}
 
     fmt = attrs.get("format_version")
-    if fmt == _V2_PE_FORMAT:
+    if fmt in _V2_PE_FORMATS:
         return _v2_pe_additions(attrs)
-    if fmt == _V2_SELECTION_FORMAT:
+    if fmt in _V2_SELECTION_FORMATS:
         return _v2_selection_additions(attrs)
     return {}
 

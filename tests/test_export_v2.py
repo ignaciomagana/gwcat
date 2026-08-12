@@ -28,6 +28,7 @@ import pytest
 from gwcat.catalog import GWCatalog
 from gwcat.export import (export, build_pe_product, get_exporter,
                           register_exporter, list_formats, ExportProduct)
+from gwcat.schema import MissingParameterError
 
 
 # ==========================================================================
@@ -401,7 +402,10 @@ def test_cli_export_pe_smoke(tmp_path):
 
     store = _build_store(tmp_path)
     out = tmp_path / "cli_pe.h5"
+    # This fixture is a chi_eff-only store, so the space has to be named: the
+    # shared default is now `component`, which it cannot supply (GW-22b).
     rc = main(["export", "pe", store, "--out", str(out),
+               "--parameter-space", "chieff",
                "--source-class", "bbh", "--cosmology", "67.74,0.3089",
                "--nsamp", "16", "--seed", "0"])
     assert rc == 0
@@ -423,6 +427,7 @@ def test_cli_export_pe_no_summary(tmp_path):
     store = _build_store(tmp_path)
     out = tmp_path / "cli_pe_nosum.h5"
     rc = main(["export", "pe", store, "--out", str(out),
+               "--spin-basis", "chieff",          # legacy alias still accepted
                "--cosmology", "67.74,0.3089", "--nsamp", "8", "--seed", "0",
                "--no-summary"])
     assert rc == 0
@@ -438,3 +443,105 @@ def test_cli_export_list_formats(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "gwcat2" in out
     assert "pe" in out
+
+
+# ==========================================================================
+# GW-22b: one default, a registry-driven space argument, and list-spaces
+# ==========================================================================
+def test_pe_and_selection_share_one_default_space():
+    """The two defaults used to differ, so the no-flags pair could never pair.
+
+    `export pe` defaulted to `chieff` and `export selection` to `component`, so
+    running both with no arguments produced files that fail the cross-file basis
+    check by construction. A default that cannot be used with itself is not one.
+    """
+    from gwcat.cli import build_parser, DEFAULT_PARAMETER_SPACE
+
+    p = build_parser()
+    pe = p.parse_args(["export", "pe", "s.h5", "--out", "o.h5"])
+    sel = p.parse_args(["export", "selection", "i.hdf", "--out", "o.h5"])
+    assert pe.spin_basis == sel.spin_basis == DEFAULT_PARAMETER_SPACE
+
+
+def test_space_choices_come_from_the_registry():
+    """A space added to the registry must be reachable without editing the CLI.
+
+    The choices were hardcoded to the three legacy bases, so `component_6d`,
+    `cartesian`, `aligned` and `nospin` were registered but unreachable.
+    """
+    from gwcat.cli import build_parser
+    from gwcat.params import list_spaces
+
+    p = build_parser()
+    for space in list_spaces():
+        args = p.parse_args(["export", "pe", "s.h5", "--out", "o.h5",
+                             "--parameter-space", space])
+        assert args.spin_basis == space
+
+
+def test_spin_basis_is_still_accepted_as_an_alias():
+    from gwcat.cli import build_parser
+
+    p = build_parser()
+    args = p.parse_args(["export", "pe", "s.h5", "--out", "o.h5",
+                         "--spin-basis", "chieff"])
+    assert args.spin_basis == "chieff"
+
+
+def test_unknown_space_is_rejected():
+    from gwcat.cli import build_parser
+
+    p = build_parser()
+    with pytest.raises(SystemExit):
+        p.parse_args(["export", "pe", "s.h5", "--out", "o.h5",
+                      "--parameter-space", "not_a_space"])
+
+
+def test_cli_export_list_spaces(capsys):
+    from gwcat.cli import main
+    from gwcat.params import list_spaces
+
+    assert main(["export", "list-spaces"]) == 0
+    out = capsys.readouterr().out
+    for space in list_spaces():
+        assert space in out
+    # the load-bearing declaration, not just the names
+    assert "projection" in out and "bijective" in out
+
+
+def test_missing_parameter_error_names_the_usable_spaces(tmp_path):
+    """A chi_eff-only store must say what it CAN export, not only what it lacks.
+
+    With `component` the shared default this is the first error such a store
+    produces, so it has to be a signpost rather than a wall.
+    """
+    from gwcat.cli import main
+
+    store = _build_store(tmp_path)
+    with pytest.raises(MissingParameterError) as ei:
+        main(["export", "pe", store, "--out", str(tmp_path / "x.h5"),
+              "--cosmology", "67.74,0.3089", "--nsamp", "8"])
+    msg = str(ei.value)
+    assert "a_1" in msg                    # what is missing
+    assert "chieff" in msg                 # what would work instead
+    assert "--parameter-space" in msg      # how to ask for it
+
+
+def test_summary_requirements_follow_the_requested_space(tmp_path):
+    """`missing_required_parameters` was hardcoded to the chi_eff-only list.
+
+    A component export therefore reported nothing missing on a store that could
+    not supply it -- the summary said fine right up until the builder raised.
+    """
+    from gwcat.catalog import GWCatalog
+    from gwcat.validation_summary import summarize_catalog
+
+    cat = GWCatalog(_build_store(tmp_path))
+    chieff = summarize_catalog(cat, parameter_space="chieff")
+    component = summarize_catalog(cat, parameter_space="component")
+
+    assert chieff["missing_required_parameters"] == []
+    assert set(component["missing_required_parameters"]) >= {"a_1", "a_2"}
+    assert component["required_for_parameter_space"] == "component"
+    # The ingest context (no export in view) keeps the legacy behaviour.
+    assert summarize_catalog(cat)["required_for_parameter_space"] is None
