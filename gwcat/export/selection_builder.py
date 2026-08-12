@@ -22,8 +22,8 @@ The legacy combined exporter, per campaign ``k`` (Essick et al. 2023):
     campaigns skipped),
 
 then, on the concatenated arrays, applies the 1-D chi_eff prior swap
-``pdraw *= exp(clip(chi_eff_prior_logprob(chieff, m1src, m2src, amax), -50,
-None))``.  For a SINGLE campaign, ``N_total == N_k`` so ``frac == 1.0`` exactly
+``pdraw *= exp(chi_eff_prior_logprob(chieff, m1src, m2src, amax))``.
+For a SINGLE campaign, ``N_total == N_k`` so ``frac == 1.0`` exactly
 and ``_pdraw[keep] * 1.0`` is bit-identical to ``_pdraw[keep]``; running the
 single case through this same code path therefore reproduces the single-campaign
 legacy exporter's ``pdraw`` bit-for-bit as well.  The chi_eff swap is applied on
@@ -32,13 +32,13 @@ the concatenated arrays in one call, in the SAME order, so the chieff-basis v2
 
 Spin-basis-specific step (the only place the bases diverge)
 -----------------------------------------------------------
-* **chieff**  ``pdraw *= exp(clip(chi_eff_prior_logprob(chieff, m1src, m2src,
-  amax), -50, None))`` -- the legacy swap, verbatim.
+* **chieff**  ``pdraw *= exp(chi_eff_prior_logprob(chieff, m1src, m2src,
+  amax))`` -- the legacy swap, minus the floor (GW-03).
 * **component**  ``pdraw *= exp(ln_spin_component)`` with the per-injection,
   frac-independent ``ln_spin_component`` (public accessor); NO clip and NO
   chi_eff factor.  Requires ``component_spin_available`` for every campaign.
-* **chieff_chip**  ``pdraw *= exp(clip(chi_eff_chi_p_prior_logprob(chieff, chip,
-  m1src, m2src, amax=amax_detected_k), -50, None))`` with each campaign's own
+* **chieff_chip**  ``pdraw *= exp(chi_eff_chi_p_prior_logprob(chieff, chip,
+  m1src, m2src, amax=amax_detected_k))`` with each campaign's own
   DETECTED amax; requires a single uniform-isotropic injected spin draw with a
   detectable amax per campaign (else :class:`SpinBasisError`).  If a campaign's
   ``amax_1 != amax_2`` the joint prior (which assumes a single amax) uses
@@ -125,7 +125,7 @@ def _detect_keep(s, far_threshold, source_class, snr_threshold):
 
 
 def _campaign_chieff_chip_lnfactor(s, keep, amax, strict):
-    """Per-injection clipped ln (chi_eff, chi_p) prior for one campaign.
+    """Per-injection ln (chi_eff, chi_p) prior for one campaign (no floor).
 
     Resolves the campaign's DETECTED amax and validates the single
     uniform-isotropic assumption; see :class:`SpinBasisError`.
@@ -154,7 +154,13 @@ def _campaign_chieff_chip_lnfactor(s, keep, amax, strict):
     lnp = chi_eff_chi_p_prior_logprob(
         s._chieff[keep], s._chi_p[keep], s._m1src[keep], s._m2src[keep],
         amax=amax_1)
-    return np.clip(np.asarray(lnp, dtype=float), -50.0, None), amax_1
+    # No -50 floor (GW-03).  A DETECTED injection whose assumed draw density is
+    # zero is not a small number, it is a contradiction: the injection really was
+    # drawn and really was detected, so a density of zero means the assumed
+    # prior does not cover the campaign.  The caller refuses rather than writing
+    # it, because the consumer would silently exclude that injection from the
+    # selection integral and bias mu.
+    return np.asarray(lnp, dtype=float), amax_1
 
 
 def build_selection_product(sets, *, spin_basis="component", far_threshold=1.0,
@@ -315,14 +321,39 @@ def build_selection_product(sets, *, spin_basis="component", far_threshold=1.0,
 
     # ── Spin-basis-specific step: apply the per-injection pdraw factor ──────
     if spin_basis == "chieff":
-        # Legacy swap, verbatim: one call on the concatenated arrays.
-        ln_factor = chi_eff_prior_logprob(
-            data["chieff"], data["m1src"], data["m2src"], amax=amax)
-        ln_factor = np.clip(ln_factor, -50.0, None)
-        data["pdraw"] = data["pdraw"] * np.exp(ln_factor)
+        # Legacy swap: one call on the concatenated arrays.  The -50 floor is
+        # gone (GW-03) -- see _campaign_chieff_chip_lnfactor for why a floored
+        # injection is worse here than on the PE side.
+        ln_factor = np.asarray(
+            chi_eff_prior_logprob(data["chieff"], data["m1src"],
+                                  data["m2src"], amax=amax), dtype=float)
+        with np.errstate(over="ignore"):
+            data["pdraw"] = data["pdraw"] * np.exp(ln_factor)
     else:
         ln_factor = np.concatenate(lnfactor_parts)
-        data["pdraw"] = data["pdraw"] * np.exp(ln_factor)
+        with np.errstate(over="ignore"):
+            data["pdraw"] = data["pdraw"] * np.exp(ln_factor)
+
+    # ── Out-of-support DETECTED injections are fatal (GW-03) ────────────────
+    # A PE sample with zero prior density can be dropped: the posterior simply
+    # has no support there.  A detected injection cannot -- it was drawn from the
+    # real campaign and it triggered, so the Monte-Carlo sum over draws must
+    # include it.  If the ASSUMED prior gives it zero density the assumption is
+    # wrong, and the consumer's `pdraw > 0` guard would quietly exclude it and
+    # bias mu low.
+    n_unsupported = int(np.sum(~np.isfinite(ln_factor)))
+    if n_unsupported:
+        frac = n_unsupported / ln_factor.size
+        raise SpinBasisError(
+            f"spin_basis={spin_basis!r}: {n_unsupported} of {ln_factor.size} "
+            f"detected injections ({100 * frac:.3f}%) fall outside the assumed "
+            f"spin prior's support, so their pdraw would be exactly zero. These "
+            f"injections were drawn and detected, so excluding them biases the "
+            f"selection integral mu low -- and darksirens' `pdraw > 0` guard "
+            f"would exclude them without reporting it. The assumed amax does "
+            f"not cover this campaign: fix the amax (GW-04) or use "
+            f"spin_basis='component', which is exact for any campaign because "
+            f"the assumed prior cancels identically.")
 
     # ── Output columns: legacy 10 + (a1,a2,cost1,cost2,chip when available) ──
     columns = {

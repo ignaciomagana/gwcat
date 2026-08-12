@@ -695,18 +695,34 @@ class GWCatalog:
         # Apply the 1-D chi_eff prior to p_pe (Mode A default: "include").
         # In "exclude" mode the exported p_pe carries no chi_eff prior factor
         # and darksirens must apply it downstream.
+        # Everything is in support unless the chi_eff prior says otherwise, which
+        # only the "include" branch evaluates (GW-03).
+        in_support_v1 = np.ones(np.shape(data["p_pe"]), dtype=bool)
         if spin_prior_mode == "include" and data["chieff"].size > 0:
             from .spin import chi_eff_prior_logprob
             logp_chi = chi_eff_prior_logprob(data["chieff"], data["m1src"],
                                              data["m2src"], amax=amax)
-            safe_logp = np.clip(logp_chi, a_min=-50.0, a_max=None)
-            data["p_pe"] = data["p_pe"] * np.exp(safe_logp)
+            # No -50 floor (GW-03): out of support is zero density, not 2e-22
+            # in a denominator.  The v1 exporter keeps the zeros (the GW-01
+            # positivity check below exempts them) and reports the count.
+            logp_chi = np.asarray(logp_chi, dtype=float)
+            n_unsupported = int(np.sum(~np.isfinite(logp_chi)))
+            if n_unsupported:
+                warnings.warn(
+                    f"to_darksirens: {n_unsupported} of {logp_chi.size} samples "
+                    f"fall outside the chi_eff prior's support (amax={amax}); "
+                    f"their p_pe is exactly zero, which the consumer masks "
+                    f"while still counting them in n for the per-event MC "
+                    f"variance.")
+            with np.errstate(over="ignore"):
+                data["p_pe"] = data["p_pe"] * np.exp(logp_chi)
+            in_support_v1 = np.isfinite(logp_chi)
 
         # ── Exported-weight support contract (GW-01) ────────────────────────
         from .schema import check_p_pe_positive
         check_p_pe_positive(
             data["p_pe"], event_names=kept, nsamp=nsamp,
-            allow_zero=allow_zero_p_pe,
+            allow_zero=allow_zero_p_pe, expected_zero=~in_support_v1,
             context="gwcat-1.0 export (to_darksirens)",
             remedy=("A zero p_pe comes from a store whose p_dL_pe was truncated "
                     "at the recorded distance-prior bounds; re-ingest the store "

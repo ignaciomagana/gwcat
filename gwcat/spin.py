@@ -64,15 +64,26 @@ class ChiEffPrior:
     # ------------------------------------------------------------------
     @staticmethod
     def _single_spin_pdf(s, amax):
-        """p(s_iz) = −log(|s|/amax) / amax  for |s| < amax."""
+        """p(s_iz) = −ln(|s|/amax) / (2·amax)  for |s| < amax.
+
+        The aligned-spin component of a body with magnitude ``a ~ U(0, amax)``
+        and isotropic orientation has ``s = a·cosθ`` distributed over
+        ``[−amax, amax]``, so the normalisation carries a factor ½ that this
+        function omitted (GW-08/GW-03): ``∫ −ln(|s|/amax) ds = 2·amax`` over the
+        full range, not ``amax``.  Both in-tree consumers renormalise their
+        convolution afterwards, so the omission was harmless there -- but it is
+        live the moment this is reused standalone, e.g. for an aligned-spin
+        block, and a density that is wrong by 2x in a denominator is not
+        something to leave sitting in a shared module.
+        """
         abs_s = np.abs(s)
         out = np.zeros_like(s)
         eps = 1e-30
         mask = abs_s > eps
         valid = mask & (abs_s < amax)
-        out[valid] = -np.log(abs_s[valid] / amax) / amax
+        out[valid] = -np.log(abs_s[valid] / amax) / (2.0 * amax)
         # At |s| ≈ 0: cap at the value at eps (integrable singularity)
-        out[~mask] = -np.log(eps / amax) / amax
+        out[~mask] = -np.log(eps / amax) / (2.0 * amax)
         return out
 
     def _convolve_at_q(self, q):
@@ -136,10 +147,30 @@ class ChiEffPrior:
         p = self._interp2d(q, chi)
         return float(p[0]) if scalar else p
 
+    def support(self, chi_eff):
+        """Whether each ``chi_eff`` is inside the prior's support, ``|χ| ≤ amax``.
+
+        An explicit predicate, so a caller can count and report out-of-support
+        samples instead of discovering them as a ``-inf`` (GW-03).
+        """
+        chi = np.abs(np.asarray(chi_eff, dtype=float))
+        return np.asarray(chi <= self.amax)
+
     def logprob(self, chi_eff, m1, m2):
-        """log p(χ_eff | m1, m2, amax).  Clipped at −50 for safety."""
+        """log p(χ_eff | m1, m2, amax).  ``-inf`` outside the support.
+
+        This used to return the sentinel ``-50``, i.e. a density of ``2e-22``
+        rather than zero.  ``p_pe``/``pdraw`` are DENOMINATORS, so that floor
+        turned an impossible sample into one carrying ~1e21 times the median
+        weight and collapsing the event's Monte-Carlo integral to a single
+        sample.  Out of support is now exactly zero density (GW-03); callers
+        must count those samples rather than clip them back up.
+        """
         p = self.prob(chi_eff, m1, m2)
-        return np.where(p > 0, np.log(p), -50.0)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            logp = np.where(np.asarray(p) > 0, np.log(p), -np.inf)
+        # NaN density (rather than zero) is also "no support", not a small number.
+        return np.where(np.isnan(np.asarray(p, dtype=float)), -np.inf, logp)
 
     def _interp2d(self, q, chi):
         """Bilinear interpolation on the (q_grid, chi_grid) table."""
@@ -574,13 +605,46 @@ class ChiEffChiPPrior:
         p = p_marg * p_cond
         return float(p) if scalar else p
 
+    def support(self, chi_eff, chi_p):
+        """Whether each ``(χ_eff, χ_p)`` is inside the joint prior's BOX.
+
+        ``|χ_eff| ≤ amax`` and ``0 ≤ χ_p ≤ amax``.  This is the predicate that
+        matters most in practice: χ_p reaches the ceiling on real data where
+        χ_eff does not, which is why the floored samples were concentrated there.
+
+        .. note::
+           This is a **necessary, not sufficient** condition.  The true support is
+           the set of ``(χ_eff, χ_p)`` reachable by some valid
+           ``(a_i, cos θ_i)`` configuration, and that region is not a box: it
+           pinches in near the ``|χ_eff| → amax`` corners, and the *density*
+           vanishes at ``χ_p = 0`` (a continuous density may legitimately be zero
+           on a boundary).  So ``logprob`` can be ``-inf`` at a point this
+           predicate accepts.  ``isfinite(logprob) ⊆ support`` always holds; the
+           converse does not.
+
+           One consequence worth knowing: an aligned-spin sample set has
+           ``χ_p ≡ 0``, so every one of its samples gets zero density under this
+           joint prior.  That is the right answer -- a precessing-spin prior does
+           not describe an aligned-spin run -- and GW-07 stopped such a run being
+           ingested as a preferred sample set in the first place.
+        """
+        chi = np.abs(np.asarray(chi_eff, dtype=float))
+        chip = np.asarray(chi_p, dtype=float)
+        return np.asarray((chi <= self.amax) & (chip >= 0.0)
+                          & (chip <= self.amax))
+
     def logprob(self, chi_eff, chi_p, m1, m2):
-        """log p(χ_eff, χ_p | m1, m2, amax).  Clipped at −50 for safety."""
+        """log p(χ_eff, χ_p | m1, m2, amax).  ``-inf`` outside the support.
+
+        See :meth:`ChiEffPrior.logprob` for why the old ``-50`` sentinel was
+        actively harmful rather than merely approximate (GW-03).
+        """
         p = self.prob(chi_eff, chi_p, m1, m2)
         p_arr = np.asarray(p, dtype=float)
         with np.errstate(divide="ignore", invalid="ignore"):
-            logp = np.where(p_arr > 0.0, np.log(p_arr), -50.0)
-        logp = np.where(np.isfinite(logp), logp, -50.0)
+            logp = np.where(p_arr > 0.0, np.log(p_arr), -np.inf)
+        # A NaN density means no support either, not a small number.
+        logp = np.where(np.isnan(p_arr), -np.inf, logp)
         return float(logp) if np.ndim(p) == 0 else logp
 
 

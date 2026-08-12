@@ -228,8 +228,18 @@ def test_chi_p_zero_and_boundary_finite():
     chi_eff = np.array([0.0, 0.0, 0.5, -0.5, 0.985, -0.985, 0.0])
     chi_p = np.array([0.0, 1e-9, 0.0, 1e-6, 0.0, 0.5, 0.99])
     lp = prior.logprob(chi_eff, chi_p, 1.0, 0.8)
-    assert np.all(np.isfinite(lp))               # never NaN / -inf
-    assert np.all(lp >= -50.0 - 1e-9)            # clipped floor is -50
+    pr = prior.prob(chi_eff, chi_p, 1.0, 0.8)
+    # Never NaN -- that is the corruption this test guards against.
+    assert not np.any(np.isnan(lp))
+    # -inf occurs exactly where the density is zero, and nowhere else (GW-03).
+    # These are all inside the BOX, but the true support is not a box: the
+    # density vanishes at chi_p = 0 and pinches out near |chi_eff| -> amax, so a
+    # -inf here is the correct answer rather than a floor.
+    np.testing.assert_array_equal(np.isneginf(lp), pr == 0.0)
+    # The genuinely interior point is a real number.
+    assert np.isfinite(lp[1])
+    # support() is necessary but not sufficient; the containment holds one way.
+    assert np.all(np.isfinite(lp) <= prior.support(chi_eff, chi_p))
 
 
 def test_logprob_scalar_and_array_shapes():
@@ -249,11 +259,23 @@ def test_module_cache_reuse():
     assert 0.99 in _spin._CHIP_CACHE
 
 
-def test_out_of_support_chi_p_is_clipped():
-    """chi_p beyond amax (unreachable) -> density 0 -> logprob clipped to -50."""
+def test_out_of_support_chi_p_is_minus_inf_not_a_floor():
+    """chi_p beyond amax is unreachable -> density 0 -> logprob -inf (GW-03).
+
+    This test previously asserted the -50 sentinel.  That floor is the defect:
+    exp(-50) = 2e-22 in a DENOMINATOR gives the sample ~1e21 times the median
+    weight, so a handful of them captured essentially all of an event's
+    reweighting (measured ESS = 1.0 out of 3337 on GW150914).
+    """
     prior = ChiEffChiPPrior(amax=0.99)
     lp = prior.logprob(0.0, 1.2, 1.0, 1.0)      # chi_p=1.2 > amax
-    assert lp == pytest.approx(-50.0)
+    assert lp == -np.inf
+    assert not prior.support(0.0, 1.2)
+    # ... and the support predicate agrees with the density everywhere.
+    chi_eff = np.array([0.0, 0.5, 1.5, -1.2, 0.0])
+    chi_p = np.array([0.5, 0.5, 0.2, 0.1, 1.5])
+    lp_arr = prior.logprob(chi_eff, chi_p, 30.0, 25.0)
+    assert np.all(np.isfinite(lp_arr) <= prior.support(chi_eff, chi_p))
 
 
 # ==========================================================================
@@ -350,3 +372,94 @@ def test_chieff_prior_uses_the_exact_q_reflection_not_a_clamp():
     # ... and that is NOT the equal-mass density the clamp would have returned.
     equal = prior.prob(chi, 25.0, 25.0)
     assert np.max(np.abs(ordered - equal)) > 1e-3
+
+
+# ==========================================================================
+# GW-03: -inf, support predicates, and the missing factor 1/2
+# ==========================================================================
+def test_chieff_logprob_is_neg_inf_outside_support():
+    from gwcat.spin import ChiEffPrior
+
+    prior = ChiEffPrior(amax=0.99)
+    assert prior.logprob(1.5, 30.0, 25.0) == -np.inf
+    assert prior.logprob(-1.5, 30.0, 25.0) == -np.inf
+    assert np.isfinite(prior.logprob(0.2, 30.0, 25.0))
+    assert not prior.support(1.5)
+    assert prior.support(0.2)
+    # array form, and the containment direction that always holds
+    chi = np.array([-1.4, -0.5, 0.0, 0.5, 1.4])
+    lp = prior.logprob(chi, 30.0, 25.0)
+    assert np.all(np.isfinite(lp) <= prior.support(chi))
+    assert not np.any(np.isnan(lp))
+
+
+def test_no_minus_fifty_sentinel_survives_anywhere():
+    """The floor was a magic -50 in two prior classes and four call sites; a
+    grep-level guard is the cheapest way to stop it coming back."""
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent / "gwcat"
+    offenders = []
+    for path in root.rglob("*.py"):
+        # skip stale duplicate trees (build/, .ipynb_checkpoints/) if any return
+        if any(part.startswith(".") or part == "build" for part in path.parts):
+            continue
+        for i, line in enumerate(path.read_text().splitlines(), 1):
+            if "np.clip" not in line:
+                continue
+            if "-50.0" in line or "-50," in line:
+                offenders.append(f"{path.relative_to(root)}:{i}: {line.strip()}")
+    assert not offenders, "a -50 clip came back:\n" + "\n".join(offenders)
+
+
+def test_single_spin_pdf_normalises_to_one():
+    """p(s) = -ln(|s|/amax) / (2*amax) integrates to 1 over [-amax, amax].
+
+    The factor 1/2 was missing.  Both in-tree consumers renormalise their
+    convolution afterwards so it was harmless there, but the density was wrong by
+    2x for anyone reusing it standalone.
+    """
+    from gwcat.spin import ChiEffPrior
+
+    amax = 0.99
+    s = np.linspace(-amax, amax, 400001)
+    p = ChiEffPrior._single_spin_pdf(s, amax)
+    trapz = getattr(np, "trapezoid", getattr(np, "trapz", None))
+    # 1e-3 not 1e-4: the density has an integrable log singularity at s = 0 that
+    # the implementation caps at a finite value, so a uniform-grid trapezoid
+    # slightly over-counts the central bins.
+    assert trapz(p, s) == pytest.approx(1.0, rel=1e-3)
+    # symmetric (to grid round-off), and peaked at the integrable log singularity
+    np.testing.assert_allclose(p, p[::-1], rtol=1e-9)
+    assert p[len(p) // 2] > p[0]
+
+
+def test_single_spin_pdf_matches_monte_carlo():
+    """Independent check: draw a ~ U(0, amax), cos(theta) ~ U(-1, 1) and compare
+    the histogram of s = a*cos(theta) against the analytic density."""
+    from gwcat.spin import ChiEffPrior
+
+    amax = 0.99
+    rng = np.random.default_rng(4)
+    n = 4_000_000
+    s = rng.uniform(0.0, amax, n) * rng.uniform(-1.0, 1.0, n)
+    edges = np.linspace(-amax, amax, 61)
+    hist, _ = np.histogram(s, bins=edges, density=True)
+    mid = 0.5 * (edges[1:] + edges[:-1])
+    pred = ChiEffPrior._single_spin_pdf(mid, amax)
+    # skip the two bins straddling the log singularity at s = 0
+    keep = np.abs(mid) > 2.0 * (edges[1] - edges[0])
+    rel = np.abs(hist[keep] / pred[keep] - 1.0)
+    assert np.median(rel) < 0.02, f"median rel dev {np.median(rel):.4f}"
+
+
+def test_chieff_prior_renormalisation_is_unchanged_by_the_factor():
+    """The convolved chi_eff prior still integrates to 1, i.e. the 1/2 fix did
+    not move any number the two in-tree consumers see."""
+    from gwcat.spin import ChiEffPrior
+
+    prior = ChiEffPrior(amax=0.99, nq=32, nchi=1024)
+    trapz = getattr(np, "trapezoid", getattr(np, "trapz", None))
+    for m1, m2 in ((30.0, 25.0), (40.0, 10.0), (30.0, 30.0)):
+        p = prior.prob(prior.chi_grid, m1, m2)
+        assert trapz(p, prior.chi_grid) == pytest.approx(1.0, rel=2e-3)

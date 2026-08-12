@@ -986,9 +986,23 @@ class SelectionSet:
         chieff_det = self._chieff[keep]
         m1src_det = self._m1src[keep]
         m2src_det = self._m2src[keep]
-        logp_chi = chi_eff_prior_logprob(chieff_det, m1src_det, m2src_det, amax=amax)
-        safe_logp = np.clip(logp_chi, a_min=-50.0, a_max=None)
-        pdraw_det = self._pdraw[keep] * np.exp(safe_logp)
+        logp_chi = np.asarray(
+            chi_eff_prior_logprob(chieff_det, m1src_det, m2src_det, amax=amax),
+            dtype=float)
+        # No -50 floor (GW-03): a detected injection with zero assumed draw
+        # density is a contradiction, not a small number -- see
+        # gwcat/export/selection_builder.py.  The v1 twin refuses identically.
+        n_unsupported = int(np.sum(~np.isfinite(logp_chi)))
+        if n_unsupported:
+            raise ValueError(
+                f"to_selection_file: {n_unsupported} of {logp_chi.size} "
+                f"detected injections fall outside the assumed chi_eff prior's "
+                f"support (amax={amax}), so their pdraw would be exactly zero. "
+                f"They were drawn and detected, so dropping them biases the "
+                f"selection integral mu low. Fix the amax or export in the "
+                f"component basis, which is exact for any campaign.")
+        with np.errstate(over="ignore"):
+            pdraw_det = self._pdraw[keep] * np.exp(logp_chi)
 
         with h5py.File(out_path, "w") as f:
             f.attrs["format_version"] = "gwcat-selection-1.0"
@@ -1286,10 +1300,21 @@ class CombinedSelectionSet:
         data = {k: np.concatenate(v) for k, v in cols.items()}
 
         # Apply 1-D chi_eff prior swap
-        logp_chi = chi_eff_prior_logprob(
-            data["chieff"], data["m1src"], data["m2src"], amax=amax)
-        safe_logp = np.clip(logp_chi, a_min=-50.0, a_max=None)
-        data["pdraw"] *= np.exp(safe_logp)
+        logp_chi = np.asarray(chi_eff_prior_logprob(
+            data["chieff"], data["m1src"], data["m2src"], amax=amax),
+            dtype=float)
+        # No -50 floor (GW-03); see the sibling exporter above.
+        n_unsupported = int(np.sum(~np.isfinite(logp_chi)))
+        if n_unsupported:
+            raise ValueError(
+                f"to_combined_selection_file: {n_unsupported} of "
+                f"{logp_chi.size} detected injections fall outside the assumed "
+                f"chi_eff prior's support (amax={amax}), so their pdraw would "
+                f"be exactly zero. They were drawn and detected, so dropping "
+                f"them biases the selection integral mu low. Fix the amax or "
+                f"export in the component basis.")
+        with np.errstate(over="ignore"):
+            data["pdraw"] *= np.exp(logp_chi)
 
         # Write
         with h5py.File(out_path, "w") as f:

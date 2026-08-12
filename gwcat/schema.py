@@ -275,8 +275,8 @@ class ZeroWeightError(ValueError):
 
 
 def check_p_pe_positive(p_pe, event_names=None, nsamp=None, *,
-                        allow_zero: bool = False, context: str = "export",
-                        remedy: str = ""):
+                        allow_zero: bool = False, expected_zero=None,
+                        context: str = "export", remedy: str = ""):
     """Refuse to export ``p_pe`` samples that are not finite and positive.
 
     Historically an exact ``p_pe == 0`` was a documented-legal state: the
@@ -293,6 +293,11 @@ def check_p_pe_positive(p_pe, event_names=None, nsamp=None, *,
         error names them.  ``nsamp`` is the (constant) samples-per-event count.
     allow_zero : bool
         Warn instead of raising.  Escape hatch for inspecting a legacy store.
+    expected_zero : array-like of bool, optional
+        Samples whose ``p_pe`` is *legitimately* zero and must be excluded from
+        the check -- the out-of-support mask (GW-03).  A prior genuinely assigns
+        no density outside its support, so that zero is a correct answer, unlike
+        the unexplained zeros this function exists to catch.
     context : str
         Prefix for the message, e.g. ``"gwcat-pe-2.0 export"``.
     remedy : str
@@ -309,12 +314,17 @@ def check_p_pe_positive(p_pe, event_names=None, nsamp=None, *,
     if p.size == 0:
         return 0
     bad = ~(np.isfinite(p) & (p > 0.0))
+    if expected_zero is not None:
+        exempt = np.asarray(expected_zero, dtype=bool)
+        if exempt.shape == p.shape:
+            # An exempt sample may be zero, but must still not be NaN/negative.
+            bad = bad & ~(exempt & (p == 0.0))
     n_bad = int(bad.sum())
     if not n_bad:
         return 0
 
-    n_zero = int(np.sum(p == 0.0))
-    n_nonfinite = int(np.sum(~np.isfinite(p)))
+    n_zero = int(np.sum(bad & (p == 0.0)))
+    n_nonfinite = int(np.sum(bad & ~np.isfinite(p)))
     n_neg = n_bad - n_zero - n_nonfinite
     detail = (f"{n_bad} of {p.size} samples "
               f"({n_zero} exactly zero, {n_nonfinite} non-finite, "

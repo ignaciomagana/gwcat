@@ -389,20 +389,44 @@ def test_chieff_chip_ppe_joint_prior(tmp_path):
 
 
 def test_chieff_chip_nan_amax_falls_back(tmp_path):
+    """A fabricated fallback amax is recorded -- and, since GW-03, is now also
+    caught when it fails to cover the samples.
+
+    The fixture's spins reach beyond ``amax_fallback=0.85``, so those samples are
+    genuinely outside the joint prior's support and their ``p_pe`` is zero.  The
+    export therefore refuses unless the caller opts in, which is the point: a
+    made-up ceiling that excludes real samples is exactly the state that used to
+    be papered over by the ``-50`` floor.
+    """
+    from gwcat.export.pe_builder import OutOfSupportError
+
     events = [{"name": "GWc5_000001", "amax1": np.nan, "amax2": np.nan}]
     store, _ = _build_spin_store(tmp_path, events)
     cat = GWCatalog(store)
+
+    kw = dict(format="gwcat2", spin_basis="chieff_chip", nsamp=24, seed=0,
+              cosmology=(67.74, 0.3089), amax_fallback=0.85)
+    with pytest.raises(OutOfSupportError, match="GWc5_000001"):
+        cat.export(str(tmp_path / "refused.h5"), **kw)
+
     out = tmp_path / "fallback.h5"
-    with pytest.warns(UserWarning, match="amax_fallback"):
-        cat.export(str(out), format="gwcat2", spin_basis="chieff_chip",
-                   nsamp=24, seed=0, cosmology=(67.74, 0.3089),
-                   amax_fallback=0.85)
+    with pytest.warns(UserWarning):
+        cat.export(str(out), allow_out_of_support=True, **kw)
     cols, attrs = _read(out)
     fb = [s.decode() if isinstance(s, bytes) else s
           for s in attrs["spin_amax_fallback_events"]]
     assert fb == ["GWc5_000001"]
     np.testing.assert_allclose(
         np.asarray(attrs["chi_eff_chi_p_amax_per_event"], float), [0.85])
+    # The out-of-support accounting is recorded rather than hidden.
+    assert int(attrs["n_samples_out_of_support"]) > 0
+    assert float(attrs["frac_samples_out_of_support"]) > 0.0
+    assert np.all(np.asarray(cols["in_support"], dtype=int) <= 1)
+    n_zero = int(np.sum(np.asarray(cols["p_pe"], float) == 0.0))
+    assert n_zero == int(attrs["n_samples_out_of_support"])
+    # ESS is finite and no larger than nsamp.
+    ess = np.asarray(attrs["prior_reweight_ess_per_event"], float)
+    assert ess.size == 1 and 0.0 < ess[0] <= 24.0
 
 
 # ==========================================================================

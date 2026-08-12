@@ -25,7 +25,8 @@ bit-for-bit identical it mirrors, in order:
   * the same per-event cosmology resolution and ``z_of_dL`` inversion,
   * the same ``p_pe = m1det * p_dL_pe`` mass Jacobian, and (chieff basis always
     uses "include" semantics) the same 1-D chi_eff prior factor applied to the
-    concatenated ``p_pe`` with the same ``clip(logp, -50, None)`` guard, and
+    concatenated ``p_pe`` -- since GW-03 with NO floor on the log-density, in
+    both this builder and the frozen v1 twin, so the parity still holds -- and
   * the same concatenation order.
 
 The only spin-basis-specific step -- the output columns plus the ``p_pe`` spin
@@ -47,8 +48,8 @@ Design decisions (PR 6)
 * **component p_pe.**  ``p_pe = m1det * p_dL_pe / (4 * amax_1 * amax_2)`` with
   the event's own ``amax`` (a per-event *constant* that nonetheless varies event
   to event, so it multiplies ``p_pe`` explicitly).  No chi_eff factor.
-* **chieff_chip p_pe.**  ``p_pe = m1det * p_dL_pe * exp(clip(joint_lnprob, -50,
-  None))`` where ``joint_lnprob = chi_eff_chi_p_prior_logprob(chieff, chip,
+* **chieff_chip p_pe.**  ``p_pe = m1det * p_dL_pe * exp(joint_lnprob)`` (no
+  floor since GW-03) where ``joint_lnprob = chi_eff_chi_p_prior_logprob(chieff, chip,
   m1src, m2src, amax=amax_1)`` -- the SAME source-frame mass convention the
   chieff basis uses for its 1-D chi_eff prior.  ``amax`` is the event's
   ``amax_1``; a per-event ``amax_1 != amax_2`` warns (the joint prior assumes a
@@ -89,6 +90,39 @@ def _group_available_all(sub, *members):
     return bool(ok.all())
 
 
+class OutOfSupportError(ValueError):
+    """Samples fall outside the spin prior's support beyond the allowed fraction.
+
+    Their density is genuinely zero (the prior really does exclude them), so this
+    is not a numerical accident -- it means the declared ``amax`` does not cover
+    the samples the export is built from.
+    """
+
+
+def _ess_of_inverse_weights(p_pe, nobs, nsamp):
+    """Per-event effective sample size of the ``1/p_pe`` reweighting.
+
+    ``ESS = (Σ w)^2 / Σ w^2`` with ``w = 1/p_pe`` over the event's samples,
+    counting a zero-density sample as ``w = 0`` (it drops out of the sum but
+    still counts in ``n``, matching the consumer's convention).
+
+    This is the diagnostic the ``-50`` floor destroyed: floored samples carried
+    ~1e21 times the median weight, so a single one drove ESS to ~1 out of
+    thousands, and nothing recorded it.
+    """
+    if not nobs or not nsamp:
+        return np.array([], dtype=float)
+    p = np.asarray(p_pe, dtype=float).reshape(nobs, nsamp)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        w = np.where(p > 0, 1.0 / p, 0.0)
+    w = np.where(np.isfinite(w), w, 0.0)
+    s1 = w.sum(axis=1)
+    s2 = (w ** 2).sum(axis=1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ess = np.where(s2 > 0, s1 ** 2 / s2, 0.0)
+    return np.asarray(ess, dtype=float)
+
+
 class ChiPDefinitionError(ValueError):
     """The stored chi_p column is not the Schmidt chi_p of the store's own
     components, so a joint (chi_eff, chi_p) prior would not describe it."""
@@ -104,7 +138,9 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
                      waveform_policy="preferred", approximant=None,
                      allow_zero_p_pe=False,
                      chi_p_definition="schmidt_recomputed",
-                     chi_p_def_tol=1e-6):
+                     chi_p_def_tol=1e-6,
+                     max_out_of_support_frac=0.0,
+                     allow_out_of_support=False):
     """Build a PE :class:`ExportProduct` from a :class:`~gwcat.catalog.GWCatalog`.
 
     For ``spin_basis="chieff"`` this reproduces the legacy
@@ -560,16 +596,58 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
             spin_attrs["spin_amax_mismatch_events"] = np.array(
                 mismatch_events, dtype=_str)
 
+    # ── Prior support accounting (GW-03) ────────────────────────────────────
+    # The basis helpers return the per-sample support mask alongside the
+    # columns; it is provenance, not a fit column, so it is popped here.
+    in_support = np.asarray(columns.pop("_in_support",
+                                        np.ones(nobs * nsamp, dtype=bool)))
+    n_out = int(np.sum(~in_support))
+    frac_out = (n_out / in_support.size) if in_support.size else 0.0
+    per_event_out = (in_support.reshape(nobs, nsamp) if nobs and nsamp
+                     else np.zeros((0, 0), dtype=bool))
+    n_out_per_event = ((~per_event_out).sum(axis=1).astype(np.int64)
+                       if per_event_out.size else np.array([], dtype=np.int64))
+    # Effective sample size of the 1/p_pe reweighting, per event.  This is the
+    # diagnostic the -50 floor destroyed: a single floored sample took
+    # essentially all the weight, giving ESS ~ 1 out of thousands.
+    ess_per_event = _ess_of_inverse_weights(columns["p_pe"], nobs, nsamp)
+
+    if n_out and frac_out > max_out_of_support_frac and not allow_out_of_support:
+        hit = np.nonzero(n_out_per_event)[0]
+        listed = ", ".join(f"{kept[i]}: {int(n_out_per_event[i])}/{nsamp}"
+                           for i in hit[:10])
+        more = "" if hit.size <= 10 else f", ... (+{hit.size - 10} more)"
+        raise OutOfSupportError(
+            f"spin_basis={spin_basis!r}: {n_out} of {in_support.size} samples "
+            f"({100 * frac_out:.3f}%) fall outside the spin prior's support, "
+            f"above max_out_of_support_frac={max_out_of_support_frac:g}. "
+            f"Affected event(s) [{hit.size} of {nobs}]: {listed}{more}. "
+            f"Their p_pe is exactly zero, which is correct -- the prior really "
+            f"does assign them no density -- but it means the declared amax "
+            f"does not cover the samples. Fix the amax (see GW-04), pick a "
+            f"basis whose support does cover them (component), or pass "
+            f"allow_out_of_support=True to export anyway.")
+    if n_out and allow_out_of_support:
+        warnings.warn(
+            f"spin_basis={spin_basis!r}: exporting with {n_out} of "
+            f"{in_support.size} samples ({100 * frac_out:.3f}%) outside the "
+            f"spin prior's support (allow_out_of_support=True). Their p_pe is "
+            f"zero, so the consumer will drop them while still counting them in "
+            f"n for the per-event MC variance -- see "
+            f"prior_reweight_ess_per_event for the resulting concentration.")
+
     # ── Exported-weight support contract (GW-01) ────────────────────────────
     from ..schema import check_p_pe_positive
     check_p_pe_positive(
         columns["p_pe"], event_names=kept, nsamp=nsamp,
-        allow_zero=allow_zero_p_pe,
+        allow_zero=allow_zero_p_pe, expected_zero=~in_support,
         context=f"gwcat-pe-2.0 export (spin_basis={spin_basis!r})",
-        remedy=("A zero p_pe comes from a store whose p_dL_pe was truncated at "
-                "the recorded distance-prior bounds; re-ingest the store so the "
-                "distance prior is evaluated over the full sample range, or "
-                "pass allow_zero_p_pe=True to write it anyway."))
+        remedy=("A zero p_pe at an IN-SUPPORT sample comes from a store whose "
+                "p_dL_pe was truncated at the recorded distance-prior bounds; "
+                "re-ingest the store so the distance prior is evaluated over "
+                "the full sample range, or pass allow_zero_p_pe=True to write "
+                "it anyway. (Out-of-support samples are expected to be zero and "
+                "are excluded from this check -- see max_out_of_support_frac.)"))
 
     # Sanity check
     expected = nobs * nsamp
@@ -624,8 +702,22 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
         "sample_set_selection_reason": np.array(
             [str(x) for x in kept_ss_reason], dtype=_str),
         "event_names": np.array([str(k) for k in kept], dtype=_str),
+        # ── Prior-support accounting (GW-03) ─────────────────────────────────
+        # Observability at the source: how many samples the prior excludes, and
+        # what that does to the reweighting's effective sample size.  The
+        # consumer masks zero-weight samples by design but reports nothing, so
+        # without these a producer writing many zeros loses them silently.
+        "n_samples_out_of_support": int(n_out),
+        "frac_samples_out_of_support": float(frac_out),
+        "n_out_of_support_per_event": n_out_per_event,
+        "prior_reweight_ess_per_event": ess_per_event,
+        "max_out_of_support_frac": float(max_out_of_support_frac),
+        "out_of_support_allowed": bool(allow_out_of_support),
     }
     attrs.update(spin_attrs)
+    # Per-sample support mask, written as uint8 so the consumer can mask without
+    # re-deriving the prior.
+    columns["in_support"] = in_support.astype(np.uint8)
 
     # ── Validation-summary feed (writer fills output_path + summary_context) ─
     from ..validation_summary import summarize_catalog
@@ -657,6 +749,13 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
         "waveform_policy": str(waveform_policy),
         "approximant": None if approximant is None else str(approximant),
         "homogeneous_sample_sets": homogeneous,
+        "n_samples_out_of_support": int(n_out),
+        "frac_samples_out_of_support": float(frac_out),
+        "prior_reweight_ess_min": (float(np.min(ess_per_event))
+                                   if ess_per_event.size else None),
+        "prior_reweight_ess_median": (float(np.median(ess_per_event))
+                                      if ess_per_event.size else None),
+        "chi_p_definition": str(chi_p_definition),
     })
 
     return ExportProduct(kind="pe", columns=columns, attrs=attrs,
@@ -677,18 +776,27 @@ def _apply_chieff_basis(data, *, amax):
     This is the single spin-basis-specific step.  ``data`` already carries the
     mass-Jacobian ``p_pe = m1det * p_dL_pe`` and the source-frame masses; here
     the 1-D isotropic chi_eff prior is multiplied into ``p_pe`` (chieff basis
-    is always "include") with the same ``clip(logp, -50, None)`` guard the
-    legacy exporter uses, and the legacy 10 columns are returned in order.
+    is always "include"), and the legacy 10 columns are returned in order.
+
+    The ``clip(logp, -50, None)`` guard is gone (GW-03): an out-of-support sample
+    now gets ``p_pe = 0`` and is counted, rather than a floored ``2e-22`` that
+    dominates every downstream weight.  ``in_support`` comes back alongside the
+    columns so the caller can account for it.
     """
     p_pe = data["p_pe"]
+    in_support = np.ones(p_pe.shape, dtype=bool)
     if data["chieff"].size > 0:
         from ..spin import chi_eff_prior_logprob
-        logp_chi = chi_eff_prior_logprob(data["chieff"], data["m1src"],
-                                         data["m2src"], amax=amax)
-        safe_logp = np.clip(logp_chi, a_min=-50.0, a_max=None)
-        p_pe = p_pe * np.exp(safe_logp)
+        logp_chi = np.asarray(
+            chi_eff_prior_logprob(data["chieff"], data["m1src"],
+                                  data["m2src"], amax=amax), dtype=float)
+        in_support = np.isfinite(logp_chi)
+        with np.errstate(over="ignore"):
+            p_pe = p_pe * np.exp(logp_chi)
+        p_pe = np.where(in_support, p_pe, 0.0)
 
     return {
+        "_in_support": in_support,
         "ra": data["ra"],
         "dec": data["dec"],
         "m1det": data["m1det"],
@@ -708,11 +816,24 @@ def _apply_component_basis(data, amax1_ps, amax2_ps, chip, extras):
     ``p_pe = m1det * p_dL_pe / (4 * amax_1 * amax_2)`` with the per-sample
     (per-event-constant) spin amax; NO chi_eff factor.  Emits the legacy 10
     columns plus ``a1``/``a2``/``cost1``/``cost2``/``chip``.
+
+    Support (GW-03): the component prior is a flat box, so a sample is out of
+    support only when a magnitude exceeds its own ``amax``.  That is a genuinely
+    per-sample condition here -- unlike the projections, whose whole density
+    depends on the assumed ceiling -- so it is checked directly on ``a_i``.
     """
     p_pe = data["p_pe"]
+    in_support = np.ones(p_pe.shape, dtype=bool)
     if p_pe.size > 0:
         p_pe = p_pe / (4.0 * amax1_ps * amax2_ps)
+        if extras is not None:
+            in_support = ((np.abs(extras["a1"]) <= amax1_ps)
+                          & (np.abs(extras["a2"]) <= amax2_ps)
+                          & (np.abs(extras["cost1"]) <= 1.0)
+                          & (np.abs(extras["cost2"]) <= 1.0))
+            p_pe = np.where(in_support, p_pe, 0.0)
     out = {
+        "_in_support": in_support,
         "ra": data["ra"],
         "dec": data["dec"],
         "m1det": data["m1det"],
@@ -736,14 +857,21 @@ def _apply_component_basis(data, amax1_ps, amax2_ps, chip, extras):
 def _apply_chieff_chip_basis(data, amax1_ps, chip, extras):
     """chieff_chip-basis output columns + the joint (chi_eff, chi_p) prior on p_pe.
 
-    ``p_pe = m1det * p_dL_pe * exp(clip(joint_lnprob, -50, None))`` where
-    ``joint_lnprob = chi_eff_chi_p_prior_logprob(chieff, chip, m1src, m2src,
-    amax=amax_1)`` -- the SAME source-frame mass convention the chieff basis
-    uses.  The joint prior takes a scalar ``amax``, so the (per-event-constant)
-    ``amax_1`` array is grouped by unique value.  Emits the legacy 10 columns
-    plus ``chip`` (and ``a1``/``a2``/``cost1``/``cost2`` when available).
+    ``p_pe = m1det * p_dL_pe * exp(joint_lnprob)`` where ``joint_lnprob =
+    chi_eff_chi_p_prior_logprob(chieff, chip, m1src, m2src, amax=amax_1)`` -- the
+    SAME source-frame mass convention the chieff basis uses.  The joint prior
+    takes a scalar ``amax``, so the (per-event-constant) ``amax_1`` array is
+    grouped by unique value.  Emits the legacy 10 columns plus ``chip`` (and
+    ``a1``/``a2``/``cost1``/``cost2`` when available).
+
+    This is where the ``-50`` floor did the most damage (GW-03): chi_p reaches
+    the assumed ceiling on real data where chi_eff does not, so a handful of
+    floored samples captured essentially all of an event's ``1/p_pe`` weight
+    (measured ESS = 1.0 out of 3337 on GW150914).  Out of support is now zero
+    density, counted and reported.
     """
     p_pe = data["p_pe"]
+    in_support = np.ones(p_pe.shape, dtype=bool)
     if p_pe.size > 0:
         from ..spin import chi_eff_chi_p_prior_logprob
         logp = np.empty(p_pe.shape, dtype=float)
@@ -753,9 +881,12 @@ def _apply_chieff_chip_basis(data, amax1_ps, chip, extras):
                 data["chieff"][m], chip[m], data["m1src"][m], data["m2src"][m],
                 amax=float(a))
             logp[m] = np.asarray(lp, dtype=float)
-        safe_logp = np.clip(logp, a_min=-50.0, a_max=None)
-        p_pe = p_pe * np.exp(safe_logp)
+        in_support = np.isfinite(logp)
+        with np.errstate(over="ignore"):
+            p_pe = p_pe * np.exp(logp)
+        p_pe = np.where(in_support, p_pe, 0.0)
     out = {
+        "_in_support": in_support,
         "ra": data["ra"],
         "dec": data["dec"],
         "m1det": data["m1det"],
