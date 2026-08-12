@@ -887,10 +887,29 @@ is wrong. `IngestConfig(prior_ks_fatal=True)` makes that a hard error.
   them from GWOSC (requires network).  Pass `event_table={}` or `--no-event-table`
   to skip.  Use `allowed_names` / `fetch_bbh_list()` instead of FAR cuts for
   BBH selection — this is more robust and does not depend on the event table.
+
+  > **Fixed 2026-08-12 (GW-15a).** The GWOSC parser read a
+  > `parameters[<pipeline>]` sub-dict the event API does not return, so **every**
+  > event was stored with `far = p_astro = NaN` — 0 of 282 rows in the shipped
+  > store had a finite FAR, and any FAR-threshold cut was therefore operating on
+  > no FAR information at all.  `far`/`p_astro` are top-level fields; a live
+  > fetch now yields 381/391 finite.  The remaining ~10 (including GW150914)
+  > genuinely have none in the public API and stay NaN, which is what makes
+  > `far_available=False` an honest state rather than a fabricated value.
+  > **A store ingested before this fix has no usable FAR** — re-ingest before
+  > relying on a FAR cut.
 - **GWTC-5.0 GWOSC indexing**: the GWOSC v2 API was not yet updated to include
   GWTC-5.0 events at the time of the May 2026 paper release. `fetch_bbh_list()`
   will return the full 259-event list once the API is updated (expected within
   weeks). Until then, `BBH_ALL` covers the 126 confirmed O1–O4a BBH.
-- **`mass_prior_kind`** is assumed `uniform_detector_frame`.
+- ~~**`mass_prior_kind`** is assumed `uniform_detector_frame`.~~  **Parsed since
+  GW-07.**  The real releases put the prior on `(chirp_mass, mass_ratio)` and
+  record `mass_1`/`mass_2` only as `Constraint(1, 1000)`; the classes are
+  `UniformInComponentsChirpMass` / `UniformInComponentsMassRatio`, which is
+  exactly what makes the prior flat in `(m1det, m2det)` — so the exported
+  `p_pe = m1det · p_dL_pe` Jacobian **is** correct.  It is now verified per row
+  rather than assumed (273 `uniform_detector_frame`, 9 `assumed_default` where
+  no analytic prior exists, 0 unrecognised), with the bounds recorded and a loud
+  warning if a file ever declares something else.
 - **Ingest requires `pesummary`** (`pip install gwcat[ingest]`).
 - **healpy** is optional; without it `sky_area_90` is NaN.
