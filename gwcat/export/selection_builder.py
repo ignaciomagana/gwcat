@@ -175,6 +175,105 @@ def _campaign_chieff_chip_lnfactor(s, keep, amax, strict):
     return np.asarray(lnp, dtype=float), amax_1
 
 
+class BlockCampaignMismatch(SpinBasisError):
+    """A campaign's injected draw contradicts the requested basis's assumption.
+
+    Distinct from a bare :class:`SpinBasisError` (which reports an *unavailable*
+    quantity) because this one is a physics mismatch: the density gwcat would
+    write is simply not the density the campaign was drawn from.
+    """
+
+
+def _check_chieff_swap_valid(set_list, *, strict, violations):
+    """Refuse the chi_eff swap on a campaign that is not uniform-isotropic.
+
+    The swap divides out the injected spin prior and multiplies in the analytic
+    ``p(chi_eff)`` for uniform magnitudes and isotropic orientations.  If the
+    campaign did not draw its spins that way, the exported ``pdraw`` is the wrong
+    density by an O(1), chi_eff-DEPENDENT factor -- the textbook Essick &
+    Fishbach p_draw mismatch, which biases the chi_eff population posterior and
+    leaks into masses, rate and H0 through the selection integral.
+
+    Unlike the constant amax offset (GW-04), this one does NOT cancel: it varies
+    across injections, so it moves posteriors, not just log Z.
+
+    The evidence is already in hand -- ``s.spin_meta['uniform_isotropic']`` --
+    and ``chieff_chip`` has checked it since PR5.  ``chieff`` never did, which is
+    how the shipped ``selection_o3o4ab_allsky.h5`` came to apply it to an O4ab
+    campaign measured at ``isotropy_dev = 0.6419``.
+    """
+    bad, unverifiable = [], []
+    for s in set_list:
+        meta = s.spin_meta or {}
+        if meta.get("uniform_isotropic"):
+            continue
+        checks = meta.get("checks") or {}
+        record = {
+            "path": str(s.path),
+            "spin_format": meta.get("spin_format"),
+            "uniform_isotropic": bool(meta.get("uniform_isotropic")),
+            "magnitude_uniform": _jsonable(checks.get("magnitude_uniform")),
+            "isotropy_dev": _jsonable(checks.get("isotropy_dev")),
+            "max_spin_uniform": _jsonable(checks.get("max_spin_uniform")),
+        }
+        # "False" carries two very different meanings and they must not be
+        # conflated: a check that RAN AND FAILED is a measured contradiction; a
+        # check that never ran (the file carries no spin draw densities at all)
+        # is simply unknown.  Refusing the second would break every legacy
+        # spin-less campaign, for which the chi_eff swap is the only option
+        # available -- there is no component density to fall back to.
+        ran = any(checks.get(k) is not None for k in
+                  ("magnitude_uniform", "max_spin_uniform", "isotropy_dev"))
+        record["verified"] = bool(ran)
+        (bad if ran else unverifiable).append(record)
+
+    if unverifiable:
+        warnings.warn(
+            f"spin_basis='chieff': {len(unverifiable)} campaign(s) carry no "
+            f"injected spin draw densities, so the uniform-magnitude/isotropic "
+            f"assumption behind the chi_eff swap could not be CHECKED: "
+            + "; ".join(str(b["path"]) for b in unverifiable)
+            + ". Proceeding (the swap is the only basis such a file supports), "
+            f"but the assumption is unverified rather than confirmed; recorded "
+            f"in spin_basis_assumption_unverified.")
+        violations.extend(unverifiable)
+    if not bad:
+        return
+    detail = "; ".join(
+        f"{b['path']} (spin_format={b['spin_format']!r}, "
+        f"magnitude_uniform={b['magnitude_uniform']}, "
+        f"isotropy_dev={b['isotropy_dev']})" for b in bad)
+    msg = (
+        f"spin_basis='chieff' replaces each campaign's real spin-draw density "
+        f"with the analytic uniform-magnitude/isotropic chi_eff marginal, but "
+        f"{len(bad)} campaign(s) did NOT draw spins that way: {detail}. The "
+        f"exported pdraw would be the wrong density by an O(1), "
+        f"chi_eff-dependent factor -- unlike a constant offset this does not "
+        f"cancel, so it biases the chi_eff population posterior and leaks into "
+        f"masses, rate and H0. Use spin_basis='component', which is EXACT for "
+        f"any campaign because it keeps the injected per-injection spin density "
+        f"instead of assuming one. Pass strict=False to export anyway; the file "
+        f"then records spin_basis_assumption_violations so it is at least "
+        f"self-describing.")
+    if strict:
+        raise BlockCampaignMismatch(msg)
+    warnings.warn(msg)
+    violations.extend(bad)
+
+
+def _jsonable(v):
+    """Coerce numpy scalars/tuples in a check value to plain Python."""
+    if v is None:
+        return None
+    if isinstance(v, (tuple, list)):
+        return [_jsonable(x) for x in v]
+    if isinstance(v, (np.bool_, bool)):
+        return bool(v)
+    if isinstance(v, (np.floating, float, np.integer, int)):
+        return float(v)
+    return str(v)
+
+
 def build_selection_product(sets, *, spin_basis="component", far_threshold=1.0,
                             source_class=None, amax=0.99, snr_threshold=None,
                             strict=True):
@@ -330,9 +429,19 @@ def build_selection_product(sets, *, spin_basis="component", far_threshold=1.0,
                else f" in source class {source_class!r}"))
 
     data = {k: np.concatenate(v) for k, v in parts.items()}
+    #: Campaigns whose injected draw contradicts the basis (GW-06, strict=False).
+    swap_violations = []
 
     # ── Spin-basis-specific step: apply the per-injection pdraw factor ──────
     if spin_basis == "chieff":
+        # ── Uniform-isotropic gate (GW-06) ─────────────────────────────────
+        # The swap below REPLACES each campaign's real spin-draw density with
+        # the analytic uniform-magnitude/isotropic chi_eff marginal.  That is
+        # only valid if the campaign actually drew its spins that way.  Until
+        # GW-06 the check existed for chieff_chip and not for chieff -- i.e. the
+        # basis that ships was the one with no gate.
+        _check_chieff_swap_valid(set_list, strict=strict,
+                                 violations=swap_violations)
         # Legacy swap: one call on the concatenated arrays.  The -50 floor is
         # gone (GW-03) -- see _campaign_chieff_chip_lnfactor for why a floored
         # injection is worse here than on the PE side.
@@ -439,6 +548,13 @@ def build_selection_product(sets, *, spin_basis="component", far_threshold=1.0,
         attrs["chi_eff_swap_applied"] = True
         attrs["chi_eff_prior_applied_to_pdraw"] = True
         attrs["chi_eff_amax"] = float(amax)
+        # GW-06: empty unless strict=False let a non-uniform-isotropic campaign
+        # through, in which case the file says so about itself.
+        attrs["spin_basis_assumption_violations"] = json.dumps(swap_violations)
+        attrs["spin_basis_assumption_violated"] = bool(
+            [v for v in swap_violations if v.get("verified")])
+        attrs["spin_basis_assumption_unverified"] = bool(
+            [v for v in swap_violations if not v.get("verified")])
     elif spin_basis == "component":
         attrs["spin_prior_mode"] = "component"
         attrs["chi_eff_prior_applied_to_pdraw"] = False

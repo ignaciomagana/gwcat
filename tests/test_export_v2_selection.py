@@ -390,3 +390,92 @@ def test_write_summary(tmp_path):
     assert summary["kind"] == "selection_export"
     assert summary["spin_basis"] == "component"
     assert summary["schema_version"] == "gwcat-selection-2.0"
+
+
+# ==========================================================================
+# GW-06: the chieff swap is gated on a uniform-isotropic injected draw
+# ==========================================================================
+def _fake_set(path, *, uniform, checks=None):
+    class _S:
+        pass
+    s = _S()
+    s.path = path
+    s.spin_meta = {"spin_format": "o4_factored",
+                   "uniform_isotropic": uniform,
+                   "checks": checks or {}}
+    return s
+
+
+def test_chieff_raises_on_a_verified_non_uniform_campaign():
+    """The measured O4ab case: magnitude uniformity and isotropy both FAIL, so
+    the analytic chi_eff swap is invalid and must be refused."""
+    from gwcat.export.selection_builder import (BlockCampaignMismatch,
+                                                _check_chieff_swap_valid)
+
+    sets = [_fake_set("o4ab.hdf", uniform=False,
+                      checks={"magnitude_uniform": (False, False),
+                              "isotropy_dev": (0.6419, 0.6419)})]
+    with pytest.raises(BlockCampaignMismatch) as exc:
+        _check_chieff_swap_valid(sets, strict=True, violations=[])
+    msg = str(exc.value)
+    assert "o4ab.hdf" in msg
+    assert "0.6419" in msg
+    assert "component" in msg          # names the remedy
+
+
+def test_chieff_non_strict_warns_and_records_the_violation():
+    from gwcat.export.selection_builder import _check_chieff_swap_valid
+
+    viol = []
+    sets = [_fake_set("o4ab.hdf", uniform=False,
+                      checks={"magnitude_uniform": (False, False),
+                              "isotropy_dev": (0.6419, 0.6419)})]
+    with pytest.warns(UserWarning, match="did NOT draw spins that way"):
+        _check_chieff_swap_valid(sets, strict=False, violations=viol)
+    assert len(viol) == 1
+    assert viol[0]["verified"] is True
+    assert viol[0]["isotropy_dev"] == [0.6419, 0.6419]
+
+
+def test_chieff_passes_a_uniform_isotropic_campaign():
+    from gwcat.export.selection_builder import _check_chieff_swap_valid
+
+    viol = []
+    sets = [_fake_set("endo3.hdf", uniform=True,
+                      checks={"magnitude_uniform": (True, True),
+                              "isotropy_dev": (1e-9, 1e-9)})]
+    _check_chieff_swap_valid(sets, strict=True, violations=viol)   # no raise
+    assert viol == []
+
+
+def test_unverifiable_campaign_warns_but_does_not_refuse():
+    """A file carrying NO spin draw densities is unknown, not contradicted.
+
+    Refusing it would break every legacy spin-less campaign, for which the
+    chi_eff swap is the only basis available -- there is no component density to
+    fall back to.  So "checked and failed" and "never checked" must not be
+    conflated, even though both leave uniform_isotropic False.
+    """
+    from gwcat.export.selection_builder import _check_chieff_swap_valid
+
+    viol = []
+    sets = [_fake_set("legacy.hdf", uniform=False, checks={})]
+    with pytest.warns(UserWarning, match="could not be CHECKED"):
+        _check_chieff_swap_valid(sets, strict=True, violations=viol)  # no raise
+    assert len(viol) == 1 and viol[0]["verified"] is False
+
+
+def test_only_the_offending_campaign_is_named_in_a_mixed_export():
+    from gwcat.export.selection_builder import (BlockCampaignMismatch,
+                                                _check_chieff_swap_valid)
+
+    sets = [_fake_set("endo3.hdf", uniform=True,
+                      checks={"magnitude_uniform": (True, True)}),
+            _fake_set("o4ab.hdf", uniform=False,
+                      checks={"magnitude_uniform": (False, False),
+                              "isotropy_dev": (0.6419, 0.6419)})]
+    with pytest.raises(BlockCampaignMismatch) as exc:
+        _check_chieff_swap_valid(sets, strict=True, violations=[])
+    assert "o4ab.hdf" in str(exc.value)
+    assert "endo3.hdf" not in str(exc.value)
+    assert "1 campaign(s)" in str(exc.value)
