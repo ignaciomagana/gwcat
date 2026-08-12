@@ -320,6 +320,8 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
         chip_src_list = []
         chip_maxdiff_list = []
         chip_mismatch_events, chip_no_ingredient_events = [], []
+        amax_src1_list, amax_src2_list, amax_infl_list = [], [], []
+        samples_bound_events = []
         fallback_events, unrecognized_events, mismatch_events = [], [], []
 
     def _resolve_cost(e, avail_cos, avail_tilt, cos_name, tilt_name):
@@ -416,8 +418,7 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
                 used_fallback = True
             if used_fallback:
                 fallback_events.append(str(name))
-            kept_amax1.append(a1max)
-            kept_amax2.append(a2max)
+
             # np.isclose, not exact float equality (GW-04): a single injected
             # ceiling round-trips as 0.9980000000000001 vs 0.9979999999999999
             # through the numerical amax resolution, so `!=` fired on files with
@@ -439,6 +440,57 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
                     if avail_a1[e] else None)
             a2_e = (per_extra["a_2"][e][idx_orig]
                     if avail_a2[e] else None)
+
+            # ── Resolved-amax provenance (GW-04) ────────────────────────────
+            # "analytic"      the ingested analysis's own prior covers its
+            #                 samples -- the honest case;
+            # "samples_bound" the parsed prior does NOT cover the samples, so
+            #                 the ceiling is raised to max|a_i| and the
+            #                 inflation is recorded;
+            # "fallback"      no stored amax at all, a fabricated ceiling.
+            #
+            # samples_bound is not a nicety: the GWTC analytic priors declare
+            # amax = 0.99 for all 282 rows while the posteriors reach 0.9996+,
+            # so 1810 of 1.16M samples (71 of 282 events) sit outside the
+            # declared box.  Under GW-03 those get p_pe = 0 and the export
+            # refuses -- correctly, because a ceiling that excludes real samples
+            # is wrong.  Raising it to cover them is exact for the COMPONENT
+            # basis, whose density is a flat box: widening the box changes only
+            # the per-event constant 1/(4*amax_1*amax_2), which cancels in the
+            # per-event normalisation the consumer applies.
+            src1 = src2 = "fallback" if used_fallback else "analytic"
+            infl1 = infl2 = 0.0
+            # ONLY for a flat-box (bijection-like) prior.  Widening the box
+            # changes just the per-event constant 1/(4*amax_1*amax_2), which
+            # cancels in the consumer's per-event normalisation -- so it is
+            # exact.  For a PROJECTION (chieff / chieff_chip) the entire density
+            # p(chi_eff[, chi_p] | amax) depends on the ceiling, so raising it
+            # would silently change the physics rather than fix a bookkeeping
+            # bound.  Those bases keep the declared amax and are refused by the
+            # GW-03 support gate instead, which is the honest outcome: a
+            # projection cannot be built against a prior whose support does not
+            # contain the samples.
+            if spin_basis == "component" and a1_e is not None and np.size(a1_e):
+                s1 = float(np.nanmax(np.abs(np.asarray(a1_e, float))))
+                if np.isfinite(s1) and s1 > a1max:
+                    infl1 = s1 / a1max - 1.0
+                    a1max = s1 * (1.0 + 1e-6)
+                    src1 = "samples_bound"
+            if spin_basis == "component" and a2_e is not None and np.size(a2_e):
+                s2 = float(np.nanmax(np.abs(np.asarray(a2_e, float))))
+                if np.isfinite(s2) and s2 > a2max:
+                    infl2 = s2 / a2max - 1.0
+                    a2max = s2 * (1.0 + 1e-6)
+                    src2 = "samples_bound"
+            if "samples_bound" in (src1, src2):
+                samples_bound_events.append(
+                    (str(name), max(infl1, infl2)))
+            amax_src1_list.append(src1)
+            amax_src2_list.append(src2)
+            amax_infl_list.append(max(infl1, infl2))
+
+            kept_amax1.append(a1max)
+            kept_amax2.append(a2max)
             cost1_full = _resolve_cost(e, avail_cos1, avail_tilt1,
                                        "cos_tilt_1", "tilt_1")
             cost2_full = _resolve_cost(e, avail_cos2, avail_tilt2,
@@ -570,6 +622,20 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
                 f"column under a prior that does not describe it. Use "
                 f"chi_p_definition='schmidt_recomputed' (the default), or raise "
                 f"chi_p_def_tol deliberately.")
+        if samples_bound_events:
+            worst = sorted(samples_bound_events, key=lambda t: -t[1])[:5]
+            listed = ", ".join(f"{nm}: +{100 * f:.3f}%" for nm, f in worst)
+            warnings.warn(
+                f"spin_basis={spin_basis!r}: {len(samples_bound_events)} of "
+                f"{nobs} event(s) have posterior spin samples ABOVE the amax "
+                f"their analytic prior declares, so the ceiling was raised to "
+                f"cover them (spin_amax_source='samples_bound'). Largest "
+                f"inflations: {listed}. For the component basis this is exact "
+                f"-- widening a flat box changes only the per-event constant "
+                f"1/(4*amax_1*amax_2), which cancels in the consumer's "
+                f"per-event normalisation -- which is why it is applied ONLY "
+                f"here. A projection basis keeps its declared ceiling and is "
+                f"refused by the support gate instead.")
         if chip_no_ingredient_events:
             warnings.warn(
                 f"chi_p_definition='schmidt_recomputed': "
@@ -593,6 +659,12 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
                                                       dtype=float),
             "chi_p_def_tol": float(chi_p_def_tol),
             "spin_amax_fallback": float(amax_fallback),
+            # GW-04: how each per-body ceiling was resolved, and by how much a
+            # samples_bound ceiling had to be raised above the declared prior.
+            "spin_amax_source_1_per_event": np.array(amax_src1_list, dtype=_str),
+            "spin_amax_source_2_per_event": np.array(amax_src2_list, dtype=_str),
+            "spin_amax_inflation_per_event": np.asarray(amax_infl_list,
+                                                        dtype=float),
         }
         if spin_basis == "component":
             spin_attrs["component_spin_prior_applied_to_p_pe"] = True
@@ -630,9 +702,16 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
             f"Affected event(s) [{hit.size} of {nobs}]: {listed}{more}. "
             f"Their p_pe is exactly zero, which is correct -- the prior really "
             f"does assign them no density -- but it means the declared amax "
-            f"does not cover the samples. Fix the amax (see GW-04), pick a "
-            f"basis whose support does cover them (component), or pass "
-            f"allow_out_of_support=True to export anyway.")
+            f"does not cover the samples. "
+            + ("The component prior is a flat box, so its ceiling can be "
+               "raised to cover them exactly -- see the samples_bound "
+               "resolution in GW-04; reaching this message means a sample "
+               "exceeded even that. "
+               if spin_basis == "component"
+               else "Use spin_basis='component', whose flat-box support can be "
+                    "widened to cover the samples exactly (a projection's "
+                    "whole density depends on the ceiling, so it cannot). ")
+            + f"Or pass allow_out_of_support=True to export anyway.")
     if n_out and allow_out_of_support:
         warnings.warn(
             f"spin_basis={spin_basis!r}: exporting with {n_out} of "
