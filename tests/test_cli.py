@@ -206,7 +206,7 @@ def test_export_darksirens_happy_path(tmp_path):
     assert summary["n_events_exported"] == 2
     assert summary["n_events_missing_far"] == 1
     assert summary["far_policy"] == "allow_missing"
-    assert summary["source_class_filter"] == "bbh"
+    assert summary["source_class_filter"] == "BBH"
     assert summary["spin_prior_mode"] == "include"
     assert summary["cosmology_mode"] == "override"
 
@@ -265,7 +265,7 @@ def test_selection_single_file(tmp_path):
     assert summary["kind"] == "selection_export"
     assert summary["n_detected"] == 4
     assert summary["n_campaigns"] == 1
-    assert summary["source_class_filter"] == "bbh"
+    assert summary["source_class_filter"] == "BBH"
 
 
 def test_selection_combined_multiple_files(tmp_path):

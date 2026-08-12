@@ -52,7 +52,8 @@ import h5py
 
 from .cosmology import PLANCK15
 from .source_class import (classify_by_mass, normalize_source_class,
-                          resolve_filter_classes, DEFAULT_NSBH_MASS_THRESHOLD)
+                           resolve_filter_classes, format_source_class_filter,
+                           DEFAULT_NSBH_MASS_THRESHOLD)
 from . import selection_spin as _sspin
 from .spin import chi_p_from_components
 
@@ -156,10 +157,7 @@ def _selection_provenance_dict(source_class, nsbh_mass_threshold,
     d["pdraw_state"] = PDRAW_STATE
 
     # ── Source-class filter provenance ─────────────────────────────────────
-    d["source_class_filter"] = (
-        "" if source_class is None
-        else (str(source_class) if isinstance(source_class, (str, bytes))
-              else ",".join(str(x) for x in source_class)))
+    d["source_class_filter"] = format_source_class_filter(source_class)
     d["source_class_method"] = (
         "none" if source_class is None else "mass_threshold")
     d["nsbh_mass_threshold"] = float(nsbh_mass_threshold)
@@ -1195,8 +1193,9 @@ class SelectionSet:
                 "significance_columns": list(self._far_columns),
                 "significance_available": bool(self._far_columns),
                 "p_astro_available": False,
-                "source_class_filter": (None if source_class is None
-                                        else str(source_class)),
+                "source_class_filter": (
+                    None if source_class is None
+                    else format_source_class_filter(source_class)),
                 "source_class_counts_detected": (
                     value_counts([normalize_source_class(c) for c in classes_det])),
                 "cosmology_H0": float(self.H0),
@@ -1511,8 +1510,9 @@ class CombinedSelectionSet:
                 "significance_columns": list(far_columns_union),
                 "significance_available": bool(far_columns_union),
                 "p_astro_available": False,
-                "source_class_filter": (None if source_class is None
-                                        else str(source_class)),
+                "source_class_filter": (
+                    None if source_class is None
+                    else format_source_class_filter(source_class)),
                 "source_class_counts_detected": (
                     value_counts([normalize_source_class(c) for c in classes_det])),
                 "cosmology_H0": float(self._sets[0].H0),

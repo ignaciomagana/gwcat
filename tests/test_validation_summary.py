@@ -277,7 +277,7 @@ def test_to_darksirens_write_summary_records_missing_far(tmp_path):
     assert summary["n_events_exported"] == 2
     assert summary["n_events_missing_far"] == 1
     assert summary["far_policy"] == "allow_missing"
-    assert summary["source_class_filter"] == "bbh"
+    assert summary["source_class_filter"] == "BBH"
     assert summary["spin_prior_mode"] == "include"
     assert summary["cosmology_mode"] == "override"
     assert summary["cosmology_override_used"] is True
@@ -377,7 +377,7 @@ def test_selection_set_write_summary(tmp_path):
     assert summary["kind"] == "selection_export"
     assert summary["n_detected"] == 4
     assert summary["n_campaigns"] == 1
-    assert summary["source_class_filter"] == "bbh"
+    assert summary["source_class_filter"] == "BBH"
     assert summary["source_class_counts_detected"] == {"BBH": 4}
     assert summary["p_astro_available"] is False
     assert summary["spin_prior_mode"] == "include"

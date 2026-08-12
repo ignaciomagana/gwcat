@@ -150,8 +150,19 @@ def normalize_source_class(label) -> str:
 
     Case/punctuation-insensitive.  Unrecognised or empty values normalise to
     :data:`UNKNOWN` (explicit-absence), never to a crash.
+
+    This function classifies *data* -- a label read off an event whose class
+    nobody recorded is genuinely unknown, and mapping it to :data:`UNKNOWN` is
+    the right answer.  A *request* is different: see
+    :func:`resolve_filter_classes`, which raises instead.
     """
     return _CLASS_ALIASES.get(_compact_key(label), UNKNOWN)
+
+
+def _accepted_tokens() -> str:
+    """The tokens a request may use, for an error message."""
+    return (f"keywords {sorted(_FILTER_MAP)} or canonical class names "
+            f"{list(SOURCE_CLASSES)} (case- and punctuation-insensitive)")
 
 
 def resolve_filter_classes(
@@ -162,6 +173,13 @@ def resolve_filter_classes(
     Accepts the keywords ``bbh``/``nsbh``/``bns``/``massgap``/``cbc``/``all``,
     a canonical class name, or an iterable of any of those.  ``None`` means "no
     source-class restriction" and returns every canonical class.
+
+    Raises ``ValueError`` on a token that is neither.  This is deliberately
+    stricter than :func:`normalize_source_class`: an unrecognised *request*
+    used to resolve to ``{"Unknown"}``, so a typo like ``--source-class BBHs``
+    silently selected only the *unclassified* events -- zero of them on the real
+    store -- and reported success.  A request names classes the caller believes
+    exist; if one does not, that is an error, not an empty selection.
     """
     if source_class is None:
         return set(SOURCE_CLASSES)
@@ -170,11 +188,78 @@ def resolve_filter_classes(
         for item in source_class:
             out |= resolve_filter_classes(item)
         return out
+    if isinstance(source_class, bytes):
+        source_class = source_class.decode("utf-8", "replace")
+    # A comma-separated string is the CLI spelling of a list.  Resolving it here
+    # rather than in the CLI is what makes "nsbh,bns" and ["nsbh", "bns"] the
+    # same request everywhere, including on the Python API path the CLI helper
+    # never touches.
+    if isinstance(source_class, str) and "," in source_class:
+        parts = [p for p in source_class.split(",") if p.strip()]
+        if not parts:
+            raise ValueError(
+                f"empty source-class request {source_class!r}; accepted: "
+                f"{_accepted_tokens()}")
+        return resolve_filter_classes(parts)
     key = _compact_key(source_class)
     if key in _FILTER_MAP:
         return set(_FILTER_MAP[key])
-    # Fall back to interpreting it as a single canonical class name.
-    return {normalize_source_class(source_class)}
+    if key in _CLASS_ALIASES:
+        return {_CLASS_ALIASES[key]}
+    raise ValueError(
+        f"unrecognised source-class request {source_class!r}; accepted: "
+        f"{_accepted_tokens()}. To select events whose class was never "
+        f"recorded, ask for {UNKNOWN!r} explicitly.")
+
+
+def canonical_source_class(
+    source_class: Union[str, Iterable[str], None],
+) -> tuple:
+    """The canonical, order-independent form of a source-class request.
+
+    Returns a tuple of canonical labels in :data:`SOURCE_CLASSES` order, so that
+    ``["nsbh", "bns"]``, ``"nsbh,bns"`` and ``("BNS", "NSBH")`` all produce the
+    same value.  ``None`` (no restriction) returns ``()``, which is distinct
+    from an explicit request that happens to admit every class.
+    """
+    if source_class is None:
+        return ()
+    resolved = resolve_filter_classes(source_class)
+    return tuple(c for c in SOURCE_CLASSES if c in resolved)
+
+
+def format_source_class_filter(
+    source_class: Union[str, Iterable[str], None],
+) -> str:
+    """Serialise a source-class request to a stable, round-trippable string.
+
+    This is what the exporters write to ``source_class_filter`` and what
+    :func:`parse_source_class_filter` reads back.  ``None`` -> ``""``.
+
+    The exporters used to write ``str(source_class)``, whose value depends on
+    how the request was *spelled*: the Python API's ``["nsbh", "bns"]`` became
+    ``"['nsbh', 'bns']"`` and the CLI's ``--source-class nsbh,bns`` became
+    ``"nsbh,bns"``.  Neither round-trips, so the paired-file cross-check
+    resolved both to ``{"Unknown"}`` and passed on files that did not agree.
+    """
+    return ",".join(canonical_source_class(source_class))
+
+
+def parse_source_class_filter(raw) -> tuple:
+    """Read a ``source_class_filter`` attr back to canonical labels.
+
+    Inverse of :func:`format_source_class_filter`.  An empty/absent value means
+    "no restriction" and returns ``()``.  Tolerates the ``bytes`` and
+    ``numpy.str_`` an HDF5 attr round-trip can produce.
+    """
+    if raw is None:
+        return ()
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "replace")
+    s = str(raw).strip()
+    if not s:
+        return ()
+    return canonical_source_class([p for p in s.split(",") if p.strip()])
 
 
 def load_event_list(source: Union[str, Path, Sequence[str]]) -> list:

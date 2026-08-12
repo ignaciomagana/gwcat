@@ -219,12 +219,12 @@ def _contract_attrs(product, kind):
     # number: Essick & Fishbach require the EVENT cut and the INJECTION cut to
     # be the same statistic at the same threshold, and comparing thresholds
     # without their statistic is how that check stayed vacuous.
-    if kind == "pe":
-        stat = "far_max" if a.get("far_max") is not None else None
-        thr = a.get("far_max")
-    else:
-        stat = "far_threshold" if a.get("far_threshold") is not None else None
-        thr = a.get("far_threshold")
+    # Name the STATISTIC, not the side's attr: "far_max" and "far_threshold" are
+    # two spellings of one cut, and recording the spellings made the two sides
+    # differ by construction.
+    thr = a.get("far_max") if kind == "pe" else a.get("far_threshold")
+    thr = None if thr is None or not np.isfinite(float(thr)) else float(thr)
+    stat = None if thr is None else "far"
 
     contract = build_contract(
         parameter_space=space.name,

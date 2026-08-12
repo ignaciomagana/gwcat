@@ -21,6 +21,7 @@ import pytest
 from gwcat.catalog import GWCatalog, validate_export
 from gwcat.selection import SelectionSet, CombinedSelectionSet
 from gwcat.spin import chi_eff_prior_logprob
+from gwcat.source_class import format_source_class_filter
 
 # Reference cosmology shared by the PE store and selection fixtures.
 _H0, _Om0 = 67.74, 0.3089
@@ -248,7 +249,11 @@ def test_source_class_filter_counts(tmp_path, writer, sc, expected):
             assert f.attrs["source_class_filter"] == ""
             assert "source_class_filter_note" not in f.attrs
         else:
-            assert f.attrs["source_class_filter"] == str(sc)
+            # The canonical form, not the request's spelling: "cbc" expands to
+            # the classes it admits so the paired PE file can be compared
+            # against it (GW-11).
+            assert f.attrs["source_class_filter"] == (
+                format_source_class_filter(sc))
             assert f.attrs["source_class_method"] == "mass_threshold"
             assert "source_class_filter_note" in f.attrs
 
@@ -276,7 +281,7 @@ def test_combined_source_class_filter_counts(tmp_path):
         assert int(f.attrs["n_detected"]) == 8       # 4 BBH per campaign
         assert int(f.attrs["n_injections_before_filter"]) == 18
         assert int(f.attrs["n_injections_after_filter"]) == 8
-        assert f.attrs["source_class_filter"] == "bbh"
+        assert f.attrs["source_class_filter"] == "BBH"
 
 
 # ==========================================================================

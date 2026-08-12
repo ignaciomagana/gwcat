@@ -257,7 +257,7 @@ def test_write_summary_feed(tmp_path):
     assert sj["output_path"] == str(out)
     assert sj["n_events_exported"] == 2
     assert sj["spin_basis"] == "chieff"
-    assert sj["source_class_filter"] == "bbh"
+    assert sj["source_class_filter"] == "BBH"
     assert Path(str(out) + ".validation_summary.md").exists()
 
 

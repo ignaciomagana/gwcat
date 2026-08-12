@@ -76,7 +76,18 @@ import numpy as np
 
 from ..cosmology import make_cosmology, z_of_dL
 from ..params import get_space
+from ..source_class import format_source_class_filter
 from .product import ExportProduct
+
+
+def _cut_value(x):
+    """A detection-cut threshold as a float, with NaN for "no cut".
+
+    HDF5 has no null, so an absent cut is NaN rather than a missing attr: the
+    paired-file check must be able to tell "no cut on this statistic" apart from
+    "this file predates the check".
+    """
+    return float("nan") if x is None else float(x)
 
 
 def space_ordered_required(space, spin_basis):
@@ -834,13 +845,16 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
         "chi_eff_amax": float(amax),
         "pe_cosmology_H0": pe_H0,
         "pe_cosmology_Om0": pe_Om0,
-        "source_class_filter": ("" if source_class is None
-                                else str(source_class)),
+        "source_class_filter": format_source_class_filter(source_class),
         "event_list_filter": (
             "" if event_list is None
             else (str(event_list) if isinstance(event_list, (str, bytes))
                   else "custom_sequence")),
         "far_policy": getattr(sub, "_far_policy", "none"),
+        # The event-side detection cut, as numbers the paired selection file can
+        # be checked against.  NaN means "no cut on this statistic".
+        "far_max": _cut_value(getattr(sub, "_far_max", None)),
+        "snr_min": _cut_value(getattr(sub, "_snr_min", None)),
         "allow_missing_far": bool(allow_missing_far),
         "require_far": bool(require_far),
         "n_events_missing_far": int(getattr(sub, "_n_missing_far", 0)),
@@ -883,7 +897,7 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
         "nsamp_per_event": int(nsamp),
         "spin_basis": spin_basis,
         "source_class_filter": (None if source_class is None
-                                else str(source_class)),
+                                else format_source_class_filter(source_class)),
         "event_list_filter": (
             None if event_list is None
             else (str(event_list)

@@ -71,6 +71,7 @@ import numpy as np
 import h5py
 
 from ..params import BLOCKS, get_space
+from ..source_class import format_source_class_filter
 from ..spin import chi_eff_prior_logprob, chi_eff_chi_p_prior_logprob
 from ..selection import (SelectionSet, CombinedSelectionSet,
                          PDRAW_STATE_BY_BASIS, _selection_provenance_dict)
@@ -629,8 +630,7 @@ def build_selection_product(sets, *, spin_basis="component", far_threshold=1.0,
         "significance_columns": list(far_columns_union),
         "significance_available": bool(far_columns_union),
         "p_astro_available": False,
-        "source_class_filter": (None if source_class is None
-                                else str(source_class)),
+        "source_class_filter": format_source_class_filter(source_class),
         "source_class_counts_detected": value_counts(
             [normalize_source_class(c) for c in classes_det]),
         "cosmology_H0": float(set_list[0].H0),

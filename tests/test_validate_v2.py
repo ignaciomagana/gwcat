@@ -366,3 +366,178 @@ def test_ra_exactly_2pi_is_out_of_range(tmp_path):
         f["ra"][...] = d
     results = validate_export_v2(str(pe))
     assert results["pe_ra_range"] is False
+
+
+# ======================================================================
+# GW-11: the cross-file checks that were vacuous or absent
+# ======================================================================
+def test_source_class_mismatch_fails(tmp_path):
+    """An nsbh+bns PE file paired with a bbh selection file must fail.
+
+    This passed before GW-11.  Both sides wrote ``str(source_class)`` -- the
+    Python API's ``"['nsbh', 'bns']"`` and the CLI's ``"nsbh,bns"`` -- and
+    neither round-tripped, so ``resolve_filter_classes`` mapped both to
+    ``{"Unknown"}`` and the check compared ``{"Unknown"} == {"Unknown"}``.
+    """
+    pe = _pe_component(tmp_path)
+    sel = _sel(tmp_path)
+    with h5py.File(pe, "r+") as f:
+        f.attrs["source_class_filter"] = "NSBH,BNS"
+    with h5py.File(sel, "r+") as f:
+        f.attrs["source_class_filter"] = "BBH"
+
+    with pytest.raises(ValueError) as ei:
+        validate_export_v2(str(pe), str(sel))
+    msg = str(ei.value)
+    assert "xcheck_source_class" in msg
+    # The message must name both sides' resolved sets, not just "mismatch".
+    assert "NSBH" in msg and "BBH" in msg
+
+
+def test_source_class_legacy_repr_is_refused_not_silently_passed(tmp_path):
+    """A pre-GW-11 file records a repr that was never checkable."""
+    pe = _pe_component(tmp_path)
+    sel = _sel(tmp_path)
+    with h5py.File(pe, "r+") as f:
+        f.attrs["source_class_filter"] = "['nsbh', 'bns']"
+    with h5py.File(sel, "r+") as f:
+        f.attrs["source_class_filter"] = "BBH"
+
+    with pytest.raises(ValueError) as ei:
+        validate_export_v2(str(pe), str(sel))
+    assert "xcheck_source_class" in str(ei.value)
+
+
+def test_detection_cut_mismatch_fails(tmp_path):
+    """Two stated FAR thresholds that differ is a hard failure."""
+    pe = _pe_component(tmp_path)
+    sel = _sel(tmp_path, far_threshold=1.0)
+    with h5py.File(pe, "r+") as f:
+        f.attrs["far_max"] = 2.0
+
+    with pytest.raises(ValueError) as ei:
+        validate_export_v2(str(pe), str(sel))
+    msg = str(ei.value)
+    assert "xcheck_detection_cut" in msg
+    assert "2.0" in msg and "1.0" in msg
+
+
+def test_detection_cut_match_passes(tmp_path):
+    pe = _pe_component(tmp_path)
+    sel = _sel(tmp_path, far_threshold=1.0)
+    with h5py.File(pe, "r+") as f:
+        f.attrs["far_max"] = 1.0
+    results = validate_export_v2(str(pe), str(sel))
+    assert results["xcheck_detection_cut"] is True
+
+
+def test_detection_cut_stated_on_one_side_warns_not_fails(tmp_path):
+    """The shipped configuration: a name-whitelisted event list, FAR-cut injections.
+
+    The equivalence is real (checked directly on the shipped list) but no attr
+    can express it, so this warns rather than refusing a correct pairing.
+    """
+    pe = _pe_component(tmp_path)
+    sel = _sel(tmp_path, far_threshold=1.0)
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        results = validate_export_v2(str(pe), str(sel))
+    assert results["xcheck_detection_cut"] is True
+    assert any("one side only" in str(x.message) for x in w)
+
+
+def test_allow_missing_far_under_a_far_cut_fails(tmp_path):
+    """A declaredly FAR-cut event list that kept untested events is self-contradictory."""
+    pe = _pe_component(tmp_path)
+    sel = _sel(tmp_path, far_threshold=1.0)
+    with h5py.File(pe, "r+") as f:
+        f.attrs["far_max"] = 1.0
+        f.attrs["allow_missing_far"] = True
+        f.attrs["n_events_missing_far"] = 3
+    with pytest.raises(ValueError) as ei:
+        validate_export_v2(str(pe), str(sel))
+    assert "allow_missing_far" in str(ei.value)
+
+
+def test_unknown_format_version_errors(tmp_path):
+    """An unrecognised format must stop, not fall through to an older contract."""
+    pe = _pe_component(tmp_path)
+    with h5py.File(pe, "r+") as f:
+        f.attrs["format_version"] = "gwcat-pe-3.0"
+    with pytest.raises(ValueError) as ei:
+        validate_export_v2(str(pe))
+    msg = str(ei.value)
+    assert "gwcat-pe-3.0" in msg
+    assert "gwcat-pe-2.0" in msg and "gwcat-pe-2.1" in msg
+
+
+def test_missing_format_version_errors(tmp_path):
+    pe = _pe_component(tmp_path)
+    with h5py.File(pe, "r+") as f:
+        del f.attrs["format_version"]
+    with pytest.raises(ValueError) as ei:
+        validate_export_v2(str(pe))
+    assert "format_version" in str(ei.value)
+
+
+# ======================================================================
+# GW-11: format 2.1 actually runs through the validator (GW-22 shipped
+# writers whose output the validator rejected, and never tested it)
+# ======================================================================
+def _pair_21(tmp_path, basis="component"):
+    events = [{"name": "GWv0_000001", "amax1": 0.99, "amax2": 0.99},
+              {"name": "GWv0_000002", "amax1": 0.90, "amax2": 0.90}]
+    store, _ = _build_spin_store(tmp_path, events, name="store_21")
+    pe = tmp_path / "pe21.h5"
+    GWCatalog(store).export(str(pe), format="gwcat2.1", spin_basis=basis,
+                            nsamp=48, seed=0, cosmology=_COSMO)
+    inj = write_o4_full(tmp_path / "inj21.hdf", n=60, amax=(0.9, 0.9), seed=6)
+    sel = tmp_path / "sel21.h5"
+    SelectionSet(inj).export(str(sel), format="gwcat2.1", spin_basis=basis)
+    return pe, sel
+
+
+def test_21_pair_validates(tmp_path):
+    pe, sel = _pair_21(tmp_path)
+    with h5py.File(pe, "r") as f:
+        assert f.attrs["format_version"] == "gwcat-pe-2.1"
+    results = validate_export_v2(str(pe), str(sel))
+    assert all(results.values()), \
+        f"unexpected failures: {[k for k, v in results.items() if not v]}"
+    assert results["xcheck_contract_hash"] is True
+
+
+def test_21_contract_hash_mismatch_reports_the_field(tmp_path):
+    """A hash mismatch must name the field, not just say the hashes differ."""
+    pe, sel = _pair_21(tmp_path)
+    with h5py.File(sel, "r+") as f:
+        c = json.loads(str(f.attrs["contract"]))
+        c["spin_basis_kind"] = "projection"
+        f.attrs["contract"] = json.dumps(c)
+        f.attrs["contract_hash"] = "0" * 16
+
+    with pytest.raises(ValueError) as ei:
+        validate_export_v2(str(pe), str(sel))
+    msg = str(ei.value)
+    assert "xcheck_contract_hash" in msg
+    assert "spin_basis_kind" in msg and "projection" in msg
+
+
+def test_21_source_class_is_canonical_in_the_hash(tmp_path):
+    """Two spellings of one request must produce the SAME contract hash.
+
+    The hash input was ``str(source_class)``, so ``["bbh"]`` and ``"bbh"``
+    described the same product and hashed differently.
+    """
+    events = [{"name": "GWv0_000001", "amax1": 0.99, "amax2": 0.99},
+              {"name": "GWv0_000002", "amax1": 0.90, "amax2": 0.90}]
+    store, _ = _build_spin_store(tmp_path, events, name="store_hash")
+    hashes = []
+    for spec in ("bbh", ["bbh"], ("BBH",)):
+        out = tmp_path / f"pe_{len(hashes)}.h5"
+        GWCatalog(store).export(str(out), format="gwcat2.1",
+                                spin_basis="component", nsamp=16, seed=0,
+                                cosmology=_COSMO, source_class=spec)
+        with h5py.File(out, "r") as f:
+            hashes.append(str(f.attrs["contract_hash"]))
+    assert len(set(hashes)) == 1, hashes

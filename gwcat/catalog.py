@@ -20,7 +20,8 @@ import h5py
 
 from .cosmology import make_cosmology, z_of_dL
 from .source_class import (normalize_source_class, resolve_filter_classes,
-                           load_event_list, SOURCE_CLASSES)
+                           format_source_class_filter, load_event_list,
+                           SOURCE_CLASSES)
 
 
 class GWCatalog:
@@ -275,6 +276,12 @@ class GWCatalog:
         result = GWCatalog(self.path, _sel=kept)
         result._far_policy = far_policy
         result._n_missing_far = n_missing_far
+        # The detection cut, numerically.  Essick & Fishbach require the EVENT
+        # cut and the INJECTION detection cut to be the same statistic at the
+        # same threshold; the exports recorded only the qualitative far_policy,
+        # so there was nothing for the paired-file check to compare against.
+        result._far_max = far_max
+        result._snr_min = snr_min
         result._selection_source_class = source_class
         result._selection_event_list = event_list
         result._waveform_policy = waveform_policy
@@ -773,8 +780,8 @@ class GWCatalog:
             f.attrs["pe_cosmology_H0"] = pe_H0
             f.attrs["pe_cosmology_Om0"] = pe_Om0
             # --- Source-class / FAR-policy provenance (PR 2) ---
-            f.attrs["source_class_filter"] = (
-                "" if source_class is None else str(source_class))
+            f.attrs["source_class_filter"] = format_source_class_filter(
+                source_class)
             f.attrs["event_list_filter"] = (
                 "" if event_list is None
                 else (str(event_list) if isinstance(event_list, (str, bytes))
@@ -830,8 +837,9 @@ class GWCatalog:
                 "n_events_skipped_after_selection": int(sub.n_events - nobs),
                 "event_names_exported": [str(k) for k in kept],
                 "nsamp_per_event": int(nsamp),
-                "source_class_filter": (None if source_class is None
-                                        else str(source_class)),
+                "source_class_filter": (
+                    None if source_class is None
+                    else format_source_class_filter(source_class)),
                 "event_list_filter": (
                     None if event_list is None
                     else (str(event_list)
@@ -1141,7 +1149,8 @@ def validate_export(gw_path: str, selection_path: str = None, strict: bool = Fal
                 s = "" if raw is None else str(raw)
                 if s == "":
                     return set(SOURCE_CLASSES)
-                return set(resolve_filter_classes(s))
+                from .source_class import parse_source_class_filter
+                return set(parse_source_class_filter(s))
 
             pe_scf = _sattr(fg, "source_class_filter", "")
             sel_scf = _sattr(fs, "source_class_filter", "")

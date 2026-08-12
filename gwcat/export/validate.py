@@ -27,6 +27,33 @@ import h5py
 #: Spin bases the v2 pipeline implements.
 _KNOWN_BASES = ("chieff", "component", "chieff_chip")
 
+#: Format versions this validator understands, per side.  2.1 adds the contract
+#: attrs on top of 2.0 and is otherwise identical, so both run the same checks;
+#: the 2.1-only pairing-hash comparison is keyed off the attr, not the version.
+_PE_FORMATS = ("gwcat-pe-2.0", "gwcat-pe-2.1")
+_SEL_FORMATS = ("gwcat-selection-2.0", "gwcat-selection-2.1")
+
+
+def _validator_generation(_fail, version, kind):
+    """Refuse a format this validator was never taught.
+
+    An unrecognised ``format_version`` must stop here rather than fall through
+    to the frozen v1 validator, which would check a v1 contract against a file
+    written to some later one and report success.
+    """
+    known = _PE_FORMATS if kind == "pe" else _SEL_FORMATS
+    if version is None:
+        _fail(f"{kind}_format_version_present",
+              f"no format_version attr; a gwcat {kind} export must declare "
+              f"one of {sorted(known)}")
+    if str(version) not in known:
+        _fail(f"{kind}_format_version_known",
+              f"format_version={version!r} is not a format validate_export_v2 "
+              f"understands (knows {sorted(known)}). Refusing rather than "
+              f"validating it against the wrong contract.")
+    return str(version)
+
+
 #: The legacy 10 datasets every PE export writes (any basis).
 _PE_LEGACY = ["ra", "dec", "m1det", "m2det", "chieff", "dL", "p_pe",
               "redshift", "m1src", "m2src"]
@@ -180,10 +207,11 @@ def validate_export_v2(pe_path, selection_path=None, strict=False):
     pe_attrs, pe_present, pe_cols = _read_export(
         pe_path, _PE_LEGACY + _PE_COMPONENT_EXTRA)
 
+    _validator_generation(_fail, pe_attrs.get("format_version"), "pe")
     _check("pe_format_version",
-           pe_attrs.get("format_version") == "gwcat-pe-2.0",
+           pe_attrs.get("format_version") in _PE_FORMATS,
            f"format_version={pe_attrs.get('format_version')!r} "
-           f"(expected 'gwcat-pe-2.0')")
+           f"(expected one of {sorted(_PE_FORMATS)})")
     pe_basis = pe_attrs.get("spin_basis")
     _check("pe_spin_basis_valid", pe_basis in _KNOWN_BASES,
            f"spin_basis={pe_basis!r} not in {_KNOWN_BASES}")
@@ -237,10 +265,12 @@ def validate_export_v2(pe_path, selection_path=None, strict=False):
         sel_attrs, sel_present, sel_cols = _read_export(
             selection_path, _SEL_LEGACY + _SPIN_COLUMNS)
 
+        _validator_generation(_fail, sel_attrs.get("format_version"),
+                              "selection")
         _check("sel_format_version",
-               sel_attrs.get("format_version") == "gwcat-selection-2.0",
+               sel_attrs.get("format_version") in _SEL_FORMATS,
                f"format_version={sel_attrs.get('format_version')!r} "
-               f"(expected 'gwcat-selection-2.0')")
+               f"(expected one of {sorted(_SEL_FORMATS)})")
         sel_basis = sel_attrs.get("spin_basis")
         _check("sel_spin_basis_valid", sel_basis in _KNOWN_BASES,
                f"spin_basis={sel_basis!r} not in {_KNOWN_BASES}")
@@ -399,18 +429,30 @@ def validate_export_v2(pe_path, selection_path=None, strict=False):
                 results["xcheck_cosmology"] = True
 
         # (d) Source-class compatibility.
-        from ..source_class import resolve_filter_classes, SOURCE_CLASSES
+        #
+        # Both sides now write the canonical comma-joined form, so this compares
+        # the classes actually requested.  It used to compare
+        # ``str(source_class)`` reprs -- "['nsbh', 'bns']" from the Python API
+        # against "nsbh,bns" from the CLI -- and BOTH resolved to {"Unknown"},
+        # so the check passed on a genuinely mismatched pair.
+        from ..source_class import parse_source_class_filter, SOURCE_CLASSES
 
         def _sc_classes(raw):
-            s = "" if raw is None else str(raw)
-            if s == "":
-                return set(SOURCE_CLASSES)
-            return set(resolve_filter_classes(s))
+            parsed = parse_source_class_filter(raw)
+            # An empty filter means "no restriction", i.e. every class.
+            return set(parsed) if parsed else set(SOURCE_CLASSES)
 
         pe_scf = pe_attrs.get("source_class_filter", "")
         sel_scf = sel_attrs.get("source_class_filter", "")
-        pe_classes = _sc_classes(pe_scf)
-        sel_classes = _sc_classes(sel_scf)
+        try:
+            pe_classes = _sc_classes(pe_scf)
+            sel_classes = _sc_classes(sel_scf)
+        except ValueError as exc:
+            _fail("xcheck_source_class",
+                  f"unparseable source_class_filter (PE={pe_scf!r}, "
+                  f"selection={sel_scf!r}): {exc} Files written before the "
+                  f"canonical form record a Python repr that was never "
+                  f"checkable; re-export to make the pairing verifiable.")
         if pe_classes != sel_classes:
             _fail("xcheck_source_class",
                   f"PE source_class_filter={pe_scf!r} -> {sorted(pe_classes)} "
@@ -419,11 +461,122 @@ def validate_export_v2(pe_path, selection_path=None, strict=False):
                   f"the same source class(es) as the PE events.")
         results["xcheck_source_class"] = True
 
+        # (e) The detection cut: same statistic, same threshold.
+        _xcheck_detection_cut(_fail, results, pe_attrs, sel_attrs)
+
+        # (f) 2.1 pairing hash.  Only when BOTH sides carry one -- and never as
+        # a substitute for the checks above, which name the offending field.
+        pe_hash = pe_attrs.get("contract_hash")
+        sel_hash = sel_attrs.get("contract_hash")
+        if pe_hash is not None and sel_hash is not None:
+            if str(pe_hash) != str(sel_hash):
+                from .contract import (contract_diff, format_diff,
+                                       PAIRING_FIELDS)
+                import json as _json
+                try:
+                    diff = contract_diff(_json.loads(str(pe_attrs["contract"])),
+                                         _json.loads(str(sel_attrs["contract"])),
+                                         fields=PAIRING_FIELDS)
+                    detail = format_diff(diff)
+                except (KeyError, ValueError):
+                    detail = ("neither file records a readable 'contract' attr "
+                              "to diff")
+                _fail("xcheck_contract_hash",
+                      f"PE contract_hash={pe_hash} != selection "
+                      f"contract_hash={sel_hash}. {detail}")
+            results["xcheck_contract_hash"] = True
+
     n_pass = sum(results.values())
     n_total = len(results)
     status = "ALL PASSED" if n_pass == n_total else f"{n_total - n_pass} FAILED"
     print(f"  {n_pass}/{n_total} checks: {status}")
     return results
+
+
+def _xcheck_detection_cut(_fail, results, pe_attrs, sel_attrs):
+    """The event cut and the injection detection cut must be the same cut.
+
+    Essick & Fishbach require the statistic and the threshold to agree: beta is
+    the detection probability under *the cut the events were selected by*, so a
+    selection file built at FAR < 1/yr does not describe an event list cut at
+    FAR < 2/yr.  Until GW-11 the thresholds were not exported at all, so this
+    could not be checked -- only the qualitative ``far_policy`` was recorded.
+
+    Policy, and why it is not simply "the two numbers must match":
+
+      * **Both sides state a numeric cut on the same statistic and the numbers
+        differ** -> FAIL.  Unambiguous, and checkable from the files alone.
+      * **One side states a cut and the other does not** -> WARN.  This is the
+        real production configuration, not an error: the shipped BBH product
+        selects events by *name whitelist* (``far_policy="none"``, no
+        ``far_max``) while the injection set applies FAR < 1/yr.  Whether the
+        whitelist is equivalent to the injection cut is a claim about the data
+        -- for the shipped list it was checked directly, and 0 of 249
+        resolvable events violate FAR < 1/yr -- and no attr in either file can
+        establish it.  Refusing here would reject a pairing that is correct;
+        warning says the equivalence has to be established elsewhere.
+      * **The PE side applied a FAR cut and kept events whose FAR was unknown**
+        (``allow_missing_far``) -> FAIL.  That one *is* self-contradictory
+        within the file: the event list is declaredly FAR-cut and declaredly
+        contains events that were never tested against the cut.
+    """
+    def _num(x):
+        if x is None:
+            return float("nan")
+        try:
+            return float(np.asarray(x).ravel()[0])
+        except (TypeError, ValueError, IndexError):
+            return float("nan")
+
+    def _same(a, b):
+        if np.isnan(a) and np.isnan(b):
+            return True
+        if np.isnan(a) or np.isnan(b):
+            return False
+        return bool(np.isclose(a, b, rtol=1e-12, atol=0.0))
+
+    pe_far = _num(pe_attrs.get("far_max"))
+    sel_far = _num(sel_attrs.get("far_threshold"))
+    pe_snr = _num(pe_attrs.get("snr_min"))
+    sel_snr = _num(sel_attrs.get("snr_threshold"))
+
+    mism, unstated = [], []
+    for label, pe_v, sel_v, pe_name, sel_name in (
+            ("FAR", pe_far, sel_far, "far_max", "far_threshold"),
+            ("SNR", pe_snr, sel_snr, "snr_min", "snr_threshold")):
+        if _same(pe_v, sel_v):
+            continue
+        where = (f"PE {pe_name}={pe_v} vs selection {sel_name}={sel_v}")
+        if np.isnan(pe_v) or np.isnan(sel_v):
+            unstated.append(f"{label}: {where}")
+        else:
+            mism.append(f"{label}: {where}")
+    if mism:
+        _fail("xcheck_detection_cut",
+              "the event cut and the injection detection cut differ -- "
+              + "; ".join(mism)
+              + ". beta must be computed under the same statistic at the same "
+                "threshold the events were selected by.")
+    if unstated:
+        warnings.warn(
+            "detection cut stated on one side only -- " + "; ".join(unstated)
+            + f" (PE far_policy={pe_attrs.get('far_policy', 'none')!r}, "
+              f"event_list_filter="
+              f"{pe_attrs.get('event_list_filter', '')!r}). This is legal -- a "
+              f"name-whitelisted event list can satisfy the injection cut "
+              f"exactly -- but the files cannot show it. Verify the "
+              f"equivalence directly before quoting a rate.")
+
+    if (not np.isnan(pe_far)
+            and bool(pe_attrs.get("allow_missing_far", False))):
+        n_missing = int(_num(pe_attrs.get("n_events_missing_far")) or 0)
+        if n_missing:
+            _fail("xcheck_detection_cut",
+                  f"PE far_max={pe_far} was applied but allow_missing_far=True "
+                  f"kept {n_missing} event(s) whose FAR is unknown, so the "
+                  f"event list is not the FAR-cut list the injections model. "
+                  f"Supply the missing FARs or drop those events.")
+    results["xcheck_detection_cut"] = True
 
 
 def _sky_checks(_check, cols, prefix, sky_available=None):

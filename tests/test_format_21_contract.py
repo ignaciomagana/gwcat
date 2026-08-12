@@ -17,8 +17,9 @@ import numpy as np
 import h5py
 import pytest
 
-from gwcat.export.contract import (CONTRACT_FIELDS, build_contract,
-                                   contract_diff, contract_hash, format_diff)
+from gwcat.export.contract import (CONTRACT_FIELDS, PAIRING_FIELDS,
+                                   build_contract, contract_diff,
+                                   contract_hash, format_diff)
 
 
 # --------------------------------------------------------------------------
@@ -33,15 +34,37 @@ def test_hash_is_stable_and_order_independent():
     assert len(contract_hash(a)) == 16
 
 
-def test_hash_changes_when_any_contract_field_changes():
+def test_hash_changes_when_any_pairing_field_changes():
     base = build_contract(parameter_space="component")
     h0 = contract_hash(base)
-    for field in CONTRACT_FIELDS:
+    for field in PAIRING_FIELDS:
         other = build_contract(**{**{"parameter_space": "component"},
                                   field: "PERTURBED"})
         if field == "parameter_space":
             continue
         assert contract_hash(other) != h0, f"{field} does not affect the hash"
+
+
+def test_hash_ignores_the_fields_the_two_sides_state_differently():
+    """The digest is compared ACROSS a pair, so it may only cover fields both
+    sides can state identically.
+
+    ``mass_prior_kind``/``dL_prior_kind`` describe the PE prior and an injection
+    campaign has none; the detection cut is legitimately stated on one side only
+    (a name-whitelisted event list against a FAR-cut injection set); and the
+    cosmology is compared to a tolerance an exact digest cannot express.  Hashing
+    those made the digest differ on every correct pair -- which went unnoticed
+    because nothing compared a PE hash to a selection hash until GW-11.
+    """
+    base = build_contract(parameter_space="component")
+    h0 = contract_hash(base)
+    for field in set(CONTRACT_FIELDS) - set(PAIRING_FIELDS):
+        other = build_contract(**{**{"parameter_space": "component"},
+                                  field: "PERTURBED"})
+        assert contract_hash(other) == h0, f"{field} must not affect the hash"
+        # ...but it is still recorded, and still diffed.
+        assert field in CONTRACT_FIELDS
+        assert contract_diff(base, other)
 
 
 def test_unknown_contract_field_is_rejected():
@@ -71,15 +94,18 @@ def test_diff_names_the_disagreeing_field():
 def test_the_detection_cut_is_in_the_contract():
     """Essick & Fishbach's central requirement: the event cut and the injection
     detection cut must be the same statistic at the same threshold.  Until the
-    numeric threshold was exported, that check could not be made at all."""
+    numeric threshold was exported, that check could not be made at all.
+
+    It is recorded and diffed, but compared by ``_xcheck_detection_cut`` rather
+    than by the digest -- the shipped configuration states the cut on one side
+    only, and an equality hash cannot express "fail on two stated thresholds
+    that differ, warn when only one side states one".
+    """
     assert "detection_statistic" in CONTRACT_FIELDS
     assert "detection_threshold" in CONTRACT_FIELDS
-    a = build_contract(detection_statistic="far_max", detection_threshold=1.0)
-    b = build_contract(detection_statistic="far_max", detection_threshold=2.0)
-    assert contract_hash(a) != contract_hash(b)
-    # same threshold, different STATISTIC is also a mismatch
-    c = build_contract(detection_statistic="snr_min", detection_threshold=1.0)
-    assert contract_hash(a) != contract_hash(c)
+    a = build_contract(detection_statistic="far", detection_threshold=1.0)
+    b = build_contract(detection_statistic="far", detection_threshold=2.0)
+    assert contract_diff(a, b) == [("detection_threshold", 1.0, 2.0)]
 
 
 def test_amax_is_deliberately_not_in_the_contract():

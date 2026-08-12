@@ -13,6 +13,9 @@ import pytest
 
 from gwcat.catalog import GWCatalog
 from gwcat.source_class import (normalize_source_class, resolve_filter_classes,
+                                canonical_source_class,
+                                format_source_class_filter,
+                                parse_source_class_filter,
                                 SOURCE_CLASSES, SourceClassMeta)
 
 
@@ -181,6 +184,68 @@ def test_to_darksirens_records_source_class_filter(tmp_path):
                       cosmology=(67.74, 0.3089))
     with h5py.File(out, "r") as f:
         assert f.attrs["nobs"] == 2
-        assert f.attrs["source_class_filter"] == "bbh"
+        # The canonical label, not the caller's spelling: the attr is what the
+        # paired-file check reads, so it has to be the same string however the
+        # request was written (GW-11).
+        assert f.attrs["source_class_filter"] == "BBH"
         assert set(f.attrs["event_names"]) == {"GW900001_000001",
                                                "GW900002_000002"}
+
+
+# ==========================================================================
+# GW-11: a request is not data -- an unrecognised one is an error
+# ==========================================================================
+def test_unknown_class_raises():
+    """``--source-class BBHs`` used to select the UNCLASSIFIED events.
+
+    ``resolve_filter_classes`` fell through to ``normalize_source_class``, which
+    maps anything unrecognised to ``"Unknown"``.  On the real store that is zero
+    events, reported as a successful selection.
+    """
+    for bad in ("BBHs", "bhh", "binary", "BBH_only"):
+        with pytest.raises(ValueError) as ei:
+            resolve_filter_classes(bad)
+        msg = str(ei.value)
+        assert repr(bad) in msg
+        # The error has to say what IS accepted, and that Unknown is reachable
+        # deliberately -- otherwise the strictness just moves the confusion.
+        assert "bbh" in msg and "Unknown" in msg
+
+
+def test_unknown_class_raises_inside_an_iterable():
+    with pytest.raises(ValueError):
+        resolve_filter_classes(["bbh", "nsbh_typo"])
+
+
+def test_normalize_stays_lenient_on_data():
+    """The data path keeps mapping an unrecorded label to Unknown."""
+    assert normalize_source_class("who knows") == "Unknown"
+    assert normalize_source_class(None) == "Unknown"
+
+
+def test_provenance_roundtrips():
+    """Every spelling of one request produces one attr string."""
+    same = ["NSBH,BNS",
+            format_source_class_filter(["nsbh", "bns"]),
+            format_source_class_filter("nsbh,bns"),
+            format_source_class_filter(("BNS", "NSBH")),
+            format_source_class_filter({"bns", "nsbh"}),
+            format_source_class_filter("BNS , NSBH")]
+    assert len(set(same)) == 1, same
+
+    # parse . format == identity, including through a bytes round-trip of the
+    # kind an HDF5 attr can produce.
+    for spec in (None, "bbh", ["nsbh", "bns"], "cbc", "all", ("MassGap",)):
+        s = format_source_class_filter(spec)
+        assert parse_source_class_filter(s) == canonical_source_class(spec)
+        assert parse_source_class_filter(s.encode()) == \
+            canonical_source_class(spec)
+        assert format_source_class_filter(parse_source_class_filter(s) or None) \
+            == s
+
+
+def test_no_restriction_is_distinct_from_every_class():
+    """"" (no filter) and an explicit all-classes request are different asks."""
+    assert format_source_class_filter(None) == ""
+    assert format_source_class_filter("all") != ""
+    assert canonical_source_class(None) == ()
