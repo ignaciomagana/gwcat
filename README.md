@@ -609,6 +609,71 @@ A downstream consumer verifies the two files agree by checking
 `spin_prior_mode` matches and that `chi_eff_prior_applied_to_p_pe` equals
 `chi_eff_prior_applied_to_pdraw`.
 
+## Parameter spaces (blocks)
+
+`gwcat.params` is the declarative registry of what a given export fits, what it
+merely emits, and what each block assumes. A **space** is an ordered list of
+**blocks**; `mass.det_pair`, `distance.dl` and `sky.radec` are in every space.
+
+| space | spin block | fit columns (spin part) | map | exact draw density? | notes |
+|---|---|---|---|---|---|
+| `component` | `spin.component_polar` | `a1 a2 cost1 cost2` | bijective | **yes** | **Recommended.** Assumes nothing about the campaign |
+| `nospin` | `spin.none` | — | bijective | yes | Cosmology-only; the N_eff mitigation |
+| `component_6d` | `spin.component_6d` | `+ phi1 phi2` | bijective | yes | Pairing two 6-D files needs an explicit ack |
+| `cartesian` | `spin.cartesian` | `s1x…s2z` | bijective | yes | Per-**sample** prior: the `a⁻²` does not cancel |
+| `chieff` | `spin.chieff` | `chieff` | **projection** | **no** | Legacy default; invalid for a non-uniform campaign |
+| `chieff_chip` | `spin.chieff_chip` | `chieff chip` | **projection** | **no** | Opt-in only (`allow_projection_basis=True`) |
+| `aligned` | `spin.aligned_z` | `chi1z chi2z` | projection | no | Needs the `_single_spin_pdf` ½ fix to stand alone |
+
+```python
+from gwcat.params import get_space
+sp = get_space("component")
+sp.fit_columns        # coordinates the exported density COVERS
+sp.advisory_columns   # emitted but NOT covered -- fitting on these is wrong
+sp.is_exact           # True: no assumed density anywhere in the space
+```
+
+### The two rules the registry makes declarative
+
+> **R1 (projection rule).** `chi_eff` and `chi_p` are many-to-one projections of
+> the 4-D spin vector. Converting a component draw density into a projected one
+> integrates out three degrees of freedom *at fixed coordinate*, and that
+> integral has a closed form **only** for a uniform-magnitude/isotropic parent.
+> A projection block therefore carries a validity predicate and must **refuse**,
+> not approximate, when the parent is something else. A block declaring
+> `map_kind="projection"` and `exact_draw_density=True` without a
+> `CampaignRequirement` is rejected at construction.
+
+> **R2 (support rule).** A density that appears in a **denominator** may never be
+> floored. `clip(ln p, -50, None)` turns "impossible under this prior" into
+> "weight ≈ 10²¹". Out-of-support points get a recorded mask (`/in_support`,
+> `n_samples_out_of_support`), never a floor. On the *selection* side it is
+> stronger: a **detected** injection with zero assumed draw density is a
+> contradiction, so the export refuses rather than writing a zero the consumer
+> would silently drop.
+
+**Why `component` is the recommendation, measured rather than asserted.** Its
+prior is a flat box, so its factor is a per-event *constant* and cancels in the
+consumer's per-event `p_pe` normalisation — it adds no weight variance at all.
+The `chieff` projection multiplies by a per-sample-varying density and does. On
+the same 259 events:
+
+| | `chieff` | `component` |
+|---|---|---|
+| ESS/nsamp median | 0.589 | **0.861** |
+| events below ESS/nsamp 0.1 | 30/259 | **0** |
+| `pe_variance_sum` (of a 1.0 budget) | 0.273 | **0.014** |
+| implied selection-N_eff requirement | 92,237 | **68,001** (−26%) |
+
+### Format 2.1 (opt-in)
+
+`format="gwcat2.1"` writes `gwcat-pe-2.1` / `gwcat-selection-2.1`, adding
+`parameter_space`, `fit_columns`, `advisory_columns`, `block_provenance` and a
+16-hex `contract_hash` that makes a mismatched PE/selection pairing one
+comparison. **2.0 remains the default**: a consumer's `format_version` allowlist
+is a closed literal tuple, so a 2.1 file is unloadable until that consumer is
+patched.
+
 ## Spin bases and gwcat-2.0 exports
 
 The versioned `gwcat.export` pipeline writes `format_version="gwcat-pe-2.0"` PE

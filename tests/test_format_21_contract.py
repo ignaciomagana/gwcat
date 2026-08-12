@@ -180,3 +180,59 @@ def test_both_2_1_writers_are_registered():
     # and 2.0 is still there, unchanged
     assert ("gwcat2", "pe") in fmts
     assert ("gwcat2", "selection") in fmts
+
+
+# --------------------------------------------------------------------------
+# 3. chieff_chip is demoted to opt-in (GW-23)
+# --------------------------------------------------------------------------
+@needs_store
+def test_chieff_chip_refuses_without_opting_in(tmp_path):
+    """It is a PROJECTION, so R1 makes it undefinable against the O4 campaigns
+    at all, and it is where the support contract bites hardest (41 of 282 events
+    out of support; GW150914's reweighting collapsed to ESS = 1.0 of 3337 under
+    the old floor).  The message has to say all of that, and point at component.
+    """
+    from gwcat.export.pe_builder import ProjectionBasisNotAllowed
+
+    with pytest.raises(ProjectionBasisNotAllowed) as exc:
+        _export(tmp_path, "gwcat2", "chieff_chip", "cc.h5")
+    msg = str(exc.value)
+    assert "opt-in" in msg
+    assert "component" in msg            # names the remedy
+    assert "R1" in msg or "uniform" in msg
+    assert "allow_projection_basis" in msg
+
+
+@needs_store
+def test_chieff_chip_still_works_when_opted_in(tmp_path):
+    """Demoted, not removed -- an analyst who needs the projected density and
+    understands why can still have it."""
+    from gwcat.catalog import GWCatalog
+
+    cat = GWCatalog(STORE)
+    names = list(cat.event_names[:3])
+    out = tmp_path / "cc_ok.h5"
+    cat.export(str(out), format="gwcat2", spin_basis="chieff_chip",
+               allow_projection_basis=True, nsamp=64, seed=0,
+               cosmology=(67.74, 0.3089), allowed_names=names,
+               allowed_names_authoritative=True,
+               allow_out_of_support=True)
+    with h5py.File(out, "r") as f:
+        assert "chip" in f
+        v = f.attrs["spin_basis"]
+        assert (v.decode() if isinstance(v, bytes) else v) == "chieff_chip"
+
+
+@needs_store
+def test_the_other_bases_are_unaffected_by_the_gate(tmp_path):
+    for basis in ("chieff", "component", "nospin"):
+        a = _export(tmp_path, "gwcat2", basis, f"un_{basis}.h5")
+        assert a["format_version"] == "gwcat-pe-2.0"
+
+
+def test_projection_cost_is_advertised_on_the_block():
+    """So a CLI can warn before someone spends a minute per 1e6 points."""
+    from gwcat.params import BLOCKS
+
+    assert BLOCKS["spin.chieff_chip"].estimated_cost_per_point > 0
+    assert BLOCKS["spin.component_polar"].estimated_cost_per_point == 0.0

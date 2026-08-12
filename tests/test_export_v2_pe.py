@@ -367,7 +367,7 @@ def test_chieff_chip_ppe_joint_prior(tmp_path):
     cat = GWCatalog(store)
     out = tmp_path / "chieffchip.h5"
     with pytest.warns(UserWarning, match="spin_amax_1 != spin_amax_2"):
-        cat.export(str(out), format="gwcat2", spin_basis="chieff_chip",
+        cat.export(str(out), format="gwcat2", spin_basis="chieff_chip", allow_projection_basis=True,
                    nsamp=32, seed=0, cosmology=(67.74, 0.3089))
 
     cols, attrs = _read(out)
@@ -405,7 +405,7 @@ def test_chieff_chip_nan_amax_falls_back(tmp_path):
     store, _ = _build_spin_store(tmp_path, events)
     cat = GWCatalog(store)
 
-    kw = dict(format="gwcat2", spin_basis="chieff_chip", nsamp=24, seed=0,
+    kw = dict(format="gwcat2", spin_basis="chieff_chip", allow_projection_basis=True, nsamp=24, seed=0,
               cosmology=(67.74, 0.3089), amax_fallback=0.85)
     with pytest.raises(OutOfSupportError, match="GWc5_000001"):
         cat.export(str(tmp_path / "refused.h5"), **kw)
@@ -641,6 +641,7 @@ def test_nospin_declares_that_no_chi_eff_prior_was_applied(tmp_path):
     for basis in ("chieff", "component", "chieff_chip", "nospin"):
         p = tmp_path / f"{basis}.h5"
         GWCatalog(store).export(str(p), format="gwcat2", spin_basis=basis,
+                                allow_projection_basis=True,
                                 nsamp=32, seed=0, cosmology=(67.74, 0.3089))
         outs[basis] = _read(p)[1]
 

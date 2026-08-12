@@ -1,5 +1,18 @@
 """Selection-function export builder for the versioned pipeline (PR5).
 
+The two rules this module enforces
+---------------------------------
+**R1 (projection rule).**  A projected spin coordinate is definable only against
+a uniform-magnitude/isotropic injected draw, so a projection basis must REFUSE --
+not approximate -- when the campaign is something else.  The component basis
+assumes nothing about the campaign and is exact for all of them.
+
+**R2 (support rule).**  A density that appears in a denominator may never be
+floored.  On this side it is stronger than on the PE side: a DETECTED injection
+with zero assumed draw density is a contradiction, not a small number, so the
+export refuses rather than writing a zero the consumer would silently drop.
+
+
 :func:`build_selection_product` reproduces -- for the ``spin_basis="chieff"``
 case -- the arrays and provenance of the legacy
 :meth:`gwcat.selection.SelectionSet.to_darksirens` /

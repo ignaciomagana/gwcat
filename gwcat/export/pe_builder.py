@@ -1,5 +1,15 @@
 """PE (posterior-sample) export builder for the versioned pipeline (PR 3 / PR 6).
 
+The two rules this module enforces
+---------------------------------
+**R1 (projection rule).**  A projected spin coordinate is definable only against
+a uniform-magnitude/isotropic parent, so a projection block must REFUSE -- not
+approximate -- when the parent is something else.
+
+**R2 (support rule).**  A density that appears in a denominator may never be
+floored.  Out of support is zero density, counted and reported, never ``exp(-50)``.
+
+
 :func:`build_pe_product` reproduces -- for the ``spin_basis="chieff"`` case --
 the arrays and provenance of the legacy :meth:`gwcat.catalog.GWCatalog.to_darksirens`
 EXACTLY for identical keyword arguments, and returns them as an
@@ -143,6 +153,15 @@ def _ess_of_inverse_weights(p_pe, nobs, nsamp):
     return np.asarray(ess, dtype=float)
 
 
+class ProjectionBasisNotAllowed(ValueError):
+    """A projected spin basis was requested without opting in (GW-23).
+
+    Projections are demoted from shipped products because R1 makes them
+    undefinable against the real O4 campaigns, and because the component basis
+    is both exact and measurably better conditioned.
+    """
+
+
 class ChiPDefinitionError(ValueError):
     """The stored chi_p column is not the Schmidt chi_p of the store's own
     components, so a joint (chi_eff, chi_p) prior would not describe it."""
@@ -160,7 +179,8 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
                      chi_p_definition="schmidt_recomputed",
                      chi_p_def_tol=1e-6,
                      max_out_of_support_frac=0.0,
-                     allow_out_of_support=False):
+                     allow_out_of_support=False,
+                     allow_projection_basis=False):
     """Build a PE :class:`ExportProduct` from a :class:`~gwcat.catalog.GWCatalog`.
 
     For ``spin_basis="chieff"`` this reproduces the legacy
@@ -195,6 +215,24 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
         raise ValueError(
             f"unknown spin_basis={spin_basis!r}; known bases are "
             f"{list(_KNOWN_SPIN_BASES)}.")
+    # ── chieff_chip is opt-in, not a product (GW-23) ────────────────────────
+    if spin_basis == "chieff_chip" and not allow_projection_basis:
+        raise ProjectionBasisNotAllowed(
+            "spin_basis='chieff_chip' is opt-in and is NOT a shipped product. "
+            "It is a PROJECTION of the 4-D spin vector, so it is definable only "
+            "against a uniform-magnitude/isotropic injected draw (R1) -- which "
+            "means it cannot be built against the O4 campaigns at all "
+            "(isotropy_dev = 0.642, magnitude_uniform = [False, False]). It is "
+            "also where the support contract bites hardest: chi_p reaches the "
+            "assumed ceiling on real data where chi_eff does not, so 41 of 282 "
+            "events sit out of support and the old -50 floor drove GW150914's "
+            "reweighting to ESS = 1.0 of 3337. And it costs ~1 min per 1e6 "
+            "points. Use spin_basis='component' -- exact for any campaign, and "
+            "measured to carry far less weight variance (ESS/nsamp median 0.861 "
+            "vs 0.589 on the same 259 events); derive chi_eff/chi_p from its "
+            "columns downstream with gwcat.spin. Pass "
+            "allow_projection_basis=True if you specifically need the projected "
+            "density and understand the above.")
     if chi_p_definition not in ("schmidt_recomputed", "file"):
         raise ValueError(
             f"chi_p_definition must be 'schmidt_recomputed' or 'file'; got "

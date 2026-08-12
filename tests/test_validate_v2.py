@@ -45,6 +45,7 @@ def _pe_component(tmp_path, name="pe.h5", basis="component", **kw):
     cat = GWCatalog(store)
     out = tmp_path / name
     cat.export(str(out), format="gwcat2", spin_basis=basis, nsamp=48, seed=0,
+               allow_projection_basis=True,
                cosmology=_COSMO, **kw)
     return out
 
@@ -161,7 +162,7 @@ def test_chieff_chip_amax_recorded_not_failed(tmp_path):
     store, _ = _build_spin_store(tmp_path, events, name="cc_store.h5")
     cat = GWCatalog(store)
     pe = tmp_path / "cc_pe.h5"
-    cat.export(str(pe), format="gwcat2", spin_basis="chieff_chip", nsamp=32,
+    cat.export(str(pe), format="gwcat2", spin_basis="chieff_chip", allow_projection_basis=True, nsamp=32,
                seed=0, cosmology=_COSMO)
     o3 = write_endo3_full(tmp_path / "cc_endo3.hdf", n=40, max_spin=0.998,
                           seed=11)
@@ -264,7 +265,7 @@ def test_pe_chieff_chip_summary_amax_field(tmp_path):
     store, _ = _build_spin_store(tmp_path, events, name="s4.h5")
     cat = GWCatalog(store)
     out = tmp_path / "cc_sum.h5"
-    cat.export(str(out), format="gwcat2", spin_basis="chieff_chip", nsamp=16,
+    cat.export(str(out), format="gwcat2", spin_basis="chieff_chip", allow_projection_basis=True, nsamp=16,
                seed=0, cosmology=_COSMO, write_summary=True)
     sj = json.loads(Path(str(out) + ".validation_summary.json").read_text())
     assert "spin_amax_summary" in sj

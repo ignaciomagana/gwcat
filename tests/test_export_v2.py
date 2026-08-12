@@ -334,6 +334,7 @@ def test_spin_basis_requires_spin_columns(tmp_path, basis):
     cat = GWCatalog(store)
     with pytest.raises(MissingParameterError):
         build_pe_product(cat, spin_basis=basis, nsamp=8,
+                         allow_projection_basis=True,
                          cosmology=(67.74, 0.3089))
 
 
