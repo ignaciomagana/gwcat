@@ -598,3 +598,71 @@ def test_requirements_come_from_the_registry_not_a_ladder(tmp_path):
         GWCatalog(store).export(str(tmp_path / "x.h5"), format="gwcat2",
                                 spin_basis="component", nsamp=32, seed=0,
                                 cosmology=(67.74, 0.3089))
+
+
+# ==========================================================================
+# GW-21: the nospin space exports
+# ==========================================================================
+def test_nospin_ppe_is_the_mass_jacobian_and_distance_prior_only(tmp_path):
+    """No spin coordinate is fitted, so NO spin density enters p_pe -- not the
+    chi_eff prior, not the component box.
+
+    This is the design's stated mitigation if a 4-D spin population ever does
+    collapse N_eff downstream, so it has to be exactly what it claims.
+    """
+    events = [{"name": "GWn_000001", "provide": _FULL_SPIN}]
+    store, raw = _build_spin_store(tmp_path, events, n_per_event=200)
+    out = tmp_path / "nospin.h5"
+    GWCatalog(store).export(str(out), format="gwcat2", spin_basis="nospin",
+                            nsamp=50, seed=4, cosmology=(67.74, 0.3089))
+    cols, attrs = _read(out)
+
+    idx = _replicate_idx(raw["GWn_000001"]["a_1"].size, 50, 4)
+    m1 = raw["GWn_000001"]["mass_1"][idx]
+    np.testing.assert_allclose(cols["p_pe"], m1 * _P_DL_CONST, rtol=1e-12)
+
+    # exactly the legacy 10 columns plus the support mask -- no spin coordinates
+    assert set(cols) == {"ra", "dec", "m1det", "m2det", "chieff", "dL", "p_pe",
+                         "redshift", "m1src", "m2src", "in_support"}
+    assert np.all(np.asarray(cols["in_support"], dtype=bool))
+
+
+def test_nospin_declares_that_no_chi_eff_prior_was_applied(tmp_path):
+    """"absent" and "False" are different claims.
+
+    darksirens REQUIRES chi_eff_in_p_pe on a gwcat-pe-2.0 file, so omitting it
+    makes the file fail to LOAD with a member-check error rather than fail a
+    physics check -- and a consumer must be able to tell "no chi_eff prior was
+    applied" from "this file does not say".
+    """
+    events = [{"name": "GWn_000002", "provide": _FULL_SPIN}]
+    store, _raw = _build_spin_store(tmp_path, events, n_per_event=100)
+    outs = {}
+    for basis in ("chieff", "component", "chieff_chip", "nospin"):
+        p = tmp_path / f"{basis}.h5"
+        GWCatalog(store).export(str(p), format="gwcat2", spin_basis=basis,
+                                nsamp=32, seed=0, cosmology=(67.74, 0.3089))
+        outs[basis] = _read(p)[1]
+
+    for basis, attrs in outs.items():
+        assert "chi_eff_in_p_pe" in attrs, f"{basis} omits chi_eff_in_p_pe"
+        assert "spin_prior_mode" in attrs, f"{basis} omits spin_prior_mode"
+        mode = attrs["spin_prior_mode"]
+        mode = mode.decode() if isinstance(mode, bytes) else mode
+        expect = {"chieff": ("include", True),
+                  "component": ("component_flat", False),
+                  "chieff_chip": ("chieff_chip_joint", False),
+                  "nospin": ("none", False)}[basis]
+        assert mode == expect[0], f"{basis}: spin_prior_mode={mode!r}"
+        assert bool(attrs["chi_eff_in_p_pe"]) is expect[1]
+
+
+def test_nospin_chieff_is_emitted_but_advisory():
+    """chieff is written (every plot uses it) but no term for it is in p_pe, so
+    fitting on it against a nospin file would be wrong.  The registry says so."""
+    from gwcat.params import get_space
+
+    sp = get_space("nospin")
+    assert "chieff" in sp.advisory_columns
+    assert "chieff" not in sp.fit_columns
+    assert sp.is_exact is True

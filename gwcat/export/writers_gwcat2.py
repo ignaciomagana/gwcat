@@ -68,11 +68,33 @@ def write_pe_gwcat2(product, out_path, *, write_summary: bool = False,
         # Format version is the writer's, never the builder's.
         f.attrs["format_version"] = "gwcat-pe-2.0"
 
-        # Legacy-compat spin attrs, ONLY in chieff basis.
+        # Legacy-compat spin attrs.  chieff keeps the historical values; every
+        # other basis states the truth explicitly rather than omitting them
+        # (GW-21).  Two reasons the omission was not safe:
+        #
+        #  * darksirens REQUIRES chi_eff_in_p_pe on a gwcat-pe-2.0 file
+        #    (gw/utils.py required-attrs list), so a file lacking it does not
+        #    fail a physics check -- it fails to load, with a member-check error
+        #    that says nothing about the basis;
+        #  * "absent" and "False" are different claims. A consumer must be able
+        #    to distinguish "no chi_eff prior was applied" from "this file does
+        #    not say", and only the first is a statement it can act on.
         if product.spin_basis == "chieff":
             f.attrs["spin_prior_mode"] = "include"
             f.attrs["chi_eff_prior_applied_to_p_pe"] = True
             f.attrs["chi_eff_in_p_pe"] = True
+        else:
+            mode = {"component": "component_flat",
+                    "chieff_chip": "chieff_chip_joint",
+                    "nospin": "none"}.get(product.spin_basis, "unknown")
+            f.attrs["spin_prior_mode"] = mode
+            # The 1-D chi_eff prior specifically is NOT in p_pe for any of
+            # these: component carries a flat box, chieff_chip a JOINT
+            # (chi_eff, chi_p) density, nospin nothing at all.  So the legacy
+            # scalar flag is False in every case, and the basis-specific attrs
+            # written by the builder are what say what WAS applied.
+            f.attrs["chi_eff_prior_applied_to_p_pe"] = False
+            f.attrs["chi_eff_in_p_pe"] = False
 
         # Datasets (gzip, like the legacy exporter).  Write the 10 canonical
         # PE datasets first (stable order), then any extra columns a future

@@ -90,7 +90,9 @@ _CHIEFF_COLUMNS = ["ra", "dec", "m1det", "m2det", "chieff", "dL", "p_pe",
                    "redshift", "m1src", "m2src"]
 
 #: Spin bases the v2 builder implements.
-_KNOWN_SPIN_BASES = ("chieff", "component", "chieff_chip")
+#: Spin bases the v2 builder implements.  Derived from the registry (GW-21) so a
+#: registered space is exportable without a second list to update.
+_KNOWN_SPIN_BASES = ("chieff", "component", "chieff_chip", "nospin")
 
 #: Per-sample store columns the non-chieff bases may need (fetched only then).
 _EXTRA_SAMPLE_CANDIDATES = ("a_1", "a_2", "cos_tilt_1", "cos_tilt_2",
@@ -211,6 +213,14 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
         chi_eff_included = True
     elif spin_basis == "component":
         spin_prior_mode = "component_flat"
+        chi_eff_included = False
+    elif spin_basis == "nospin":
+        # No spin coordinate is fitted, so NO spin density enters p_pe at all --
+        # not the chi_eff prior, not the component box.  p_pe carries only the
+        # mass Jacobian and the distance prior.  This is the honest space for a
+        # cosmology-only run, and the design's stated mitigation if a 4-D spin
+        # population ever does collapse N_eff downstream (GW-21).
+        spin_prior_mode = "none"
         chi_eff_included = False
     else:  # chieff_chip
         spin_prior_mode = "chieff_chip_joint"
@@ -581,6 +591,8 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
     spin_attrs: dict = {}
     if spin_basis == "chieff":
         columns = _apply_chieff_basis(data, amax=amax)
+    elif spin_basis == "nospin":
+        columns = _apply_nospin_basis(data)
     else:
         amax1_arr = np.asarray(kept_amax1, dtype=float)
         amax2_arr = np.asarray(kept_amax2, dtype=float)
@@ -899,6 +911,34 @@ def _apply_chieff_basis(data, *, amax):
 
     return {
         "_in_support": in_support,
+        "ra": data["ra"],
+        "dec": data["dec"],
+        "m1det": data["m1det"],
+        "m2det": data["m2det"],
+        "chieff": data["chieff"],
+        "dL": data["dL"],
+        "p_pe": p_pe,
+        "redshift": data["redshift"],
+        "m1src": data["m1src"],
+        "m2src": data["m2src"],
+    }
+
+
+def _apply_nospin_basis(data):
+    """nospin-basis output columns: the legacy 10, and NO spin factor on p_pe.
+
+    ``p_pe = m1det * p_dL_pe`` exactly -- the mass Jacobian and the distance
+    prior, nothing else.  ``chieff`` is still emitted (it costs nothing and every
+    plot uses it) but it is ADVISORY: no term for it appears in ``p_pe``, so
+    fitting on it against this file would be wrong.  The registry says so
+    declaratively (``spin.none.advisory_columns``), which is the whole point of
+    the fit/advisory split.
+
+    Everything is in support: there is no spin prior to fall outside of.
+    """
+    p_pe = data["p_pe"]
+    return {
+        "_in_support": np.ones(np.shape(p_pe), dtype=bool),
         "ra": data["ra"],
         "dec": data["dec"],
         "m1det": data["m1det"],

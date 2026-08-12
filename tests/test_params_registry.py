@@ -309,3 +309,92 @@ def test_the_pe_builder_now_drives_itself_from_the_registry():
     assert 'need = list(DARKSIRENS_REQUIRED)' not in src
     # and the extras gate is derived, not asserted
     assert 'need_extras = spin_basis != "chieff"' not in src
+
+
+# --------------------------------------------------------------------------
+# 9. Projection recovery: the "free test" the registry makes possible
+# --------------------------------------------------------------------------
+def _draw_component_prior(amax, q, n, seed):
+    """Sample the COMPONENT block's prior and push through the deterministic
+    maps to the projected coordinates.
+
+    a_i ~ U(0, amax), cos t_i ~ U(-1, 1) -- exactly ``spin.component_polar``'s
+    flat box.  m1 = 1, m2 = q so mass_2/mass_1 = q.
+    """
+    from gwcat.spin import chi_p_from_components
+
+    rng = np.random.default_rng(seed)
+    a1 = rng.uniform(0.0, amax, n)
+    a2 = rng.uniform(0.0, amax, n)
+    c1 = rng.uniform(-1.0, 1.0, n)
+    c2 = rng.uniform(-1.0, 1.0, n)
+    chi_eff = (a1 * c1 + q * a2 * c2) / (1.0 + q)
+    chi_p = chi_p_from_components(a1, a2, c1, c2, np.ones(n), np.full(n, q))
+    return chi_eff, chi_p
+
+
+@pytest.mark.parametrize("q", [1.0, 0.6, 0.3])
+def test_chieff_projection_recovers_the_component_prior(q):
+    """Sampling the bijective block's prior and projecting must reproduce the
+    projection block's analytic density.
+
+    This is the check the registry makes automatic: a projected block claims to
+    be the pushforward of the component prior under a deterministic map, and
+    that claim is testable by construction.  It is also the strongest available
+    statement that the chi_eff density is right -- the earlier tests in this
+    repo's suite compared the formula against a fixture written BY the formula.
+    """
+    from gwcat.spin import ChiEffPrior
+
+    amax = 0.99
+    chi_eff, _ = _draw_component_prior(amax, q, 2_000_000, seed=5)
+    prior = ChiEffPrior(amax=amax)
+
+    edges = np.linspace(-amax, amax, 41)
+    hist, _ = np.histogram(chi_eff, bins=edges, density=True)
+    mid = 0.5 * (edges[1:] + edges[:-1])
+    pred = prior.prob(mid, 1.0, q)
+
+    keep = pred > 0.05 * pred.max()          # avoid MC-noisy tails
+    rel = np.abs(hist[keep] / pred[keep] - 1.0)
+    assert np.median(rel) < 0.02, (
+        f"q={q}: median relative deviation {np.median(rel):.4f}")
+
+
+@pytest.mark.parametrize("q", [1.0, 0.5])
+def test_chieff_chip_projection_recovers_the_component_prior(q):
+    """The same check for the JOINT (chi_eff, chi_p) block."""
+    from gwcat.spin import ChiEffChiPPrior
+
+    amax = 0.99
+    chi_eff, chi_p = _draw_component_prior(amax, q, 4_000_000, seed=6)
+    prior = ChiEffChiPPrior(amax=amax)
+
+    ex = np.linspace(-amax, amax, 25)
+    ey = np.linspace(0.0, amax, 25)
+    hist, _, _ = np.histogram2d(chi_eff, chi_p, bins=[ex, ey], density=True)
+    mx = 0.5 * (ex[1:] + ex[:-1])
+    my = 0.5 * (ey[1:] + ey[:-1])
+    X, Y = np.meshgrid(mx, my, indexing="ij")
+    pred = np.exp(prior.logprob(X.ravel(), Y.ravel(), 1.0, q)).reshape(X.shape)
+
+    keep = pred > 0.05 * pred.max()
+    rel = np.abs(hist[keep] / pred[keep] - 1.0)
+    assert np.median(rel) < 0.05, (
+        f"q={q}: median relative deviation {np.median(rel):.4f} "
+        f"over {int(keep.sum())} bins")
+
+
+def test_every_projection_block_has_a_recovery_check():
+    """A registry-level guard: adding a projection block without a recovery test
+    should be visible.  The two above cover the two that exist; aligned_z is
+    listed as known-untested so a new one cannot slip in silently.
+    """
+    from gwcat.params import BLOCKS
+
+    projections = {n for n, b in BLOCKS.items() if b.map_kind == "projection"}
+    covered = {"spin.chieff", "spin.chieff_chip"}
+    known_untested = {"spin.aligned_z"}   # needs the _single_spin_pdf 1/2 fix
+    assert projections == covered | known_untested, (
+        f"projection blocks without a recovery test: "
+        f"{projections - covered - known_untested}")
