@@ -414,7 +414,8 @@ class GWCatalog:
                       allow_missing_far=False, require_far=False,
                       waveform_policy="preferred", approximant=None,
                       write_summary: bool = False,
-                      summary_context: Optional[dict] = None):
+                      summary_context: Optional[dict] = None,
+                      allow_zero_p_pe: bool = False):
         """Write an HDF5 consumable by darksirens.gw.utils.load_gw_samples.
 
         p_pe convention (spin-prior contract)
@@ -701,6 +702,17 @@ class GWCatalog:
             safe_logp = np.clip(logp_chi, a_min=-50.0, a_max=None)
             data["p_pe"] = data["p_pe"] * np.exp(safe_logp)
 
+        # ── Exported-weight support contract (GW-01) ────────────────────────
+        from .schema import check_p_pe_positive
+        check_p_pe_positive(
+            data["p_pe"], event_names=kept, nsamp=nsamp,
+            allow_zero=allow_zero_p_pe,
+            context="gwcat-1.0 export (to_darksirens)",
+            remedy=("A zero p_pe comes from a store whose p_dL_pe was truncated "
+                    "at the recorded distance-prior bounds; re-ingest the store "
+                    "so the distance prior is evaluated over the full sample "
+                    "range, or pass allow_zero_p_pe=True to write it anyway."))
+
         # Sanity check
         expected = nobs * nsamp
         assert data["m1det"].size == expected, \
@@ -923,7 +935,8 @@ def validate_export(gw_path: str, selection_path: str = None, strict: bool = Fal
 
     Checks:
       * array lengths == nobs * nsamp
-      * p_pe finite and positive
+      * p_pe finite and STRICTLY positive -- an exact zero is a hard failure
+        (GW-01), not a documented "distance-prior tail"
       * source masses <= detector masses
       * redshift non-negative
       * format_version present
@@ -984,13 +997,19 @@ def validate_export(gw_path: str, selection_path: str = None, strict: bool = Fal
             p = np.array(f["p_pe"])
             if p.size > 0:
                 _check("pe_p_pe_finite", np.all(np.isfinite(p)))
-                _check("pe_p_pe_nonneg", np.all(p >= 0),
-                       f"min={p.min():.3e}")
+                # Strictly positive (GW-01).  An exact zero was previously
+                # tolerated as a "distance-prior tail", but that state only ever
+                # came from the truncated distance prior, and darksirens turns a
+                # zero weight into a -inf log-weight that still counts in n.
                 n_zero = int(np.sum(p == 0))
-                if n_zero > 0:
-                    pct = 100 * n_zero / p.size
-                    print(f"  NOTE: {n_zero} ({pct:.1f}%) p_pe samples are zero "
-                          f"(expected at distance-prior tails)")
+                n_neg = int(np.sum(p < 0))
+                _check("pe_p_pe_positive", n_zero == 0 and n_neg == 0,
+                       f"{n_zero} zero ({100 * n_zero / p.size:.2f}%) and "
+                       f"{n_neg} negative of {p.size} samples; "
+                       f"min={np.nanmin(p):.3e}. A zero p_pe means the store's "
+                       f"p_dL_pe was truncated at the recorded distance-prior "
+                       f"bounds -- re-ingest so the distance prior is evaluated "
+                       f"over the full sample range.")
                 # Check no event is entirely zero-weight
                 p_ev = p.reshape(nobs, nsamp) if nobs > 0 and nsamp > 0 else p
                 if p_ev.ndim == 2:

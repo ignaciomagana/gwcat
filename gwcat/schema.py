@@ -259,3 +259,87 @@ def check_required_alternatives(alternative_groups, store_params, avail,
             f"alternative is present+available for some selected events: "
             + "; ".join(problems)
             + ". Provide one alternative per group (or drop the events).")
+
+
+# --------------------------------------------------------------------------
+# Exported-weight support contract (GW-01)
+# --------------------------------------------------------------------------
+class ZeroWeightError(ValueError):
+    """An export would ship ``p_pe`` samples that are zero or non-finite.
+
+    ``p_pe`` is a *denominator*: darksirens divides by it and masks the sample
+    (``valid &= prior_wt > 0``), but the masked sample still counts in ``n`` for
+    the per-event Monte-Carlo variance, so an exact zero silently degrades the
+    event rather than failing.  gwcat therefore refuses to write one.
+    """
+
+
+def check_p_pe_positive(p_pe, event_names=None, nsamp=None, *,
+                        allow_zero: bool = False, context: str = "export",
+                        remedy: str = ""):
+    """Refuse to export ``p_pe`` samples that are not finite and positive.
+
+    Historically an exact ``p_pe == 0`` was a documented-legal state: the
+    distance prior was truncated at its recorded bounds, so samples outside them
+    got zero density (GW-01).  With the truncation gone, a zero or NaN weight can
+    only mean a real defect -- most often a store ingested *before* that fix.
+
+    Parameters
+    ----------
+    p_pe : array-like
+        The concatenated ``p_pe`` column about to be written.
+    event_names, nsamp
+        When both are given, offending samples are attributed to events so the
+        error names them.  ``nsamp`` is the (constant) samples-per-event count.
+    allow_zero : bool
+        Warn instead of raising.  Escape hatch for inspecting a legacy store.
+    context : str
+        Prefix for the message, e.g. ``"gwcat-pe-2.0 export"``.
+    remedy : str
+        Appended instruction, e.g. which re-ingest fixes it.
+
+    Returns
+    -------
+    int
+        The number of offending samples (0 when the column is clean).
+    """
+    import numpy as np
+
+    p = np.asarray(p_pe, dtype=float)
+    if p.size == 0:
+        return 0
+    bad = ~(np.isfinite(p) & (p > 0.0))
+    n_bad = int(bad.sum())
+    if not n_bad:
+        return 0
+
+    n_zero = int(np.sum(p == 0.0))
+    n_nonfinite = int(np.sum(~np.isfinite(p)))
+    n_neg = n_bad - n_zero - n_nonfinite
+    detail = (f"{n_bad} of {p.size} samples "
+              f"({n_zero} exactly zero, {n_nonfinite} non-finite, "
+              f"{n_neg} negative)")
+
+    where = ""
+    if event_names is not None and nsamp:
+        names = np.asarray(event_names)
+        per_event = bad.reshape(len(names), int(nsamp)).sum(axis=1)
+        hit = np.nonzero(per_event)[0]
+        listed = ", ".join(f"{names[i]}: {int(per_event[i])}"
+                           for i in hit[:10])
+        more = "" if hit.size <= 10 else f", ... (+{hit.size - 10} more)"
+        where = (f"  Affected event(s) [{hit.size} of {len(names)}]: "
+                 f"{listed}{more}.")
+
+    msg = (f"{context}: p_pe must be finite and strictly positive, but "
+           f"{detail}.{where}  p_pe is a denominator -- darksirens masks a "
+           f"zero-weight sample but still counts it in n for the per-event "
+           f"MC variance, so shipping one silently degrades the event.")
+    if remedy:
+        msg += f"  {remedy}"
+
+    if allow_zero:
+        import warnings
+        warnings.warn(msg + "  (allow_zero=True: writing it anyway.)")
+        return n_bad
+    raise ZeroWeightError(msg)

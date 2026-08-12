@@ -96,7 +96,8 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
                      allowed_names=None, allowed_names_authoritative=True,
                      source_class=None, event_list=None,
                      allow_missing_far=False, require_far=False,
-                     waveform_policy="preferred", approximant=None):
+                     waveform_policy="preferred", approximant=None,
+                     allow_zero_p_pe=False):
     """Build a PE :class:`ExportProduct` from a :class:`~gwcat.catalog.GWCatalog`.
 
     For ``spin_basis="chieff"`` this reproduces the legacy
@@ -109,6 +110,11 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
     only used by the chieff basis; the new bases read a per-event ``amax`` from
     the store meta (``spin_amax_1``/``spin_amax_2``), falling back to
     ``amax_fallback`` (with a warning) when it is NaN (old stores).
+
+    The assembled ``p_pe`` must be finite and strictly positive (GW-01); a zero
+    weight means the store's ``p_dL_pe`` was written by a pre-GW-01 ingest that
+    truncated the distance prior at its recorded bounds.  Pass
+    ``allow_zero_p_pe=True`` to downgrade that to a warning.
     """
     if spin_basis not in _KNOWN_SPIN_BASES:
         raise ValueError(
@@ -470,6 +476,17 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
             spin_attrs["chi_eff_chi_p_amax_per_event"] = amax1_arr
             spin_attrs["spin_amax_mismatch_events"] = np.array(
                 mismatch_events, dtype=_str)
+
+    # ── Exported-weight support contract (GW-01) ────────────────────────────
+    from ..schema import check_p_pe_positive
+    check_p_pe_positive(
+        columns["p_pe"], event_names=kept, nsamp=nsamp,
+        allow_zero=allow_zero_p_pe,
+        context=f"gwcat-pe-2.0 export (spin_basis={spin_basis!r})",
+        remedy=("A zero p_pe comes from a store whose p_dL_pe was truncated at "
+                "the recorded distance-prior bounds; re-ingest the store so the "
+                "distance prior is evaluated over the full sample range, or "
+                "pass allow_zero_p_pe=True to write it anyway."))
 
     # Sanity check
     expected = nobs * nsamp

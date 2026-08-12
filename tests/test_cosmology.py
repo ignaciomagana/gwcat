@@ -305,3 +305,221 @@ def test_z_of_dL_in_range_is_unchanged_and_silent():
     assert np.all(np.isfinite(z))
     np.testing.assert_allclose(
         cosmo.luminosity_distance(z).to("Mpc").value, dL, rtol=1e-3)
+
+
+# --------------------------------------------------------------------------
+# 6. GW-01: the distance prior is NOT truncated at its recorded bounds
+# --------------------------------------------------------------------------
+from gwcat.cosmology import (  # noqa: E402  (grouped with the GW-01 tests)
+    DistancePriorImplError, resolve_usf_impl, uniform_source_frame_prob,
+    _usf_grid,
+)
+
+
+def test_usf_prob_unnormalised_outside_bounds():
+    """Samples outside the recorded [dmin, dmax] must get a finite, positive,
+    continuous density -- not zero.
+
+    The recorded bounds routinely come from a sibling analysis's analytic prior,
+    so posterior samples legitimately fall outside them; zeroing the density
+    there hands darksirens a -inf log-weight that still counts in n.
+    """
+    cosmo = make_cosmology(67.9, 0.3065)
+    dmin, dmax = 100.0, 500.0
+    dL = np.array([40.0, 100.0, 300.0, 500.0, 900.0])
+
+    p, info = uniform_source_frame_prob(dL, cosmo, dmin, dmax,
+                                        impl="astropy", return_info=True)
+
+    assert np.all(np.isfinite(p))
+    assert np.all(p > 0.0), f"truncated density: {p}"
+    # p(dL) still rises with distance across the bounds (comoving-volume shape),
+    # i.e. the out-of-bounds samples are on the physical curve, not a floor.
+    assert np.all(np.diff(p) > 0)
+
+    assert info["n_below_dmin"] == 1
+    assert info["n_above_dmax"] == 1
+    assert info["n_outside_bounds"] == 2
+    assert info["frac_outside_bounds"] == pytest.approx(2 / 5)
+    assert info["widened"] is True
+    assert info["eval_min"] < 40.0 and info["eval_max"] > 900.0
+    # The recorded bounds survive as provenance.
+    assert info["dmin"] == dmin and info["dmax"] == dmax
+
+
+@pytest.mark.parametrize("bound", [100.0, 500.0])
+def test_usf_prob_is_continuous_across_the_recorded_bounds(bound):
+    """No step at dmin/dmax -- the old np.where truncation put one there."""
+    cosmo = make_cosmology(67.9, 0.3065)
+    eps = 1e-3
+    p = uniform_source_frame_prob(np.array([bound - eps, bound + eps]),
+                                  cosmo, 100.0, 500.0, impl="astropy")
+    assert np.all(p > 0)
+    assert p[1] / p[0] == pytest.approx(1.0, rel=1e-3)
+
+
+def test_usf_prob_in_bounds_does_not_widen():
+    """When every sample is inside the recorded bounds, the evaluation range is
+    exactly [dmin, dmax] -- the common case is not perturbed."""
+    cosmo = make_cosmology(67.74, 0.3089)
+    dL = np.linspace(150.0, 450.0, 40)
+    p, info = uniform_source_frame_prob(dL, cosmo, 100.0, 500.0,
+                                        impl="astropy", return_info=True)
+    assert info["widened"] is False
+    assert info["eval_min"] == 100.0 and info["eval_max"] == 500.0
+    assert info["n_outside_bounds"] == 0
+    # ... and the density is normalised on those bounds, as before.
+    grid = np.linspace(100.0, 500.0, 20000)
+    pg = uniform_source_frame_prob(grid, cosmo, 100.0, 500.0, impl="astropy")
+    trapz = getattr(np, "trapezoid", getattr(np, "trapz", None))
+    assert trapz(pg, grid) == pytest.approx(1.0, rel=1e-4)
+    assert np.all(p > 0)
+
+
+def test_usf_prob_non_finite_samples_stay_non_finite_and_are_counted():
+    """A NaN dL must yield NaN (which the export validator rejects), not the 0.0
+    the old truncation produced by comparison-with-NaN."""
+    cosmo = make_cosmology(67.9, 0.3065)
+    dL = np.array([200.0, np.nan, 300.0])
+    p, info = uniform_source_frame_prob(dL, cosmo, 100.0, 500.0,
+                                        impl="astropy", return_info=True)
+    assert info["n_nonfinite"] == 1
+    assert np.isnan(p[1])
+    assert np.all(p[[0, 2]] > 0)
+
+
+# --- implementation provenance ---------------------------------------------
+def test_resolve_usf_impl_rejects_unknown():
+    with pytest.raises(ValueError, match="impl must be"):
+        resolve_usf_impl("scipy")
+
+
+def test_impl_astropy_is_honoured_without_importing_bilby(monkeypatch):
+    """impl='astropy' must not depend on bilby at all."""
+    import gwcat.cosmology as gc
+
+    def boom(name, *a, **k):
+        raise AssertionError(f"unexpected import of {name}")
+
+    monkeypatch.setattr(gc.importlib, "import_module", boom)
+    assert resolve_usf_impl("astropy") == "astropy"
+    _, info = uniform_source_frame_prob(np.array([300.0]),
+                                        make_cosmology(70.0, 0.3),
+                                        100.0, 500.0, impl="astropy",
+                                        return_info=True)
+    assert info["impl"] == "astropy"
+
+
+def test_missing_bilby_falls_back_only_under_auto(monkeypatch):
+    """A missing bilby install degrades to astropy under 'auto' but is a loud
+    error when bilby was explicitly requested (the two densities differ by a few
+    percent and that does NOT cancel in the per-event normalisation)."""
+    import gwcat.cosmology as gc
+
+    def no_bilby(name, *a, **k):
+        raise ImportError("No module named 'bilby'")
+
+    monkeypatch.setattr(gc.importlib, "import_module", no_bilby)
+    assert resolve_usf_impl("auto") == "astropy"
+    with pytest.raises(DistancePriorImplError, match="bilby"):
+        resolve_usf_impl("bilby")
+
+
+def test_bilby_failure_is_not_silently_swallowed(monkeypatch):
+    """The old code wrapped the bilby branch in `except Exception` and fell back
+    to astropy, so a real bilby failure silently changed the density.  Any
+    non-import failure must now propagate."""
+    import gwcat.cosmology as gc
+
+    monkeypatch.setattr(gc, "resolve_usf_impl", lambda impl="auto": "bilby")
+
+    def broken(*a, **k):
+        raise RuntimeError("bilby exploded")
+
+    monkeypatch.setattr(gc, "_usf_prob_bilby", broken)
+    with pytest.raises(RuntimeError, match="bilby exploded"):
+        gc.uniform_source_frame_prob(np.array([300.0]),
+                                     make_cosmology(70.0, 0.3), 100.0, 500.0)
+
+
+def test_astropy_and_bilby_agree_in_shape_and_impl_is_recorded():
+    """bilby is the object the LVK PE used; the astropy fallback reproduces the
+    same shape but is NOT identical, so which one ran is provenance."""
+    pytest.importorskip("bilby")
+    cosmo = make_cosmology(67.9, 0.3065)
+    dmin, dmax = 10.0, 10000.0
+    dL = np.array([500.0, 1000.0, 2000.0, 4000.0])
+
+    p_b, info_b = uniform_source_frame_prob(dL, cosmo, dmin, dmax,
+                                            impl="bilby", return_info=True)
+    p_a, info_a = uniform_source_frame_prob(dL, cosmo, dmin, dmax,
+                                            impl="astropy", return_info=True)
+    assert info_b["impl"] == "bilby"
+    assert info_a["impl"] == "astropy"
+    assert np.all(p_b > 0) and np.all(p_a > 0)
+    # Same shape (ratios agree) even where the absolute normalisation differs.
+    ratio = p_b / p_a
+    assert np.max(np.abs(ratio / ratio[0] - 1.0)) < 5e-3
+    # 'auto' picks bilby when it is importable.
+    _, info_auto = uniform_source_frame_prob(dL, cosmo, dmin, dmax,
+                                             return_info=True)
+    assert info_auto["impl"] == "bilby"
+
+
+def test_bilby_prob_would_zero_out_of_bounds_samples():
+    """Pin the underlying defect: bilby's UniformSourceFrame.prob IS zero below
+    its minimum, so the fix must widen the evaluation range rather than hand
+    bilby the recorded bounds."""
+    pytest.importorskip("bilby")
+    from bilby.gw.prior import UniformSourceFrame
+    cosmo = make_cosmology(67.9, 0.3065)
+    prior = UniformSourceFrame(minimum=100.0, maximum=500.0, cosmology=cosmo,
+                               name="luminosity_distance")
+    assert float(prior.prob(40.0)) == 0.0
+    # ... whereas gwcat's wrapper gives it a real density.
+    p = uniform_source_frame_prob(np.array([40.0]), cosmo, 100.0, 500.0,
+                                  impl="bilby")
+    assert p[0] > 0.0
+
+
+# --- E(z) comes from the cosmology object, not a hardcoded form -------------
+def _old_hardcoded_grid(cosmology, zmax=10.0, ngrid=4000):
+    """The pre-GW-01 astropy fallback: comoving_distance from the cosmology
+    object but E(z) hardcoded as sqrt(Om0(1+z)^3 + 1-Om0)."""
+    import astropy.units as u
+
+    c_kms = 299792.458
+    dH = c_kms / cosmology.H0.value
+    z = np.expm1(np.linspace(np.log(1.0), np.log(1.0 + zmax), ngrid))
+    DC = cosmology.comoving_distance(z).to(u.Mpc).value
+    E = np.sqrt(cosmology.Om0 * (1 + z) ** 3 + (1.0 - cosmology.Om0))
+    dL_grid = (1 + z) * DC
+    ddL_dz = DC + (1 + z) * (dH / E)
+    pz = (DC ** 2 / E) * (1.0 / (1 + z))
+    return dL_grid, pz / ddL_dz
+
+
+def test_usf_grid_efunc_matches_hardcoded_form_for_bare_flat_lcdm():
+    """For FlatLambdaCDM(H0, Om0) -- what make_cosmology builds -- taking E(z)
+    from the object is numerically identical to the old hardcoded expression, so
+    this change moves no production number."""
+    cosmo = make_cosmology(67.9, 0.3065)
+    dL_new, p_new = _usf_grid(cosmo, 10.0, 4000)
+    dL_old, p_old = _old_hardcoded_grid(cosmo)
+    np.testing.assert_allclose(dL_new, dL_old, rtol=1e-13, atol=0)
+    np.testing.assert_allclose(p_new, p_old, rtol=1e-12, atol=0)
+
+
+def test_usf_grid_efunc_differs_for_a_cosmology_with_radiation():
+    """For a cosmology carrying radiation/neutrinos the hardcoded matter+Lambda
+    E(z) is simply wrong; reading efunc off the object fixes it."""
+    from astropy.cosmology import Planck15
+
+    dL_new, p_new = _usf_grid(Planck15, 10.0, 4000)
+    dL_old, p_old = _old_hardcoded_grid(Planck15)
+    # Same distance grid (both use the object's comoving_distance) ...
+    np.testing.assert_allclose(dL_new, dL_old, rtol=1e-13, atol=0)
+    # ... but the density differs because E(z) does.  (Skip the z=0 point, where
+    # both densities are identically zero.)
+    rel = np.abs(p_new[1:] / p_old[1:] - 1.0)
+    assert np.max(rel) > 1e-4, f"max rel diff {np.max(rel):.3e}"

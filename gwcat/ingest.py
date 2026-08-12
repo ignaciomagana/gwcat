@@ -88,10 +88,18 @@ META_FLOAT_FIELDS = [
     "f_ref", "nsamp_original", "sky_area_90",
     # source-class contract
     "p_astro", "p_bbh", "p_nsbh", "p_bns", "p_terr", "far_available",
+    # distance-prior bounds diagnostic (GW-01): how many of this row's samples
+    # fall outside the RECORDED [dL_prior_min, dL_prior_max].  The density is
+    # evaluated everywhere regardless (see gwcat.cosmology), so this is a
+    # provenance/quality signal, not a count of discarded samples.
+    "n_samples_outside_dL_prior_bounds",
 ]
 META_STR_FIELDS = [
     "name", "catalog", "analysis_used", "dL_prior_source",
     "mass_prior_kind", "compact_type",
+    # which implementation evaluated p_dL_pe ("bilby" / "astropy"); they differ
+    # by ~3% at the low-distance end and that does NOT cancel downstream (GW-01)
+    "dL_prior_impl",
     # source-class contract
     "release", "observing_run", "source_class", "source_class_method",
     "source_class_reference", "metadata_source",
@@ -155,6 +163,15 @@ class IngestConfig:
     o4_fallback_cosmo: tuple = (O4_FALLBACK.H0.value, O4_FALLBACK.Om0)
     validate_prior: bool = True
     compression: str = "gzip"
+    #: Which UniformSourceFrame implementation evaluates p_dL_pe (GW-01).
+    #: "auto" prefers bilby (the object the LVK PE used) and falls back to
+    #: astropy only when bilby is not installed; "bilby"/"astropy" pin it.
+    dL_prior_impl: str = "auto"
+    #: Warn when more than this FRACTION of a row's dL samples fall outside the
+    #: recorded distance-prior bounds.  The default warns on any occurrence: the
+    #: samples are no longer zeroed (GW-01), but the mismatch means the recorded
+    #: bounds describe a different analysis than the one being ingested.
+    dL_outside_warn_frac: float = 0.0
 
 
 # --------------------------------------------------------------------------
@@ -595,7 +612,8 @@ def _derive_spin_columns(rec):
     return derived, chi_p_def_maxdiff
 
 
-def validate_prior_against_samples(priors, analyses_to_try, H0, Om0, dmin, dmax):
+def validate_prior_against_samples(priors, analyses_to_try, H0, Om0, dmin, dmax,
+                                   *, impl: str = "auto"):
     """If prior 'samples' exist (under any of analyses_to_try), check our
     UniformSourceFrame reproduces their dL density. Returns {ks, n, analysis}
     or None. pesummary keys prior samples by the *constituent* analyses, not by
@@ -612,7 +630,7 @@ def validate_prior_against_samples(priors, analyses_to_try, H0, Om0, dmin, dmax)
     dlp = np.asarray(node["luminosity_distance"], float)
     cosmo = make_cosmology(H0, Om0)
     grid = np.linspace(max(dmin, dlp.min()), min(dmax, dlp.max()), 200)
-    pdf = uniform_source_frame_prob(grid, cosmo, dmin, dmax)
+    pdf = uniform_source_frame_prob(grid, cosmo, dmin, dmax, impl=impl)
     cdf_model = np.concatenate([[0], np.cumsum(0.5 * (pdf[1:] + pdf[:-1]) * np.diff(grid))])
     cdf_model /= cdf_model[-1]
     ecdf = np.searchsorted(np.sort(dlp), grid, side="right") / dlp.size
@@ -635,8 +653,12 @@ def inspect(path: str, cfg: Optional[IngestConfig] = None):
     H0, Om0, dmin, dmax, src = resolve_dL_prior(catalog, analysis, analyses,
                                                 priors, dL, cfg)
     val = (validate_prior_against_samples(priors, [analysis] + analyses,
-                                          H0, Om0, dmin, dmax)
+                                          H0, Om0, dmin, dmax,
+                                          impl=cfg.dL_prior_impl)
            if cfg.validate_prior else None)
+    _, dL_info = uniform_source_frame_prob(dL, make_cosmology(H0, Om0),
+                                          dmin, dmax, impl=cfg.dL_prior_impl,
+                                          return_info=True)
     f_ref = _read_f_ref(data, analysis)
     a1_samp = np.asarray(s["a_1"], float) if "a_1" in s else None
     a2_samp = np.asarray(s["a_2"], float) if "a_2" in s else None
@@ -653,7 +675,13 @@ def inspect(path: str, cfg: Optional[IngestConfig] = None):
         "preferred_sample_set": analysis,
         "n_samples": int(dL.size),
         "f_ref": f_ref,
-        "dL_prior": {"H0": H0, "Om0": Om0, "min": dmin, "max": dmax, "source": src},
+        "dL_prior": {"H0": H0, "Om0": Om0, "min": dmin, "max": dmax,
+                     "source": src,
+                     # GW-01: which implementation evaluates p_dL_pe, and how
+                     # many samples the recorded bounds fail to cover.
+                     "impl": dL_info["impl"],
+                     "n_samples_outside_bounds": dL_info["n_outside_bounds"],
+                     "frac_outside_bounds": dL_info["frac_outside_bounds"]},
         # Spin-magnitude prior resolution (PR 2).
         "spin_prior": {"amax_1": spin_amax_1, "amax_2": spin_amax_2,
                        "kind": spin_kind, "source": spin_src},
@@ -850,14 +878,38 @@ def build_store(paths, out_path, params=None, extra_params=None,
                 catalog, analysis, analyses, priors, dL, cfg)
             if cfg.validate_prior:
                 v = validate_prior_against_samples(priors, [analysis] + analyses,
-                                                   H0, Om0, dmin, dmax)
+                                                   H0, Om0, dmin, dmax,
+                                                   impl=cfg.dL_prior_impl)
                 if v and v["ks"] > 0.05:
                     warnings.warn(f"{name}: prior KS={v['ks']:.3f} > 0.05 "
                                   f"(assumed cosmology may be wrong)")
-            # distance prior evaluated per sample, stored mass-prior-agnostic
-            p_dL = uniform_source_frame_prob(dL, make_cosmology(H0, Om0),
-                                             dmin, dmax)
+            # distance prior evaluated per sample, stored mass-prior-agnostic.
+            # Evaluated over the FULL sample range, not truncated at the
+            # recorded bounds (GW-01): those bounds often come from a sibling
+            # analysis, and a truncated density hands legitimate samples
+            # p_dL_pe = 0 -> p_pe = 0 -> a -inf darksirens log-weight.
+            p_dL, dL_info = uniform_source_frame_prob(
+                dL, make_cosmology(H0, Om0), dmin, dmax,
+                impl=cfg.dL_prior_impl, return_info=True)
             rec["p_dL_pe"] = p_dL
+            if dL_info["frac_outside_bounds"] > cfg.dL_outside_warn_frac:
+                warnings.warn(
+                    f"{name} [{analysis}]: {dL_info['n_outside_bounds']} of "
+                    f"{dL_info['n_samples']} dL samples "
+                    f"({100 * dL_info['frac_outside_bounds']:.2f}%) fall "
+                    f"outside the recorded distance-prior bounds "
+                    f"[{dmin:.4g}, {dmax:.4g}] Mpc from {src} "
+                    f"({dL_info['n_below_dmin']} below, "
+                    f"{dL_info['n_above_dmax']} above).  The density was "
+                    f"evaluated over [{dL_info['eval_min']:.4g}, "
+                    f"{dL_info['eval_max']:.4g}] Mpc instead of zeroing them, "
+                    f"but the recorded bounds describe a different analysis "
+                    f"than the one ingested.")
+            if dL_info["n_nonfinite"]:
+                warnings.warn(
+                    f"{name} [{analysis}]: {dL_info['n_nonfinite']} non-finite "
+                    f"dL sample(s); p_dL_pe is NaN for those samples and the "
+                    f"export validator will reject the row.")
             # Derived spin columns (cos_tilt_i, chi_p) + chi_p definition
             # diagnostic (PR 2).  Additive: only fills columns the file lacks;
             # never overwrites the file's chi_p.
@@ -938,6 +990,9 @@ def build_store(paths, out_path, params=None, extra_params=None,
             meta["dL_prior_Om0"].append(float(Om0))
             meta["dL_prior_min"].append(float(dmin))
             meta["dL_prior_max"].append(float(dmax))
+            meta["dL_prior_impl"].append(dL_info["impl"])
+            meta["n_samples_outside_dL_prior_bounds"].append(
+                float(dL_info["n_outside_bounds"]))
             meta["f_ref"].append(float(f_ref) if f_ref else np.nan)
             meta["nsamp_original"].append(float(n))
             # ── Spin-prior / derived-column provenance (PR 2) ───────────────

@@ -86,8 +86,11 @@ def validate_export_v2(pe_path, selection_path=None, strict=False):
       * required datasets (the legacy 10 always; ``component`` additionally
         writes ``a1/a2/cost1/cost2/chip``; ``chieff_chip`` additionally writes
         ``chip``);
-      * ``p_pe`` finite and non-negative (exact zeros are allowed at
-        distance-prior tails, as the v1 validator documents);
+      * ``p_pe`` finite and **strictly positive** -- an exact zero is a hard
+        failure (GW-01), reported with a count.  It used to be documented as
+        legal at "distance-prior tails", but that state only arose from the
+        truncated distance prior, and darksirens turns a zero weight into a
+        ``-inf`` log-weight that still counts in ``n``;
       * ``nobs * nsamp`` length consistency across the legacy datasets;
       * physical ranges when spin columns are present: ``a1``/``a2`` in
         ``[0, max(spin_amax)*1.001]``, ``|cost{1,2}| <= 1``, ``chip`` in
@@ -203,15 +206,22 @@ def validate_export_v2(pe_path, selection_path=None, strict=False):
             _check(f"pe_{ds}_length", pe_cols[ds].shape[0] == expected,
                    f"{pe_cols[ds].shape[0]} != nobs*nsamp = {expected}")
 
-    # p_pe finite & non-negative (zeros are allowed at distance-prior tails).
+    # p_pe finite & STRICTLY positive.  An exact zero used to be documented as
+    # legal ("distance-prior tails"), but that state only ever arose from the
+    # truncated distance prior GW-01 removed, and darksirens turns a zero weight
+    # into a -inf log-weight that still counts in n for the per-event MC
+    # variance.  It is now a hard failure, reported with a count.
     if "p_pe" in pe_cols and pe_cols["p_pe"].size:
         p = pe_cols["p_pe"]
         _check("pe_p_pe_finite", np.all(np.isfinite(p)))
-        _check("pe_p_pe_nonneg", np.all(p >= 0.0), f"min={p.min():.3e}")
-        n_zero = int(np.sum(p == 0))
-        if n_zero:
-            print(f"  NOTE: {n_zero} ({100 * n_zero / p.size:.1f}%) p_pe samples "
-                  f"are zero (expected at distance-prior tails)")
+        n_zero = int(np.sum(p == 0.0))
+        n_neg = int(np.sum(p < 0.0))
+        _check("pe_p_pe_positive", n_zero == 0 and n_neg == 0,
+               f"{n_zero} zero ({100 * n_zero / p.size:.2f}%) and {n_neg} "
+               f"negative of {p.size} samples; min={np.nanmin(p):.3e}. A zero "
+               f"p_pe means the store's p_dL_pe was truncated at the recorded "
+               f"distance-prior bounds -- re-ingest so the distance prior is "
+               f"evaluated over the full sample range.")
 
     # Physical ranges.
     pe_amax = _amax_bound(pe_attrs.get("spin_amax_1_per_event", []),

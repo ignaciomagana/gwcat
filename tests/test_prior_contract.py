@@ -320,3 +320,94 @@ def test_pe_and_selection_agree_on_contract(tmp_path):
         assert fp.attrs["spin_prior_mode"] == fs.attrs["spin_prior_mode"]
         assert (bool(fp.attrs["chi_eff_prior_applied_to_p_pe"])
                 == bool(fs.attrs["chi_eff_prior_applied_to_pdraw"]))
+
+
+# --------------------------------------------------------------------------
+# GW-01: an exported p_pe of exactly zero is refused, not documented as legal
+# --------------------------------------------------------------------------
+def _zero_some_p_dL(store_path, event_index=0, n_zero=3):
+    """Mimic a pre-GW-01 store: p_dL_pe truncated to 0 for a few samples.
+
+    This is exactly what the shipped ``gwsamples_bbh_whitelist_all_events.h5``
+    carries -- the distance prior was evaluated with a hard zero outside the
+    recorded [dmin, dmax], and those bounds came from a sibling analysis.
+    """
+    with h5py.File(store_path, "r+") as f:
+        offsets = f["index/offsets"][:]
+        a = int(offsets[event_index])
+        col = f["samples/p_dL_pe"]
+        col[a:a + n_zero] = 0.0
+        name = f["index/event_names"][event_index]
+    return name.decode() if isinstance(name, bytes) else str(name)
+
+
+def test_no_zero_p_pe_in_export(tmp_path):
+    """The ordinary path exports a strictly positive p_pe."""
+    store = _build_tiny_store(tmp_path, seed=31)
+    out = tmp_path / "clean.h5"
+    GWCatalog(store).to_darksirens(str(out), nsamp=20, seed=0)
+    with h5py.File(out, "r") as f:
+        p = f["p_pe"][:]
+    assert p.size and np.all(np.isfinite(p)) and np.all(p > 0)
+
+
+def test_zero_p_dL_pe_refuses_export_and_names_the_event(tmp_path):
+    """A store carrying truncated (zero) p_dL_pe must fail the export loudly,
+    naming the offending event and counting the samples -- p_pe is a denominator
+    and darksirens masks a zero-weight sample while still counting it in n."""
+    from gwcat.schema import ZeroWeightError
+
+    store = _build_tiny_store(tmp_path, n_per_event=25, seed=32,
+                              name="truncated.h5")
+    bad_name = _zero_some_p_dL(store, event_index=0, n_zero=5)
+
+    out = tmp_path / "refused.h5"
+    with pytest.raises(ZeroWeightError) as exc:
+        # nsamp == n_per_event with replace="auto" keeps every stored sample,
+        # so the zeroed ones are certain to be drawn.
+        GWCatalog(store).to_darksirens(str(out), nsamp=25, seed=0,
+                                       replace=False)
+    msg = str(exc.value)
+    assert bad_name in msg
+    assert "exactly zero" in msg
+    assert "re-ingest" in msg.lower()
+    assert not out.exists(), "a refused export must not leave a file behind"
+
+
+def test_zero_p_pe_export_allowed_with_flag_but_warns_and_fails_validation(
+        tmp_path):
+    """The escape hatch writes the file but warns, and the validator reports the
+    zeros as a FAILED check rather than a benign NOTE."""
+    from gwcat.catalog import validate_export
+
+    store = _build_tiny_store(tmp_path, n_per_event=25, seed=33,
+                              name="truncated2.h5")
+    _zero_some_p_dL(store, event_index=1, n_zero=4)
+
+    out = tmp_path / "allowed.h5"
+    with pytest.warns(UserWarning, match="strictly positive"):
+        GWCatalog(store).to_darksirens(str(out), nsamp=25, seed=0,
+                                       replace=False, allow_zero_p_pe=True)
+    assert out.exists()
+
+    results = validate_export(str(out), strict=False)
+    assert results["pe_p_pe_positive"] is False
+    assert results["pe_p_pe_finite"] is True
+    # ... and it is a hard error under strict.
+    with pytest.raises(AssertionError, match="pe_p_pe_positive"):
+        validate_export(str(out), strict=True)
+
+
+def test_v2_pe_export_also_refuses_zero_p_pe(tmp_path):
+    """The gwcat-2.0 builder carries the same guard as the frozen v1 twin."""
+    from gwcat.schema import ZeroWeightError
+
+    store = _build_tiny_store(tmp_path, n_per_event=25, seed=34,
+                              name="truncated3.h5")
+    _zero_some_p_dL(store, event_index=0, n_zero=2)
+
+    out = tmp_path / "v2_refused.h5"
+    with pytest.raises(ZeroWeightError, match="gwcat-pe-2.0"):
+        GWCatalog(store).export(str(out), format="gwcat2",
+                                spin_basis="chieff", nsamp=25, seed=0,
+                                replace=False)
