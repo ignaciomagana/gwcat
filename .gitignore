@@ -184,3 +184,6 @@ cython_debug/
 
 *.h5
 *.hdf5
+
+# multi-agent review artifacts (working notes, not source)
+review/
