@@ -75,7 +75,7 @@ import warnings
 import numpy as np
 
 from ..cosmology import make_cosmology, z_of_dL
-from ..params import get_space
+from ..params import DEFAULT_PARAMETER_SPACE, get_space
 from ..source_class import format_source_class_filter
 from .product import ExportProduct
 
@@ -178,7 +178,8 @@ class ChiPDefinitionError(ValueError):
     components, so a joint (chi_eff, chi_p) prior would not describe it."""
 
 
-def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
+def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
+                     nsamp=4096, seed=0,
                      far_max=None, pastro_min=None, z_max=None,
                      replace="auto", cosmology=None, amax=0.99,
                      amax_fallback=0.99,

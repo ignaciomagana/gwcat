@@ -302,7 +302,7 @@ def test_the_pe_builder_now_drives_itself_from_the_registry():
 
     src = (pathlib.Path(__file__).resolve().parent.parent
            / "gwcat" / "export" / "pe_builder.py").read_text()
-    assert "from ..params import get_space" in src
+    assert "from ..params import" in src and "get_space" in src
     assert "space = get_space(spin_basis)" in src
     # the three-branch requirement ladder is gone
     assert 'need = list(COMPONENT_REQUIRED)' not in src

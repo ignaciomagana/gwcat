@@ -47,14 +47,17 @@ import os
 import sys
 from typing import Optional, Sequence
 
-#: The default parameter space for BOTH `export pe` and `export selection`.
-#:
-#: These used to differ -- PE defaulted to `chieff`, selection to `component` --
-#: so running both with no flags produced a pair that fails the cross-file basis
-#: check by construction. A default that cannot be used with itself is not a
-#: default. `component` is the shared value because it is the exact (bijective)
-#: space, and it is the one the selection side already defaulted to.
-DEFAULT_PARAMETER_SPACE = "component"
+#: Re-exported for the CLI's help text and for callers that used to read it
+#: here.  The single source of truth is :data:`gwcat.params.
+#: DEFAULT_PARAMETER_SPACE`, so the CLI and the Python API cannot drift.
+
+
+def _default_parameter_space() -> str:
+    from .params import DEFAULT_PARAMETER_SPACE as _d
+    return _d
+
+
+DEFAULT_PARAMETER_SPACE = _default_parameter_space()
 
 
 def _add_space_argument(parser) -> None:

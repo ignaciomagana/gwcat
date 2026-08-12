@@ -13,9 +13,10 @@ builders to it is GW-18 (PE) and GW-19 (selection).
 from .block import (KINDS, MAP_KINDS, CampaignRequirement, ParameterBlock,
                     Range)
 from .context import InjContext, PEContext
-from .registry import (BLOCKS, LEGACY_SPIN_BASES, SPACES, ParameterSpace,
-                       get_space, list_spaces)
+from .registry import (BLOCKS, DEFAULT_PARAMETER_SPACE, LEGACY_SPIN_BASES,
+                       SPACES, ParameterSpace, get_space, list_spaces)
 
 __all__ = ["ParameterBlock", "Range", "CampaignRequirement", "KINDS",
            "MAP_KINDS", "PEContext", "InjContext", "BLOCKS", "SPACES",
-           "ParameterSpace", "get_space", "list_spaces", "LEGACY_SPIN_BASES"]
+           "ParameterSpace", "get_space", "list_spaces", "LEGACY_SPIN_BASES",
+           "DEFAULT_PARAMETER_SPACE"]

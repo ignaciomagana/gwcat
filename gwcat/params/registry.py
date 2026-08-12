@@ -200,3 +200,22 @@ def get_space(name: str) -> ParameterSpace:
 
 def list_spaces() -> Tuple[str, ...]:
     return tuple(sorted(SPACES))
+
+
+#: The default parameter space for EVERY no-argument export path -- the CLI's
+#: ``export pe`` / ``export selection``, ``GWCatalog.export``, and
+#: ``SelectionSet.export`` / ``CombinedSelectionSet.export``.
+#:
+#: It lives here, in the registry, because the PE and selection defaults used to
+#: be written out separately and had drifted apart: PE defaulted to ``chieff``
+#: and selection to ``component``, so *either* no-argument path -- CLI or Python
+#: -- produced a pair that fails the cross-file basis check by construction. A
+#: default that cannot be used with itself is not a default. One constant, in
+#: the module that owns the spaces, is what stops them drifting again.
+#:
+#: ``component`` because it is the exact (bijective) space: its density is
+#: definable against any campaign, whereas a projection is valid only against a
+#: uniform-magnitude/isotropic parent draw (R1) and silently wrong otherwise.
+#: The legacy chi_eff behaviour remains one explicit argument away, and
+#: ``GWCatalog.to_darksirens`` (frozen v1) is unaffected.
+DEFAULT_PARAMETER_SPACE = "component"

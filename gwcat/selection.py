@@ -1213,7 +1213,7 @@ class SelectionSet:
               f"source_class={source_class}")
         return out_path
 
-    def export(self, out_path, format="gwcat2", spin_basis="component",
+    def export(self, out_path, format="gwcat2", spin_basis=None,
                write_summary=False, summary_context=None, **builder_kwargs):
         """Export via the versioned :mod:`gwcat.export` pipeline (PR5).
 
@@ -1231,6 +1231,9 @@ class SelectionSet:
         ``source_class``, ``amax``, ``snr_threshold``, ``strict``).
         """
         from .export import build_selection_product, get_exporter
+        from .params import DEFAULT_PARAMETER_SPACE
+        if spin_basis is None:
+            spin_basis = DEFAULT_PARAMETER_SPACE
         product = build_selection_product(self, spin_basis=spin_basis,
                                           **builder_kwargs)
         writer = get_exporter(format, "selection")
@@ -1533,7 +1536,7 @@ class CombinedSelectionSet:
               f"FAR<{far_threshold}, campaigns={len(self._sets)}")
         return out_path
 
-    def export(self, out_path, format="gwcat2", spin_basis="component",
+    def export(self, out_path, format="gwcat2", spin_basis=None,
                write_summary=False, summary_context=None, **builder_kwargs):
         """Export the combined campaigns via the versioned pipeline (PR5).
 
@@ -1543,6 +1546,9 @@ class CombinedSelectionSet:
         ``(format, "selection")`` writer.  See :meth:`SelectionSet.export`.
         """
         from .export import build_selection_product, get_exporter
+        from .params import DEFAULT_PARAMETER_SPACE
+        if spin_basis is None:
+            spin_basis = DEFAULT_PARAMETER_SPACE
         product = build_selection_product(self._sets, spin_basis=spin_basis,
                                           **builder_kwargs)
         writer = get_exporter(format, "selection")

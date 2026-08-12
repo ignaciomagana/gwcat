@@ -70,7 +70,7 @@ import warnings
 import numpy as np
 import h5py
 
-from ..params import BLOCKS, get_space
+from ..params import BLOCKS, DEFAULT_PARAMETER_SPACE, get_space
 from ..source_class import format_source_class_filter
 from ..spin import chi_eff_prior_logprob, chi_eff_chi_p_prior_logprob
 from ..selection import (SelectionSet, CombinedSelectionSet,
@@ -293,7 +293,8 @@ def _jsonable(v):
     return str(v)
 
 
-def build_selection_product(sets, *, spin_basis="component", far_threshold=1.0,
+def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
+                            far_threshold=1.0,
                             source_class=None, amax=0.99, snr_threshold=None,
                             strict=True):
     """Build a selection :class:`ExportProduct` from one or more SelectionSets.

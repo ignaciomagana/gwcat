@@ -266,7 +266,8 @@ def test_write_summary_context_merged(tmp_path):
     store = _build_store(tmp_path)
     cat = GWCatalog(store)
     out = tmp_path / "ctx_summary.h5"
-    cat.export(str(out), format="gwcat2", write_summary=True,
+    cat.export(str(out), format="gwcat2", spin_basis="chieff",
+               write_summary=True,
                summary_context={"analyst": "unit-test"},
                cosmology=(67.74, 0.3089), nsamp=8, seed=0)
     import json
@@ -545,3 +546,39 @@ def test_summary_requirements_follow_the_requested_space(tmp_path):
     assert component["required_for_parameter_space"] == "component"
     # The ingest context (no export in view) keeps the legacy behaviour.
     assert summarize_catalog(cat)["required_for_parameter_space"] is None
+
+
+def test_every_no_argument_export_path_agrees_on_the_default():
+    """CLI and Python API must not disagree about what "the default" is.
+
+    GW-22b fixed the CLI's two defaults but left `GWCatalog.export` on `chieff`
+    while `SelectionSet.export` was on `component`, so the no-argument *Python*
+    pair still failed the basis cross-check -- the same defect one layer down,
+    reachable by the more commonly used path. One constant now feeds all four.
+    """
+    import inspect
+
+    from gwcat.cli import build_parser
+    from gwcat.params import DEFAULT_PARAMETER_SPACE
+    from gwcat.catalog import GWCatalog
+    from gwcat.selection import SelectionSet, CombinedSelectionSet
+    from gwcat.export import build_pe_product
+    from gwcat.export.selection_builder import build_selection_product
+
+    p = build_parser()
+    assert p.parse_args(["export", "pe", "s.h5", "--out", "o.h5"]
+                        ).spin_basis == DEFAULT_PARAMETER_SPACE
+    assert p.parse_args(["export", "selection", "i.hdf", "--out", "o.h5"]
+                        ).spin_basis == DEFAULT_PARAMETER_SPACE
+
+    # The builders default to the constant directly...
+    for fn in (build_pe_product, build_selection_product):
+        assert (inspect.signature(fn).parameters["spin_basis"].default
+                == DEFAULT_PARAMETER_SPACE), fn.__name__
+
+    # ...and the user-facing methods resolve None to it, so the constant is not
+    # baked into a signature default that a stale import could pin.
+    for meth in (GWCatalog.export, SelectionSet.export,
+                 CombinedSelectionSet.export):
+        assert inspect.signature(meth).parameters["spin_basis"].default is None, \
+            meth.__qualname__

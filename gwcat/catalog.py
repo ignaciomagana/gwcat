@@ -887,7 +887,7 @@ class GWCatalog:
         return self.to_darksirens(*args, **kwargs)
 
     # ---- versioned export (PR 3): build a product, look up a writer ----------
-    def export(self, out_path, format="gwcat2", spin_basis="chieff",
+    def export(self, out_path, format="gwcat2", spin_basis=None,
                write_summary=False, summary_context=None, **builder_kwargs):
         """Export via the versioned :mod:`gwcat.export` pipeline.
 
@@ -900,6 +900,15 @@ class GWCatalog:
         :meth:`to_darksirens`, the mass Jacobian is applied in the builder, not
         here -- this method never touches sample arrays.
 
+        ``spin_basis=None`` means :data:`gwcat.params.DEFAULT_PARAMETER_SPACE`
+        (``component``), the same value the CLI uses, so a no-argument PE export
+        and a no-argument selection export pair.  It used to default to
+        ``chieff`` here while the selection side defaulted to ``component``, so
+        the no-argument Python pair failed the cross-file basis check by
+        construction -- the same defect as the CLI's, one layer down.  Pass
+        ``spin_basis="chieff"`` for the legacy behaviour; :meth:`to_darksirens`
+        (frozen v1) is unaffected either way.
+
         ``**builder_kwargs`` are forwarded to
         :func:`gwcat.export.build_pe_product` (``nsamp``, ``seed``, ``far_max``,
         ``pastro_min``, ``z_max``, ``replace``, ``cosmology``, ``amax``,
@@ -907,6 +916,9 @@ class GWCatalog:
         flags, ``waveform_policy``, ``approximant``).
         """
         from .export import build_pe_product, get_exporter
+        from .params import DEFAULT_PARAMETER_SPACE
+        if spin_basis is None:
+            spin_basis = DEFAULT_PARAMETER_SPACE
         product = build_pe_product(self, spin_basis=spin_basis,
                                    **builder_kwargs)
         writer = get_exporter(format, "pe")
