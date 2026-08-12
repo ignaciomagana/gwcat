@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Optional
 
 import h5py
+import numpy as np
 
 from .registry import register_exporter
 
@@ -184,3 +185,103 @@ def write_selection_gwcat2(product, out_path, *, write_summary: bool = False,
         write_validation_summary(out_path, summary)
 
     return str(out_path)
+
+
+# ==========================================================================
+# Format 2.1 (GW-22) -- OPT-IN.  "gwcat2" still means 2.0.
+# ==========================================================================
+# 2.1 adds the declarative contract to the file: the parameter space, its fit
+# and advisory columns, per-block provenance, and a contract_hash that makes a
+# mismatched PE/selection pairing one comparison instead of a growing list of
+# per-field checks.
+#
+# It is registered as a SEPARATE format name rather than bumping "gwcat2",
+# because `_require_hdf5_format` in darksirens is a closed literal tuple: a 2.1
+# file is unloadable by any consumer that has not been taught the version, and
+# the plan's rule is that the consumer patch deploys FIRST.  Keeping 2.0 the
+# default means nothing gwcat writes by accident becomes unreadable.
+_PE_FORMAT_21 = "gwcat-pe-2.1"
+_SEL_FORMAT_21 = "gwcat-selection-2.1"
+
+
+def _contract_attrs(product, kind):
+    """The 2.1 contract attrs for a product, plus its hash."""
+    import json as _json
+
+    from ..params import get_space
+    from .contract import build_contract, contract_hash
+
+    space = get_space(product.spin_basis)
+    a = product.attrs
+    spin = space.spin_block
+
+    # The detection cut, as a (statistic, threshold) pair rather than a bare
+    # number: Essick & Fishbach require the EVENT cut and the INJECTION cut to
+    # be the same statistic at the same threshold, and comparing thresholds
+    # without their statistic is how that check stayed vacuous.
+    if kind == "pe":
+        stat = "far_max" if a.get("far_max") is not None else None
+        thr = a.get("far_max")
+    else:
+        stat = "far_threshold" if a.get("far_threshold") is not None else None
+        thr = a.get("far_threshold")
+
+    contract = build_contract(
+        parameter_space=space.name,
+        fit_columns=list(space.fit_columns),
+        advisory_columns=list(space.advisory_columns),
+        spin_basis_kind=spin.map_kind,
+        spin_density_exact=bool(space.is_exact),
+        mass_prior_kind=a.get("mass_prior_basis") or a.get("mass_prior_kind"),
+        dL_prior_kind=a.get("dL_prior_kind"),
+        sky_prior_in_density=True,      # sky.radec declares -ln4pi both sides
+        source_class=a.get("source_class_filter") or None,
+        detection_statistic=stat,
+        detection_threshold=thr,
+        allow_missing_far=bool(a.get("allow_missing_far", False)),
+        cosmology_H0=(a.get("pe_cosmology_H0") if kind == "pe"
+                      else a.get("cosmology_H0")),
+        cosmology_Om0=(a.get("pe_cosmology_Om0") if kind == "pe"
+                       else a.get("cosmology_Om0")),
+    )
+    return {
+        "parameter_space": space.name,
+        "parameter_blocks": np.array([b.name for b in space.blocks],
+                                     dtype=h5py.string_dtype()),
+        "fit_columns": np.array(list(space.fit_columns),
+                                dtype=h5py.string_dtype()),
+        "advisory_columns": np.array(list(space.advisory_columns),
+                                     dtype=h5py.string_dtype()),
+        "spin_basis_kind": spin.map_kind,
+        "spin_density_exact": bool(space.is_exact),
+        "block_provenance": _json.dumps(space.describe()),
+        "contract": _json.dumps(contract),
+        "contract_hash": contract_hash(contract),
+    }
+
+
+@register_exporter("gwcat2.1", kind="pe")
+def write_pe_gwcat21(product, out_path, *, write_summary: bool = False,
+                     summary_context=None):
+    """Write a ``gwcat-pe-2.1`` PE export (opt-in; see the module note)."""
+    path = write_pe_gwcat2(product, out_path, write_summary=write_summary,
+                           summary_context=summary_context)
+    with h5py.File(out_path, "r+") as f:
+        f.attrs["format_version"] = _PE_FORMAT_21
+        for k, v in _contract_attrs(product, "pe").items():
+            f.attrs[k] = v
+    return path
+
+
+@register_exporter("gwcat2.1", kind="selection")
+def write_selection_gwcat21(product, out_path, *, write_summary: bool = False,
+                            summary_context=None):
+    """Write a ``gwcat-selection-2.1`` selection export (opt-in)."""
+    path = write_selection_gwcat2(product, out_path,
+                                  write_summary=write_summary,
+                                  summary_context=summary_context)
+    with h5py.File(out_path, "r+") as f:
+        f.attrs["format_version"] = _SEL_FORMAT_21
+        for k, v in _contract_attrs(product, "selection").items():
+            f.attrs[k] = v
+    return path
