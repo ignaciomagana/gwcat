@@ -296,3 +296,85 @@ def test_fetch_catalog_dry_run_uses_manifest_filter_offline(tmp_path, monkeypatc
     # have accepted exactly the one true cosmo PE file (proven indirectly:
     # a non-matching filter would raise "No PE files matched filter").
     assert paths == []
+
+
+# ==========================================================================
+# GW-15: FAR / p_astro are TOP-LEVEL in the GWOSC event API
+# ==========================================================================
+def test_event_table_parses_top_level_far():
+    """The real GWOSC payload shape.
+
+    The parser read ``info["parameters"][<pipeline>]``, a key the event API does
+    not return, so ``info.get("parameters", {})`` was always ``{}`` and EVERY
+    event was stored with far = p_astro = NaN.  Verified live against
+    gwosc.org: the response has no "parameters" key and carries far/p_astro at
+    the top level.  The production store shows the consequence -- 0 of 282 rows
+    had a finite FAR.
+    """
+    from gwcat.fetch import _parse_gwosc_event_table_page
+
+    table = {}
+    _parse_gwosc_event_table_page(
+        {"events": {"GW200322_091133-v1": {"far": 140.0, "p_astro": 0.61501,
+                                           "commonName": "GW200322_091133"}}},
+        table)
+    assert table == {"GW200322_091133": {"far": 140.0, "pastro": 0.61501}}
+
+
+def test_event_table_still_parses_the_legacy_sub_dict():
+    """A recorded old payload (or a future API shape) must still work."""
+    from gwcat.fetch import _parse_gwosc_event_table_page
+
+    table = {}
+    _parse_gwosc_event_table_page(
+        {"events": {"GW1-v2": {"parameters": {"pycbc": {"far": 1.2,
+                                                        "p_astro": 0.9}}}}},
+        table)
+    assert table["GW1"]["far"] == 1.2
+    assert table["GW1"]["pastro"] == 0.9
+
+
+def test_top_level_wins_over_the_legacy_sub_dict():
+    from gwcat.fetch import _parse_gwosc_event_table_page
+
+    table = {}
+    _parse_gwosc_event_table_page(
+        {"events": {"GW1-v1": {"far": 7.0,
+                               "parameters": {"pycbc": {"far": 1.2}}}}},
+        table)
+    assert table["GW1"]["far"] == 7.0
+
+
+def test_absent_far_is_nan_never_fabricated():
+    """FAR is genuinely missing from some public entries; that must stay an
+    explicit absence so build_store can record far_available=False."""
+    import numpy as np
+
+    from gwcat.fetch import _parse_gwosc_event_table_page
+
+    table = {}
+    _parse_gwosc_event_table_page({"events": {"GW2-v1": {}}}, table)
+    assert np.isnan(table["GW2"]["far"])
+    assert np.isnan(table["GW2"]["pastro"])
+    # non-numeric junk is absence too, not a crash
+    table = {}
+    _parse_gwosc_event_table_page(
+        {"events": {"GW3-v1": {"far": "n/a", "p_astro": None}}}, table)
+    assert np.isnan(table["GW3"]["far"])
+
+
+def test_a_later_nan_page_does_not_clobber_a_finite_value():
+    """The cumulative and per-catalog endpoints overlap, so the same event
+    arrives twice; a page lacking FAR must not erase one that had it."""
+    import numpy as np
+
+    from gwcat.fetch import _parse_gwosc_event_table_page
+
+    table = {"GW3": {"far": 5.0, "pastro": 0.8}}
+    _parse_gwosc_event_table_page({"events": {"GW3-v2": {}}}, table)
+    assert table["GW3"]["far"] == 5.0
+    assert table["GW3"]["pastro"] == 0.8
+    # ... but a finite later value does update
+    _parse_gwosc_event_table_page(
+        {"events": {"GW3-v3": {"far": 2.0, "p_astro": 0.95}}}, table)
+    assert table["GW3"]["far"] == 2.0

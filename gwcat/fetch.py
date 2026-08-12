@@ -55,6 +55,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Union
 from urllib.parse import urlencode
+
+import numpy as np
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError
 
@@ -710,6 +712,17 @@ def fetch_bbh_names_gwosc(
     return result
 
 
+def _coerce_float(value):
+    """A finite float from a GWOSC field, else NaN (never fabricated)."""
+    if value is None:
+        return float("nan")
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+    return out if np.isfinite(out) else float("nan")
+
+
 def _parse_gwosc_event_table_page(data: dict, table: dict) -> None:
     """Merge one raw GWOSC event-API page's events into ``table`` in place.
 
@@ -720,14 +733,37 @@ def _parse_gwosc_event_table_page(data: dict, table: dict) -> None:
     events = data.get("events", {})
     for name, info in events.items():
         clean = re.sub(r"-v\d+$", "", name)
-        far = pastro = float("nan")
-        params = info.get("parameters", {})
-        for _key, pset in params.items():
-            if isinstance(pset, dict):
-                if "far" in pset and pset["far"] is not None:
-                    far = float(pset["far"])
-                if "p_astro" in pset and pset["p_astro"] is not None:
-                    pastro = float(pset["p_astro"])
+        if not isinstance(info, dict):
+            continue
+        # GWOSC returns `far` and `p_astro` as TOP-LEVEL fields of each event
+        # (GW-15).  The previous code read them out of an
+        # ``info["parameters"][<pipeline>]`` sub-dict that the event API does not
+        # return at all, so ``info.get("parameters", {})`` was always ``{}`` and
+        # EVERY event was stored with far = p_astro = NaN.  Verified live: the
+        # response has no "parameters" key and does carry e.g.
+        # far=140.0, p_astro=0.61501 at the top level.
+        far = _coerce_float(info.get("far"))
+        pastro = _coerce_float(info.get("p_astro"))
+        # Keep the legacy sub-dict as a fallback so a future API shape (or a
+        # recorded old payload) still parses, but never let it override a real
+        # top-level value.
+        params = info.get("parameters")
+        if isinstance(params, dict):
+            for _key, pset in params.items():
+                if not isinstance(pset, dict):
+                    continue
+                if not np.isfinite(far):
+                    far = _coerce_float(pset.get("far"))
+                if not np.isfinite(pastro):
+                    pastro = _coerce_float(pset.get("p_astro"))
+        # A later page for the same event must not clobber a finite value with
+        # a NaN (the cumulative and per-catalog endpoints overlap).
+        prev = table.get(clean)
+        if prev is not None:
+            if not np.isfinite(far):
+                far = prev.get("far", float("nan"))
+            if not np.isfinite(pastro):
+                pastro = prev.get("pastro", float("nan"))
         table[clean] = {"far": far, "pastro": pastro}
 
 
