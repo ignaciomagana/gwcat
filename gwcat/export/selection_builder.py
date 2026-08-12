@@ -347,13 +347,21 @@ def build_selection_product(sets, *, spin_basis="component", far_threshold=1.0,
         raise SpinBasisError(
             f"spin_basis={spin_basis!r}: {n_unsupported} of {ln_factor.size} "
             f"detected injections ({100 * frac:.3f}%) fall outside the assumed "
-            f"spin prior's support, so their pdraw would be exactly zero. These "
-            f"injections were drawn and detected, so excluding them biases the "
-            f"selection integral mu low -- and darksirens' `pdraw > 0` guard "
-            f"would exclude them without reporting it. The assumed amax does "
-            f"not cover this campaign: fix the amax (GW-04) or use "
-            f"spin_basis='component', which is exact for any campaign because "
-            f"the assumed prior cancels identically.")
+            f"spin prior's support, so their pdraw would be exactly zero. "
+            f"These injections were drawn and detected, so they belong in the "
+            f"Monte-Carlo sum: mu = (1/Ndraw) * sum(p_pop/p_draw), where Ndraw "
+            f"is the campaign's TOTAL generated count read from the file attr "
+            f"and is independent of the detection mask. Dropping a detected "
+            f"injection therefore removes a positive term from the numerator "
+            f"while the denominator stays fixed -- mu is biased LOW, "
+            f"-N_obs*log(mu) goes UP, and the likelihood is inflated in the "
+            f"direction that looks like a better fit. Worse, the consumer "
+            f"excludes it with the same `prior_wt > 0` mask it uses for padded "
+            f"sentinel rows, so the two are indistinguishable downstream and "
+            f"neither is counted. The assumed amax does not cover this "
+            f"campaign: fix the amax (GW-04) or use spin_basis='component', "
+            f"which is exact for any campaign because the assumed prior "
+            f"cancels identically.")
 
     # ── Output columns: legacy 10 + (a1,a2,cost1,cost2,chip when available) ──
     columns = {
