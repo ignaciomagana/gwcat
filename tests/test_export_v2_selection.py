@@ -479,3 +479,75 @@ def test_only_the_offending_campaign_is_named_in_a_mixed_export():
     assert "o4ab.hdf" in str(exc.value)
     assert "endo3.hdf" not in str(exc.value)
     assert "1 campaign(s)" in str(exc.value)
+
+
+# ==========================================================================
+# GW-19: the selection builder is driven by the block registry
+# ==========================================================================
+def test_extra_columns_come_from_the_registry_not_a_literal():
+    """The column set lives in one place now.
+
+    Before GW-19 the same four spin column names were re-typed in the PE
+    builder, the selection builder, the writers and the validator; adding a
+    coordinate meant finding all of them.
+    """
+    from gwcat.export.selection_builder import _EXTRA_COLUMNS
+    from gwcat.params import BLOCKS, get_space
+
+    assert _EXTRA_COLUMNS == ("a1", "a2", "cost1", "cost2")
+    block_cols = BLOCKS["spin.component_polar"].columns
+    assert set(_EXTRA_COLUMNS) == set(block_cols)
+    # and the space agrees about what is fittable vs merely emitted
+    comp = get_space("component")
+    for c in _EXTRA_COLUMNS:
+        assert c in comp.fit_columns
+    assert "chip" in comp.advisory_columns
+
+
+def test_removal_amax_cancels_exactly_for_the_component_basis():
+    """The containment that decides how much the assumed-ceiling defect matters.
+
+    ``pdraw`` for the component basis is
+    ``pdraw_base * exp(ln_p_comp - ln_pdraw_no_spin)`` with
+    ``pdraw_base ∝ exp(ln_pdraw_no_spin)``, so ``ln_pdraw_no_spin`` -- the ONLY
+    place the removal amax appears -- divides out identically.  A projection
+    multiplies ``pdraw_base`` by something built independently of it, so there
+    the constant survives.
+
+    Checked algebraically here; verified on the real O4ab campaign in
+    working/ (perturbing 0.99 -> 0.998 moves component_pdraw by <1e-14 while
+    moving pdraw_base by the predicted 1.0162269).
+    """
+    rng = np.random.default_rng(0)
+    n = 4096
+    a1 = rng.uniform(0.01, 0.9, n)
+    a2 = rng.uniform(0.01, 0.9, n)
+    ln_joint = rng.normal(-30.0, 2.0, n)
+    ln_p_comp = rng.normal(-2.0, 1.0, n)
+
+    def chain(amax):
+        ln6d = -np.log(16 * np.pi ** 2 * a1 ** 2 * a2 ** 2 * amax ** 2)
+        no_spin = ln_joint - ln6d
+        base = np.exp(no_spin)
+        return base, base * np.exp(ln_p_comp - no_spin), base * np.exp(-1.5)
+
+    b1, c1, k1 = chain(0.99)
+    b2, c2, k2 = chain(0.998)
+    expected = (0.998 / 0.99) ** 2
+    np.testing.assert_allclose(b2 / b1, expected, rtol=1e-12)
+    np.testing.assert_allclose(k2 / k1, expected, rtol=1e-12)   # projection: lives
+    np.testing.assert_allclose(c2 / c1, 1.0, rtol=1e-13)        # component: gone
+
+
+def test_removal_amax_is_recorded_per_campaign(tmp_path):
+    """NaN where the campaign never took a removal branch -- which is every
+    real file so far, since both shipped campaigns are factored formats that
+    read their spin-free density directly."""
+    from gwcat.selection import SelectionSet
+
+    path = write_o4_full(tmp_path / "o4.hdf", n=64, seed=21)
+    s = SelectionSet(path, strict_spin_checks="off")
+    s._load()
+    assert s.spin_meta["spin_format"] == "o4_factored"
+    assert getattr(s, "_removal_amax", None) is None, (
+        "a factored file must not go through the assumed-prior removal")

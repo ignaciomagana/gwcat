@@ -306,6 +306,27 @@ class SelectionSet:
         in ``pdraw``.  endo3 injects 0.998 while this step assumed 0.99, so
         ``c ~ 0.9840``.
 
+        Scope: which files, and which bases, this can reach at all
+        ----------------------------------------------------------
+        Two containments, both verified rather than argued (GW-19):
+
+        1. **It cancels EXACTLY for the component basis.**  ``pdraw`` for that
+           basis is ``pdraw_base * exp(ln_p_comp - ln_pdraw_no_spin)`` and
+           ``pdraw_base ∝ exp(ln_pdraw_no_spin)``, so the whole
+           ``ln_pdraw_no_spin`` -- the only place the removal amax appears --
+           divides out.  Measured on the real O4ab campaign: perturbing the
+           assumed ceiling 0.99 -> 0.998 moves ``component_pdraw`` by 0 (to
+           1e-14) while it moves ``pdraw_base`` by the predicted 1.0162269.
+        2. **No real file reaches it.**  ``ASSUMED_REMOVAL_AMAX`` is used only in
+           the ``joint_cartesian`` and ``joint_polar`` branches, and both shipped
+           campaigns are factored formats (``o4_factored``, ``endo3_factored``)
+           that read their spin-free density directly with no assumed-prior
+           subtraction.  So this is a latent defect on a path production data
+           does not take -- not a bias in any shipped product.
+
+        For a projection basis on a joint-format file it would be live, and the
+        following describes what it would then do.
+
         What that does and does NOT affect
         ----------------------------------
         Because ``c`` is the same for every injection, it cancels out of
@@ -473,6 +494,7 @@ class SelectionSet:
             # (derivation in gwcat.selection_spin.ln_pdraw_no_spin_from_polar_joint).
             ln_pdraw_joint = _h5_read_field(ev, joint_polar)
             spin_fmt = "joint_polar"
+            self._removal_amax = float(ASSUMED_REMOVAL_AMAX)
             ln_pdraw_no_spin = _sspin.ln_pdraw_no_spin_from_polar_joint(
                 ln_pdraw_joint, scost1, scost2,
                 amax=ASSUMED_REMOVAL_AMAX)

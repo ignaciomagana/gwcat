@@ -57,6 +57,7 @@ import warnings
 import numpy as np
 import h5py
 
+from ..params import BLOCKS, get_space
 from ..spin import chi_eff_prior_logprob, chi_eff_chi_p_prior_logprob
 from ..selection import (SelectionSet, CombinedSelectionSet,
                          PDRAW_STATE_BY_BASIS, _selection_provenance_dict)
@@ -69,7 +70,11 @@ _KNOWN_SPIN_BASES = ("chieff", "component", "chieff_chip")
 _SNR_COLUMN = "semianalytic_observed_phase_maximized_snr_net"
 
 #: Extra per-injection spin columns (emitted when available for every campaign).
-_EXTRA_COLUMNS = ("a1", "a2", "cost1", "cost2")
+#: Read off the component block rather than re-typed (GW-19): the registry is the
+#: single place the column set lives, so a new spin coordinate is one edit there
+#: instead of edits here, in the PE builder, in the writers and in the validator.
+_EXTRA_COLUMNS = tuple(
+    c for c in BLOCKS["spin.component_polar"].columns if c not in ("chip",))
 
 
 class SpinBasisError(RuntimeError):
@@ -540,6 +545,20 @@ def build_selection_product(sets, *, spin_basis="component", far_threshold=1.0,
             [bool(getattr(s, "_sky_position_available", True))
              for s in set_list], dtype=bool),
         "component_columns_emitted": bool(extras_available),
+        # ── Spin-removal amax provenance (GW-19) ─────────────────────────────
+        # The cartesian/polar prior-REMOVAL step has to assume a ceiling before
+        # the campaign's own is known.  Its amax dependence is the constant
+        # -2*ln(amax), so a wrong value leaves a constant factor
+        # (assumed/injected)^2 in pdraw -- which CANCELS EXACTLY for the
+        # component basis (verified: perturbing it 0.99 -> 0.998 moves
+        # component_pdraw by 0 to 1e-14) but not for a projection.  Recorded so
+        # the constant is knowable rather than buried; NaN where the campaign
+        # never took a removal branch, which is every real file so far
+        # (o4_factored / endo3_factored read their spin-free density directly).
+        "spin_removal_amax_assumed_per_campaign": np.array(
+            [float(getattr(s, "_removal_amax", None) or np.nan)
+             for s in set_list], dtype=float),
+        "spin_removal_amax_cancels": bool(spin_basis == "component"),
     })
 
     # Basis-specific spin-prior contract attrs (mirror the v1 / PE naming).
