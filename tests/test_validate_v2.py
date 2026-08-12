@@ -297,3 +297,71 @@ def test_sel_range_bound_physical_for_non_uniform_campaign(tmp_path):
         f["a1"][...] = d
     results = validate_export_v2(str(pe), str(sel))
     assert results["sel_a1_range"] is False
+
+
+# ======================================================================
+# GW-20: sky finiteness AND range are validated
+# ======================================================================
+def test_nan_sky_fails(tmp_path):
+    """NaN ra/dec passed every check and reached hp.ang2pix in the consumer.
+
+    The loader NaN-fills the semianalytic O1/O2 rows of cumulative-mixture
+    files, the exporters write those NaNs, and neither the validator nor the
+    consumer looked -- the validator's only finiteness check was on p_pe/pdraw.
+    """
+    pe = _pe_component(tmp_path)
+    with h5py.File(pe, "r+") as f:
+        d = f["dec"][:]
+        d[3] = np.nan
+        f["dec"][...] = d
+    results = validate_export_v2(str(pe))
+    assert results["pe_dec_finite"] is False
+    with pytest.raises(AssertionError, match="dec_finite"):
+        validate_export_v2(str(pe), strict=True)
+
+
+def test_degrees_sky_fails(tmp_path):
+    """A degrees ingest produces a plausible-looking but wrong pixelisation
+    with no symptom anywhere; the declared radian range is what catches it."""
+    pe = _pe_component(tmp_path)
+    with h5py.File(pe, "r+") as f:
+        f["dec"][...] = np.degrees(f["dec"][:])      # radians -> degrees
+    results = validate_export_v2(str(pe))
+    assert results["pe_dec_range"] is False
+
+
+def test_colatitude_sky_fails(tmp_path):
+    """dec in [0, pi] (colatitude) rather than [-pi/2, pi/2]."""
+    pe = _pe_component(tmp_path)
+    with h5py.File(pe, "r+") as f:
+        f["dec"][...] = np.pi / 2.0 - f["dec"][:]    # dec -> theta
+    results = validate_export_v2(str(pe))
+    assert results["pe_dec_range"] is False
+
+
+def test_negative_ra_fails(tmp_path):
+    """ra must be in [0, 2pi); a [-pi, pi) convention is a different wrap."""
+    pe = _pe_component(tmp_path)
+    with h5py.File(pe, "r+") as f:
+        f["ra"][...] = f["ra"][:] - np.pi
+    results = validate_export_v2(str(pe))
+    assert results["pe_ra_range"] is False
+
+
+def test_valid_sky_passes(tmp_path):
+    """The ordinary path is unaffected -- radians, in range, finite."""
+    pe = _pe_component(tmp_path)
+    results = validate_export_v2(str(pe))
+    for k in ("pe_ra_finite", "pe_dec_finite", "pe_ra_range", "pe_dec_range"):
+        assert results[k] is True, k
+
+
+def test_ra_exactly_2pi_is_out_of_range(tmp_path):
+    """[0, 2pi) is half-open: 2pi wraps to 0 and must not pass as itself."""
+    pe = _pe_component(tmp_path)
+    with h5py.File(pe, "r+") as f:
+        d = f["ra"][:]
+        d[0] = 2.0 * np.pi
+        f["ra"][...] = d
+    results = validate_export_v2(str(pe))
+    assert results["pe_ra_range"] is False

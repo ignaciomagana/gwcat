@@ -229,6 +229,7 @@ def validate_export_v2(pe_path, selection_path=None, strict=False):
                           pe_attrs.get("chi_eff_chi_p_amax_per_event", []),
                           pe_attrs.get("chi_eff_amax", []))
     _range_checks(_check, pe_cols, pe_amax, prefix="pe")
+    _sky_checks(_check, pe_cols, prefix="pe")
 
     # ── Selection file (internal) + cross-checks ────────────────────────────
     if selection_path is not None:
@@ -285,6 +286,13 @@ def validate_export_v2(pe_path, selection_path=None, strict=False):
         else:
             sel_amax = 1.0
         _range_checks(_check, sel_cols, sel_amax, prefix="sel")
+        # A campaign that genuinely drew no sky position exempts its NaN rows,
+        # but only if the file SAYS so -- the flag exists to be read (GW-20).
+        _sky_avail = sel_attrs.get("sky_position_available")
+        _sky_all = (None if _sky_avail is None
+                    else bool(np.all(np.asarray(_sky_avail, dtype=bool))))
+        _sky_checks(_check, sel_cols, prefix="sel",
+                    sky_available=_sky_all)
 
         # ── Cross-file contract checks (ALWAYS raise on mismatch) ────────────
         # (a) spin_basis must match -- name BOTH sides.
@@ -418,11 +426,58 @@ def validate_export_v2(pe_path, selection_path=None, strict=False):
     return results
 
 
+def _sky_checks(_check, cols, prefix, sky_available=None):
+    """Finiteness AND range checks on ra/dec (GW-20).
+
+    Neither existed.  ``_range_checks`` inspected only the spin columns, and the
+    validator's only finiteness check was on ``p_pe``/``pdraw`` -- ra/dec were
+    read into the column dict and never examined.  Two distinct defects that
+    both reach ``hp.ang2pix`` in the consumer:
+
+    * **NaN sky.**  The loader NaN-fills the semianalytic O1/O2 rows of
+      cumulative-mixture files and records ``sky_position_available=False`` per
+      campaign, the exporters write those NaNs, and nothing read the flag.
+    * **Wrong units or convention.**  A degrees ingest, or colatitude in place of
+      declination, produces a plausible-looking but wrong pixelisation with no
+      symptom anywhere.  The ranges are what make that catchable: ``dec`` must be
+      in ``[-pi/2, pi/2]``, so 45.0 (degrees) or 2.0 (colatitude) both fail.
+
+    ``sky_available``, when given, is the per-campaign availability flag: rows
+    from a campaign that genuinely drew no sky position are exempt from the
+    finiteness check but still counted and reported, because dropping them
+    silently while keeping ``ndraw`` would bias the selection integral.
+    """
+    for name, lo, hi_, closed in (("ra", 0.0, 2.0 * np.pi, "left"),
+                                  ("dec", -np.pi / 2.0, np.pi / 2.0, "both")):
+        if name not in cols or not cols[name].size:
+            continue
+        v = np.asarray(cols[name], dtype=float)
+        finite = np.isfinite(v)
+        n_nan = int((~finite).sum())
+        exempt = bool(sky_available is False)
+        _check(f"{prefix}_{name}_finite", n_nan == 0 or exempt,
+               f"{n_nan} of {v.size} {name} values are non-finite and the "
+               f"campaign does not declare sky_position_available=False; they "
+               f"would reach hp.ang2pix as NaN")
+        if n_nan and exempt:
+            print(f"  NOTE: {n_nan} {name} values are NaN, declared via "
+                  f"sky_position_available=False")
+        if not finite.any():
+            continue
+        f_ = v[finite]
+        in_hi = f_ < hi_ if closed == "left" else f_ <= hi_ + _TOL
+        ok = bool(np.all(f_ >= lo - _TOL) and np.all(in_hi))
+        _check(f"{prefix}_{name}_range", ok,
+               f"{name} outside [{lo:.6g}, {hi_:.6g}] radians "
+               f"(min={f_.min():.6g}, max={f_.max():.6g}) -- degrees, "
+               f"colatitude or a sign convention?")
+
+
 def _range_checks(_check, cols, amax, prefix):
     """Physical-range checks shared by the PE and selection internal blocks.
 
     ``amax`` bounds ``a1``/``a2``/``chip``; ``|cost{1,2}| <= 1``;
-    ``chieff`` in ``[-1, 1]``.
+    ``chieff`` in ``[-1, 1]``.  Sky is handled by :func:`_sky_checks`.
     """
     hi = amax * _SLACK
     if "chieff" in cols and cols["chieff"].size:
