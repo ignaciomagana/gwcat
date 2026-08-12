@@ -195,7 +195,10 @@ def test_build_store_all_ingests_every_analysis(tmp_path, monkeypatch):
     # exactly the Mixed row is preferred; schema advertises sample-set columns
     assert int(np.sum(np.asarray(cat.meta["is_preferred"]) > 0.5)) == 1
     with h5py.File(str(out), "r") as f:
-        assert f.attrs["schema_version"] == "1.2"
+        # 1.3 since GW-01/GW-02: the store now carries the distance-prior
+        # provenance (dL_prior_kind / _impl / out-of-bounds counts) that a
+        # correct p_dL_pe depends on.  Sample-set columns alone would be 1.2.
+        assert f.attrs["schema_version"] == "1.3"
 
     # default preferred ingest keeps exactly one row (the Mixed set).
     out1 = tmp_path / "store_pref.h5"

@@ -42,6 +42,8 @@ import numpy as np
 import h5py
 
 from .cosmology import (make_cosmology, uniform_source_frame_prob,
+                        dL_prior_prob, DL_PRIOR_KINDS, DL_PRIOR_NEEDS_ALPHA,
+                        DistancePriorKindError, NAMED_COSMOLOGIES,
                         PLANCK15, O4_FALLBACK)
 from .source_class import (normalize_source_class, classify_by_mass,
                           DEFAULT_NSBH_MASS_THRESHOLD)
@@ -93,13 +95,27 @@ META_FLOAT_FIELDS = [
     # evaluated everywhere regardless (see gwcat.cosmology), so this is a
     # provenance/quality signal, not a count of discarded samples.
     "n_samples_outside_dL_prior_bounds",
+    # distance-prior CLASS provenance (GW-02): the exponent of the effective
+    # prior when it is a power law (NaN otherwise), the exponent the file's own
+    # analytic group declares, and the KS of that declared class against the
+    # file's own prior samples (NaN when the file carries none).
+    "dL_prior_alpha", "dL_prior_sampling_alpha", "dL_prior_ks",
 ]
 META_STR_FIELDS = [
     "name", "catalog", "analysis_used", "dL_prior_source",
     "mass_prior_kind", "compact_type",
-    # which implementation evaluated p_dL_pe ("bilby" / "astropy"); they differ
-    # by ~3% at the low-distance end and that does NOT cancel downstream (GW-01)
+    # which implementation evaluated p_dL_pe ("bilby" / "astropy" / "analytic");
+    # bilby and astropy differ by ~3% at the low-distance end and that does NOT
+    # cancel downstream (GW-01)
     "dL_prior_impl",
+    # distance-prior CLASS provenance (GW-02).  dL_prior_kind is the EFFECTIVE
+    # distribution divided out of p_pe; dL_prior_sampling_kind is what the file
+    # declares.  They differ for a reweighted release, where
+    # dL_prior_basis="release_reweighted" and dL_prior_release_flavour="cosmo"
+    # record exactly why.  dL_prior_cosmology_name is the verbatim cosmology
+    # token ("Planck15_LAL" vs "Planck15" -- matched exactly, never by substring).
+    "dL_prior_kind", "dL_prior_sampling_kind", "dL_prior_cosmology_name",
+    "dL_prior_release_flavour", "dL_prior_basis",
     # source-class contract
     "release", "observing_run", "source_class", "source_class_method",
     "source_class_reference", "metadata_source",
@@ -167,6 +183,14 @@ class IngestConfig:
     #: "auto" prefers bilby (the object the LVK PE used) and falls back to
     #: astropy only when bilby is not installed; "bilby"/"astropy" pin it.
     dL_prior_impl: str = "auto"
+    #: KS threshold above which the file's own prior samples are taken to reject
+    #: the parsed distance prior (GW-02).  This compares the SAMPLING class the
+    #: file declares against its own prior draws, so exceeding it means the parse
+    #: / bounds / cosmology mapping is wrong.
+    prior_ks_max: float = 0.05
+    #: Make that a hard failure rather than a warning.  Default False so a single
+    #: odd release cannot block a 282-file ingest; set True for an audited build.
+    prior_ks_fatal: bool = False
     #: Warn when more than this FRACTION of a row's dL samples fall outside the
     #: recorded distance-prior bounds.  The default warns on any occurrence: the
     #: samples are no longer zeroed (GW-01), but the mismatch means the recorded
@@ -355,39 +379,220 @@ def _sample_set_meta(analysis: str, preferred_label: str, ranked, path: str,
 _NUM = r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?"
 
 
-def _parse_analytic_dL(prior_string: str):
-    """Parse a bilby UniformSourceFrame repr into (dmin, dmax, H0, Om0|None).
+@dataclass(frozen=True)
+class AnalyticDLPrior:
+    """One parsed analytic ``luminosity_distance`` prior repr.
 
-    Cosmology may be a named astropy cosmology or a FlatLambdaCDM(...) repr or
-    absent. Returns H0/Om0 = None when not parseable.
+    ``kind`` is the distribution CLASS -- the field the pre-GW-02 parser never
+    read, which is why every row was evaluated as UniformSourceFrame regardless
+    of what it declared.  ``cosmology_name`` is the verbatim token when the repr
+    named one (``'Planck15_LAL'``, ``'Planck15'``), so the mapping can be exact
+    rather than a substring test.
+    """
+    kind: Optional[str] = None
+    dmin: Optional[float] = None
+    dmax: Optional[float] = None
+    alpha: Optional[float] = None
+    H0: Optional[float] = None
+    Om0: Optional[float] = None
+    cosmology_name: str = ""
+    cosmology_recognized: Optional[bool] = None
+    raw: str = ""
+
+
+def _balanced_arg(s: str, key: str) -> Optional[str]:
+    """The value of ``key=`` in a repr, honouring nested parentheses.
+
+    ``cosmology=LambdaCDM(name=None, H0=67.9, Om0=0.3065, ...)`` must come back
+    whole; a naive ``[^,)]+`` capture stops at the first comma and yields
+    ``"LambdaCDM(name=None"``, which then forces a search for ``H0=`` across the
+    ENTIRE prior string -- where a recalibration parameter could match instead.
+    """
+    m = re.search(rf"{key}\s*=\s*", s)
+    if not m:
+        return None
+    i = m.end()
+    if i >= len(s):
+        return None
+    # Scan to the delimiter that ends this argument, but only at depth 0 -- so
+    # ``LambdaCDM(name=None, H0=67.9, ...)`` comes back whole even though it does
+    # not START with a bracket, and a quoted token containing a comma survives.
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    opens, closes = set(pairs), set(pairs.values())
+    depth, j, quote = 0, i, None
+    while j < len(s):
+        c = s[j]
+        if quote is not None:
+            if c == quote:
+                quote = None
+        elif c in "'\"":
+            quote = c
+        elif c in opens:
+            depth += 1
+        elif c in closes:
+            if depth == 0:
+                break          # the close of the ENCLOSING call
+            depth -= 1
+        elif c == "," and depth == 0:
+            break
+        j += 1
+    return s[i:j].strip()
+
+
+def _parse_analytic_dL(prior_string: str) -> AnalyticDLPrior:
+    """Parse an analytic ``luminosity_distance`` prior repr.
+
+    Handles the three shapes the real releases use::
+
+        PowerLaw(alpha=2, minimum=10, maximum=10000, name='luminosity_distance')
+        bilby.gw.prior.UniformSourceFrame(minimum=10.0, maximum=4000.0,
+            cosmology='Planck15_LAL', ...)
+        bilby.gw.prior.UniformSourceFrame(minimum=1.0, maximum=500.0,
+            cosmology=LambdaCDM(name=None, H0=67.9, Om0=0.3065, ...), ...)
+
+    The class name is taken from the first ``Name(`` in the string, so a dotted
+    module path is stripped and a nested cosmology repr cannot be mistaken for
+    it.  Cosmology resolution is by EXACT token match against
+    :data:`gwcat.cosmology.NAMED_COSMOLOGIES`: the old ``"Planck15" in tok``
+    substring test also matched ``'Planck15_LAL'``, silently giving 190 O4 rows
+    astropy's (67.74, 0.3075) instead of LAL's (67.90, 0.3065).
     """
     s = str(prior_string)
-    dmin = re.search(rf"minimum\s*=\s*({_NUM})", s)
-    dmax = re.search(rf"maximum\s*=\s*({_NUM})", s)
-    dmin = float(dmin.group(1)) if dmin else None
-    dmax = float(dmax.group(1)) if dmax else None
+
+    kind = None
+    km = re.search(r"([A-Za-z_]\w*)\s*\(", s)
+    if km:
+        kind = km.group(1)
+
+    def _num(key):
+        v = _balanced_arg(s, key)
+        if v is None:
+            return None
+        m = re.match(rf"^\(?\s*({_NUM})", v)
+        return float(m.group(1)) if m else None
+
+    dmin = _num("minimum")
+    dmax = _num("maximum")
+    alpha = _num("alpha")
 
     H0 = Om0 = None
-    cm = re.search(r"cosmology\s*=\s*([^,\)]+)", s)
-    if cm:
-        tok = cm.group(1).strip()
-        if "Planck15" in tok:
-            H0, Om0 = PLANCK15.H0.value, PLANCK15.Om0
-        else:
-            h = re.search(rf"H0\s*=\s*({_NUM})", s)
-            o = re.search(rf"Om0\s*=\s*({_NUM})", s)
+    cosmology_name = ""
+    cosmology_recognized = None
+    tok = _balanced_arg(s, "cosmology")
+    if tok is not None:
+        bare = tok.strip().strip("'\"")
+        if "(" in bare:
+            # An inline cosmology repr: read H0/Om0 from INSIDE it only.
+            h = re.search(rf"H0\s*=\s*({_NUM})", bare)
+            o = re.search(rf"Om0\s*=\s*({_NUM})", bare)
             if h and o:
                 H0, Om0 = float(h.group(1)), float(o.group(1))
-    return dmin, dmax, H0, Om0
+                cosmology_name = bare.split("(", 1)[0].strip()
+                cosmology_recognized = True
+            else:
+                cosmology_name = bare.split("(", 1)[0].strip()
+                cosmology_recognized = False
+        elif bare in NAMED_COSMOLOGIES:
+            cosmo = NAMED_COSMOLOGIES[bare]
+            H0, Om0 = cosmo.H0.value, cosmo.Om0
+            cosmology_name = bare
+            cosmology_recognized = True
+        else:
+            # A named cosmology gwcat does not know.  Do NOT guess: record the
+            # token and leave H0/Om0 unresolved so the caller can be loud.
+            cosmology_name = bare
+            cosmology_recognized = False
+
+    return AnalyticDLPrior(kind=kind, dmin=dmin, dmax=dmax, alpha=alpha,
+                           H0=H0, Om0=Om0, cosmology_name=cosmology_name,
+                           cosmology_recognized=cosmology_recognized, raw=s)
 
 
-def resolve_dL_prior(catalog, analysis, analyses, priors, dL_samples, cfg: IngestConfig):
-    """Return (H0, Om0, dmin, dmax, source_label).
+class PriorMismatchError(ValueError):
+    """The file's own prior samples reject the distance prior gwcat parsed."""
 
-    Strategy: read analytic from the chosen analysis; if absent (e.g. O4 Mixed),
-    search sibling analyses; if still absent (e.g. GWTC-2.1), use the catalog
-    default cosmology with bounds from the dL sample range.
+
+#: Release flavours, i.e. whether the posterior samples in a file are still on
+#: the prior its ``priors/analytic`` group records.
+#:
+#:   "cosmo"   -- GWTC-2.1/GWTC-3 ``*_cosmo.h5``: posteriors have been REWEIGHTED
+#:                by the LVK to a distance prior uniform in comoving volume and
+#:                source-frame time, while ``priors/analytic`` still records the
+#:                original ``PowerLaw(alpha=2)`` SAMPLING prior.  The effective
+#:                prior is therefore UniformSourceFrame, not the declared class.
+#:   "nocosmo" -- the sibling release with the original priors intact: the
+#:                declared class IS the effective prior.
+#:   "native"  -- no flavour token in the name (the O4 combined releases).  The
+#:                declared class is the effective prior; verified on real files,
+#:                where the prior samples follow UniformSourceFrame to KS<0.01.
+RELEASE_FLAVOURS = ("cosmo", "nocosmo", "native")
+
+
+def detect_release_flavour(path: str) -> str:
+    """Which :data:`RELEASE_FLAVOURS` a PE file is, from its name.
+
+    This distinction is load-bearing and was previously undeclared anywhere in
+    gwcat: the correctness of the 81 GWTC-2.1/3 rows rests entirely on the input
+    being the ``_cosmo`` variant, a property of the FILENAME that nothing read.
     """
+    b = os.path.basename(path).lower()
+    if "nocosmo" in b:
+        return "nocosmo"
+    if "cosmo" in b:
+        return "cosmo"
+    return "native"
+
+
+@dataclass(frozen=True)
+class ResolvedDLPrior:
+    """The distance prior gwcat will divide out, plus how it got there.
+
+    ``kind``/``alpha`` are the EFFECTIVE prior -- the density actually evaluated
+    into ``p_dL_pe``.  ``sampling_kind``/``sampling_alpha`` are what the file's
+    ``priors/analytic`` group declares, which for a reweighted release is a
+    different distribution.  Keeping both is the point: the two disagreeing is a
+    normal, documented state for ``_cosmo`` files, and conflating them is what
+    made a KS of 0.27 against the file's own prior samples look like an error.
+    """
+    kind: str
+    H0: float
+    Om0: float
+    dmin: float
+    dmax: float
+    source: str
+    alpha: Optional[float] = None
+    sampling_kind: str = ""
+    sampling_alpha: Optional[float] = None
+    cosmology_name: str = ""
+    flavour: str = "native"
+    basis: str = ""
+
+    @property
+    def cosmology(self):
+        return make_cosmology(self.H0, self.Om0)
+
+
+def resolve_dL_prior(catalog, analysis, analyses, priors, dL_samples,
+                     cfg: IngestConfig, flavour: str = "native"):
+    """Resolve the effective distance prior for one ingested analysis.
+
+    Strategy for the bounds/cosmology is unchanged: read analytic from the chosen
+    analysis; if absent (e.g. the GWTC-2.1/3 ``Mixed`` sets, whose analytic AND
+    prior-sample groups are both empty), search sibling analyses; if still absent
+    use the catalog default cosmology with bounds from the dL sample range.
+
+    What GW-02 adds is the distribution CLASS, which was never parsed, and an
+    exact cosmology-token mapping.  The effective class is the declared one
+    EXCEPT for a reweighted ``_cosmo`` release, where it is UniformSourceFrame by
+    release convention -- recorded as ``basis="release_reweighted"`` so the
+    assumption is visible in the store rather than implicit in a filename.
+
+    Returns a :class:`ResolvedDLPrior`.
+    """
+    if flavour not in RELEASE_FLAVOURS:
+        raise ValueError(f"flavour must be one of {RELEASE_FLAVOURS}; "
+                         f"got {flavour!r}")
+
     analytic = priors.get("analytic", {}) if isinstance(priors, dict) else {}
 
     def _try(an):
@@ -407,22 +612,63 @@ def resolve_dL_prior(catalog, analysis, analyses, priors, dL_samples, cfg: Inges
 
     dmin = float(np.min(dL_samples))
     dmax = float(np.max(dL_samples))
-    if parsed is not None:
-        p_dmin, p_dmax, H0, Om0 = parsed
-        if p_dmin is not None:
-            dmin = p_dmin
-        if p_dmax is not None:
-            dmax = p_dmax
-        if H0 is None:  # analytic gave bounds but no cosmology
-            H0, Om0 = (cfg.o3_default_cosmo if analysis.startswith("C01")
-                       else cfg.o4_fallback_cosmo)
-            src += "+default_cosmo"
-        return H0, Om0, dmin, dmax, src
+    default_cosmo = (cfg.o3_default_cosmo if analysis.startswith("C01")
+                     else cfg.o4_fallback_cosmo)
 
-    # No analytic anywhere (GWTC-2.1)
-    H0, Om0 = (cfg.o3_default_cosmo if analysis.startswith("C01")
-               else cfg.o4_fallback_cosmo)
-    return H0, Om0, dmin, dmax, "default(no_analytic)"
+    if parsed is None:
+        # No analytic anywhere (9 of the GWTC-2.1 rows).  A cosmo-flavour
+        # release is still reweighted, so UniformSourceFrame remains the
+        # effective prior; there is simply no declaration to compare it to.
+        H0, Om0 = default_cosmo
+        return ResolvedDLPrior(
+            kind="UniformSourceFrame", H0=H0, Om0=Om0, dmin=dmin, dmax=dmax,
+            source="default(no_analytic)", sampling_kind="",
+            flavour=flavour,
+            basis=("release_reweighted" if flavour == "cosmo"
+                   else "assumed_default"))
+
+    if parsed.dmin is not None:
+        dmin = parsed.dmin
+    if parsed.dmax is not None:
+        dmax = parsed.dmax
+
+    H0, Om0 = parsed.H0, parsed.Om0
+    if H0 is None:
+        H0, Om0 = default_cosmo
+        src += "+default_cosmo"
+        if parsed.cosmology_recognized is False:
+            warnings.warn(
+                f"{analysis}: analytic distance prior names an unrecognised "
+                f"cosmology {parsed.cosmology_name!r}; falling back to "
+                f"(H0={H0}, Om0={Om0}). Add it to "
+                f"gwcat.cosmology.NAMED_COSMOLOGIES if it is real -- the KS "
+                f"check against the file's own prior samples is the only thing "
+                f"standing between this guess and a wrong p_dL_pe.")
+
+    sampling_kind = parsed.kind or ""
+    if flavour == "cosmo":
+        # Reweighted release: the declared class is the sampling prior only.
+        kind, alpha, basis = "UniformSourceFrame", None, "release_reweighted"
+    else:
+        kind = sampling_kind or "UniformSourceFrame"
+        alpha = parsed.alpha
+        basis = "analytic_declared" if sampling_kind else "assumed_default"
+        if kind not in DL_PRIOR_KINDS:
+            raise DistancePriorKindError(
+                f"{analysis}: analytic distance prior declares class "
+                f"{kind!r}, which gwcat cannot evaluate (known: "
+                f"{list(DL_PRIOR_KINDS)}). Refusing to substitute "
+                f"UniformSourceFrame -- that substitution is the GW-02 defect.")
+        if kind in DL_PRIOR_NEEDS_ALPHA and alpha is None:
+            raise ValueError(
+                f"{analysis}: analytic distance prior declares {kind} but no "
+                f"alpha could be parsed from {parsed.raw[:120]!r}.")
+
+    return ResolvedDLPrior(
+        kind=kind, H0=H0, Om0=Om0, dmin=dmin, dmax=dmax, source=src,
+        alpha=alpha, sampling_kind=sampling_kind,
+        sampling_alpha=parsed.alpha, cosmology_name=parsed.cosmology_name,
+        flavour=flavour, basis=basis)
 
 
 # --------------------------------------------------------------------------
@@ -612,12 +858,39 @@ def _derive_spin_columns(rec):
     return derived, chi_p_def_maxdiff
 
 
-def validate_prior_against_samples(priors, analyses_to_try, H0, Om0, dmin, dmax,
+def _ks_against_prior_samples(dlp, *, kind, cosmo, dmin, dmax, alpha, impl):
+    """KS distance between prior samples ``dlp`` and one candidate density."""
+    grid = np.linspace(max(dmin, dlp.min()), min(dmax, dlp.max()), 200)
+    pdf = dL_prior_prob(grid, kind=kind, cosmology=cosmo, dmin=dmin,
+                        dmax=dmax, alpha=alpha, impl=impl)
+    cdf_model = np.concatenate(
+        [[0], np.cumsum(0.5 * (pdf[1:] + pdf[:-1]) * np.diff(grid))])
+    if cdf_model[-1] <= 0:
+        return float("nan")
+    cdf_model = cdf_model / cdf_model[-1]
+    ecdf = np.searchsorted(np.sort(dlp), grid, side="right") / dlp.size
+    return float(np.max(np.abs(cdf_model - ecdf)))
+
+
+def validate_prior_against_samples(priors, analyses_to_try, resolved,
                                    *, impl: str = "auto"):
-    """If prior 'samples' exist (under any of analyses_to_try), check our
-    UniformSourceFrame reproduces their dL density. Returns {ks, n, analysis}
-    or None. pesummary keys prior samples by the *constituent* analyses, not by
-    'Mixed', so we search a list."""
+    """Check the parsed distance prior against the file's own prior samples.
+
+    The prior samples are draws from the **sampling** prior, so they validate
+    ``resolved.sampling_kind`` -- the thing GW-02 taught the parser to read. They
+    do NOT validate the effective prior on a reweighted ``_cosmo`` release, and
+    the pre-GW-02 code conflated the two: it compared UniformSourceFrame against
+    dL^2 prior samples, measured KS = 0.27 on every GWTC-2.1/3 event, and warned
+    that "the assumed cosmology may be wrong". The cosmology was fine; the
+    comparison was against the wrong distribution.
+
+    Returns a dict with the KS of the sampling class (``ks``, the one that must be
+    small) and of the effective class (``ks_effective``, expected to be large for
+    a reweighted release), or ``None`` when the file carries no prior samples.
+
+    pesummary keys prior samples by the *constituent* analyses, not by 'Mixed',
+    so we search a list.
+    """
     psamp = priors.get("samples", {}) if isinstance(priors, dict) else {}
     node, used = None, None
     for an in analyses_to_try:
@@ -628,14 +901,24 @@ def validate_prior_against_samples(priors, analyses_to_try, H0, Om0, dmin, dmax,
     if node is None:
         return None
     dlp = np.asarray(node["luminosity_distance"], float)
-    cosmo = make_cosmology(H0, Om0)
-    grid = np.linspace(max(dmin, dlp.min()), min(dmax, dlp.max()), 200)
-    pdf = uniform_source_frame_prob(grid, cosmo, dmin, dmax, impl=impl)
-    cdf_model = np.concatenate([[0], np.cumsum(0.5 * (pdf[1:] + pdf[:-1]) * np.diff(grid))])
-    cdf_model /= cdf_model[-1]
-    ecdf = np.searchsorted(np.sort(dlp), grid, side="right") / dlp.size
-    ks = float(np.max(np.abs(cdf_model - ecdf)))
-    return {"ks": ks, "n_prior_samples": int(dlp.size), "analysis": used}
+    dlp = dlp[np.isfinite(dlp)]
+    if dlp.size < 50:
+        return None
+    cosmo = resolved.cosmology
+    dmin, dmax = resolved.dmin, resolved.dmax
+
+    sampling_kind = resolved.sampling_kind or resolved.kind
+    ks_sampling = _ks_against_prior_samples(
+        dlp, kind=sampling_kind, cosmo=cosmo, dmin=dmin, dmax=dmax,
+        alpha=resolved.sampling_alpha, impl=impl)
+    ks_effective = (
+        ks_sampling if sampling_kind == resolved.kind
+        else _ks_against_prior_samples(
+            dlp, kind=resolved.kind, cosmo=cosmo, dmin=dmin, dmax=dmax,
+            alpha=resolved.alpha, impl=impl))
+    return {"ks": ks_sampling, "ks_effective": ks_effective,
+            "sampling_kind": sampling_kind, "effective_kind": resolved.kind,
+            "n_prior_samples": int(dlp.size), "analysis": used}
 
 
 # --------------------------------------------------------------------------
@@ -650,15 +933,15 @@ def inspect(path: str, cfg: Optional[IngestConfig] = None):
     ranked = rank_analyses(analyses, prefix, cfg)
     s = samples_dict[analysis]
     dL = np.asarray(s["luminosity_distance"], float)
-    H0, Om0, dmin, dmax, src = resolve_dL_prior(catalog, analysis, analyses,
-                                                priors, dL, cfg)
-    val = (validate_prior_against_samples(priors, [analysis] + analyses,
-                                          H0, Om0, dmin, dmax,
+    flavour = detect_release_flavour(path)
+    res = resolve_dL_prior(catalog, analysis, analyses, priors, dL, cfg,
+                           flavour=flavour)
+    val = (validate_prior_against_samples(priors, [analysis] + analyses, res,
                                           impl=cfg.dL_prior_impl)
            if cfg.validate_prior else None)
-    _, dL_info = uniform_source_frame_prob(dL, make_cosmology(H0, Om0),
-                                          dmin, dmax, impl=cfg.dL_prior_impl,
-                                          return_info=True)
+    _, dL_info = dL_prior_prob(dL, kind=res.kind, cosmology=res.cosmology,
+                               dmin=res.dmin, dmax=res.dmax, alpha=res.alpha,
+                               impl=cfg.dL_prior_impl, return_info=True)
     f_ref = _read_f_ref(data, analysis)
     a1_samp = np.asarray(s["a_1"], float) if "a_1" in s else None
     a2_samp = np.asarray(s["a_2"], float) if "a_2" in s else None
@@ -675,8 +958,15 @@ def inspect(path: str, cfg: Optional[IngestConfig] = None):
         "preferred_sample_set": analysis,
         "n_samples": int(dL.size),
         "f_ref": f_ref,
-        "dL_prior": {"H0": H0, "Om0": Om0, "min": dmin, "max": dmax,
-                     "source": src,
+        "dL_prior": {"H0": res.H0, "Om0": res.Om0, "min": res.dmin,
+                     "max": res.dmax, "source": res.source,
+                     # GW-02: the effective distribution CLASS, what the file
+                     # declared, and why they differ when they do.
+                     "kind": res.kind, "alpha": res.alpha,
+                     "sampling_kind": res.sampling_kind,
+                     "sampling_alpha": res.sampling_alpha,
+                     "cosmology_name": res.cosmology_name,
+                     "release_flavour": res.flavour, "basis": res.basis,
                      # GW-01: which implementation evaluates p_dL_pe, and how
                      # many samples the recorded bounds fail to cover.
                      "impl": dL_info["impl"],
@@ -862,6 +1152,9 @@ def build_store(paths, out_path, params=None, extra_params=None,
         labels = select_analyses(analyses, prefix, cfg, sample_sets)
         et = event_table.get(name, {})
         prov = file_provenance.get(os.path.basename(path), {})
+        # Whether this release's posteriors are still on the prior its
+        # priors/analytic group records (GW-02).
+        flavour = detect_release_flavour(path)
 
         for analysis in labels:
             s = samples_dict[analysis]
@@ -874,23 +1167,46 @@ def build_store(paths, out_path, params=None, extra_params=None,
             rec = {p: np.asarray(s[p], dtype=np.float64) for p in params if p in s}
 
             dL = np.asarray(s["luminosity_distance"], float)
-            H0, Om0, dmin, dmax, src = resolve_dL_prior(
-                catalog, analysis, analyses, priors, dL, cfg)
+            res = resolve_dL_prior(catalog, analysis, analyses, priors, dL, cfg,
+                                   flavour=flavour)
+            H0, Om0, dmin, dmax, src = (res.H0, res.Om0, res.dmin, res.dmax,
+                                        res.source)
+            ks_val = None
             if cfg.validate_prior:
-                v = validate_prior_against_samples(priors, [analysis] + analyses,
-                                                   H0, Om0, dmin, dmax,
-                                                   impl=cfg.dL_prior_impl)
-                if v and v["ks"] > 0.05:
-                    warnings.warn(f"{name}: prior KS={v['ks']:.3f} > 0.05 "
-                                  f"(assumed cosmology may be wrong)")
+                v = validate_prior_against_samples(
+                    priors, [analysis] + analyses, res, impl=cfg.dL_prior_impl)
+                if v is not None:
+                    ks_val = v["ks"]
+                    # The KS is now against the SAMPLING class the file declares,
+                    # so a failure means the parse is wrong -- not that "the
+                    # assumed cosmology may be wrong", which is what the
+                    # pre-GW-02 message said while comparing two different
+                    # distributions on every GWTC-2.1/3 event.
+                    if np.isfinite(ks_val) and ks_val > cfg.prior_ks_max:
+                        msg = (
+                            f"{name} [{analysis}]: the file's own prior samples "
+                            f"reject the parsed distance prior "
+                            f"{v['sampling_kind']}"
+                            f"{'' if res.sampling_alpha is None else f'(alpha={res.sampling_alpha:g})'}"
+                            f" on [{dmin:.4g}, {dmax:.4g}] Mpc with "
+                            f"cosmology={res.cosmology_name or f'(H0={H0}, Om0={Om0})'}: "
+                            f"KS={ks_val:.4f} > {cfg.prior_ks_max} over "
+                            f"{v['n_prior_samples']} samples from "
+                            f"{v['analysis']}. The parse, the bounds or the "
+                            f"cosmology mapping is wrong.")
+                        if cfg.prior_ks_fatal:
+                            raise PriorMismatchError(msg)
+                        warnings.warn(msg)
             # distance prior evaluated per sample, stored mass-prior-agnostic.
-            # Evaluated over the FULL sample range, not truncated at the
+            # Dispatched on the EFFECTIVE distribution class (GW-02) and
+            # evaluated over the FULL sample range rather than truncated at the
             # recorded bounds (GW-01): those bounds often come from a sibling
             # analysis, and a truncated density hands legitimate samples
             # p_dL_pe = 0 -> p_pe = 0 -> a -inf darksirens log-weight.
-            p_dL, dL_info = uniform_source_frame_prob(
-                dL, make_cosmology(H0, Om0), dmin, dmax,
-                impl=cfg.dL_prior_impl, return_info=True)
+            p_dL, dL_info = dL_prior_prob(
+                dL, kind=res.kind, cosmology=res.cosmology, dmin=dmin,
+                dmax=dmax, alpha=res.alpha, impl=cfg.dL_prior_impl,
+                return_info=True)
             rec["p_dL_pe"] = p_dL
             if dL_info["frac_outside_bounds"] > cfg.dL_outside_warn_frac:
                 warnings.warn(
@@ -993,6 +1309,19 @@ def build_store(paths, out_path, params=None, extra_params=None,
             meta["dL_prior_impl"].append(dL_info["impl"])
             meta["n_samples_outside_dL_prior_bounds"].append(
                 float(dL_info["n_outside_bounds"]))
+            # ── Distance-prior class provenance (GW-02) ─────────────────────
+            meta["dL_prior_kind"].append(res.kind)
+            meta["dL_prior_sampling_kind"].append(res.sampling_kind)
+            meta["dL_prior_cosmology_name"].append(res.cosmology_name)
+            meta["dL_prior_release_flavour"].append(res.flavour)
+            meta["dL_prior_basis"].append(res.basis)
+            meta["dL_prior_alpha"].append(
+                np.nan if res.alpha is None else float(res.alpha))
+            meta["dL_prior_sampling_alpha"].append(
+                np.nan if res.sampling_alpha is None
+                else float(res.sampling_alpha))
+            meta["dL_prior_ks"].append(
+                np.nan if ks_val is None else float(ks_val))
             meta["f_ref"].append(float(f_ref) if f_ref else np.nan)
             meta["nsamp_original"].append(float(n))
             # ── Spin-prior / derived-column provenance (PR 2) ───────────────
@@ -1131,6 +1460,22 @@ SCHEMA_VERSION = "1.1"
 #: single-sample-set-per-event, so waveform-policy resolution is a no-op.
 SCHEMA_VERSION_SAMPLESETS = "1.2"
 
+#: 1.3 adds the distance-prior provenance a correct p_dL_pe depends on (GW-01,
+#: GW-02): dL_prior_impl, n_samples_outside_dL_prior_bounds, and the class fields
+#: dL_prior_kind / _sampling_kind / _alpha / _sampling_alpha /
+#: _cosmology_name / _release_flavour / _basis / _ks.  A store is written as 1.3
+#: when any of them is present.  Every one is read-optional, so 1.1/1.2 stores
+#: still load -- but they carry NO record of which distribution was divided out,
+#: which is why GW-16 re-ingests rather than back-filling.
+SCHEMA_VERSION_DL_PRIOR = "1.3"
+
+#: The meta columns whose presence marks a 1.3 store.
+_SCHEMA_13_FIELDS = ("dL_prior_kind", "dL_prior_sampling_kind",
+                     "dL_prior_cosmology_name", "dL_prior_release_flavour",
+                     "dL_prior_basis", "dL_prior_impl", "dL_prior_alpha",
+                     "dL_prior_sampling_alpha", "dL_prior_ks",
+                     "n_samples_outside_dL_prior_bounds")
+
 
 def _write_store(out_path, stored_params, columns, offsets, names, avail, meta,
                  cfg):
@@ -1146,7 +1491,15 @@ def _write_store(out_path, stored_params, columns, offsets, names, avail, meta,
     # so a store with none still advertises 1.1 and loads unchanged.
     has_sampleset = any(k in meta for k in
                         SAMPLE_SET_STR_FIELDS + SAMPLE_SET_FLOAT_FIELDS)
-    schema_version = SCHEMA_VERSION_SAMPLESETS if has_sampleset else SCHEMA_VERSION
+    # 1.3 when the distance-prior provenance is present (GW-01/GW-02), else 1.2
+    # when sample-set columns are, else 1.1.
+    has_dL_prov = any(k in meta and len(meta[k]) for k in _SCHEMA_13_FIELDS)
+    if has_dL_prov:
+        schema_version = SCHEMA_VERSION_DL_PRIOR
+    elif has_sampleset:
+        schema_version = SCHEMA_VERSION_SAMPLESETS
+    else:
+        schema_version = SCHEMA_VERSION
     with h5py.File(out_path, "w") as f:
         f.attrs["schema_version"] = schema_version
         f.attrs.create("param_names",

@@ -793,14 +793,56 @@ the policy provenance:
 
 > **Schema 1.2.** A store written with sample-set metadata advertises
 > `schema_version = "1.2"`. Older stores (1.0/1.1, no sample-set columns) load as
-> single-sample-set-per-event and any waveform policy is a no-op.
+> single-sample-set-per-event and any waveform policy is a no-op. A store also
+> carrying the distance-prior provenance advertises `"1.3"` (see below); every
+> one of those columns is read-optional, so older stores still load — they simply
+> carry no record of which distance prior was divided out.
 
 ## Design
 
 - **Store layout**: concatenated 1-D columns + integer `offsets` index. Each
   row is one `(event, sample_set)` pair; a single-sample-set event is one row,
   exactly as before. Schema versions: 1.0 (no availability mask), 1.1 (adds the
-  `avail/mask`), 1.2 (adds the per-row sample-set/waveform meta columns).
+  `avail/mask`), 1.2 (adds the per-row sample-set/waveform meta columns), 1.3
+  (adds the distance-prior provenance, below).
+
+### Distance-prior provenance (schema 1.3)
+
+`p_dL_pe` is the density gwcat divides out of every posterior, so *which*
+density it is has to be recorded rather than assumed. Schema 1.3 stores:
+
+| meta column | meaning |
+|---|---|
+| `dL_prior_kind` | the **effective** class actually evaluated into `p_dL_pe` |
+| `dL_prior_sampling_kind` | the class the file's `priors/analytic` group **declares** |
+| `dL_prior_alpha` / `_sampling_alpha` | the power-law exponent of each (NaN when not a power law) |
+| `dL_prior_cosmology_name` | the verbatim cosmology token, e.g. `Planck15_LAL` |
+| `dL_prior_release_flavour` | `cosmo` / `nocosmo` / `native` |
+| `dL_prior_basis` | why the effective class was chosen: `analytic_declared`, `release_reweighted`, `assumed_default` |
+| `dL_prior_ks` | KS of the **declared** class against the file's own prior samples |
+| `dL_prior_impl` | which implementation evaluated it: `bilby`, `astropy` or `analytic` |
+| `n_samples_outside_dL_prior_bounds` | samples outside the recorded `[dL_prior_min, dL_prior_max]` |
+
+Two things this makes explicit that used to be implicit:
+
+- **The declared class is not always the prior in force.** The GWTC-2.1/3
+  `*_cosmo.h5` releases gwcat ingests carry posteriors the LVK already
+  reweighted to a comoving-volume prior, while `priors/analytic` still records
+  the original `PowerLaw(alpha=2)` *sampling* prior — verified on the real files,
+  where the prior samples follow dL² (KS 0.012) and not `UniformSourceFrame`
+  (KS 0.271). The effective prior is therefore `UniformSourceFrame` and the
+  basis is recorded as `release_reweighted`. Point the same code at a `nocosmo`
+  sibling and it dispatches on the declared `PowerLaw` instead. Nothing in gwcat
+  read this distinction before 1.3: the correctness of 81 rows rested on an
+  undeclared property of the input *filename*.
+- **`Planck15_LAL` is not astropy's `Planck15`.** LAL's is (67.90, 0.3065),
+  astropy's is (67.74, 0.3075). Cosmology tokens are matched **exactly**; a
+  substring test for `"Planck15"` matches both and silently gave 190 O4 rows the
+  wrong values. An unrecognised token is recorded and warned about, never guessed.
+
+The KS check compares the **declared sampling** class against the file's own
+prior samples, so a failure means the parse, the bounds or the cosmology mapping
+is wrong. `IngestConfig(prior_ks_fatal=True)` makes that a hard error.
 - **Union parameter schema** (schema 1.1): ingest and merge store the *union*
   of parameters across events, not the intersection. A parameter present for
   only some events is kept as a full column, NaN-filled for the events that lack

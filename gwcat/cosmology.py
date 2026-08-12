@@ -46,9 +46,25 @@ _trapz = getattr(np, "trapezoid", getattr(np, "trapz", None))
 
 # LVK default cosmology used for the O3 cosmo-file reweighting (bilby default).
 PLANCK15 = Planck15
-# Fallback O4 PE cosmology observed in GWTC-4 configs (used only if a file's
-# analytic prior string does not carry an explicit cosmology).
-O4_FALLBACK = FlatLambdaCDM(H0=67.9, Om0=0.3065)
+
+#: LAL's Planck15, which is NOT astropy's.  GWTC-4.1/5 analytic priors record
+#: ``cosmology='Planck15_LAL'`` (and GWTC-4.1 sometimes spells the same numbers
+#: out as a ``LambdaCDM(H0=67.9, Om0=0.3065, ...)`` repr).  astropy's Planck15 is
+#: (67.74, 0.3075); LAL's is (67.90, 0.3065).  A substring test for "Planck15"
+#: matches BOTH tokens, which is how these rows silently acquired astropy's
+#: values -- see :data:`NAMED_COSMOLOGIES`, which is matched exactly.
+LAL_PLANCK15 = FlatLambdaCDM(H0=67.90, Om0=0.3065)
+
+# Historical name for the same object: the fallback O4 PE cosmology, used when a
+# file's analytic prior string carries no explicit cosmology.
+O4_FALLBACK = LAL_PLANCK15
+
+#: Cosmology tokens that appear verbatim in LVK analytic prior reprs, resolved by
+#: EXACT match (after stripping quotes/whitespace) -- never by substring.
+NAMED_COSMOLOGIES = {
+    "Planck15": PLANCK15,
+    "Planck15_LAL": LAL_PLANCK15,
+}
 
 
 def make_cosmology(H0: float, Om0: float) -> FlatLambdaCDM:
@@ -136,8 +152,12 @@ def resolve_usf_impl(impl: str = "auto") -> str:
 
 def uniform_source_frame_prob(dL_mpc, cosmology: FlatLambdaCDM,
                               dmin: float, dmax: float, *,
-                              impl: str = "auto", return_info: bool = False):
+                              impl: str = "auto", return_info: bool = False,
+                              time_dilation: bool = True):
     """p(dL) for a UniformSourceFrame prior, evaluated everywhere. dL in Mpc.
+
+    ``time_dilation=False`` gives UniformComovingVolume instead (same shape
+    without the ``1/(1+z)`` source-frame-time factor).
 
     The density is **not** truncated at ``[dmin, dmax]``: when finite samples
     fall outside the recorded bounds, the evaluation range is widened to cover
@@ -174,16 +194,21 @@ def uniform_source_frame_prob(dL_mpc, cosmology: FlatLambdaCDM,
         eval_min = max(lo - pad, 1e-6)
         eval_max = hi + pad
 
+    cls_name = ("UniformSourceFrame" if time_dilation
+                else "UniformComovingVolume")
     impl_used = resolve_usf_impl(impl)
     if impl_used == "bilby":
-        p = _usf_prob_bilby(dL, cosmology, eval_min, eval_max)
+        p = _usf_prob_bilby(dL, cosmology, eval_min, eval_max,
+                            cls_name=cls_name)
     else:
-        p = _usf_prob_astropy(dL, cosmology, eval_min, eval_max)
+        p = _usf_prob_astropy(dL, cosmology, eval_min, eval_max,
+                              time_dilation=time_dilation)
 
     if not return_info:
         return p
     info = {
         "impl": impl_used,
+        "kind": cls_name,
         "dmin": dmin,
         "dmax": dmax,
         "eval_min": float(eval_min),
@@ -199,10 +224,12 @@ def uniform_source_frame_prob(dL_mpc, cosmology: FlatLambdaCDM,
     return p, info
 
 
-def _usf_prob_bilby(dL, cosmology, dmin, dmax):
-    """bilby's UniformSourceFrame density -- the object the LVK PE itself used."""
-    from bilby.gw.prior import UniformSourceFrame
-    prior = UniformSourceFrame(
+def _usf_prob_bilby(dL, cosmology, dmin, dmax, *,
+                    cls_name: str = "UniformSourceFrame"):
+    """bilby's cosmological distance prior -- the object the LVK PE itself used."""
+    import bilby.gw.prior as _bp
+    cls = getattr(_bp, cls_name)
+    prior = cls(
         minimum=float(dmin), maximum=float(dmax),
         cosmology=cosmology, name="luminosity_distance",
         latex_label="$d_L$", unit="Mpc", boundary=None,
@@ -210,13 +237,18 @@ def _usf_prob_bilby(dL, cosmology, dmin, dmax):
     return np.asarray(prior.prob(dL), dtype=float)
 
 
-def _usf_grid(cosmology, zmax: float, ngrid: int):
+def _usf_grid(cosmology, zmax: float, ngrid: int, *,
+              time_dilation: bool = True):
     """(dL, p(dL)) on a log-spaced z grid, up to an arbitrary constant.
 
     ``E(z)`` comes from the cosmology object (``efunc``) rather than a
     hardcoded matter+Lambda form, so a cosmology carrying radiation, neutrinos
     or curvature is handled correctly.  For a bare ``FlatLambdaCDM(H0, Om0)``
     -- what :func:`make_cosmology` builds -- the two agree exactly.
+
+    ``time_dilation=True`` gives UniformSourceFrame (uniform in comoving volume
+    *and source-frame time*, the extra ``1/(1+z)``); ``False`` gives
+    UniformComovingVolume.
     """
     z = np.expm1(np.linspace(np.log(1.0), np.log(1.0 + zmax), ngrid))
     DC = cosmology.comoving_distance(z).to(u.Mpc).value
@@ -225,14 +257,17 @@ def _usf_grid(cosmology, zmax: float, ngrid: int):
     dDC_dz = dH / E
     dL_grid = (1 + z) * DC
     ddL_dz = DC + (1 + z) * dDC_dz
-    # p(z) propto comoving-volume element * time dilation
-    pz = (DC ** 2 / E) * (1.0 / (1 + z))
+    # p(z) propto comoving-volume element [* time dilation]
+    pz = DC ** 2 / E
+    if time_dilation:
+        pz = pz / (1 + z)
     # change of variables to dL
     return dL_grid, pz / ddL_dz
 
 
-def _usf_prob_astropy(dL, cosmology, dmin, dmax, ngrid: int = 4000):
-    """Astropy fallback: p(dL) propto dVc/dz * 1/(1+z) * |dz/ddL|, normalised
+def _usf_prob_astropy(dL, cosmology, dmin, dmax, ngrid: int = 4000, *,
+                      time_dilation: bool = True):
+    """Astropy fallback: p(dL) propto dVc/dz [* 1/(1+z)] * |dz/ddL|, normalised
     on [dmin, dmax].
 
     The z grid is extended until it covers ``dmax`` so that no sample is
@@ -240,10 +275,12 @@ def _usf_prob_astropy(dL, cosmology, dmin, dmax, ngrid: int = 4000):
     """
     dL = np.asarray(dL, dtype=float)
     zmax = 10.0
-    dL_grid, p_dL_grid = _usf_grid(cosmology, zmax, ngrid)
+    dL_grid, p_dL_grid = _usf_grid(cosmology, zmax, ngrid,
+                                   time_dilation=time_dilation)
     while dL_grid[-1] < dmax and zmax < 1e4:
         zmax *= 2.0
-        dL_grid, p_dL_grid = _usf_grid(cosmology, zmax, ngrid)
+        dL_grid, p_dL_grid = _usf_grid(cosmology, zmax, ngrid,
+                                       time_dilation=time_dilation)
     if dL_grid[-1] < dmax:
         raise ValueError(
             f"_usf_prob_astropy: dmax={dmax:.4g} Mpc exceeds dL at z={zmax:g}; "
@@ -268,3 +305,123 @@ def _usf_prob_astropy(dL, cosmology, dmin, dmax, ngrid: int = 4000):
     # No left/right zero-fill needed: the grid spans [0, dL(zmax)] >= dmax, and
     # the density is evaluated everywhere rather than truncated at the bounds.
     return np.interp(dL, dL_grid, p_dL_grid) / norm
+
+
+# --------------------------------------------------------------------------
+# Distance-prior dispatch by distribution CLASS (GW-02)
+# --------------------------------------------------------------------------
+#: Distance-prior classes gwcat can evaluate.  These are the bilby class names
+#: that appear verbatim at the head of an LVK analytic ``luminosity_distance``
+#: prior repr.  Anything else must fail loudly rather than be silently treated
+#: as UniformSourceFrame -- which is exactly the GW-02 defect: the parser read
+#: only ``minimum``/``maximum``/``cosmology``, so a ``PowerLaw(alpha=2, ...)``
+#: was stored with a comoving-volume density.
+DL_PRIOR_KINDS = ("UniformSourceFrame", "UniformComovingVolume",
+                  "PowerLaw", "Uniform")
+
+#: Which kinds need a cosmology, and which need an ``alpha``.
+DL_PRIOR_NEEDS_COSMOLOGY = ("UniformSourceFrame", "UniformComovingVolume")
+DL_PRIOR_NEEDS_ALPHA = ("PowerLaw",)
+
+
+class DistancePriorKindError(ValueError):
+    """An analytic distance prior names a class gwcat cannot evaluate."""
+
+
+def power_law_dL_prob(dL_mpc, alpha: float, dmin: float, dmax: float):
+    """p(dL) proportional to ``dL**alpha``, normalised on ``[dmin, dmax]``.
+
+    Cosmology-independent and exact in closed form, so there is no
+    implementation choice and no grid.  Following GW-01 the density is evaluated
+    everywhere rather than truncated at the bounds; the normalisation over
+    ``[dmin, dmax]`` is a per-event constant that cancels downstream.
+
+    ``alpha = 2`` is what GWTC-2.1/GWTC-3 record for ``luminosity_distance``
+    (uniform in Euclidean volume), which is NOT the same density as
+    UniformSourceFrame under any cosmology.
+    """
+    dL = np.asarray(dL_mpc, dtype=float)
+    a = float(alpha)
+    lo, hi = float(dmin), float(dmax)
+    if not (hi > lo >= 0.0):
+        raise ValueError(
+            f"power_law_dL_prob: need dmax > dmin >= 0, got [{lo!r}, {hi!r}].")
+
+    if np.isclose(a, -1.0):
+        if lo <= 0.0:
+            raise ValueError(
+                "power_law_dL_prob: alpha == -1 is not normalisable with "
+                f"dmin = {lo!r}.")
+        norm = np.log(hi / lo)
+    else:
+        norm = (hi ** (a + 1.0) - lo ** (a + 1.0)) / (a + 1.0)
+    if not (norm > 0):
+        raise ValueError(
+            f"power_law_dL_prob: alpha={a!r} on [{lo:.4g}, {hi:.4g}] encloses "
+            "no normalisable probability.")
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        p = np.power(dL, a) / norm
+    # dL < 0 is unphysical; return NaN rather than a sign-flipped density so the
+    # export validator rejects it loudly.
+    return np.where(dL >= 0.0, p, np.nan)
+
+
+def dL_prior_prob(dL_mpc, *, kind: str, dmin: float, dmax: float,
+                  cosmology: FlatLambdaCDM = None, alpha: float = None,
+                  impl: str = "auto", return_info: bool = False):
+    """Evaluate the recorded analytic distance prior, dispatched on its CLASS.
+
+    This is the single entry point ingest should use: it guarantees the density
+    gwcat divides out is the one the file actually declares, instead of assuming
+    UniformSourceFrame for every row.
+
+    Raises :class:`DistancePriorKindError` for an unknown class, and
+    ``ValueError`` when a class's required inputs are missing -- a row whose
+    prior gwcat cannot reproduce must fail, not be approximated.
+    """
+    if kind not in DL_PRIOR_KINDS:
+        raise DistancePriorKindError(
+            f"unknown analytic distance-prior class {kind!r}; gwcat can "
+            f"evaluate {list(DL_PRIOR_KINDS)}. Refusing to substitute a "
+            f"different density -- the ratio p_true/p_assumed does NOT cancel "
+            f"in the per-event normalisation.")
+    if kind in DL_PRIOR_NEEDS_COSMOLOGY and cosmology is None:
+        raise ValueError(f"{kind} requires a cosmology.")
+    if kind in DL_PRIOR_NEEDS_ALPHA and alpha is None:
+        raise ValueError(f"{kind} requires alpha.")
+
+    if kind in DL_PRIOR_NEEDS_COSMOLOGY:
+        return uniform_source_frame_prob(
+            dL_mpc, cosmology, dmin, dmax, impl=impl, return_info=return_info,
+            time_dilation=(kind == "UniformSourceFrame"))
+
+    # Closed-form kinds: exact, no implementation choice, no widening needed
+    # (the density is defined for every dL >= 0).
+    dL = np.asarray(dL_mpc, dtype=float)
+    a = 0.0 if kind == "Uniform" else float(alpha)
+    p = power_law_dL_prob(dL, a, dmin, dmax)
+    if not return_info:
+        return p
+
+    finite = dL[np.isfinite(dL)]
+    n_below = int(np.sum(finite < dmin))
+    n_above = int(np.sum(finite > dmax))
+    n_outside = n_below + n_above
+    info = {
+        "impl": "analytic",
+        "kind": kind,
+        "alpha": a,
+        "dmin": float(dmin),
+        "dmax": float(dmax),
+        "eval_min": float(dmin),
+        "eval_max": float(dmax),
+        "widened": False,
+        "n_samples": int(dL.size),
+        "n_below_dmin": n_below,
+        "n_above_dmax": n_above,
+        "n_outside_bounds": n_outside,
+        "frac_outside_bounds": (n_outside / dL.size) if dL.size else 0.0,
+        "n_nonfinite": int(dL.size - finite.size),
+    }
+    return p, info
