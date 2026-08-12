@@ -593,3 +593,86 @@ def test_events_file_without_sky_position_loads(tmp_path):
     assert s._sky_position_available is False
     assert np.all(~np.isfinite(s._ra)) and np.all(~np.isfinite(s._dec))
     assert np.isfinite(s.component_pdraw()).all()
+
+
+# ==========================================================================
+# GW-05: the checks that matter are routed, and no amax is fabricated
+# ==========================================================================
+def test_non_uniform_magnitude_raises_under_strict(tmp_path):
+    """A non-uniform spin-magnitude draw must fail strict_spin_checks="raise".
+
+    It did not: `detect_uniform_amax_from_lnmag`'s verdict was stored in
+    `checks` and never passed to `report_check`, so only the AZIMUTH checks
+    could fire.  The real O4ab file fails both magnitude uniformity and
+    isotropy and loaded silently -- and those two are precisely the assumptions
+    the chieff / chieff_chip projections rest on, whereas azimuth uniformity
+    marginalises out.
+    """
+    path = write_o4_full(tmp_path / "o4.hdf", n=64, seed=11)
+    with h5py.File(path, "r+") as f:
+        # make the magnitude density vary -> not a uniform draw
+        n = f["events"]["lnpdraw_spin1_magnitude"].shape[0]
+        f["events"]["lnpdraw_spin1_magnitude"][:] += np.linspace(0, 0.4, n)
+    with pytest.raises(ValueError, match="magnitude_uniform"):
+        SelectionSet(path, strict_spin_checks="raise")._load()
+
+
+def test_non_isotropic_polar_raises_under_strict(tmp_path):
+    path = write_o4_full(tmp_path / "o4.hdf", n=64, seed=12)
+    with h5py.File(path, "r+") as f:
+        f["events"]["lnpdraw_spin2_polar_angle"][:] += 0.2
+    with pytest.raises(ValueError, match="isotropy_polar"):
+        SelectionSet(path, strict_spin_checks="raise")._load()
+
+
+def test_non_uniform_magnitude_warns_and_records_under_warn(tmp_path):
+    path = write_o4_full(tmp_path / "o4.hdf", n=64, seed=13)
+    with h5py.File(path, "r+") as f:
+        n = f["events"]["lnpdraw_spin1_magnitude"].shape[0]
+        f["events"]["lnpdraw_spin1_magnitude"][:] += np.linspace(0, 0.4, n)
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        sel = SelectionSet(path, strict_spin_checks="warn")
+        sel._load()
+    assert any("magnitude_uniform" in str(w.message) for w in rec)
+    assert sel.spin_meta["checks"]["magnitude_uniform"][0] is False
+    assert sel.spin_meta["uniform_isotropic"] is False
+
+
+def test_no_amax_is_fabricated_for_a_non_uniform_draw(tmp_path):
+    """`detect_uniform_amax_from_lnmag` returns None, not exp(-median(lnp)).
+
+    For a varying log-magnitude-density that expression is a summary of a
+    mixture, not a ceiling: on the real O4ab campaign it yields 0.7478/0.7397
+    while the injected spins reach 0.99999, and `strict=False` fed it straight
+    into the joint prior.
+    """
+    from gwcat.selection_spin import detect_uniform_amax_from_lnmag
+
+    uniform = np.full(500, -np.log(0.998))
+    amax, is_uni = detect_uniform_amax_from_lnmag(uniform)
+    assert is_uni is True
+    assert amax == pytest.approx(0.998)
+
+    varying = uniform + np.linspace(0.0, 0.4, 500)
+    amax, is_uni = detect_uniform_amax_from_lnmag(varying)
+    assert is_uni is False
+    assert amax is None, "a non-uniform draw must not yield a fabricated amax"
+
+
+def test_chieff_chip_refuses_an_undetectable_amax(tmp_path):
+    """With amax=None the joint-prior path must refuse, even at strict=False.
+
+    It previously warned "proceeding with the detected amax if one is
+    available" and then used the fabricated number.
+    """
+    from gwcat.export.selection_builder import (SpinBasisError,
+                                                _campaign_chieff_chip_lnfactor)
+
+    class _FakeSet:
+        path = "fake_o4ab.hdf"
+        spin_meta = {"uniform_isotropic": False, "amax_detected": (None, None)}
+
+    with pytest.raises(SpinBasisError, match="undetectable"):
+        _campaign_chieff_chip_lnfactor(_FakeSet(), slice(None), 0.99,
+                                       strict=False)

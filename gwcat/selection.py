@@ -302,10 +302,35 @@ class SelectionSet:
         The removal subtracts the analytic 6-D cartesian spin prior
         ``ln p = -ln(16 pi^2 a1^2 a2^2 amax^2)``, whose amax dependence is the
         constant ``-2 ln(amax)``.  Using the wrong amax therefore leaves a
-        CONSTANT multiplicative error ``(amax_assumed / amax_injected)^2`` in
-        ``pdraw`` -- and pdraw is un-normalised, so that constant scales mu
-        directly.  endo3 injects 0.998 while this step assumed 0.99, i.e. a
-        1.6e-2 error in mu.
+        CONSTANT multiplicative error ``c = (amax_assumed / amax_injected)^2``
+        in ``pdraw``.  endo3 injects 0.998 while this step assumed 0.99, so
+        ``c ~ 0.9840``.
+
+        What that does and does NOT affect
+        ----------------------------------
+        Because ``c`` is the same for every injection, it cancels out of
+        everything except the absolute evidence.  With ``w = Lambda/pdraw``:
+
+          * ``log_mu -> log_mu - ln c`` (mu is high by 1/c ~ 1.6%);
+          * ``log_sigma2 -> log_sigma2 - 2 ln c``, so
+            ``N_eff = exp(2 log_mu - log_sigma2)`` is **exactly unchanged**
+            (verified numerically to 3e-15) -- the sparse-selection guard and its
+            variance budget are not engaged by this at all;
+          * the selection correction ``-N_obs log mu`` picks up the
+            Theta-INDEPENDENT constant ``+N_obs ln c``.
+
+        So **no posterior moves**: H0, the population hyper-parameters and every
+        credible interval are unaffected, and the offset cancels identically in a
+        Bayes factor between two models fit against the same file.  The only
+        quantity that shifts is the absolute ``log Z``, by ``N_obs ln c``
+        (~ -1.4 nats at 90 BBH, ~ -4.2 at 259).  The real hazard is therefore
+        comparing log-evidences ACROSS files built with different amax
+        conventions -- which is exactly what a re-export creates.
+
+        This all rests on ``c`` being genuinely constant, which holds only while
+        a single amax applies to both bodies.  A real NSBH campaign with
+        ``amax_2 ~ 0.05`` would make it per-injection and none of the above would
+        apply; the ``np.isclose`` mismatch check (GW-04) is what surfaces that.
 
         The removal happens while reading the file, before the injected-spin
         state (and hence the detected amax) is known, so it cannot simply use the
@@ -330,9 +355,14 @@ class SelectionSet:
             f"{self.path}: the spin-removal step subtracted a cartesian spin "
             f"prior assuming amax={removal}, but this campaign's injected amax "
             f"is {worst}. The 6-D prior's amax dependence is the constant "
-            f"-2*ln(amax), so pdraw carries a spurious constant factor of "
-            f"{factor:.6f} -- and pdraw is un-normalised, so that scales the "
-            f"selection integral mu by the same factor. Tracked for GW-19.")
+            f"-2*ln(amax), so pdraw carries a spurious CONSTANT factor "
+            f"c={factor:.6f} and mu is high by 1/c ({100 * (1 / factor - 1):.2f}%). "
+            f"Because c is the same for every injection it cancels everywhere "
+            f"except the absolute evidence: N_eff is exactly unchanged, and NO "
+            f"posterior moves (H0, population, intervals) -- only log Z shifts, "
+            f"by N_obs*ln(c) = {np.log(factor):+.4f} nats per observed event. Do "
+            f"not compare log-evidences across files built with different amax "
+            f"conventions. Tracked for GW-19.")
         return factor
 
     def _read_events(self, f):
@@ -661,6 +691,28 @@ class SelectionSet:
                 uniform_isotropic = bool(uni1 and uni2 and iso1 and iso2)
                 checks["magnitude_uniform"] = (bool(uni1), bool(uni2))
                 checks["isotropy_dev"] = (dev_i1, dev_i2)
+                checks["isotropy_uniform"] = (bool(iso1), bool(iso2))
+                # Route the MAGNITUDE and ISOTROPY checks through report_check
+                # too (GW-05).  They were computed, stored in `checks`, and then
+                # never acted on -- only the azimuth checks below reached
+                # report_check -- so strict_spin_checks="raise" passed silently
+                # on the real O4ab file even though both of these fail there
+                # (isotropy_dev = 0.6419, magnitude_uniform = [False, False]).
+                # Those are exactly the assumptions the chieff/chieff_chip
+                # projections depend on, whereas azimuth uniformity marginalises
+                # out; the two checks that mattered were the two being ignored.
+                _sspin.report_check(
+                    "magnitude_uniform_spin1", uni1,
+                    f"amax_detected={amax1!r}", mode, self.path)
+                _sspin.report_check(
+                    "magnitude_uniform_spin2", uni2,
+                    f"amax_detected={amax2!r}", mode, self.path)
+                _sspin.report_check(
+                    "isotropy_polar_spin1", iso1,
+                    f"max|lnp_polar-ln(sinθ/2)|={dev_i1:.3e}", mode, self.path)
+                _sspin.report_check(
+                    "isotropy_polar_spin2", iso2,
+                    f"max|lnp_polar-ln(sinθ/2)|={dev_i2:.3e}", mode, self.path)
                 # Azimuth check (records + acts per strict mode).
                 if (_h5_has_field(ev, "lnpdraw_spin1_azimuthal_angle")
                         and _h5_has_field(ev, "lnpdraw_spin2_azimuthal_angle")):
@@ -843,6 +895,13 @@ class SelectionSet:
             amax_detected = (ms1, ms2)
             uniform_isotropic = bool(uni1 and uni2)
             checks["max_spin_uniform"] = (bool(uni1), bool(uni2))
+            # Route it through report_check (GW-05): the same omission as the
+            # events path -- computed, stored, and never acted on, so
+            # strict_spin_checks="raise" could not fire on it.
+            _sspin.report_check("max_spin_uniform_spin1", uni1,
+                                f"max_spin_detected={ms1!r}", mode, self.path)
+            _sspin.report_check("max_spin_uniform_spin2", uni2,
+                                f"max_spin_detected={ms2!r}", mode, self.path)
             # Consistency of the factored product vs the joint sampling_pdf.
             if "sampling_pdf" in inj:
                 ok, dev = _sspin.check_factored_vs_joint(

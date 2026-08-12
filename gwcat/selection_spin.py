@@ -208,12 +208,20 @@ def detect_uniform_amax_from_lnmag(lnp_mag, tol_std=1e-6):
 
     For ``a ~ U(0, amax)`` the magnitude density is ``p(a)=1/amax`` so
     ``lnp_mag = −ln amax`` is *constant*.  Returns ``(amax, is_uniform)`` where
-    ``is_uniform`` is ``std(lnp_mag) < tol_std`` and
-    ``amax = exp(−median(lnp_mag))``.
+    ``is_uniform`` is ``std(lnp_mag) < tol_std``.
+
+    ``amax`` is ``exp(−median(lnp_mag))`` **only when the draw is actually
+    uniform**, and ``None`` otherwise (GW-05).  Returning the expression
+    unconditionally produced a number that is not an amax at all for a
+    non-uniform draw: the O4ab campaign yields 0.7478 / 0.7397 by this formula
+    while its spins reach 0.99999, because the median of a *varying* log-density
+    is just a summary statistic of a mixture, not a ceiling.  That fabricated
+    value was fed straight into the joint (chi_eff, chi_p) prior under
+    ``strict=False``, silently mis-specifying the support by ~25%.
     """
     lnp_mag = np.asarray(lnp_mag, dtype=float)
     is_uniform = bool(np.std(lnp_mag) < tol_std)
-    amax = float(np.exp(-np.median(lnp_mag)))
+    amax = float(np.exp(-np.median(lnp_mag))) if is_uniform else None
     return amax, is_uniform
 
 

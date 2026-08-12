@@ -140,11 +140,18 @@ def _campaign_chieff_chip_lnfactor(s, keep, amax, strict):
             raise SpinBasisError(msg)
         warnings.warn(msg + " (strict=False: proceeding with the detected amax "
                             "if one is available)")
-    if amax_detected is None or any(not np.isfinite(a) for a in amax_detected):
+    # `None` now means "undetectable" rather than a fabricated median-derived
+    # number (GW-05), so this refuses where it used to warn-and-proceed.
+    if (amax_detected is None
+            or any(a is None or not np.isfinite(a) for a in amax_detected)):
         raise SpinBasisError(
             f"{s.path}: injected spin amax is undetectable (the injected spin "
             f"draw is not a single uniform-magnitude distribution); the joint "
-            f"(chi_eff, chi_p) prior needs one amax. Use spin_basis='component'.")
+            f"(chi_eff, chi_p) prior needs one amax, and there is no honest "
+            f"value to use -- the median of a varying log-magnitude-density is "
+            f"a summary of a mixture, not a ceiling. Use "
+            f"spin_basis='component', which keeps the campaign's exact "
+            f"per-injection spin draw.")
     amax_1, amax_2 = float(amax_detected[0]), float(amax_detected[1])
     # np.isclose, not exact float equality (GW-04): the detected amax comes out
     # of a numerical fit, so a single injected 0.998 ceiling is recovered as
@@ -498,10 +505,15 @@ def build_selection_product(sets, *, spin_basis="component", far_threshold=1.0,
 
 
 def _amax_pair(amax_detected):
-    """``(amax_1, amax_2)`` as floats; ``(nan, nan)`` when unavailable."""
+    """``(amax_1, amax_2)`` as floats; ``(nan, nan)`` when unavailable.
+
+    A per-body ``None`` (GW-05: "not a uniform draw, so no amax exists") maps to
+    NaN, which is how "undetectable" is spelled in the exported attrs.
+    """
     if amax_detected is None:
         return (float("nan"), float("nan"))
-    return (float(amax_detected[0]), float(amax_detected[1]))
+    return tuple(float("nan") if a is None else float(a)
+                 for a in amax_detected[:2])
 
 
 def _json_checks(checks):
