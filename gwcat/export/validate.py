@@ -24,8 +24,12 @@ import warnings
 import numpy as np
 import h5py
 
-#: Spin bases the v2 pipeline implements.
-_KNOWN_BASES = ("chieff", "component", "chieff_chip")
+#: Spin bases each side of the v2 pipeline implements -- read from the
+#: builders themselves, so the validator cannot reject a file the builder
+#: legitimately wrote (nospin PE files failed here) or accept one it could
+#: never have produced.
+from .pe_builder import SUPPORTED_SPIN_BASES as _PE_BASES
+from .selection_builder import SUPPORTED_SPIN_BASES as _SEL_BASES
 
 #: Format versions this validator understands, per side.  2.1 adds the contract
 #: attrs on top of 2.0 and is otherwise identical, so both run the same checks;
@@ -213,8 +217,8 @@ def validate_export_v2(pe_path, selection_path=None, strict=False):
            f"format_version={pe_attrs.get('format_version')!r} "
            f"(expected one of {sorted(_PE_FORMATS)})")
     pe_basis = pe_attrs.get("spin_basis")
-    _check("pe_spin_basis_valid", pe_basis in _KNOWN_BASES,
-           f"spin_basis={pe_basis!r} not in {_KNOWN_BASES}")
+    _check("pe_spin_basis_valid", pe_basis in _PE_BASES,
+           f"spin_basis={pe_basis!r} not in {_PE_BASES}")
 
     # Required datasets per basis.
     pe_required = list(_PE_LEGACY)
@@ -272,8 +276,8 @@ def validate_export_v2(pe_path, selection_path=None, strict=False):
                f"format_version={sel_attrs.get('format_version')!r} "
                f"(expected one of {sorted(_SEL_FORMATS)})")
         sel_basis = sel_attrs.get("spin_basis")
-        _check("sel_spin_basis_valid", sel_basis in _KNOWN_BASES,
-               f"spin_basis={sel_basis!r} not in {_KNOWN_BASES}")
+        _check("sel_spin_basis_valid", sel_basis in _SEL_BASES,
+               f"spin_basis={sel_basis!r} not in {_SEL_BASES}")
 
         ndraw = int(sel_attrs.get("ndraw", 0))
         n_det = int(sel_attrs.get("n_detected", 0))
@@ -572,7 +576,10 @@ def _xcheck_detection_cut(_fail, results, pe_attrs, sel_attrs):
 
     if (not np.isnan(pe_far)
             and bool(pe_attrs.get("allow_missing_far", False))):
-        n_missing = int(_num(pe_attrs.get("n_events_missing_far")) or 0)
+        # NaN (attr absent) is truthy, so `or 0` never catches it and int(nan)
+        # raises; a foreign 2.x file without the attr must read as 0, not crash.
+        n_missing_raw = _num(pe_attrs.get("n_events_missing_far"))
+        n_missing = 0 if np.isnan(n_missing_raw) else int(n_missing_raw)
         if n_missing:
             _fail("xcheck_detection_cut",
                   f"PE far_max={pe_far} was applied but allow_missing_far=True "
@@ -628,7 +635,13 @@ def _xcheck_campaign_cosmology(_check, results, sel_attrs):
                f"recorded H0/Om0: {bad}. 'file' means no cosmology entered "
                f"pdraw and must carry NaN; every other source must carry "
                f"finite values.")
-    results.setdefault("xcheck_campaign_cosmology", True)
+    # The aggregate reflects the sub-checks; setdefault(True) here recorded a
+    # passing aggregate even when they had just failed.
+    subs = ("sel_cosmology_per_campaign_length", "sel_cosmology_source_known",
+            "sel_cosmology_source_matches_values")
+    results.setdefault(
+        "xcheck_campaign_cosmology",
+        all(results.get(k, True) for k in subs))
 
 
 def _sky_checks(_check, cols, prefix, sky_available=None):

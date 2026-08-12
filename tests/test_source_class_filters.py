@@ -244,8 +244,33 @@ def test_provenance_roundtrips():
             == s
 
 
-def test_no_restriction_is_distinct_from_every_class():
-    """"" (no filter) and an explicit all-classes request are different asks."""
+def test_no_restriction_and_every_class_canonicalise_identically():
+    """"" (no filter) and an explicit all-classes request are the SAME selection.
+
+    They select identical events, so they must serialise identically: keeping
+    them distinct made the two pairing checks contradict each other on one
+    pair -- a PE file exported with --source-class cbc against a no-flag
+    selection file passed xcheck_source_class (both resolve to the full class
+    set) while contract_hash hard-failed on "BBH,...,Unknown" vs "".  The
+    canonical form records the selection, not the spelling.
+    """
     assert format_source_class_filter(None) == ""
-    assert format_source_class_filter("all") != ""
+    assert format_source_class_filter("all") == ""
+    assert format_source_class_filter("cbc,massgap,unknown") == ""
     assert canonical_source_class(None) == ()
+    assert canonical_source_class("all") == ()
+
+
+def test_empty_requests_are_refused():
+    """"" and [] silently selected zero events while their provenance read as
+    "no restriction" -- refuse both; None is how "no restriction" is spelled."""
+    import pytest
+    from gwcat.source_class import resolve_filter_classes
+
+    for empty in ("", "   ", []):
+        with pytest.raises(ValueError, match="[Ee]mpty source-class"):
+            resolve_filter_classes(empty)
+    # Reading an empty ATTR back is still "no restriction" -- that path is a
+    # file describing itself, not a caller making a request.
+    assert parse_source_class_filter("") == ()
+    assert parse_source_class_filter(",") == ()

@@ -110,10 +110,12 @@ def space_ordered_required(space, spin_basis):
 _CHIEFF_COLUMNS = ["ra", "dec", "m1det", "m2det", "chieff", "dL", "p_pe",
                    "redshift", "m1src", "m2src"]
 
-#: Spin bases the v2 builder implements.
-#: Spin bases the v2 builder implements.  Derived from the registry (GW-21) so a
-#: registered space is exportable without a second list to update.
+#: Spin bases the v2 PE builder implements.  A registry space outside this
+#: tuple is declarable but not yet buildable; the CLI and the validator read
+#: this tuple (as ``SUPPORTED_SPIN_BASES``) so they cannot advertise or reject
+#: a different set than the builder enforces.
 _KNOWN_SPIN_BASES = ("chieff", "component", "chieff_chip", "nospin")
+SUPPORTED_SPIN_BASES = _KNOWN_SPIN_BASES
 
 #: Per-sample store columns the non-chieff bases may need (fetched only then).
 _EXTRA_SAMPLE_CANDIDATES = ("a_1", "a_2", "cos_tilt_1", "cos_tilt_2",
@@ -821,12 +823,25 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                 "it anyway. (Out-of-support samples are expected to be zero and "
                 "are excluded from this check -- see max_out_of_support_frac.)"))
 
-    # Sanity check
+    # Rectangularity.  A raise, not an assert: `python -O` strips asserts, and
+    # this guards the invariant every consumer reshapes on (same rationale as
+    # the v1 writer's twin check in catalog.py).
     expected = nobs * nsamp
-    assert columns["m1det"].size == expected, \
-        f"data length {columns['m1det'].size} != nobs*nsamp = {expected}"
+    if columns["m1det"].size != expected:
+        raise RuntimeError(
+            f"internal error: assembled {columns['m1det'].size} rows but "
+            f"nobs*nsamp = {nobs}*{nsamp} = {expected}. The export would not "
+            f"be reshapeable by any consumer; refusing to build it.")
 
-    homogeneous = bool(len(set(str(k) for k in kept)) == len(kept))
+    # From the view's policy resolution, matching the v1 writer: False iff the
+    # SELECTED view holds more than one sample set of one event (only possible
+    # under waveform_policy="all") -- the case where the hierarchical
+    # likelihood would count one physical event N times.  The written-file
+    # uniqueness of `kept` (event NAMES) can differ when a duplicate row is
+    # later skipped (z_max / undersampling); the view-level answer is the one
+    # the flag exists to give, and using name-uniqueness here while the v1
+    # writer used the view made the two writers disagree on the same input.
+    homogeneous = bool(getattr(sub, "_homogeneous_sample_sets", True))
 
     # ── Provenance attrs (everything the legacy exporter records EXCEPT ──────
     # format_version, which is the writer's; plus the new spin_basis). The two

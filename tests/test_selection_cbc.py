@@ -271,10 +271,13 @@ def test_source_class_filter_ndraw_unchanged(tmp_path):
 
 
 def test_combined_source_class_filter_counts(tmp_path):
+    # No cosmology override: an O4-style events campaign cannot honour one, so
+    # a combined export with a partial override is refused (GW-09) -- and the
+    # counts under test do not depend on the cosmology at all.
     o3 = write_o3(tmp_path / "o3.hdf", _COUNTS)
     o4 = write_o4(tmp_path / "o4.hdf", _COUNTS)
     combined = CombinedSelectionSet(
-        [SelectionSet(o3, H0=_H0, Om0=_Om0), SelectionSet(o4, H0=_H0, Om0=_Om0)])
+        [SelectionSet(o3), SelectionSet(o4)])
     out = tmp_path / "sel.h5"
     combined.to_darksirens(str(out), far_threshold=1.0, source_class="bbh")
     with h5py.File(out, "r") as f:
@@ -344,11 +347,17 @@ def _make_pe_export(tmp_path, events=None, cosmology=(_H0, _Om0),
 
 def _make_combined_selection(tmp_path, source_class=None, H0=_H0, Om0=_Om0,
                              name="sel.h5", counts=None):
+    # Two injections-format (O3-style) campaigns, so the explicit cosmology
+    # reaches BOTH and the exported scalar cosmology_H0/Om0 is finite and
+    # honest.  An O3+O4 mix with an override is refused since GW-09 (an
+    # events-format campaign reads its ddL/dz from the file and cannot honour
+    # an override); the no-override O3+O4 combination is covered by
+    # test_combined_source_class_filter_counts.
     counts = counts or {"BBH": 4}
-    o3 = write_o3(tmp_path / "xo3.hdf", counts)
-    o4 = write_o4(tmp_path / "xo4.hdf", counts)
+    o3a = write_o3(tmp_path / "xo3a.hdf", counts)
+    o3b = write_o3(tmp_path / "xo3b.hdf", counts)
     combined = CombinedSelectionSet(
-        [SelectionSet(o3, H0=H0, Om0=Om0), SelectionSet(o4, H0=H0, Om0=Om0)])
+        [SelectionSet(o3a, H0=H0, Om0=Om0), SelectionSet(o3b, H0=H0, Om0=Om0)])
     out = tmp_path / name
     combined.to_darksirens(str(out), far_threshold=1.0, source_class=source_class)
     return str(out)

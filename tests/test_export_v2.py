@@ -464,20 +464,48 @@ def test_pe_and_selection_share_one_default_space():
     assert pe.spin_basis == sel.spin_basis == DEFAULT_PARAMETER_SPACE
 
 
-def test_space_choices_come_from_the_registry():
-    """A space added to the registry must be reachable without editing the CLI.
+def test_space_choices_are_registry_spaces_the_builder_implements():
+    """The CLI must offer exactly the spaces the builder for that subcommand
+    can build -- no more, no less.
 
-    The choices were hardcoded to the three legacy bases, so `component_6d`,
-    `cartesian`, `aligned` and `nospin` were registered but unreachable.
+    Offering the full registry advertised `component_6d`/`cartesian`/`aligned`
+    (and `nospin` on the selection side), which then crashed in the builder
+    with a raw traceback: spellable but unbuildable.  Hardcoding a list here
+    instead would drift the other way.  So the choices are the registry order
+    filtered to the builder's SUPPORTED_SPIN_BASES.
     """
     from gwcat.cli import build_parser
     from gwcat.params import list_spaces
+    from gwcat.export.pe_builder import (
+        SUPPORTED_SPIN_BASES as PE_SUPPORTED)
+    from gwcat.export.selection_builder import (
+        SUPPORTED_SPIN_BASES as SEL_SUPPORTED)
 
     p = build_parser()
-    for space in list_spaces():
-        args = p.parse_args(["export", "pe", "s.h5", "--out", "o.h5",
-                             "--parameter-space", space])
-        assert args.spin_basis == space
+    for sub, supported in (("pe", PE_SUPPORTED), ("selection", SEL_SUPPORTED)):
+        head = {"pe": ["export", "pe", "s.h5"],
+                "selection": ["export", "selection", "i.hdf"]}[sub]
+        for space in list_spaces():
+            if space in supported:
+                args = p.parse_args(head + ["--out", "o.h5",
+                                            "--parameter-space", space])
+                assert args.spin_basis == space
+            else:
+                with pytest.raises(SystemExit):
+                    p.parse_args(head + ["--out", "o.h5",
+                                         "--parameter-space", space])
+
+
+def test_validator_known_bases_match_the_builders():
+    """The validator must accept exactly what each builder can write.
+
+    Its own hardcoded list rejected valid nospin PE files and claimed to
+    accept selection bases the selection builder never produced.
+    """
+    from gwcat.export import validate, pe_builder, selection_builder
+
+    assert validate._PE_BASES == pe_builder.SUPPORTED_SPIN_BASES
+    assert validate._SEL_BASES == selection_builder.SUPPORTED_SPIN_BASES
 
 
 def test_spin_basis_is_still_accepted_as_an_alias():
@@ -582,3 +610,17 @@ def test_every_no_argument_export_path_agrees_on_the_default():
                  CombinedSelectionSet.export):
         assert inspect.signature(meth).parameters["spin_basis"].default is None, \
             meth.__qualname__
+
+    # ...and the top-level gwcat.export.export() dispatcher forwards
+    # spin_basis untouched instead of reinstating per-type defaults in the
+    # None slot -- it carried "chieff" for PE / "component" for selection
+    # after both layers around it were fixed.
+    import gwcat.export as export_mod
+
+    seen = {}
+    for cls, key in ((GWCatalog, "pe"), (SelectionSet, "sel")):
+        obj = cls.__new__(cls)
+        obj.export = (lambda out_path, key=key, **kw:
+                      seen.__setitem__(key, kw.get("spin_basis", "MISSING")))
+        export_mod.export(obj, "o.h5")
+    assert seen == {"pe": None, "sel": None}

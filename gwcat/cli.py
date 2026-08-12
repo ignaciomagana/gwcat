@@ -60,25 +60,35 @@ def _default_parameter_space() -> str:
 DEFAULT_PARAMETER_SPACE = _default_parameter_space()
 
 
-def _add_space_argument(parser) -> None:
+def _add_space_argument(parser, kind) -> None:
     """Add ``--parameter-space`` (with ``--spin-basis`` as the legacy alias).
 
-    The choices are generated from :mod:`gwcat.params`, so a space added to the
-    registry is reachable from the CLI without a second edit here.  The list was
-    hardcoded to the three legacy bases, which is why `component_6d`,
-    `cartesian`, `aligned` and `nospin` were registered but unreachable.
+    The choices are the registry spaces the *builder for this export kind*
+    actually implements (its ``SUPPORTED_SPIN_BASES``), in registry order.
+    Offering the full registry here advertised spaces (`component_6d`,
+    `cartesian`, `aligned`) that then crashed in the builder with a raw
+    traceback -- and `nospin`, which only the PE side can build.  A registered
+    but not-yet-buildable space stays visible via 'export list-spaces'.
     """
     from .params import list_spaces
+    if kind == "pe":
+        from .export.pe_builder import SUPPORTED_SPIN_BASES as supported
+    elif kind == "selection":
+        from .export.selection_builder import (
+            SUPPORTED_SPIN_BASES as supported)
+    else:
+        raise ValueError(f"unknown export kind {kind!r}")
 
+    choices = [s for s in list_spaces() if s in supported]
     parser.add_argument("--parameter-space", "--spin-basis",
                         dest="spin_basis",
                         default=DEFAULT_PARAMETER_SPACE,
-                        choices=list(list_spaces()),
+                        choices=choices,
                         help=f"Parameter space to export "
                              f"(default: {DEFAULT_PARAMETER_SPACE}). "
                              f"--spin-basis is an accepted alias. "
-                             f"Run 'export list-spaces' for what each one "
-                             f"declares.")
+                             f"Run 'export list-spaces' for every declared "
+                             f"space, including ones no builder ships yet.")
 
 
 def _invoked_program_name() -> str:
@@ -193,7 +203,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_pe.add_argument("--out", required=True, metavar="OUT.h5")
     p_pe.add_argument("--format", default="gwcat2",
                       help="Registered export format (default: gwcat2).")
-    _add_space_argument(p_pe)
+    _add_space_argument(p_pe, "pe")
     p_pe.add_argument("--source-class", default=None,
                       help="bbh / nsbh / bns / massgap / cbc, or a "
                            "canonical class name.")
@@ -239,7 +249,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_xsel.add_argument("--out", required=True, metavar="OUT.h5")
     p_xsel.add_argument("--format", default="gwcat2",
                         help="Registered export format (default: gwcat2).")
-    _add_space_argument(p_xsel)
+    _add_space_argument(p_xsel, "selection")
     p_xsel.add_argument("--far-threshold", type=float, default=1.0,
                         metavar="FAR_YR")
     p_xsel.add_argument("--source-class", default=None,
@@ -615,14 +625,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.command == "inspect":
         return _cmd_inspect(args)
-    if args.command == "export-darksirens":
-        return _cmd_export_darksirens(args)
-    if args.command == "export":
-        return _cmd_export(args)
-    if args.command == "selection":
-        return _cmd_selection(args)
-    if args.command == "validate":
-        return _cmd_validate(args)
+    # A ValueError out of these commands is a *diagnosed refusal* -- an
+    # unrecognised --source-class token, a partial cosmology override, a
+    # zero-density injection -- whose message already says what to fix.  The
+    # user asked on the command line, so answer there, not with a traceback
+    # (validate already did; the export commands surfaced raw tracebacks).
+    try:
+        if args.command == "export-darksirens":
+            return _cmd_export_darksirens(args)
+        if args.command == "export":
+            return _cmd_export(args)
+        if args.command == "selection":
+            return _cmd_selection(args)
+        if args.command == "validate":
+            return _cmd_validate(args)
+    except ValueError as e:
+        print(f"{PROG} {args.command}: error: {e}", file=sys.stderr)
+        return 1
 
     parser.error(f"unknown command {args.command!r}")  # pragma: no cover
     return 2

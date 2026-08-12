@@ -184,12 +184,36 @@ def resolve_filter_classes(
     if source_class is None:
         return set(SOURCE_CLASSES)
     if isinstance(source_class, (list, tuple, set, frozenset)):
+        # An accidentally-empty list would resolve to set() -- a zero-event
+        # selection -- while its provenance serialised to "", which every
+        # reader takes as "no restriction".  A silent zero-event export whose
+        # attrs claim it is unfiltered is the exact class of trap this module
+        # exists to close, so refuse instead: "no restriction" is spelled
+        # None.
+        if not source_class:
+            raise ValueError(
+                "empty source-class request (an empty list selects nothing, "
+                "and its provenance would serialise identically to 'no "
+                "restriction'); pass None for no restriction, or name the "
+                f"class(es): {_accepted_tokens()}")
         out: Set[str] = set()
         for item in source_class:
             out |= resolve_filter_classes(item)
         return out
     if isinstance(source_class, bytes):
         source_class = source_class.decode("utf-8", "replace")
+    # An empty/whitespace string is the same trap as the empty list -- and the
+    # easiest to hit: `--source-class "$SC"` with an unset shell variable.  It
+    # used to reach the alias table, whose "" -> Unknown mapping (correct for
+    # EVENT metadata, where an unrecorded class IS unknown) turned it into a
+    # request for only the unclassified events: zero on the real store,
+    # reported as success.  A *request* spelled "" is an error.
+    if isinstance(source_class, str) and not source_class.strip():
+        raise ValueError(
+            "empty source-class request '' (an unset shell variable?); pass "
+            "None / omit the flag for no restriction, or name the class(es): "
+            f"{_accepted_tokens()}. To select events whose class was never "
+            f"recorded, ask for {UNKNOWN!r} explicitly.")
     # A comma-separated string is the CLI spelling of a list.  Resolving it here
     # rather than in the CLI is what makes "nsbh,bns" and ["nsbh", "bns"] the
     # same request everywhere, including on the Python API path the CLI helper
@@ -219,12 +243,19 @@ def canonical_source_class(
 
     Returns a tuple of canonical labels in :data:`SOURCE_CLASSES` order, so that
     ``["nsbh", "bns"]``, ``"nsbh,bns"`` and ``("BNS", "NSBH")`` all produce the
-    same value.  ``None`` (no restriction) returns ``()``, which is distinct
-    from an explicit request that happens to admit every class.
+    same value.  ``None`` (no restriction) returns ``()`` -- and so does an
+    explicit request that admits every class (``"cbc"``/``"all"``): the two
+    select identical events, so serialising them differently made the two
+    pairing checks contradict each other on one pair (``xcheck_source_class``
+    resolved both to the full class set and passed, while ``contract_hash``
+    kept ``"BBH,...,Unknown"`` distinct from ``None`` and hard-failed).  What
+    is canonicalised is the *selection*, not the spelling.
     """
     if source_class is None:
         return ()
     resolved = resolve_filter_classes(source_class)
+    if resolved == set(SOURCE_CLASSES):
+        return ()
     return tuple(c for c in SOURCE_CLASSES if c in resolved)
 
 
@@ -259,7 +290,10 @@ def parse_source_class_filter(raw) -> tuple:
     s = str(raw).strip()
     if not s:
         return ()
-    return canonical_source_class([p for p in s.split(",") if p.strip()])
+    parts = [p for p in s.split(",") if p.strip()]
+    # A stray-separator attr like "," carries no tokens: same "no restriction"
+    # reading as "" (canonical_source_class would refuse an empty request).
+    return canonical_source_class(parts) if parts else ()
 
 
 def load_event_list(source: Union[str, Path, Sequence[str]]) -> list:

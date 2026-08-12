@@ -160,6 +160,11 @@ def _supported_spaces_hint(store_params) -> str:
     """The '--parameter-space X would work' half of a missing-parameter error."""
     try:
         ok = spaces_supported_by(store_params)
+        # Recommend only spaces the PE builder can actually build; a hint that
+        # says "pass --parameter-space X" for an X the builder then rejects is
+        # worse than no hint.
+        from .export.pe_builder import SUPPORTED_SPIN_BASES as _buildable
+        ok = tuple(s for s in ok if s in _buildable)
     except Exception:          # a hint must never mask the real error
         return ""
     if not ok:

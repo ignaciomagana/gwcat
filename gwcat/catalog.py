@@ -62,7 +62,10 @@ class GWCatalog:
         self._selection_source_class = None
         self._selection_event_list = None
         # Waveform / sample-set policy provenance (PR 6).  Defaults describe a
-        # fresh view with no policy applied yet: one row per event, homogeneous.
+        # fresh view with no policy applied yet.  NOTE: _homogeneous_sample_sets
+        # = True here is a placeholder, not a measurement -- a fresh multi-set
+        # store IS inhomogeneous, and the real value is computed by select(),
+        # which both exporters go through.  Read it only from a select()ed view.
         self._waveform_policy = "preferred"
         self._waveform_approximant = None
         self._selection_reasons = None
@@ -867,10 +870,12 @@ class GWCatalog:
             f.attrs["n_events_missing_far"] = int(
                 getattr(sub, "_n_missing_far", 0))
             # --- Waveform / sample-set provenance (PR 6) ---
-            # homogeneous_sample_sets is honest about the WRITTEN file: False iff
-            # any event contributes more than one sample-set row (only possible
-            # under waveform_policy="all").  A multi-waveform file is thus never
-            # advertised as homogeneous.
+            # homogeneous_sample_sets describes the SELECTED VIEW: False iff it
+            # holds more than one sample set of one event (only possible under
+            # waveform_policy="all").  A multi-waveform export is thus never
+            # advertised as homogeneous, even if a duplicate row was later
+            # skipped by z_max/undersampling and the written file happens to be
+            # one-row-per-event.
             f.attrs["waveform_policy"] = str(waveform_policy)
             f.attrs["approximant"] = "" if approximant is None else str(approximant)
             # Derived from the policy resolution, not re-inferred from name
@@ -1262,8 +1267,20 @@ def validate_export(gw_path: str, selection_path: str = None, strict: bool = Fal
 
             pe_scf = _sattr(fg, "source_class_filter", "")
             sel_scf = _sattr(fs, "source_class_filter", "")
-            pe_classes = _sc_classes(pe_scf)
-            sel_classes = _sc_classes(sel_scf)
+            try:
+                pe_classes = _sc_classes(pe_scf)
+                sel_classes = _sc_classes(sel_scf)
+            except ValueError as exc:
+                # Mirrors the v2 validator: a pre-canonical-form file recorded
+                # a Python repr that was never checkable.  Report it as this
+                # check's failure instead of raising an unexplained parse
+                # error out of the middle of validation.
+                _fail("xcheck_source_class",
+                      f"unparseable source_class_filter (PE={pe_scf!r}, "
+                      f"selection={sel_scf!r}): {exc} Files written before "
+                      f"the canonical form record a Python repr that was "
+                      f"never checkable; re-export to make the pairing "
+                      f"verifiable.")  # _fail raises; nothing runs below
             if pe_classes != sel_classes:
                 _fail("xcheck_source_class",
                       f"PE source_class_filter={pe_scf!r} -> {sorted(pe_classes)} "

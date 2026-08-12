@@ -226,3 +226,99 @@ def test_combined_records_per_campaign_cosmology(tmp_path):
                 "cosmology_Om0_per_campaign"):
         assert len(np.atleast_1d(a[key])) == 2
     assert bool(a["cosmology_mixed_across_campaigns"]) is True
+
+
+def test_detect_generation_cosmology_finds_off_grid_om0():
+    """A campaign generated at an Om0 between grid points must still detect.
+
+    The coarse grid alone left a ~2e-4 residual for a half-step Om0 error --
+    20x over rtol -- so Planck18's 0.30966 (or any future off-grid campaign)
+    silently fell back to Planck15: the exact wrong-Jacobian bug the detector
+    exists to prevent.  Local refinement closes it.
+    """
+    from gwcat.selection import detect_generation_cosmology
+    from gwcat.cosmology import make_cosmology
+
+    z = np.linspace(0.01, 2.0, 500)
+    dL = make_cosmology(67.66, 0.30966).luminosity_distance(z).value
+    got = detect_generation_cosmology(z, dL)
+    assert got is not None
+    H0, Om0, resid = got
+    assert abs(H0 - 67.66) < 1e-3
+    assert abs(Om0 - 0.30966) < 1e-4
+    assert resid < 1e-5
+
+
+def test_detect_generation_cosmology_rejects_unit_errors():
+    """dL scales exactly as 1/H0, so dL-in-Gpc fits PERFECTLY at H0~68000.
+
+    A confident detection of an absurd H0 is a unit mistake, not a cosmology;
+    accepting it would build that campaign's Jacobian off by the unit factor
+    relative to every other campaign in a combined product.
+    """
+    from gwcat.selection import detect_generation_cosmology
+    from gwcat.cosmology import make_cosmology
+
+    z = np.linspace(0.01, 2.0, 500)
+    dL_gpc = make_cosmology(67.90, 0.3065).luminosity_distance(z).value / 1e3
+    assert detect_generation_cosmology(z, dL_gpc) is None
+
+
+def test_v1_combined_export_refuses_partial_override(tmp_path):
+    """The v1/CLI path hits the identical corruption the v2 builder refuses.
+
+    GW-09 added the refusal only to build_selection_product; `gwcat selection
+    --H0 ... --Om0 ...` dispatches to CombinedSelectionSet.to_darksirens,
+    which also has every campaign in view and must refuse identically.
+    """
+    from gwcat.selection import SelectionSet, CombinedSelectionSet
+
+    o4 = write_o4_full(tmp_path / "v1o4.hdf", n=200)
+    e3 = write_endo3_full(tmp_path / "v1e3.hdf", n=200)
+    comb = CombinedSelectionSet([SelectionSet(str(e3), H0=70.0, Om0=0.30),
+                                 SelectionSet(str(o4), H0=70.0, Om0=0.30)])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pytest.raises(ValueError) as ei:
+            comb.to_darksirens(str(tmp_path / "v1out.h5"))
+    assert "only SOME campaigns" in str(ei.value)
+
+
+def test_v1_writers_stamp_the_cosmology_pdraw_used(tmp_path):
+    """v1 attrs must describe the file's own Jacobian, not Planck15 by rote.
+
+    After GW-09 an endo3-style campaign's pdraw uses its DETECTED generation
+    cosmology, and an events-format campaign's uses none at all; stamping
+    self.H0 regardless (the pre-GW-09 stamp) made every v1 file mis-describe
+    its own pdraw.
+    """
+    from gwcat.selection import SelectionSet, CombinedSelectionSet
+
+    o4 = write_o4_full(tmp_path / "h1o4.hdf", n=200)
+    e3 = write_endo3_full(tmp_path / "h1e3.hdf", n=200)
+
+    # Single events-format campaign: no cosmology entered pdraw -> NaN + source.
+    out1 = tmp_path / "h1_single.h5"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        SelectionSet(str(o4)).to_darksirens(str(out1))
+    with h5py.File(out1, "r") as f:
+        assert not np.isfinite(f.attrs["cosmology_H0"])
+        src = f.attrs["cosmology_source"]
+        assert (src.decode() if isinstance(src, bytes) else str(src)) == "file"
+
+    # Combined campaigns that legitimately differ: scalar NaN, per-campaign
+    # arrays authoritative, mixed flag set.
+    out2 = tmp_path / "h1_comb.h5"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        CombinedSelectionSet([SelectionSet(str(e3)), SelectionSet(str(o4))]
+                             ).to_darksirens(str(out2))
+    with h5py.File(out2, "r") as f:
+        assert not np.isfinite(f.attrs["cosmology_H0"])
+        assert bool(f.attrs["cosmology_mixed_across_campaigns"]) is True
+        src = [s.decode() if isinstance(s, bytes) else str(s)
+               for s in f.attrs["cosmology_source_per_campaign"]]
+        assert len(src) == 2 and "file" in src
+        H0pc = np.asarray(f.attrs["cosmology_H0_per_campaign"], dtype=float)
+        assert not np.isfinite(H0pc[src.index("file")])

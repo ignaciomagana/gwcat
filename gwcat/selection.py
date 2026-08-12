@@ -209,18 +209,31 @@ _OM0_GRID_LO, _OM0_GRID_HI, _OM0_GRID_STEP = 0.20, 0.40, 0.0005
 #: there are four orders of magnitude of daylight between match and miss.
 COSMOLOGY_DETECT_RTOL = 1e-5
 
+#: Detected H0 outside this band is rejected (-> fallback with a warning)
+#: rather than reported.  dL scales exactly as 1/H0, so a unit mistake in the
+#: file (dL in Gpc, say) is otherwise absorbed into H0 perfectly and comes
+#: back as a CONFIDENT detection of H0=67900 -- and a pdraw Jacobian off by
+#: the unit factor relative to every other campaign in a combined product.
+COSMOLOGY_DETECT_H0_BAND = (40.0, 120.0)
+
 
 def detect_generation_cosmology(z, dL_mpc, n_sample: int = 4000,
                                 rtol: float = COSMOLOGY_DETECT_RTOL):
     """Recover the flat-LCDM cosmology a campaign's ``(z, dL)`` pairs were made with.
 
-    Returns ``(H0, Om0, max_rel_residual)``, or ``None`` when no cosmology on
-    the grid reproduces the pairs to ``rtol``.
+    Returns ``(H0, Om0, max_rel_residual)``, or ``None`` when no cosmology
+    reproduces the pairs to ``rtol`` or the implied ``H0`` falls outside
+    :data:`COSMOLOGY_DETECT_H0_BAND`.
 
     Exploits the fact that at fixed ``Om0`` a flat-LCDM ``dL`` scales exactly as
     ``1/H0`` (verified to 1e-12), so ``H0`` is solved in closed form per ``Om0``
     rather than searched: one distance evaluation per grid point, not a 2-D
-    scan.
+    scan.  The coarse grid alone is NOT enough to accept: a half-grid-step Om0
+    error leaves a ~2e-4 residual, 20x over ``rtol``, so a campaign generated
+    at an off-grid Om0 (Planck18's 0.30966, say) would be reported as "not
+    identified" and silently fall back to Planck15 -- the exact wrong-Jacobian
+    bug this function exists to prevent.  The best grid point is therefore
+    refined locally (the residual is smooth in Om0) before the ``rtol`` test.
 
     Used because the file's own generation cosmology -- not the caller's, and
     not Planck15 -- is what makes ``ddL/dz`` the right Jacobian for that
@@ -241,20 +254,119 @@ def detect_generation_cosmology(z, dL_mpc, n_sample: int = 4000,
     from .cosmology import make_cosmology
 
     H0_ref = 70.0
-    best = None
-    for Om0 in np.arange(_OM0_GRID_LO, _OM0_GRID_HI + 1e-12, _OM0_GRID_STEP):
+
+    def _try(Om0):
         pred_ref = make_cosmology(H0_ref, float(Om0)).luminosity_distance(z).value
         # dL ∝ 1/H0  =>  H0 = H0_ref * median(pred_ref / dL)
         H0 = H0_ref * float(np.median(pred_ref / dL))
         if not np.isfinite(H0) or H0 <= 0:
-            continue
+            return None
         resid = float(np.max(np.abs(pred_ref * (H0_ref / H0) / dL - 1.0)))
-        if best is None or resid < best[2]:
-            best = (H0, float(Om0), resid)
+        return (H0, float(Om0), resid)
 
-    if best is None or best[2] > rtol:
+    best = None
+    for Om0 in np.arange(_OM0_GRID_LO, _OM0_GRID_HI + 1e-12, _OM0_GRID_STEP):
+        cand = _try(Om0)
+        if cand is not None and (best is None or cand[2] < best[2]):
+            best = cand
+    if best is None:
+        return None
+
+    # Local Om0 refinement around the best grid point: three rounds of an
+    # 11-point sub-grid, each a decade finer, take the Om0 error from
+    # half-a-grid-step (~2.5e-4, residual ~2e-4) down to ~2.5e-7 (residual
+    # ~2e-7), comfortably inside rtol for a genuinely-LCDM campaign while a
+    # non-LCDM (z, dL) relation still cannot get anywhere near it.
+    step = _OM0_GRID_STEP
+    for _ in range(3):
+        step /= 10.0
+        lo, hi = best[1] - 10 * step, best[1] + 10 * step
+        for Om0 in np.arange(lo, hi + step / 2, step):
+            if not (0.0 < Om0 < 1.0):
+                continue
+            cand = _try(Om0)
+            if cand is not None and cand[2] < best[2]:
+                best = cand
+
+    if best[2] > rtol:
+        return None
+    lo_H0, hi_H0 = COSMOLOGY_DETECT_H0_BAND
+    if not (lo_H0 <= best[0] <= hi_H0):
+        # A perfect fit at an absurd H0 is a unit error, not a cosmology.
         return None
     return best
+
+
+def _cosmo_or_nan(s, attr):
+    """A recorded per-campaign cosmology value, or NaN when none applies.
+
+    NaN is the honest answer for an events-format campaign: its pdraw used the
+    stored ddL/dz and therefore NO cosmology, which is a different statement
+    from "the same cosmology as everyone else".
+    """
+    v = getattr(s, attr, None)
+    return float("nan") if v is None else float(v)
+
+
+def _cosmology_is_mixed(set_list) -> bool:
+    """Whether the campaigns in this product disagree about their cosmology.
+
+    True when they used different (H0, Om0), or when some used one and others
+    used none at all.  A combined O3+O4 export is the live case: an explicit
+    override changes endo3's pdraw (it computes ddL/dz) and not O4ab's (which
+    reads it), so one product would carry two cosmologies while reporting one.
+    """
+    seen = {(getattr(s, "_cosmology_source", None),
+             _cosmo_or_nan(s, "_cosmology_used_H0"),
+             _cosmo_or_nan(s, "_cosmology_used_Om0"))
+            for s in set_list}
+    # NaN != NaN, so compare the rounded tuple form rather than the raw floats.
+    norm = {(src, None if h != h else round(h, 9),
+             None if o != o else round(o, 9)) for src, h, o in seen}
+    return len(norm) > 1
+
+
+def _refuse_mixed_cosmology(set_list):
+    """Refuse a product in which an override reached only SOME campaigns.
+
+    Campaigns legitimately differ in cosmology, and that is not the fault: an
+    endo3-style campaign should use its own detected generation cosmology while
+    an O4-era ``events`` campaign uses the ddL/dz it ships, and both are right.
+    Recording them per campaign is enough for that case.
+
+    The corrupting case is narrower and is what this refuses: a caller supplies
+    one ``H0``/``Om0`` believing it governs the product, and it silently governs
+    only part of it.  Every cosmology-dependent quantity of an ``events``
+    campaign -- z, dL, the detector masses and critically ddL/dz -- is read
+    verbatim, so the kwarg never reaches its ``pdraw``; an ``injections``
+    campaign has no stored derivative, so the same kwarg *does* change its
+    ``pdraw``.  The result is one product built under two cosmologies while
+    reporting a single scalar, and nothing downstream can see it: ``pdraw``
+    arrives at the consumer as a bare per-injection array with no campaign
+    labelling that anything reads.
+
+    Lives here (not in the v2 builder) because BOTH selection export
+    generations combine campaigns: ``CombinedSelectionSet.to_darksirens`` /
+    ``to_combined_selection_file`` hit the identical corruption on the v1/CLI
+    path.
+    """
+    if len(set_list) < 2:
+        return
+    sources = {getattr(s, "_cosmology_source", None) for s in set_list}
+    if not ("override" in sources and "file" in sources):
+        return
+    rows = "; ".join(
+        f"{s.path}: source={getattr(s, '_cosmology_source', None)!r}"
+        for s in set_list)
+    raise ValueError(
+        "an explicit cosmology was supplied but reached only SOME campaigns in "
+        "this export, so the product would be built under two cosmologies "
+        "while reporting one -- and pdraw reaches the consumer unlabelled by "
+        f"campaign, so that would be undetectable downstream. Per campaign: "
+        f"{rows}. A campaign with cosmology_source='file' ships its own "
+        "ddL/dz and cannot honour an override. Drop the override so every "
+        "campaign uses its own generation cosmology, which is what makes each "
+        "campaign's Jacobian correct.")
 
 
 def _ddL_dz(z, dL_mpc, H0, Om0):
@@ -665,8 +777,9 @@ class SelectionSet:
             # The case that IS corrupting is a COMBINED export, where the same
             # override changes an endo3-style campaign's pdraw and not this one,
             # so one product carries two cosmologies while reporting a scalar.
-            # That is refused in the selection builder, which is the only place
-            # every campaign is in view.
+            # That is refused wherever campaigns are combined: the v2 selection
+            # builder AND the v1 combined exporter (both call
+            # _refuse_mixed_cosmology).
             if self._cosmology_override:
                 warnings.warn(
                     f"{self.path}: an explicit cosmology (H0={self.H0}, "
@@ -1307,8 +1420,17 @@ class SelectionSet:
             f.attrs["T_obs_yr"] = float(self._T_yr)
             f.attrs["far_threshold"] = float(far_threshold)
             f.attrs["n_detected"] = n_det
-            f.attrs["cosmology_H0"] = float(self.H0)
-            f.attrs["cosmology_Om0"] = float(self.Om0)
+            # The cosmology pdraw ACTUALLY used (GW-09): the detected
+            # generation cosmology for an injections-format campaign, the
+            # override if one was given, NaN for an events-format campaign
+            # whose Jacobian was read verbatim from the file (no cosmology
+            # entered pdraw at all).  Stamping self.H0 here regardless -- the
+            # pre-GW-09 behavior -- mis-described the file's own Jacobian the
+            # moment detection started changing pdraw.
+            f.attrs["cosmology_H0"] = _cosmo_or_nan(self, "_cosmology_used_H0")
+            f.attrs["cosmology_Om0"] = _cosmo_or_nan(self,
+                                                     "_cosmology_used_Om0")
+            f.attrs["cosmology_source"] = str(self._cosmology_source)
             f.attrs["chi_eff_swap_applied"] = True
             f.attrs["chi_eff_amax"] = float(amax)
             # ── Spin-prior contract provenance (PR 3) ──────────────────────
@@ -1363,8 +1485,9 @@ class SelectionSet:
                     else format_source_class_filter(source_class)),
                 "source_class_counts_detected": (
                     value_counts([normalize_source_class(c) for c in classes_det])),
-                "cosmology_H0": float(self.H0),
-                "cosmology_Om0": float(self.Om0),
+                "cosmology_H0": _cosmo_or_nan(self, "_cosmology_used_H0"),
+                "cosmology_Om0": _cosmo_or_nan(self, "_cosmology_used_Om0"),
+                "cosmology_source": str(self._cosmology_source),
                 "cosmology_override_used": bool(self._cosmology_override),
                 "spin_prior_mode": "include",
                 "chi_eff_prior_applied_to_pdraw": True,
@@ -1374,7 +1497,10 @@ class SelectionSet:
             write_validation_summary(out_path, summary)
 
         print(f"Wrote {out_path}: n_det={n_det}, ndraw={self._ndraw}, "
-              f"FAR<{far_threshold}, H0={self.H0}, Om0={self.Om0}, "
+              f"FAR<{far_threshold}, "
+              f"H0={_cosmo_or_nan(self, '_cosmology_used_H0')}, "
+              f"Om0={_cosmo_or_nan(self, '_cosmology_used_Om0')} "
+              f"(source={self._cosmology_source}), "
               f"source_class={source_class}")
         return out_path
 
@@ -1617,6 +1743,11 @@ class CombinedSelectionSet:
         with np.errstate(over="ignore"):
             data["pdraw"] *= np.exp(logp_chi)
 
+        # An override that reached only SOME campaigns corrupts the combined
+        # pdraw exactly as it does on the v2 path (GW-09); this exporter has
+        # every campaign in view too, so it refuses identically.
+        _refuse_mixed_cosmology(self._sets)
+
         # Write
         with h5py.File(out_path, "w") as f:
             f.attrs["format_version"] = "gwcat-selection-1.0"
@@ -1624,8 +1755,32 @@ class CombinedSelectionSet:
             f.attrs["T_obs_yr"] = float(sum(s._T_yr for s in self._sets))
             f.attrs["far_threshold"] = float(far_threshold)
             f.attrs["n_detected"] = n_det_total
-            f.attrs["cosmology_H0"] = float(self._sets[0].H0)
-            f.attrs["cosmology_Om0"] = float(self._sets[0].Om0)
+            # The scalar is the cosmology every campaign's pdraw used -- NaN
+            # when the campaigns legitimately differ (each used its own
+            # generation cosmology) or used none at all; the per-campaign
+            # arrays below are the authoritative record.  Stamping
+            # sets[0].H0 (always Planck15) mis-described every campaign whose
+            # pdraw used a DETECTED cosmology.
+            _mixed = _cosmology_is_mixed(self._sets)
+            f.attrs["cosmology_H0"] = (
+                float("nan") if _mixed
+                else _cosmo_or_nan(self._sets[0], "_cosmology_used_H0"))
+            f.attrs["cosmology_Om0"] = (
+                float("nan") if _mixed
+                else _cosmo_or_nan(self._sets[0], "_cosmology_used_Om0"))
+            f.attrs["cosmology_mixed_across_campaigns"] = bool(_mixed)
+            f.attrs.create(
+                "cosmology_source_per_campaign",
+                np.array([str(getattr(s, "_cosmology_source", None))
+                          for s in self._sets], dtype=h5py.string_dtype()))
+            f.attrs.create(
+                "cosmology_H0_per_campaign",
+                np.array([_cosmo_or_nan(s, "_cosmology_used_H0")
+                          for s in self._sets], dtype=float))
+            f.attrs.create(
+                "cosmology_Om0_per_campaign",
+                np.array([_cosmo_or_nan(s, "_cosmology_used_Om0")
+                          for s in self._sets], dtype=float))
             f.attrs["chi_eff_swap_applied"] = True
             f.attrs["chi_eff_amax"] = float(amax)
             # ── Spin-prior contract provenance (PR 3) ──────────────────────
@@ -1683,8 +1838,16 @@ class CombinedSelectionSet:
                     else format_source_class_filter(source_class)),
                 "source_class_counts_detected": (
                     value_counts([normalize_source_class(c) for c in classes_det])),
-                "cosmology_H0": float(self._sets[0].H0),
-                "cosmology_Om0": float(self._sets[0].Om0),
+                "cosmology_H0": (
+                    float("nan") if _mixed
+                    else _cosmo_or_nan(self._sets[0], "_cosmology_used_H0")),
+                "cosmology_Om0": (
+                    float("nan") if _mixed
+                    else _cosmo_or_nan(self._sets[0], "_cosmology_used_Om0")),
+                "cosmology_mixed_across_campaigns": bool(_mixed),
+                "cosmology_source_per_campaign": [
+                    str(getattr(s, "_cosmology_source", None))
+                    for s in self._sets],
                 "cosmology_override_used": bool(
                     any(getattr(s, "_cosmology_override", False)
                         for s in self._sets)),

@@ -56,9 +56,9 @@ def export(obj, out_path, format="gwcat2", spin_basis=None,
     format : str, default "gwcat2"
         Registered export format.
     spin_basis : str, optional
-        Spin basis.  Defaults to ``"chieff"`` for a PE export and
-        ``"component"`` for a selection export (each type's own default) when
-        left as ``None``.
+        Spin basis.  ``None`` resolves to the package-wide
+        :data:`~gwcat.params.DEFAULT_PARAMETER_SPACE` on both the PE and the
+        selection side, so a no-argument pair agrees by construction.
     write_summary : bool, default False
         Write a validation summary next to ``out_path``.
     summary_context : dict, optional
@@ -70,17 +70,13 @@ def export(obj, out_path, format="gwcat2", spin_basis=None,
     from ..catalog import GWCatalog
 
     if isinstance(obj, GWCatalog):
-        return obj.export(out_path, format=format,
-                          spin_basis="chieff" if spin_basis is None
-                          else spin_basis,
+        return obj.export(out_path, format=format, spin_basis=spin_basis,
                           write_summary=write_summary,
                           summary_context=summary_context, **builder_kwargs)
 
     from ..selection import SelectionSet, CombinedSelectionSet
     if isinstance(obj, (SelectionSet, CombinedSelectionSet)):
-        return obj.export(out_path, format=format,
-                          spin_basis="component" if spin_basis is None
-                          else spin_basis,
+        return obj.export(out_path, format=format, spin_basis=spin_basis,
                           write_summary=write_summary,
                           summary_context=summary_context, **builder_kwargs)
 

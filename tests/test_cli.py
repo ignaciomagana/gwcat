@@ -228,14 +228,33 @@ def test_export_darksirens_no_summary_flag(tmp_path):
     assert not Path(str(out) + ".validation_summary.json").exists()
 
 
-def test_export_darksirens_require_far_fails_loud(tmp_path):
+def test_export_darksirens_require_far_fails_loud(tmp_path, capsys):
+    """A diagnosed refusal exits non-zero with the message on stderr.
+
+    main() used to let the ValueError escape as a raw traceback; the message
+    (which already says what to fix) is the user interface, not the stack.
+    """
     store = _build_mixed_store(tmp_path, MIXED_EVENTS)
     out = tmp_path / "should_not_exist.h5"
-    with pytest.raises(ValueError, match="require_far"):
-        main(["export-darksirens", store, "--out", str(out),
-              "--source-class", "bbh", "--far-max", "1.0",
-              "--require-far", "--cosmology", "67.74,0.3089",
-              "--nsamp", "8", "--seed", "0"])
+    rc = main(["export-darksirens", store, "--out", str(out),
+               "--source-class", "bbh", "--far-max", "1.0",
+               "--require-far", "--cosmology", "67.74,0.3089",
+               "--nsamp", "8", "--seed", "0"])
+    assert rc != 0
+    assert "require_far" in capsys.readouterr().err
+    assert not out.exists()
+
+
+def test_cli_unrecognised_source_class_is_a_clean_error(tmp_path, capsys):
+    """--source-class BBHs must produce the named-token error, not a traceback."""
+    store = _build_mixed_store(tmp_path, MIXED_EVENTS)
+    out = tmp_path / "typo.h5"
+    rc = main(["export-darksirens", store, "--out", str(out),
+               "--source-class", "BBHs", "--cosmology", "67.74,0.3089",
+               "--nsamp", "8", "--seed", "0"])
+    assert rc != 0
+    err = capsys.readouterr().err
+    assert "BBHs" in err and "error" in err
     assert not out.exists()
 
 

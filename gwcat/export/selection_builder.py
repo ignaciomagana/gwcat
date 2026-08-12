@@ -74,11 +74,17 @@ from ..params import BLOCKS, DEFAULT_PARAMETER_SPACE, get_space
 from ..source_class import format_source_class_filter
 from ..spin import chi_eff_prior_logprob, chi_eff_chi_p_prior_logprob
 from ..selection import (SelectionSet, CombinedSelectionSet,
-                         PDRAW_STATE_BY_BASIS, _selection_provenance_dict)
+                         PDRAW_STATE_BY_BASIS, _selection_provenance_dict,
+                         _refuse_mixed_cosmology, _cosmo_or_nan,
+                         _cosmology_is_mixed)
 from .product import ExportProduct
 
-#: Spin bases the selection builder implements.
+#: Spin bases the selection builder implements.  A registry space outside this
+#: tuple is declarable but not yet buildable; the CLI and the validator read
+#: this tuple (as ``SUPPORTED_SPIN_BASES``) so they cannot advertise or reject
+#: a different set than the builder enforces.
 _KNOWN_SPIN_BASES = ("chieff", "component", "chieff_chip")
+SUPPORTED_SPIN_BASES = _KNOWN_SPIN_BASES
 
 #: The cumulative-mixture SNR column used by the optional OR-branch.
 _SNR_COLUMN = "semianalytic_observed_phase_maximized_snr_net"
@@ -676,71 +682,7 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                          spin_basis=spin_basis, summary=summary)
 
 
-def _refuse_mixed_cosmology(set_list):
-    """Refuse a product in which an override reached only SOME campaigns.
 
-    Campaigns legitimately differ in cosmology, and that is not the fault: an
-    endo3-style campaign should use its own detected generation cosmology while
-    an O4-era ``events`` campaign uses the ddL/dz it ships, and both are right.
-    Recording them per campaign is enough for that case.
-
-    The corrupting case is narrower and is what this refuses: a caller supplies
-    one ``H0``/``Om0`` believing it governs the product, and it silently governs
-    only part of it.  Every cosmology-dependent quantity of an ``events``
-    campaign -- z, dL, the detector masses and critically ddL/dz -- is read
-    verbatim, so the kwarg never reaches its ``pdraw``; an ``injections``
-    campaign has no stored derivative, so the same kwarg *does* change its
-    ``pdraw``.  The result is one product built under two cosmologies while
-    reporting a single scalar, and nothing downstream can see it: ``pdraw``
-    arrives at the consumer as a bare per-injection array with no campaign
-    labelling that anything reads.
-    """
-    if len(set_list) < 2:
-        return
-    sources = {getattr(s, "_cosmology_source", None) for s in set_list}
-    if not ("override" in sources and "file" in sources):
-        return
-    rows = "; ".join(
-        f"{s.path}: source={getattr(s, '_cosmology_source', None)!r}"
-        for s in set_list)
-    raise ValueError(
-        "an explicit cosmology was supplied but reached only SOME campaigns in "
-        "this export, so the product would be built under two cosmologies "
-        "while reporting one -- and pdraw reaches the consumer unlabelled by "
-        f"campaign, so that would be undetectable downstream. Per campaign: "
-        f"{rows}. A campaign with cosmology_source='file' ships its own "
-        "ddL/dz and cannot honour an override. Drop the override so every "
-        "campaign uses its own generation cosmology, which is what makes each "
-        "campaign's Jacobian correct.")
-
-
-def _cosmo_or_nan(s, attr):
-    """A recorded per-campaign cosmology value, or NaN when none applies.
-
-    NaN is the honest answer for an events-format campaign: its pdraw used the
-    stored ddL/dz and therefore NO cosmology, which is a different statement
-    from "the same cosmology as everyone else".
-    """
-    v = getattr(s, attr, None)
-    return float("nan") if v is None else float(v)
-
-
-def _cosmology_is_mixed(set_list) -> bool:
-    """Whether the campaigns in this product disagree about their cosmology.
-
-    True when they used different (H0, Om0), or when some used one and others
-    used none at all.  A combined O3+O4 export is the live case: an explicit
-    override changes endo3's pdraw (it computes ddL/dz) and not O4ab's (which
-    reads it), so one product would carry two cosmologies while reporting one.
-    """
-    seen = {(getattr(s, "_cosmology_source", None),
-             _cosmo_or_nan(s, "_cosmology_used_H0"),
-             _cosmo_or_nan(s, "_cosmology_used_Om0"))
-            for s in set_list}
-    # NaN != NaN, so compare the rounded tuple form rather than the raw floats.
-    norm = {(src, None if h != h else round(h, 9),
-             None if o != o else round(o, 9)) for src, h, o in seen}
-    return len(norm) > 1
 
 
 def _amax_pair(amax_detected):
