@@ -291,20 +291,21 @@ def test_mass_and_distance_contribute_nothing_on_the_injection_side():
     assert BLOCKS["distance.dl"].ln_draw_inj({}, None) == 0.0
 
 
-def test_nothing_in_gwcat_imports_params_yet():
-    """GW-17 is pure assembly; wiring is GW-18/GW-19.  If this starts failing,
-    the wiring PR has landed and this test should be deleted with it."""
+def test_the_pe_builder_now_drives_itself_from_the_registry():
+    """GW-17 asserted that nothing imported ``gwcat.params``; GW-18 wired the PE
+    builder to it, so that tripwire is replaced by its inverse.
+
+    The point is not merely that the import exists -- it is that the builder no
+    longer carries its own copy of the per-basis requirement ladder.
+    """
     import pathlib
 
-    root = pathlib.Path(__file__).resolve().parent.parent / "gwcat"
-    offenders = []
-    for path in root.rglob("*.py"):
-        if "params" in path.parts or path.name == "__init__.py":
-            continue
-        if any(p.startswith(".") or p == "build" for p in path.parts):
-            continue
-        text = path.read_text()
-        if "from .params" in text or "from ..params" in text \
-                or "import params" in text:
-            offenders.append(str(path.relative_to(root)))
-    assert not offenders, f"gwcat.params is imported by {offenders}"
+    src = (pathlib.Path(__file__).resolve().parent.parent
+           / "gwcat" / "export" / "pe_builder.py").read_text()
+    assert "from ..params import get_space" in src
+    assert "space = get_space(spin_basis)" in src
+    # the three-branch requirement ladder is gone
+    assert 'need = list(COMPONENT_REQUIRED)' not in src
+    assert 'need = list(DARKSIRENS_REQUIRED)' not in src
+    # and the extras gate is derived, not asserted
+    assert 'need_extras = spin_basis != "chieff"' not in src

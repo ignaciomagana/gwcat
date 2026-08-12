@@ -23,6 +23,7 @@ import numpy as np
 import h5py
 import pytest
 
+from gwcat import schema
 from gwcat.catalog import GWCatalog
 from gwcat.spin import chi_p_from_components, chi_eff_chi_p_prior_logprob
 
@@ -502,3 +503,98 @@ def test_unrecognized_spin_prior_kind_warns(tmp_path):
     unrec = [s.decode() if isinstance(s, bytes) else s
              for s in attrs["spin_prior_unrecognized_events"]]
     assert unrec == ["GWc9_000002"]
+
+
+# ==========================================================================
+# GW-18: the PE builder is driven by the block registry
+# ==========================================================================
+def test_chieff_export_is_byte_identical_to_to_darksirens(tmp_path):
+    """The parity contract GW-18 must not break.
+
+    For spin_basis="chieff" the block-driven builder must reproduce the frozen
+    v1 exporter's arrays EXACTLY -- same selection, same rng stream, same
+    Jacobian, same chi_eff factor, same concatenation order.
+    """
+    from gwcat.catalog import GWCatalog
+
+    events = [{"name": "GWp_000001", "provide": _FULL_SPIN},
+              {"name": "GWp_000002", "provide": _FULL_SPIN}]
+    store, _raw = _build_spin_store(tmp_path, events, n_per_event=300)
+    cat = GWCatalog(store)
+
+    kw = dict(nsamp=64, seed=3, cosmology=(67.74, 0.3089))
+    v1 = tmp_path / "v1.h5"
+    v2 = tmp_path / "v2.h5"
+    cat.to_darksirens(str(v1), **kw)
+    cat.export(str(v2), format="gwcat2", spin_basis="chieff", **kw)
+
+    with h5py.File(v1, "r") as a, h5py.File(v2, "r") as b:
+        assert int(a.attrs["nobs"]) == int(b.attrs["nobs"])
+        assert int(a.attrs["nsamp"]) == int(b.attrs["nsamp"])
+        for col in ("ra", "dec", "m1det", "m2det", "chieff", "dL", "p_pe",
+                    "redshift", "m1src", "m2src"):
+            np.testing.assert_array_equal(
+                a[col][:], b[col][:],
+                err_msg=f"chieff parity broken for {col!r}")
+
+
+def test_rng_neutrality_chieff_fetches_no_extra_store_columns(tmp_path,
+                                                              monkeypatch):
+    """The mechanism behind the parity above, pinned directly.
+
+    chieff parity holds only because that path fetches no EXTRA per-event
+    columns and therefore consumes an identical default_rng(seed) stream.
+    Assert the exact column set handed to ``sub.get``, so a future space that
+    quietly starts fetching spin columns for chieff fails here rather than
+    silently shifting every exported sample.
+    """
+    from gwcat.catalog import GWCatalog
+    from gwcat.params import get_space
+
+    events = [{"name": "GWr_000001", "provide": _FULL_SPIN}]
+    store, _raw = _build_spin_store(tmp_path, events, n_per_event=200)
+    cat = GWCatalog(store)
+
+    calls = []
+    orig = GWCatalog.get
+
+    def spy(self, params, **kw):
+        calls.append(tuple(params))
+        return orig(self, params, **kw)
+
+    monkeypatch.setattr(GWCatalog, "get", spy)
+    cat.export(str(tmp_path / "c.h5"), format="gwcat2", spin_basis="chieff",
+               nsamp=32, seed=0, cosmology=(67.74, 0.3089))
+
+    # exactly one fetch, and it is the legacy required set -- no spin extras
+    assert len(calls) == 1, f"chieff made {len(calls)} store fetches: {calls}"
+    assert set(calls[0]) == set(schema.EXPORT_REQUIREMENTS["gwcat2_pe:chieff"])
+    assert get_space("chieff").store_params_fetched == ()
+
+    # ... whereas component DOES fetch extras, which is why it is exempt from
+    # the parity contract rather than violating it.
+    calls.clear()
+    cat.export(str(tmp_path / "k.h5"), format="gwcat2", spin_basis="component",
+               nsamp=32, seed=0, cosmology=(67.74, 0.3089))
+    assert len(calls) == 2, f"component made {len(calls)} fetches: {calls}"
+    assert set(calls[1]) & {"a_1", "a_2"}
+
+
+def test_requirements_come_from_the_registry_not_a_ladder(tmp_path):
+    """A missing required parameter must still fail loudly, naming it -- the
+    behaviour the removed per-basis ladder provided."""
+    from gwcat.catalog import GWCatalog
+    from gwcat.schema import MissingParameterError, export_requirements_for
+
+    # the generated view agrees with the legacy tuple for every legacy basis
+    for basis in ("chieff", "component", "chieff_chip"):
+        assert set(export_requirements_for(basis)) == set(
+            schema.EXPORT_REQUIREMENTS[f"gwcat2_pe:{basis}"])
+
+    events = [{"name": "GWq_000001", "provide": {"a_2", "cos_tilt_1",
+                                                 "cos_tilt_2"}}]
+    store, _raw = _build_spin_store(tmp_path, events, n_per_event=100)
+    with pytest.raises(MissingParameterError, match="a_1"):
+        GWCatalog(store).export(str(tmp_path / "x.h5"), format="gwcat2",
+                                spin_basis="component", nsamp=32, seed=0,
+                                cosmology=(67.74, 0.3089))

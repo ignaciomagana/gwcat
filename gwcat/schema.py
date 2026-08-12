@@ -121,6 +121,27 @@ EXPORT_REQUIREMENTS = {
 }
 
 
+def export_requirements_for(space_name: str):
+    """Required store parameters for a registered parameter space (GW-18).
+
+    A generated view over :data:`gwcat.params.SPACES`, so a space that has no
+    legacy ``EXPORT_REQUIREMENTS`` entry still has a requirement contract, and
+    the two can never disagree for the spaces that do (pinned by
+    ``tests/test_params_registry.py``).
+
+    The import is local and lazy: :mod:`gwcat.schema` is imported by
+    :mod:`gwcat.ingest` and :mod:`gwcat.catalog`, and it must stay free of
+    heavier dependencies at module scope.
+    """
+    from .params import get_space
+
+    space = get_space(space_name)
+    legacy = EXPORT_REQUIREMENTS.get(f"gwcat2_pe:{space_name}")
+    if legacy is not None and set(legacy) == set(space.store_required):
+        return tuple(legacy)
+    return tuple(space.store_required)
+
+
 def required_params(export: str) -> List[str]:
     """Return the ordered list of parameters a named export requires."""
     if export not in EXPORT_REQUIREMENTS:

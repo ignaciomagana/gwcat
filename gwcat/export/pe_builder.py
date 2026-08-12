@@ -65,7 +65,25 @@ import warnings
 import numpy as np
 
 from ..cosmology import make_cosmology, z_of_dL
+from ..params import get_space
 from .product import ExportProduct
+
+
+def space_ordered_required(space, spin_basis):
+    """``space.store_required`` in the legacy schema's ORDER where one exists.
+
+    The set is the registry's (and a test pins the two equal); the order is the
+    schema tuple's, so a missing-parameter error message reads exactly as it
+    always has.  For a space with no legacy counterpart the registry order is
+    used directly.
+    """
+    from ..schema import EXPORT_REQUIREMENTS
+
+    want = set(space.store_required)
+    legacy = EXPORT_REQUIREMENTS.get(f"gwcat2_pe:{spin_basis}")
+    if legacy is not None and set(legacy) == want:
+        return tuple(legacy)
+    return tuple(space.store_required)
 
 #: The datasets a chieff-basis PE export writes, in legacy order.
 _CHIEFF_COLUMNS = ["ra", "dec", "m1det", "m2det", "chieff", "dL", "p_pe",
@@ -180,7 +198,10 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
             f"chi_p_definition must be 'schmidt_recomputed' or 'file'; got "
             f"{chi_p_definition!r}.")
 
-    need_extras = spin_basis != "chieff"
+    space = get_space(spin_basis)
+    # Whether this space needs per-sample spin columns beyond the legacy set.
+    # Derived from the registry rather than asserted (GW-18).
+    need_extras = bool(space.store_params_fetched)
 
     # chieff basis ALWAYS uses "include" semantics: the 1-D chi_eff prior is
     # multiplied into p_pe here (Mode A), matching the legacy default.  The
@@ -207,33 +228,29 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
                      waveform_policy=waveform_policy,
                      approximant=approximant)
 
-    # ── Required-parameter checks (per basis) ───────────────────────────────
-    from ..schema import (DARKSIRENS_REQUIRED, COMPONENT_REQUIRED,
-                          COMPONENT_TILT_ALTERNATIVES,
-                          CHIEFF_CHIP_CHIP_ALTERNATIVES)
-    if spin_basis == "chieff":
-        need = list(DARKSIRENS_REQUIRED)
-        sub._require_params(need, export="gwcat2 PE export")
-    elif spin_basis == "component":
-        need = list(COMPONENT_REQUIRED)
-        sub._require_params(need, export="gwcat2 PE export (component basis)")
-        sub._require_alternatives(
-            COMPONENT_TILT_ALTERNATIVES,
-            export="gwcat2 PE export (component basis)")
-    else:  # chieff_chip
-        need = list(DARKSIRENS_REQUIRED)
-        sub._require_params(need, export="gwcat2 PE export (chieff_chip basis)")
-        sub._require_alternatives(
-            CHIEFF_CHIP_CHIP_ALTERNATIVES,
-            export="gwcat2 PE export (chieff_chip basis)")
+    # ── Required-parameter checks, driven by the space (GW-18) ──────────────
+    # The three-branch ladder is gone: what a space requires is now a property
+    # of its blocks (gwcat.params), and schema.EXPORT_REQUIREMENTS is a
+    # generated view over the same registry -- so the two cannot disagree.
+    # Order still comes from the schema tuple for the legacy bases, purely so
+    # error messages read the way they always have.
+    label = ("gwcat2 PE export" if spin_basis == "chieff"
+             else f"gwcat2 PE export ({spin_basis} basis)")
+    need = list(space_ordered_required(space, spin_basis))
+    sub._require_params(need, export=label)
+    if space.store_alternatives:
+        sub._require_alternatives(space.store_alternatives, export=label)
 
     per = sub.get(need, per_event=True)
     rng = np.random.default_rng(seed)
 
-    # Extra per-sample columns (fetched ONLY for non-chieff bases so the chieff
-    # rng stream / parity is untouched).
-    extra_params = ([p for p in _EXTRA_SAMPLE_CANDIDATES
-                     if p in sub._param_index] if need_extras else [])
+    # Extra per-sample columns.  The gate is the space's declared
+    # store_params_fetched, NOT a hardcoded `spin_basis != "chieff"`: that is
+    # the rng-neutrality contract made structural.  A space declaring () fetches
+    # nothing, so it cannot perturb the default_rng(seed) stream, which is the
+    # whole reason the chieff export stays byte-identical to to_darksirens.
+    extra_params = [p for p in space.store_params_fetched
+                    if p in sub._param_index]
     per_extra = (sub.get(extra_params, per_event=True)
                  if extra_params else {})
 
