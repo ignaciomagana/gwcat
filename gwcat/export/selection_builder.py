@@ -441,6 +441,8 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             f"{s.path}: N={ndraw_per[k]}, T={s._T_yr:.2f}yr, "
             f"n_det={n_det_k}, frac={frac:.4f}")
 
+    _refuse_mixed_cosmology(set_list)
+
     if n_det_total == 0:
         raise RuntimeError(
             f"No detected injections across {len(set_list)} campaign(s) at "
@@ -537,6 +539,20 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         "cosmology_Om0": float(set_list[0].Om0),
         "cosmology_override_used": bool(
             any(getattr(s, "_cosmology_override", False) for s in set_list)),
+        # Per-campaign, because a combined export legitimately mixes campaigns
+        # whose pdraw used DIFFERENT cosmologies -- or none at all.  The scalar
+        # above is the first campaign's reference value, kept for backward
+        # compatibility; these are the authoritative record (GW-09).
+        "cosmology_source_per_campaign": np.array(
+            [str(getattr(s, "_cosmology_source", None)) for s in set_list],
+            dtype=_str),
+        "cosmology_H0_per_campaign": np.array(
+            [_cosmo_or_nan(s, "_cosmology_used_H0") for s in set_list],
+            dtype=float),
+        "cosmology_Om0_per_campaign": np.array(
+            [_cosmo_or_nan(s, "_cosmology_used_Om0") for s in set_list],
+            dtype=float),
+        "cosmology_mixed_across_campaigns": bool(_cosmology_is_mixed(set_list)),
         "mass_jacobian_applied": True,
         "distance_prior_removed": False,
         "n_campaigns": len(set_list),
@@ -638,6 +654,13 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         "cosmology_Om0": float(set_list[0].Om0),
         "cosmology_override_used": bool(
             any(getattr(s, "_cosmology_override", False) for s in set_list)),
+        "cosmology_source_per_campaign": [
+            str(getattr(s, "_cosmology_source", None)) for s in set_list],
+        "cosmology_H0_per_campaign": [
+            _cosmo_or_nan(s, "_cosmology_used_H0") for s in set_list],
+        "cosmology_Om0_per_campaign": [
+            _cosmo_or_nan(s, "_cosmology_used_Om0") for s in set_list],
+        "cosmology_mixed_across_campaigns": bool(_cosmology_is_mixed(set_list)),
         "injected_spin_format": [str(s.spin_meta.get("spin_format"))
                                  for s in set_list],
         "component_columns_emitted": bool(extras_available),
@@ -651,6 +674,73 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
 
     return ExportProduct(kind="selection", columns=columns, attrs=attrs,
                          spin_basis=spin_basis, summary=summary)
+
+
+def _refuse_mixed_cosmology(set_list):
+    """Refuse a product in which an override reached only SOME campaigns.
+
+    Campaigns legitimately differ in cosmology, and that is not the fault: an
+    endo3-style campaign should use its own detected generation cosmology while
+    an O4-era ``events`` campaign uses the ddL/dz it ships, and both are right.
+    Recording them per campaign is enough for that case.
+
+    The corrupting case is narrower and is what this refuses: a caller supplies
+    one ``H0``/``Om0`` believing it governs the product, and it silently governs
+    only part of it.  Every cosmology-dependent quantity of an ``events``
+    campaign -- z, dL, the detector masses and critically ddL/dz -- is read
+    verbatim, so the kwarg never reaches its ``pdraw``; an ``injections``
+    campaign has no stored derivative, so the same kwarg *does* change its
+    ``pdraw``.  The result is one product built under two cosmologies while
+    reporting a single scalar, and nothing downstream can see it: ``pdraw``
+    arrives at the consumer as a bare per-injection array with no campaign
+    labelling that anything reads.
+    """
+    if len(set_list) < 2:
+        return
+    sources = {getattr(s, "_cosmology_source", None) for s in set_list}
+    if not ("override" in sources and "file" in sources):
+        return
+    rows = "; ".join(
+        f"{s.path}: source={getattr(s, '_cosmology_source', None)!r}"
+        for s in set_list)
+    raise ValueError(
+        "an explicit cosmology was supplied but reached only SOME campaigns in "
+        "this export, so the product would be built under two cosmologies "
+        "while reporting one -- and pdraw reaches the consumer unlabelled by "
+        f"campaign, so that would be undetectable downstream. Per campaign: "
+        f"{rows}. A campaign with cosmology_source='file' ships its own "
+        "ddL/dz and cannot honour an override. Drop the override so every "
+        "campaign uses its own generation cosmology, which is what makes each "
+        "campaign's Jacobian correct.")
+
+
+def _cosmo_or_nan(s, attr):
+    """A recorded per-campaign cosmology value, or NaN when none applies.
+
+    NaN is the honest answer for an events-format campaign: its pdraw used the
+    stored ddL/dz and therefore NO cosmology, which is a different statement
+    from "the same cosmology as everyone else".
+    """
+    v = getattr(s, attr, None)
+    return float("nan") if v is None else float(v)
+
+
+def _cosmology_is_mixed(set_list) -> bool:
+    """Whether the campaigns in this product disagree about their cosmology.
+
+    True when they used different (H0, Om0), or when some used one and others
+    used none at all.  A combined O3+O4 export is the live case: an explicit
+    override changes endo3's pdraw (it computes ddL/dz) and not O4ab's (which
+    reads it), so one product would carry two cosmologies while reporting one.
+    """
+    seen = {(getattr(s, "_cosmology_source", None),
+             _cosmo_or_nan(s, "_cosmology_used_H0"),
+             _cosmo_or_nan(s, "_cosmology_used_Om0"))
+            for s in set_list}
+    # NaN != NaN, so compare the rounded tuple form rather than the raw floats.
+    norm = {(src, None if h != h else round(h, 9),
+             None if o != o else round(o, 9)) for src, h, o in seen}
+    return len(norm) > 1
 
 
 def _amax_pair(amax_detected):

@@ -198,6 +198,65 @@ def _write_selection_provenance(f, source_class, nsbh_mass_threshold,
         f.attrs[k] = v
 
 
+#: Candidate Om0 grid for :func:`detect_generation_cosmology`.  Coarse enough to
+#: stay cheap at load time, fine enough that the residual test below either
+#: identifies the cosmology to ~1e-7 or rejects outright.
+_OM0_GRID_LO, _OM0_GRID_HI, _OM0_GRID_STEP = 0.20, 0.40, 0.0005
+
+#: A campaign is only declared "identified" when every sampled (z, dL) pair is
+#: reproduced to better than this.  The real endo3 BBH campaign hits 1.6e-7;
+#: a wrong-but-nearby cosmology (Planck15 against endo3) sits at 2.3e-3, so
+#: there are four orders of magnitude of daylight between match and miss.
+COSMOLOGY_DETECT_RTOL = 1e-5
+
+
+def detect_generation_cosmology(z, dL_mpc, n_sample: int = 4000,
+                                rtol: float = COSMOLOGY_DETECT_RTOL):
+    """Recover the flat-LCDM cosmology a campaign's ``(z, dL)`` pairs were made with.
+
+    Returns ``(H0, Om0, max_rel_residual)``, or ``None`` when no cosmology on
+    the grid reproduces the pairs to ``rtol``.
+
+    Exploits the fact that at fixed ``Om0`` a flat-LCDM ``dL`` scales exactly as
+    ``1/H0`` (verified to 1e-12), so ``H0`` is solved in closed form per ``Om0``
+    rather than searched: one distance evaluation per grid point, not a 2-D
+    scan.
+
+    Used because the file's own generation cosmology -- not the caller's, and
+    not Planck15 -- is what makes ``ddL/dz`` the right Jacobian for that
+    campaign.
+    """
+    z = np.asarray(z, dtype=float).ravel()
+    dL = np.asarray(dL_mpc, dtype=float).ravel()
+    good = np.isfinite(z) & np.isfinite(dL) & (z > 0) & (dL > 0)
+    if good.sum() < 16:
+        return None
+    z, dL = z[good], dL[good]
+    if z.size > n_sample:
+        # Deterministic stride, not a random draw: detection must not depend on
+        # an rng, and a stride over a generated set spans the z range.
+        step = int(np.ceil(z.size / n_sample))
+        z, dL = z[::step], dL[::step]
+
+    from .cosmology import make_cosmology
+
+    H0_ref = 70.0
+    best = None
+    for Om0 in np.arange(_OM0_GRID_LO, _OM0_GRID_HI + 1e-12, _OM0_GRID_STEP):
+        pred_ref = make_cosmology(H0_ref, float(Om0)).luminosity_distance(z).value
+        # dL ∝ 1/H0  =>  H0 = H0_ref * median(pred_ref / dL)
+        H0 = H0_ref * float(np.median(pred_ref / dL))
+        if not np.isfinite(H0) or H0 <= 0:
+            continue
+        resid = float(np.max(np.abs(pred_ref * (H0_ref / H0) / dL - 1.0)))
+        if best is None or resid < best[2]:
+            best = (H0, float(Om0), resid)
+
+    if best is None or best[2] > rtol:
+        return None
+    return best
+
+
 def _ddL_dz(z, dL_mpc, H0, Om0):
     """d(dL)/dz evaluated at z.  dL in Mpc."""
     c_kms = 299792.458
@@ -245,6 +304,13 @@ class SelectionSet:
         self.Om0 = Om0 or PLANCK15.Om0
         # Whether the caller supplied a non-default reference cosmology.
         self._cosmology_override = (H0 is not None) or (Om0 is not None)
+        # Which cosmology this campaign's pdraw actually used, set on load by
+        # _record_cosmology.  Unset until then rather than guessed: for an
+        # events-format file the answer is "none at all" (GW-09).
+        self._cosmology_source = None
+        self._cosmology_used_H0 = None
+        self._cosmology_used_Om0 = None
+        self._cosmology_detect_residual = None
         # PR4 read-time spin checks: "warn" (default) records + emits a warning
         # on failure, "raise" raises, "off" records silently.  Normalised here
         # so an invalid value fails loudly at construction.
@@ -278,6 +344,68 @@ class SelectionSet:
     # ------------------------------------------------------------------
     # Loading
     # ------------------------------------------------------------------
+    def _record_cosmology(self, source, H0, Om0, resid=None):
+        """Record which cosmology this campaign's ``pdraw`` actually used.
+
+        ``source`` is one of:
+
+        ``"file"``
+            The campaign ships ``dluminosity_distance_dredshift``, so the
+            Jacobian is read verbatim and **no** cosmology enters ``pdraw`` --
+            neither the default nor an override.  Every O4-era ``events`` file
+            is in this class.
+        ``"detected"``
+            The campaign's own generation cosmology, recovered from its
+            ``(z, dL)`` pairs (see :func:`detect_generation_cosmology`) and used
+            for the Jacobian.  This is the correct choice for a file that does
+            not ship the derivative.
+        ``"override"``
+            A caller-supplied ``H0``/``Om0`` was used.
+        ``"default"``
+            Neither detected nor supplied; the Planck15 fallback was used.
+        """
+        self._cosmology_source = source
+        self._cosmology_used_H0 = None if H0 is None else float(H0)
+        self._cosmology_used_Om0 = None if Om0 is None else float(Om0)
+        self._cosmology_detect_residual = (None if resid is None
+                                           else float(resid))
+
+    def _resolve_jacobian_cosmology(self, z, dL):
+        """Pick the cosmology for ``ddL/dz`` on a file that does not ship it.
+
+        An explicit override wins -- an analyst may be deliberately probing a
+        different cosmology -- but the campaign's *own* generation cosmology is
+        the default, because using anything else silently mis-states the
+        Jacobian that converts the generated ``(m1src, m2src, z)`` density into
+        the ``(m1det, q, dL)`` one.
+
+        The production build passed ``(67.74, 0.3089)``.  The endo3 BBH campaign
+        was generated at ``(67.90, 0.3065)``, so its ``pdraw`` carried a
+        z-dependent ~0.28% distortion -- small, but it does NOT cancel the way a
+        constant rescaling would (see GW-04), because the error varies across
+        the redshift range and therefore reweights the injections against one
+        another inside `mu`.
+        """
+        if self._cosmology_override:
+            self._record_cosmology("override", self.H0, self.Om0)
+            return self.H0, self.Om0
+
+        det = detect_generation_cosmology(z, dL)
+        if det is None:
+            warnings.warn(
+                f"{self.path}: could not identify the campaign's generation "
+                f"cosmology from its (z, dL) pairs, and the file does not ship "
+                f"dluminosity_distance_dredshift; falling back to Planck15 "
+                f"({self.H0}, {self.Om0}) for the ddL/dz Jacobian. The draw "
+                f"density is approximate to whatever the true generation "
+                f"cosmology differs by.")
+            self._record_cosmology("default", self.H0, self.Om0)
+            return self.H0, self.Om0
+
+        H0, Om0, resid = det
+        self._record_cosmology("detected", H0, Om0, resid)
+        return H0, Om0
+
     def _load(self):
         if self._loaded:
             return
@@ -527,8 +655,32 @@ class SelectionSet:
         #   |J| = m1det / (1+z)^2 / (ddL/dz)
         if _h5_has_field(ev, "dluminosity_distance_dredshift"):
             ddL = _h5_read_field(ev, "dluminosity_distance_dredshift")
+            # The file ships the derivative, so NO cosmology enters pdraw here:
+            # not the default, not an override.  This campaign's pdraw is exact
+            # either way, so an override is inert rather than harmful, and it
+            # only warns -- what used to make it dishonest was the export
+            # stamping it as though it had been applied, and
+            # cosmology_source_per_campaign now records the truth instead.
+            #
+            # The case that IS corrupting is a COMBINED export, where the same
+            # override changes an endo3-style campaign's pdraw and not this one,
+            # so one product carries two cosmologies while reporting a scalar.
+            # That is refused in the selection builder, which is the only place
+            # every campaign is in view.
+            if self._cosmology_override:
+                warnings.warn(
+                    f"{self.path}: an explicit cosmology (H0={self.H0}, "
+                    f"Om0={self.Om0}) was supplied but is INERT for this "
+                    f"campaign -- it ships "
+                    f"'dluminosity_distance_dredshift', so pdraw uses the "
+                    f"stored derivative and no cosmology at all. The export "
+                    f"records cosmology_source='file' for it. Combining it "
+                    f"with a campaign that DOES honour the override is "
+                    f"refused.")
+            self._record_cosmology("file", None, None)
         else:
-            ddL = _ddL_dz(z, dL, self.H0, self.Om0)
+            H0_j, Om0_j = self._resolve_jacobian_cosmology(z, dL)
+            ddL = _ddL_dz(z, dL, H0_j, Om0_j)
         pdraw = np.exp(ln_pdraw_no_spin) * m1det / (1 + z) ** 2 / ddL
 
         # Time normalisation and mixture/month weights.  The O4 examples keep
@@ -799,7 +951,8 @@ class SelectionSet:
         ln_pdraw_no_spin = np.log(np.maximum(p_mass * p_z, 1e-300))
 
         # Jacobian: (m1src, m2src, z) → (m1det, q, dL)
-        ddL = _ddL_dz(z, dL, self.H0, self.Om0)
+        H0_j, Om0_j = self._resolve_jacobian_cosmology(z, dL)
+        ddL = _ddL_dz(z, dL, H0_j, Om0_j)
         pdraw = np.exp(ln_pdraw_no_spin) * m1det / (1 + z) ** 2 / ddL
 
         # Time normalisation
@@ -818,8 +971,20 @@ class SelectionSet:
         else:
             weights = np.ones_like(pdraw)
 
-        ndraw = int(f.attrs.get("total_generated",
-                                inj.attrs.get("total_generated", 0)))
+        # ndraw is fatal if absent, exactly as in _read_events.  It used to
+        # default to 0, which zeroes this campaign's Essick fraction and sends
+        # every one of its injections to Lambda/0 = inf -- a silently ruined mu
+        # from a missing attribute.
+        if "total_generated" in f.attrs:
+            ndraw = int(f.attrs["total_generated"])
+        elif "total_generated" in inj.attrs:
+            ndraw = int(inj.attrs["total_generated"])
+        else:
+            raise RuntimeError(
+                f"{self.path}: no 'total_generated' attribute on the file or "
+                f"on the 'injections' group. It is the campaign's ndraw, so "
+                f"without it the Essick fraction is zero and every injection "
+                f"in this campaign contributes an infinite weight to mu.")
 
         # FAR columns: O3 uses hardcoded names
         fars_per_search = []

@@ -464,6 +464,9 @@ def validate_export_v2(pe_path, selection_path=None, strict=False):
         # (e) The detection cut: same statistic, same threshold.
         _xcheck_detection_cut(_fail, results, pe_attrs, sel_attrs)
 
+        # (e2) Per-campaign selection cosmology (GW-09).
+        _xcheck_campaign_cosmology(_check, results, sel_attrs)
+
         # (f) 2.1 pairing hash.  Only when BOTH sides carry one -- and never as
         # a substitute for the checks above, which name the offending field.
         pe_hash = pe_attrs.get("contract_hash")
@@ -577,6 +580,55 @@ def _xcheck_detection_cut(_fail, results, pe_attrs, sel_attrs):
                   f"event list is not the FAR-cut list the injections model. "
                   f"Supply the missing FARs or drop those events.")
     results["xcheck_detection_cut"] = True
+
+
+def _xcheck_campaign_cosmology(_check, results, sel_attrs):
+    """The per-campaign cosmology record must be present and self-consistent.
+
+    The scalar ``cosmology_H0``/``Om0`` cannot describe a combined export: an
+    O4-era ``events`` campaign reads its own ddL/dz and uses no cosmology at
+    all, while an endo3-style campaign uses its detected generation cosmology.
+    Both are correct and they are different, so the honest record is per
+    campaign -- ``cosmology_source_per_campaign`` with NaN H0/Om0 for the
+    campaigns that used none.
+
+    Checked here rather than merely written, because a `source` array that
+    disagrees with the H0 array (a campaign claiming ``'file'`` while carrying a
+    finite H0, or claiming ``'detected'`` with NaN) means the export layer and
+    the reader disagree about what happened.
+    """
+    src = sel_attrs.get("cosmology_source_per_campaign")
+    if src is None:
+        # A pre-GW-09 file; nothing to check and nothing to fail.
+        return
+    src = [s.decode() if isinstance(s, bytes) else str(s)
+           for s in np.atleast_1d(src)]
+    H0 = np.atleast_1d(np.asarray(
+        sel_attrs.get("cosmology_H0_per_campaign", []), dtype=float))
+    Om0 = np.atleast_1d(np.asarray(
+        sel_attrs.get("cosmology_Om0_per_campaign", []), dtype=float))
+    n_camp = int(sel_attrs.get("n_campaigns", len(src)))
+
+    _check("sel_cosmology_per_campaign_length",
+           len(src) == n_camp == H0.size == Om0.size,
+           f"n_campaigns={n_camp} but source/H0/Om0 arrays are "
+           f"{len(src)}/{H0.size}/{Om0.size}")
+
+    known = {"file", "detected", "override", "default"}
+    _check("sel_cosmology_source_known",
+           all(s in known for s in src),
+           f"unrecognised cosmology_source value(s) "
+           f"{sorted(set(src) - known)}; known are {sorted(known)}")
+
+    if len(src) == H0.size == Om0.size:
+        bad = [(s, h, o) for s, h, o in zip(src, H0, Om0)
+               if (s == "file") != (not np.isfinite(h) and not np.isfinite(o))]
+        _check("sel_cosmology_source_matches_values", not bad,
+               f"campaign(s) whose cosmology_source disagrees with their "
+               f"recorded H0/Om0: {bad}. 'file' means no cosmology entered "
+               f"pdraw and must carry NaN; every other source must carry "
+               f"finite values.")
+    results.setdefault("xcheck_campaign_cosmology", True)
 
 
 def _sky_checks(_check, cols, prefix, sky_available=None):
