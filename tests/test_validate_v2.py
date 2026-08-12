@@ -583,3 +583,42 @@ def test_the_old_defaults_would_have_failed(tmp_path):
     with pytest.raises(ValueError) as ei:
         validate_export_v2(str(pe), str(sel))
     assert "spin_basis" in str(ei.value)
+
+
+# ======================================================================
+# GW-13: the v1 validator must REPORT a ragged file, not crash on it
+# ======================================================================
+def test_ragged_file_reports_not_crashes(tmp_path):
+    """`validate_export` reshaped p_pe to (nobs, nsamp) unguarded.
+
+    On a file whose length disagrees with its own nobs*nsamp -- exactly the
+    corruption this function exists to diagnose -- it raised out of reshape and
+    took the whole report with it.
+    """
+    from gwcat.catalog import GWCatalog, validate_export
+    from test_export_v2 import _build_store
+
+    st = _build_store(tmp_path)
+    out = tmp_path / "ragged.h5"
+    GWCatalog(st).to_darksirens(str(out), nsamp=16, seed=0, cosmology=_COSMO)
+
+    # Corrupt the declared shape so nobs*nsamp no longer matches the data.
+    with h5py.File(out, "r+") as f:
+        f.attrs["nsamp"] = int(f.attrs["nsamp"]) + 1
+
+    results = validate_export(str(out))
+    assert isinstance(results, dict)
+    assert results["pe_rectangular"] is False
+    # And it kept going: other checks still ran rather than being lost.
+    assert len(results) > 1
+
+
+def test_rectangular_file_passes_the_new_check(tmp_path):
+    from gwcat.catalog import GWCatalog, validate_export
+    from test_export_v2 import _build_store
+
+    st = _build_store(tmp_path)
+    out = tmp_path / "fine.h5"
+    GWCatalog(st).to_darksirens(str(out), nsamp=16, seed=0, cosmology=_COSMO)
+    results = validate_export(str(out))
+    assert results["pe_rectangular"] is True

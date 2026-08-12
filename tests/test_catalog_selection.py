@@ -21,7 +21,7 @@ import pytest
 from gwcat.catalog import GWCatalog
 from gwcat.source_class import load_event_list
 
-from test_source_class_filters import build_mixed_store
+from test_source_class_filters import build_mixed_store, MIXED_EVENTS
 
 
 # Two BBH with FAR, one BBH with MISSING FAR (np.nan), one NSBH with FAR.
@@ -174,3 +174,104 @@ def test_to_darksirens_default_far_policy_attr(tmp_path):
         assert f.attrs["far_policy"] == "drop_missing"
         assert f.attrs["n_events_missing_far"] == 1
         assert f.attrs["nobs"] == 3
+
+
+# ==========================================================================
+# GW-13: four silent-wrong-answer defects in the catalog view
+# ==========================================================================
+def test_z_max_on_select_raises_instead_of_being_ignored(tmp_path):
+    """`select(z_max=...)` was accepted and silently did nothing.
+
+    The same keyword IS implemented on the exporters as a per-sample cut, so an
+    analysis that asked select() for it shipped uncut with no warning.
+    """
+    cat = GWCatalog(build_mixed_store(tmp_path, MIXED_EVENTS))
+    with pytest.raises(NotImplementedError) as ei:
+        cat.select(z_max=0.5)
+    msg = str(ei.value)
+    # Must point at where the cut actually lives...
+    assert "to_darksirens" in msg
+    # ...and say why an event-level median cut is not offered instead.
+    assert "median" in msg or "point estimate" in msg
+
+
+def test_select_without_z_max_is_unaffected(tmp_path):
+    cat = GWCatalog(build_mixed_store(tmp_path, MIXED_EVENTS))
+    assert cat.select(source_class="bbh").n_events == 2
+
+
+def test_event_respects_selection_and_policy(tmp_path):
+    """`event()` indexed the whole store, ignoring the current view.
+
+    Per-event inspection could therefore disagree with the file exported from
+    that same view.
+    """
+    cat = GWCatalog(build_mixed_store(tmp_path, MIXED_EVENTS))
+    bbh = cat.select(source_class="bbh")
+
+    # An event inside the view still reads.
+    d = bbh.event("GW900001_000001")
+    assert len(d["mass_1"]) > 0
+
+    # One filtered OUT must raise, and say it exists but was filtered -- the
+    # two failure modes need different fixes.
+    with pytest.raises(KeyError) as ei:
+        bbh.event("GW900004_000004")          # the BNS
+    msg = str(ei.value)
+    assert "in the store but not in this view" in msg
+
+    # A name that does not exist at all is a different message.
+    with pytest.raises(KeyError) as ei2:
+        bbh.event("GW999999_999999")
+    assert "not in" in str(ei2.value)
+
+
+def test_event_returns_the_same_samples_the_view_would_export(tmp_path):
+    cat = GWCatalog(build_mixed_store(tmp_path, MIXED_EVENTS))
+    bbh = cat.select(source_class="bbh")
+    ev = bbh.event("GW900002_000002")
+    per = bbh.get(["mass_1"], per_event=True)["mass_1"]
+    idx = list(bbh.event_names).index("GW900002_000002")
+    np.testing.assert_array_equal(ev["mass_1"], per[idx])
+
+
+def test_upsampling_recorded(tmp_path):
+    """Bootstrapping an under-sampled event used to leave no trace at all."""
+    few = [dict(e, n=6) for e in MIXED_EVENTS[:2]]
+    cat = GWCatalog(build_mixed_store(tmp_path, few, name="few.h5"))
+    out = tmp_path / "up.h5"
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        cat.to_darksirens(str(out), nsamp=64, seed=0,
+                          cosmology=(67.74, 0.3089))
+    assert any("bootstrapped WITH replacement" in str(x.message) for x in w)
+
+    with h5py.File(out, "r") as f:
+        assert bool(f.attrs["resampled_with_replacement"]) is True
+        assert int(f.attrs["n_events_resampled_with_replacement"]) == 2
+        nu = np.asarray(f.attrs["n_unique_samples_per_event"])
+        assert nu.size == int(f.attrs["nobs"])
+        # 64 rows drawn from 6 distinct samples: the ESS a naive reader would
+        # compute is inflated by ~10x, which is what the attr exists to expose.
+        assert np.all(nu <= 6)
+
+
+def test_no_upsampling_flag_when_samples_are_plentiful(tmp_path):
+    cat = GWCatalog(build_mixed_store(tmp_path, MIXED_EVENTS))
+    out = tmp_path / "noup.h5"
+    cat.to_darksirens(str(out), nsamp=8, seed=0, cosmology=(67.74, 0.3089))
+    with h5py.File(out, "r") as f:
+        assert bool(f.attrs["resampled_with_replacement"]) is False
+        assert np.all(np.asarray(f.attrs["n_unique_samples_per_event"]) == 8)
+
+
+def test_homogeneity_comes_from_the_policy_not_name_uniqueness(tmp_path):
+    """`kept` holds store ROW indices, so two sample sets of one event are two
+    distinct rows and the old uniqueness test called that homogeneous."""
+    cat = GWCatalog(build_mixed_store(tmp_path, MIXED_EVENTS))
+    out = tmp_path / "hom.h5"
+    cat.to_darksirens(str(out), nsamp=8, seed=0, cosmology=(67.74, 0.3089))
+    sub = cat.select()
+    with h5py.File(out, "r") as f:
+        assert (bool(f.attrs["homogeneous_sample_sets"])
+                is bool(sub._homogeneous_sample_sets))

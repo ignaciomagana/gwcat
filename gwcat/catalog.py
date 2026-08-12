@@ -155,6 +155,23 @@ class GWCatalog:
             raise ValueError(
                 "require_far and allow_missing_far are mutually exclusive")
 
+        if z_max is not None:
+            raise NotImplementedError(
+                "select(z_max=...) is not a per-sample redshift cut and never "
+                "was -- the argument was accepted and silently ignored, so an "
+                "analysis asking for it shipped uncut. The per-sample cut lives "
+                "on the exporters: to_darksirens(z_max=...) / "
+                "export(..., z_max=...) / build_pe_product(..., z_max=...), "
+                "which drop samples above z_max before resampling.\n"
+                "\n"
+                "An event-level z_max is deliberately NOT offered in its place. "
+                "select()'s other cuts act on posterior medians, and a hard cut "
+                "on a noisy point estimate is not reproduced by the same cut on "
+                "the injections' true values, so it biases the selection "
+                "function exactly at the boundary (Essick & Fishbach; see "
+                "GW-12). Cut samples, or cut on something the injection "
+                "campaign can reproduce.")
+
         m = np.ones(len(self.names), dtype=bool)
         if compact_type is not None:
             apply_compact_type = (allowed_names is None or
@@ -363,7 +380,41 @@ class GWCatalog:
                                     self._param_index, export=export)
 
     def event(self, name, params=None):
-        i = int(np.nonzero(self.names == name)[0][0])
+        """Posterior samples for one event, as this view sees it.
+
+        Respects the current selection and waveform policy, so inspecting an
+        event agrees with what an export from the same view wrote.  It used to
+        index the *whole* store and ignore both, which meant a per-event check
+        could silently disagree with the file it was checking.
+
+        Raises :class:`KeyError` for a name this view does not contain, naming
+        whether the event exists in the store but was filtered out -- the two
+        cases need different fixes, and a bare ``IndexError`` distinguished
+        neither.
+        """
+        rows = np.nonzero(np.asarray(self.names) == name)[0]
+        sel = np.asarray(self._sel)
+        visible = [int(i) for i in rows if i in set(sel.tolist())]
+
+        if not visible:
+            if rows.size:
+                raise KeyError(
+                    f"event {name!r} is in the store but not in this view: it "
+                    f"was removed by select() or by the waveform policy "
+                    f"({getattr(self, '_waveform_policy', 'preferred')!r}). "
+                    f"Call .event() on the unfiltered catalog to inspect it.")
+            raise KeyError(
+                f"event {name!r} is not in {self.path}. This view has "
+                f"{len(sel)} event row(s).")
+        if len(visible) > 1:
+            raise KeyError(
+                f"event {name!r} matches {len(visible)} sample-set rows in this "
+                f"view (waveform_policy="
+                f"{getattr(self, '_waveform_policy', 'preferred')!r}); "
+                f".event() returns one row. Re-select with a policy that "
+                f"resolves to a single sample set.")
+
+        i = visible[0]
         a, b = self.offsets[i], self.offsets[i + 1]
         params = params or self.params
         with h5py.File(self.path, "r") as f:
@@ -612,6 +663,8 @@ class GWCatalog:
         kept_H0, kept_Om0 = [], []
         # Per-written-row sample-set provenance (PR 6), aligned with ``kept``.
         kept_ss_name, kept_ss_approx, kept_ss_reason = [], [], []
+        # Resampling provenance (GW-13), aligned with ``kept``.
+        n_unique_per_event, upsampled_events = [], []
 
         def _ss_meta(row, field):
             v = sub.meta.get(field)
@@ -650,13 +703,20 @@ class GWCatalog:
             n_kept = len(idx_map)
             rep = (n_kept < nsamp) if replace == "auto" else bool(replace)
             if n_kept < nsamp and not rep:
-                import warnings
                 warnings.warn(f"Event {sub.event_names[e]}: only {n_kept} samples "
                               f"after z_max cut, but replace=False and nsamp={nsamp}. "
                               f"Skipping.")
                 continue
             idx_local = rng.choice(n_kept, size=nsamp, replace=rep)
             idx_orig = idx_map[idx_local]
+            # How many DISTINCT posterior samples back this event's nsamp rows.
+            # Bootstrapping an under-sampled event up to nsamp used to leave no
+            # trace, and every downstream per-event MC ESS is then overestimated
+            # by the duplication factor -- which is precisely the diagnostic
+            # meant to flag the event as unusable.
+            n_unique_per_event.append(int(np.unique(idx_orig).size))
+            if rep and n_kept < nsamp:
+                upsampled_events.append(str(sub.event_names[e]))
 
             m1 = per["mass_1"][e][idx_orig]
             m2 = per["mass_2"][e][idx_orig]
@@ -736,10 +796,25 @@ class GWCatalog:
                     "so the distance prior is evaluated over the full sample "
                     "range, or pass allow_zero_p_pe=True to write it anyway."))
 
-        # Sanity check
+        # Rectangularity.  A raise, not an assert: `python -O` strips asserts,
+        # and this one guards the invariant every consumer reshapes on.
         expected = nobs * nsamp
-        assert data["m1det"].size == expected, \
-            f"data length {data['m1det'].size} != nobs*nsamp = {expected}"
+        if data["m1det"].size != expected:
+            raise RuntimeError(
+                f"internal error: assembled {data['m1det'].size} rows but "
+                f"nobs*nsamp = {nobs}*{nsamp} = {expected}. The export would "
+                f"not be reshapeable by any consumer; refusing to write it.")
+
+        if upsampled_events:
+            warnings.warn(
+                f"{len(upsampled_events)} event(s) had fewer than nsamp="
+                f"{nsamp} samples and were bootstrapped WITH replacement, so "
+                f"their rows repeat: {upsampled_events[:5]}"
+                + (" ..." if len(upsampled_events) > 5 else "")
+                + ". Any per-event effective-sample-size computed from these "
+                  "rows is overestimated by the duplication factor -- read "
+                  "n_unique_samples_per_event, which records how many distinct "
+                  "posterior samples actually back each event.")
 
         with h5py.File(out_path, "w") as f:
             # --- Attributes darksirens reads ---
@@ -798,8 +873,21 @@ class GWCatalog:
             # advertised as homogeneous.
             f.attrs["waveform_policy"] = str(waveform_policy)
             f.attrs["approximant"] = "" if approximant is None else str(approximant)
+            # Derived from the policy resolution, not re-inferred from name
+            # uniqueness: `kept` holds store ROW indices, so two sample sets of
+            # one event are two distinct rows and the old test called that
+            # homogeneous. Under waveform_policy="all" the same physical event
+            # is written N times and the hierarchical likelihood counts each as
+            # an independent detection, which is exactly what this flag exists
+            # to warn about.
             f.attrs["homogeneous_sample_sets"] = bool(
-                len(set(str(k) for k in kept)) == len(kept))
+                getattr(sub, "_homogeneous_sample_sets", True))
+            # Resampling provenance (GW-13).
+            f.attrs["n_unique_samples_per_event"] = np.asarray(
+                n_unique_per_event, dtype=np.int64)
+            f.attrs["resampled_with_replacement"] = bool(upsampled_events)
+            f.attrs["n_events_resampled_with_replacement"] = int(
+                len(upsampled_events))
             f.attrs.create("sample_set_name_per_event",
                            np.array([str(x) for x in kept_ss_name],
                                     dtype=h5py.string_dtype()))
@@ -1046,8 +1134,16 @@ def validate_export(gw_path: str, selection_path: str = None, strict: bool = Fal
                        f"p_dL_pe was truncated at the recorded distance-prior "
                        f"bounds -- re-ingest so the distance prior is evaluated "
                        f"over the full sample range.")
-                # Check no event is entirely zero-weight
-                p_ev = p.reshape(nobs, nsamp) if nobs > 0 and nsamp > 0 else p
+                # Check no event is entirely zero-weight.  A ragged file is the
+                # exact condition this function exists to report, so record it
+                # as a failed check -- reshape would raise and take the whole
+                # report down with it, on the one file that most needs a report.
+                rect = (nobs > 0 and nsamp > 0 and p.size == nobs * nsamp)
+                _check("pe_rectangular", rect,
+                       f"p_pe has {p.size} samples but nobs*nsamp = {nobs}*"
+                       f"{nsamp} = {nobs * nsamp}; the file is not reshapeable "
+                       f"and no consumer can read it")
+                p_ev = p.reshape(nobs, nsamp) if rect else p
                 if p_ev.ndim == 2:
                     all_zero_events = np.sum(p_ev, axis=1) == 0
                     _check("pe_no_allzero_events", not np.any(all_zero_events),

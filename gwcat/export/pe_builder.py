@@ -361,6 +361,8 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     kept = []
     kept_H0, kept_Om0 = [], []
     kept_ss_name, kept_ss_approx, kept_ss_reason = [], [], []
+    # Resampling provenance (GW-13), aligned with ``kept``.
+    n_unique_per_event, upsampled_events = [], []
 
     # ── Non-chieff spin scaffolding (empty / unused for chieff) ─────────────
     # Per-event spin amax from the store meta (aligned with selected events).
@@ -445,6 +447,12 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             continue
         idx_local = rng.choice(n_kept, size=nsamp, replace=rep)
         idx_orig = idx_map[idx_local]
+        # Distinct posterior samples behind this event's nsamp rows.  Without
+        # it a bootstrapped event's per-event ESS reads high by the duplication
+        # factor -- the very diagnostic that should flag it as unusable.
+        n_unique_per_event.append(int(np.unique(idx_orig).size))
+        if rep and n_kept < nsamp:
+            upsampled_events.append(str(sub.event_names[e]))
 
         m1 = per["mass_1"][e][idx_orig]
         m2 = per["mass_2"][e][idx_orig]
@@ -862,6 +870,10 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         "waveform_policy": str(waveform_policy),
         "approximant": "" if approximant is None else str(approximant),
         "homogeneous_sample_sets": homogeneous,
+        "n_unique_samples_per_event": np.asarray(n_unique_per_event,
+                                                 dtype=np.int64),
+        "resampled_with_replacement": bool(upsampled_events),
+        "n_events_resampled_with_replacement": int(len(upsampled_events)),
         "sample_set_name_per_event": np.array(
             [str(x) for x in kept_ss_name], dtype=_str),
         "sample_set_approximant_per_event": np.array(
@@ -916,6 +928,9 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         "waveform_policy": str(waveform_policy),
         "approximant": None if approximant is None else str(approximant),
         "homogeneous_sample_sets": homogeneous,
+        "n_unique_samples_per_event": [int(x) for x in n_unique_per_event],
+        "resampled_with_replacement": bool(upsampled_events),
+        "n_events_resampled_with_replacement": int(len(upsampled_events)),
         "n_samples_out_of_support": int(n_out),
         "frac_samples_out_of_support": float(frac_out),
         "prior_reweight_ess_min": (float(np.min(ess_per_event))
