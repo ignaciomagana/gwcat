@@ -47,6 +47,7 @@ from .cosmology import (make_cosmology, uniform_source_frame_prob,
                         PLANCK15, O4_FALLBACK)
 from .source_class import (normalize_source_class, classify_by_mass,
                           DEFAULT_NSBH_MASS_THRESHOLD)
+from .spin import chi_p_from_components
 
 # --------------------------------------------------------------------------
 # Parameter sets
@@ -1069,29 +1070,11 @@ def resolve_spin_prior(analysis, analyses, priors, a1_samples, a2_samples,
     return amax_1, amax_2, kind, source
 
 
-def _chi_p_from_samples(a_1, a_2, cos_tilt_1, cos_tilt_2, mass_1, mass_2):
-    """Effective precession spin ``chi_p`` (Schmidt, Ohme & Hannam 2015) from
-    posterior samples.
-
-    ``q = mass_2 / mass_1`` (the mass ratio; either detector or source frame --
-    only the ratio matters).  ``sin_tilt_i = sqrt(1 - cos_tilt_i**2)``::
-
-        chi_p = max(a_1*sin_tilt_1, q*(4q + 3)/(4 + 3q)*a_2*sin_tilt_2)
-
-    NOTE: this duplicates the shared implementation that will land as
-    ``gwcat.spin.chi_p_from_components`` in a parallel PR.  It is kept
-    self-contained here on purpose (no import from ``gwcat.spin``) to avoid a
-    cross-PR dependency; unify the two once both have merged.
-    """
-    a_1 = np.asarray(a_1, float)
-    a_2 = np.asarray(a_2, float)
-    cos_tilt_1 = np.asarray(cos_tilt_1, float)
-    cos_tilt_2 = np.asarray(cos_tilt_2, float)
-    q = np.asarray(mass_2, float) / np.asarray(mass_1, float)
-    sin_1 = np.sqrt(np.clip(1.0 - cos_tilt_1 ** 2, 0.0, None))
-    sin_2 = np.sqrt(np.clip(1.0 - cos_tilt_2 ** 2, 0.0, None))
-    return np.maximum(a_1 * sin_1,
-                      q * (4.0 * q + 3.0) / (4.0 + 3.0 * q) * a_2 * sin_2)
+#: The single chi_p implementation (GW-08).  ``ingest`` previously carried a
+#: byte-for-byte duplicate of the Schmidt formula with a "unify the two once both
+#: have merged" note; that TODO is now discharged, so a change to the definition
+#: cannot land in one copy only.
+_chi_p_from_samples = chi_p_from_components
 
 
 def _derive_spin_columns(rec):

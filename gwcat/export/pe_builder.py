@@ -89,6 +89,11 @@ def _group_available_all(sub, *members):
     return bool(ok.all())
 
 
+class ChiPDefinitionError(ValueError):
+    """The stored chi_p column is not the Schmidt chi_p of the store's own
+    components, so a joint (chi_eff, chi_p) prior would not describe it."""
+
+
 def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
                      far_max=None, pastro_min=None, z_max=None,
                      replace="auto", cosmology=None, amax=0.99,
@@ -97,7 +102,9 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
                      source_class=None, event_list=None,
                      allow_missing_far=False, require_far=False,
                      waveform_policy="preferred", approximant=None,
-                     allow_zero_p_pe=False):
+                     allow_zero_p_pe=False,
+                     chi_p_definition="schmidt_recomputed",
+                     chi_p_def_tol=1e-6):
     """Build a PE :class:`ExportProduct` from a :class:`~gwcat.catalog.GWCatalog`.
 
     For ``spin_basis="chieff"`` this reproduces the legacy
@@ -115,11 +122,27 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
     weight means the store's ``p_dL_pe`` was written by a pre-GW-01 ingest that
     truncated the distance prior at its recorded bounds.  Pass
     ``allow_zero_p_pe=True`` to downgrade that to a warning.
+
+    ``chi_p_definition`` (GW-08) selects which quantity the ``chip`` column is:
+
+    * ``"schmidt_recomputed"`` (default) -- always recompute the Schmidt chi_p
+      from the store's own ``(a_i, cos_tilt_i, m_i)``.  This is the definition
+      :class:`~gwcat.spin.ChiEffChiPPrior` is constructed for, so the column and
+      the prior evaluated on it describe the same spin configuration.
+    * ``"file"`` -- keep the release's own ``chi_p`` column, and **fail** when it
+      disagrees with the Schmidt value by more than ``chi_p_def_tol``.  For six
+      GWTC-2.1/3 ``C01:Mixed`` events the stored column is not the Schmidt chi_p
+      of the store's own components, so half the column would be evaluated under
+      a prior that does not describe it.
     """
     if spin_basis not in _KNOWN_SPIN_BASES:
         raise ValueError(
             f"unknown spin_basis={spin_basis!r}; known bases are "
             f"{list(_KNOWN_SPIN_BASES)}.")
+    if chi_p_definition not in ("schmidt_recomputed", "file"):
+        raise ValueError(
+            f"chi_p_definition must be 'schmidt_recomputed' or 'file'; got "
+            f"{chi_p_definition!r}.")
 
     need_extras = spin_basis != "chieff"
 
@@ -259,6 +282,8 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
         kept_amax1, kept_amax2 = [], []
         a1_list, a2_list, cost1_list, cost2_list, chip_list = [], [], [], [], []
         chip_src_list = []
+        chip_maxdiff_list = []
+        chip_mismatch_events, chip_no_ingredient_events = [], []
         fallback_events, unrecognized_events, mismatch_events = [], [], []
 
     def _resolve_cost(e, avail_cos, avail_tilt, cos_name, tilt_name):
@@ -379,19 +404,47 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
             cost1_e = None if cost1_full is None else cost1_full[idx_orig]
             cost2_e = None if cost2_full is None else cost2_full[idx_orig]
 
-            # chip: prefer the stored chi_p, else derive from ingredients.
+            # chip resolution (GW-08).  ``chi_p_definition`` decides whether the
+            # exported column is the Schmidt chi_p of the store's OWN
+            # (a_i, cos_tilt_i, m_i) -- the definition ChiEffChiPPrior is built
+            # for -- or the release's stored column, which for six GWTC-2.1/3
+            # C01:Mixed events is a different quantity.
+            have_ingredients = (a1_e is not None and a2_e is not None
+                                and cost1_e is not None and cost2_e is not None)
+            chip_from_file = None
             if avail_chip[e]:
-                chip_e = per_extra["chi_p"][e][idx_orig]
-                chip_src = "file"
-            elif (a1_e is not None and a2_e is not None
-                  and cost1_e is not None and cost2_e is not None):
+                chip_from_file = per_extra["chi_p"][e][idx_orig]
+            chip_derived = None
+            if have_ingredients:
                 from ..spin import chi_p_from_components
-                chip_e = chi_p_from_components(a1_e, a2_e, cost1_e, cost2_e,
-                                               m1, m2)
-                chip_src = "derived"
-            else:  # pragma: no cover - guarded by requirement checks
-                chip_e = None
-                chip_src = ""
+                chip_derived = chi_p_from_components(a1_e, a2_e, cost1_e,
+                                                     cost2_e, m1, m2)
+
+            # Definition-consistency diagnostic, whenever both are available.
+            maxdiff = np.nan
+            if chip_from_file is not None and chip_derived is not None:
+                maxdiff = float(np.max(np.abs(
+                    np.asarray(chip_from_file, float) - chip_derived)))
+            chip_maxdiff_list.append(maxdiff)
+
+            if chi_p_definition == "schmidt_recomputed":
+                if chip_derived is not None:
+                    chip_e, chip_src = chip_derived, "schmidt_recomputed"
+                elif chip_from_file is not None:
+                    chip_e, chip_src = chip_from_file, "file_no_ingredients"
+                    chip_no_ingredient_events.append(str(sub.event_names[e]))
+                else:  # pragma: no cover - guarded by requirement checks
+                    chip_e, chip_src = None, ""
+            else:  # "file"
+                if chip_from_file is not None:
+                    chip_e, chip_src = chip_from_file, "file"
+                    if np.isfinite(maxdiff) and maxdiff > chi_p_def_tol:
+                        chip_mismatch_events.append(
+                            (str(sub.event_names[e]), maxdiff))
+                elif chip_derived is not None:
+                    chip_e, chip_src = chip_derived, "derived"
+                else:  # pragma: no cover
+                    chip_e, chip_src = None, ""
             chip_list.append(chip_e)
             chip_src_list.append(chip_src)
 
@@ -458,6 +511,30 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
                 f"have spin_amax_1 != spin_amax_2; the joint (chi_eff, chi_p) "
                 f"prior assumes a single amax and uses amax_1: "
                 f"{mismatch_events}")
+        # ── chi_p definition consistency (GW-08) ────────────────────────────
+        if chip_mismatch_events:
+            listed = ", ".join(f"{nm}: {d:.4g}" for nm, d in
+                               chip_mismatch_events[:10])
+            more = ("" if len(chip_mismatch_events) <= 10
+                    else f", ... (+{len(chip_mismatch_events) - 10} more)")
+            raise ChiPDefinitionError(
+                f"chi_p_definition='file': {len(chip_mismatch_events)} event(s) "
+                f"ship a chi_p column that is not the Schmidt chi_p of the "
+                f"store's own (a_i, cos_tilt_i, m_i), by more than "
+                f"chi_p_def_tol={chi_p_def_tol:g} "
+                f"[max|chi_p_file - chi_p_schmidt|]: {listed}{more}. "
+                f"ChiEffChiPPrior is constructed strictly for the Schmidt "
+                f"definition, so exporting these would evaluate part of the "
+                f"column under a prior that does not describe it. Use "
+                f"chi_p_definition='schmidt_recomputed' (the default), or raise "
+                f"chi_p_def_tol deliberately.")
+        if chip_no_ingredient_events:
+            warnings.warn(
+                f"chi_p_definition='schmidt_recomputed': "
+                f"{len(chip_no_ingredient_events)} event(s) lack the component "
+                f"ingredients, so the release's own chi_p column was kept and "
+                f"recorded as 'file_no_ingredients': "
+                f"{chip_no_ingredient_events}")
 
         # Basis-specific provenance attrs (never written for chieff).
         spin_attrs = {
@@ -467,6 +544,12 @@ def build_pe_product(cat, *, spin_basis="chieff", nsamp=4096, seed=0,
             "spin_prior_unrecognized_events": np.array(
                 unrecognized_events, dtype=_str),
             "chi_p_source_per_event": np.array(chip_src_list, dtype=_str),
+            # GW-08: the definition in force, and the measured disagreement with
+            # the release's own column (NaN where it could not be compared).
+            "chi_p_definition": str(chi_p_definition),
+            "chi_p_def_maxdiff_per_event": np.asarray(chip_maxdiff_list,
+                                                      dtype=float),
+            "chi_p_def_tol": float(chi_p_def_tol),
             "spin_amax_fallback": float(amax_fallback),
         }
         if spin_basis == "component":

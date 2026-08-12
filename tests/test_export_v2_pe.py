@@ -192,8 +192,13 @@ def test_component_ppe_constant_per_event(tmp_path):
 
     # The two events' amax differ -> different constants survive concatenation.
     assert not np.isclose(ratios[0], ratios[1])
-    assert attrs["spin_basis"].decode() if isinstance(
-        attrs["spin_basis"], bytes) else attrs["spin_basis"] == "component"
+    # Precedence bug (GW-08): `X.decode() if isinstance(X, bytes) else X == "c"`
+    # parses as `X.decode() if ... else (X == "c")`, so under a bytes-returning
+    # h5py the assert reduced to `assert b"component"` -- truthy for ANY
+    # non-empty value, i.e. a no-op.  Decode first, then compare.
+    basis = attrs["spin_basis"]
+    basis = basis.decode() if isinstance(basis, bytes) else basis
+    assert basis == "component"
     assert bool(attrs["component_spin_prior_applied_to_p_pe"]) is True
 
 
@@ -261,15 +266,21 @@ def test_component_tilt_only_derives_cos(tmp_path):
 # ==========================================================================
 # 4. chi_p from file vs derived; chi_p_source_per_event records which
 # ==========================================================================
-def test_chi_p_source_file_vs_derived(tmp_path):
-    # Event A ships chi_p (offset from the formula so "file" is distinguishable);
-    # event B ships only ingredients -> chi_p derived at export.
+def test_chi_p_definition_default_recomputes_schmidt_for_every_event(tmp_path):
+    """GW-08: the default no longer PRESERVES a mismatched stored chi_p.
+
+    This test used to assert the opposite -- that an event shipping a chi_p
+    column offset from the Schmidt value kept that offset in the export.  That is
+    exactly the defect: ChiEffChiPPrior is constructed strictly for the Schmidt
+    definition, so a column that is a different quantity gets evaluated under a
+    prior that does not describe it.  The default now recomputes.
+    """
     events = [
         {"name": "GWc3_000001", "provide": _FULL_SPIN | {"chi_p"},
          "chi_p_offset": 0.05},
         {"name": "GWc3_000002", "provide": _FULL_SPIN},
     ]
-    store, raw = _build_spin_store(tmp_path, events, n_per_event=200)
+    store, _raw = _build_spin_store(tmp_path, events, n_per_event=200)
     cat = GWCatalog(store)
     out = tmp_path / "chipsrc.h5"
     cat.export(str(out), format="gwcat2", spin_basis="component",
@@ -278,23 +289,69 @@ def test_chi_p_source_file_vs_derived(tmp_path):
     cols, attrs = _read(out)
     src = [s.decode() if isinstance(s, bytes) else s
            for s in attrs["chi_p_source_per_event"]]
-    assert src == ["file", "derived"]
+    assert src == ["schmidt_recomputed", "schmidt_recomputed"]
+    defn = attrs["chi_p_definition"]
+    assert (defn.decode() if isinstance(defn, bytes) else defn) \
+        == "schmidt_recomputed"
 
-    # File event: chip == stored chi_p resampled (carries the +0.05 offset, so
-    # it is NOT the bare formula).
-    idxA = _replicate_idx(raw["GWc3_000001"]["a_1"].size, 50, 2)
-    np.testing.assert_allclose(cols["chip"][:50],
-                               raw["GWc3_000001"]["chi_p"][idxA])
-    formulaA = chi_p_from_components(
-        cols["a1"][:50], cols["a2"][:50], cols["cost1"][:50],
-        cols["cost2"][:50], cols["m1det"][:50], cols["m2det"][:50])
-    assert np.allclose(cols["chip"][:50], formulaA + 0.05, rtol=1e-9)
+    # Both events' chip is the Schmidt formula on the store's OWN components.
+    formula = chi_p_from_components(
+        cols["a1"], cols["a2"], cols["cost1"], cols["cost2"],
+        cols["m1det"], cols["m2det"])
+    np.testing.assert_allclose(cols["chip"], formula, rtol=1e-12)
 
-    # Derived event: chip == Schmidt formula on the resampled ingredients.
-    formulaB = chi_p_from_components(
-        cols["a1"][50:], cols["a2"][50:], cols["cost1"][50:],
-        cols["cost2"][50:], cols["m1det"][50:], cols["m2det"][50:])
-    np.testing.assert_allclose(cols["chip"][50:], formulaB, rtol=1e-12)
+    # The disagreement with the release's column is measured and recorded, not
+    # silently carried: ~0.05 for the offset event, NaN where uncomparable.
+    maxdiff = np.asarray(attrs["chi_p_def_maxdiff_per_event"], dtype=float)
+    assert maxdiff[0] == pytest.approx(0.05, rel=1e-6)
+    assert np.isnan(maxdiff[1])
+
+
+def test_chi_p_definition_file_fails_on_a_mismatched_column(tmp_path):
+    """``chi_p_definition="file"`` is available but refuses a column that is not
+    the Schmidt chi_p of the store's own components."""
+    from gwcat.export.pe_builder import ChiPDefinitionError
+
+    events = [
+        {"name": "GWc3_000001", "provide": _FULL_SPIN | {"chi_p"},
+         "chi_p_offset": 0.05},
+    ]
+    store, _raw = _build_spin_store(tmp_path, events, n_per_event=200)
+    cat = GWCatalog(store)
+    with pytest.raises(ChiPDefinitionError) as exc:
+        cat.export(str(tmp_path / "bad.h5"), format="gwcat2",
+                   spin_basis="component", nsamp=50, seed=2,
+                   cosmology=(67.74, 0.3089), chi_p_definition="file")
+    msg = str(exc.value)
+    assert "GWc3_000001" in msg
+    assert "Schmidt" in msg
+
+
+def test_chi_p_definition_file_accepts_a_consistent_column(tmp_path):
+    """No offset -> the stored column IS the Schmidt value, so "file" is fine."""
+    events = [{"name": "GWc3_000001", "provide": _FULL_SPIN | {"chi_p"}}]
+    store, raw = _build_spin_store(tmp_path, events, n_per_event=200)
+    cat = GWCatalog(store)
+    out = tmp_path / "ok.h5"
+    cat.export(str(out), format="gwcat2", spin_basis="component", nsamp=50,
+               seed=2, cosmology=(67.74, 0.3089), chi_p_definition="file")
+    cols, attrs = _read(out)
+    src = [s.decode() if isinstance(s, bytes) else s
+           for s in attrs["chi_p_source_per_event"]]
+    assert src == ["file"]
+    idx = _replicate_idx(raw["GWc3_000001"]["a_1"].size, 50, 2)
+    np.testing.assert_allclose(cols["chip"],
+                               raw["GWc3_000001"]["chi_p"][idx])
+
+
+def test_chi_p_definition_rejects_an_unknown_value(tmp_path):
+    events = [{"name": "GWc3_000001", "provide": _FULL_SPIN}]
+    store, _raw = _build_spin_store(tmp_path, events, n_per_event=100)
+    with pytest.raises(ValueError, match="chi_p_definition"):
+        GWCatalog(store).export(str(tmp_path / "x.h5"), format="gwcat2",
+                                spin_basis="component", nsamp=50, seed=0,
+                                cosmology=(67.74, 0.3089),
+                                chi_p_definition="whatever")
 
 
 # ==========================================================================

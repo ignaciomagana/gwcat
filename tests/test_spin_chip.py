@@ -254,3 +254,99 @@ def test_out_of_support_chi_p_is_clipped():
     prior = ChiEffChiPPrior(amax=0.99)
     lp = prior.logprob(0.0, 1.2, 1.0, 1.0)      # chi_p=1.2 > amax
     assert lp == pytest.approx(-50.0)
+
+
+# ==========================================================================
+# GW-08: one chi_p definition, enforced
+# ==========================================================================
+def test_chi_p_impls_agree_between_ingest_and_spin():
+    """ingest carried a byte-for-byte duplicate of the Schmidt formula with a
+    "unify once both have merged" TODO.  It is now the same object, so the two
+    cannot drift."""
+    from gwcat.ingest import _chi_p_from_samples
+    from gwcat.spin import chi_p_from_components
+
+    assert _chi_p_from_samples is chi_p_from_components
+
+    rng = np.random.default_rng(11)
+    n = 5000
+    m1 = rng.uniform(5.0, 80.0, n)
+    m2 = m1 * rng.uniform(0.05, 1.0, n)      # guarantees m2 <= m1
+    a1 = rng.uniform(0.0, 0.99, n)
+    a2 = rng.uniform(0.0, 0.99, n)
+    c1 = rng.uniform(-1.0, 1.0, n)
+    c2 = rng.uniform(-1.0, 1.0, n)
+    np.testing.assert_allclose(_chi_p_from_samples(a1, a2, c1, c2, m1, m2),
+                               chi_p_from_components(a1, a2, c1, c2, m1, m2),
+                               rtol=1e-12, atol=0)
+
+
+def test_chi_p_reference_values_independent_of_the_implementation():
+    """Hand-computed Schmidt values, so the test cannot be tautological.
+
+    Three existing tests in this module compare the function against a fixture
+    whose chi_p was written BY the function -- they would pass under any formula.
+    These numbers come from k = q(4q+3)/(3q+4) evaluated by hand.
+    """
+    from gwcat.spin import chi_p_from_components
+
+    # 1. Equal masses (q = 1): k = 1*7/7 = 1, so chi_p = max(a1 sinθ1, a2 sinθ2).
+    #    a1=0.8, θ1=90deg -> 0.8 ;  a2=0.5, θ2=90deg -> 0.5 ; max = 0.8
+    assert chi_p_from_components(0.8, 0.5, 0.0, 0.0, 30.0, 30.0) == \
+        pytest.approx(0.8)
+
+    # 2. q = 0.5: k = 0.5*(2+3)/(1.5+4) = 2.5/5.5 = 5/11.
+    #    a1=0.1, θ1=90deg -> 0.1 ; a2=0.9, θ2=90deg -> (5/11)*0.9 = 0.409090...
+    assert chi_p_from_components(0.1, 0.9, 0.0, 0.0, 40.0, 20.0) == \
+        pytest.approx(5.0 / 11.0 * 0.9)
+
+    # 3. Aligned spins (cos θ = 1) have no in-plane component at all.
+    assert chi_p_from_components(0.9, 0.9, 1.0, 1.0, 40.0, 20.0) == \
+        pytest.approx(0.0)
+
+    # 4. Only the mass RATIO enters: detector- and source-frame masses agree.
+    z = 0.3
+    assert chi_p_from_components(0.4, 0.7, 0.2, -0.3, 40.0, 20.0) == \
+        pytest.approx(chi_p_from_components(0.4, 0.7, 0.2, -0.3,
+                                           40.0 * (1 + z), 20.0 * (1 + z)))
+
+
+def test_chi_p_refuses_unsorted_masses_instead_of_computing_k_gt_1():
+    """m2 > m1 makes the Schmidt coefficient exceed 1, so the "max" picks the
+    wrong branch and the result is not chi_p."""
+    from gwcat.spin import chi_p_from_components
+
+    with pytest.raises(ValueError, match="primary"):
+        chi_p_from_components(0.5, 0.5, 0.0, 0.0, 20.0, 40.0)
+    # the message names how badly, and how many
+    with pytest.raises(ValueError, match="2 sample"):
+        chi_p_from_components(np.full(3, 0.5), np.full(3, 0.5),
+                              np.zeros(3), np.zeros(3),
+                              np.array([40.0, 20.0, 20.0]),
+                              np.array([20.0, 40.0, 30.0]))
+    # equal masses are fine (the boundary is inclusive)
+    assert chi_p_from_components(0.5, 0.5, 0.0, 0.0, 30.0, 30.0) == \
+        pytest.approx(0.5)
+
+
+def test_chieff_prior_uses_the_exact_q_reflection_not_a_clamp():
+    """ChiEffPrior tabulates q = m_primary/(m1+m2) on [0.5, 1].
+
+    Passing the lighter body first used to give q < 0.5, which np.interp silently
+    CLAMPED to the q = 0.5 edge -- an equal-mass density for an unequal-mass
+    system.  chi_eff is symmetric under relabelling the two bodies at a single
+    amax, so the correct mapping is the exact reflection q -> 1 - q.
+    """
+    from gwcat.spin import ChiEffPrior
+
+    prior = ChiEffPrior(amax=0.99, nq=64, nchi=256)
+    chi = np.linspace(-0.8, 0.8, 33)
+    m_heavy, m_light = 40.0, 10.0            # q = 0.8 vs the clamped 0.5
+
+    swapped = prior.prob(chi, m_light, m_heavy)
+    ordered = prior.prob(chi, m_heavy, m_light)
+    np.testing.assert_allclose(swapped, ordered, rtol=1e-12, atol=0)
+
+    # ... and that is NOT the equal-mass density the clamp would have returned.
+    equal = prior.prob(chi, 25.0, 25.0)
+    assert np.max(np.abs(ordered - equal)) > 1e-3

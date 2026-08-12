@@ -115,9 +115,19 @@ class ChiEffPrior:
     # Public API
     # ------------------------------------------------------------------
     def prob(self, chi_eff, m1, m2):
-        """p(χ_eff | m1, m2, amax).  Vectorized over inputs."""
-        q = np.asarray(m1, dtype=float) / (np.asarray(m1, dtype=float)
-                                           + np.asarray(m2, dtype=float))
+        """p(χ_eff | m1, m2, amax).  Vectorized over inputs.
+
+        The grid is tabulated in the primary-mass fraction
+        ``q = m_primary/(m1+m2) ∈ [0.5, 1]``, so an input with ``m1 < m2`` is
+        mapped by the exact reflection ``q → 1 − q`` (GW-08).  Previously such an
+        input produced ``q < 0.5``, which ``_interp2d``'s ``np.interp`` silently
+        CLAMPED to the ``q = 0.5`` edge -- an equal-mass density for an unequal-
+        mass system.  The reflection is exact because ``χ_eff`` is symmetric
+        under relabelling the two bodies when they share one ``amax``.
+        """
+        m1a = np.asarray(m1, dtype=float)
+        m2a = np.asarray(m2, dtype=float)
+        q = np.maximum(m1a, m2a) / (m1a + m2a)
         chi = np.asarray(chi_eff, dtype=float)
         scalar = q.ndim == 0 and chi.ndim == 0
         q = np.atleast_1d(q)
@@ -221,6 +231,24 @@ def chi_p_from_components(a_1, a_2, cos_tilt_1, cos_tilt_2, mass_1, mass_2):
     cos_tilt_2 = np.asarray(cos_tilt_2, dtype=float)
     mass_1 = np.asarray(mass_1, dtype=float)
     mass_2 = np.asarray(mass_2, dtype=float)
+
+    # Enforce the Schmidt convention rather than silently computing k > 1
+    # (GW-08).  The formula is only defined with mass_1 the PRIMARY: for
+    # mass_2 > mass_1 the coefficient q(4q+3)/(4+3q) exceeds 1 and the "max"
+    # picks the wrong branch, i.e. it returns a number that is not chi_p.
+    # Verified on the production store: 0 of 6.87M samples have m2 > m1, so this
+    # only ever catches a caller that mixed up the two columns.
+    bad = np.asarray(mass_2 > mass_1)
+    if bad.any():
+        n_bad = int(bad.sum())
+        worst = float(np.max(np.asarray(mass_2 / mass_1)[bad]))
+        raise ValueError(
+            f"chi_p_from_components: mass_1 must be the primary (mass_1 >= "
+            f"mass_2), but {n_bad} sample(s) have mass_2 > mass_1 (worst "
+            f"mass_2/mass_1 = {worst:.6g}). Swap the (mass, a, cos_tilt) pairs "
+            f"so the more massive body is body 1; do not pass them unsorted, "
+            f"because q > 1 makes the Schmidt coefficient exceed 1 and the "
+            f"result is not chi_p.")
 
     q = mass_2 / mass_1
     k = q * (4.0 * q + 3.0) / (4.0 + 3.0 * q)
