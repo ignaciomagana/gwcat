@@ -128,6 +128,19 @@ def test_package_version_returns_nonempty_string():
     assert isinstance(v, str) and v
 
 
+def test_p_astro_available_counts_either_spelling(tmp_path):
+    """The count used to consult `pastro` only when the whole `p_astro` COLUMN
+    was absent, so a store that populated only the legacy column reported no
+    p_astro for any event (GW-14)."""
+    store = _build_mixed_store(tmp_path, MIXED_EVENTS, name="legacy_pa.h5")
+    with h5py.File(store, "a") as f:
+        # p_astro column present but empty; the value lives under `pastro`.
+        f["meta/p_astro"][:] = np.nan
+    info = summarize_catalog(GWCatalog(store))
+    assert info["p_astro_available_count"] == 3
+
+
+
 # ==========================================================================
 # summarize_catalog
 # ==========================================================================

@@ -334,6 +334,22 @@ def test_event_table_still_parses_the_legacy_sub_dict():
     assert table["GW1"]["pastro"] == 0.9
 
 
+def test_event_table_accepts_either_p_astro_spelling():
+    """One quantity, two spellings (GW-14): a payload (or a seeded table) that
+    writes `pastro` must not read as an absent p_astro."""
+    from gwcat.fetch import _parse_gwosc_event_table_page
+
+    table = {}
+    _parse_gwosc_event_table_page(
+        {"events": {"GW3-v1": {"far": 1.0, "pastro": 0.77}}}, table)
+    assert table["GW3"]["pastro"] == 0.77
+    # A later page carrying nothing must not clobber the earlier finite value,
+    # whichever spelling it was seeded under.
+    seeded = {"GW4": {"far": 2.0, "p_astro": 0.66}}
+    _parse_gwosc_event_table_page({"events": {"GW4-v2": {}}}, seeded)
+    assert seeded["GW4"]["pastro"] == 0.66
+
+
 def test_top_level_wins_over_the_legacy_sub_dict():
     from gwcat.fetch import _parse_gwosc_event_table_page
 

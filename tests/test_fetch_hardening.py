@@ -40,7 +40,7 @@ import gwcat.fetch_cache as fetch_cache
 import gwcat.ingest as ing
 from gwcat.catalog import GWCatalog
 from gwcat.event_metadata import (assemble_event_metadata, metadata_diagnostics,
-                                  load_user_overrides)
+                                  load_user_overrides, resolve_pastro)
 from gwcat.ingest import build_store, IngestConfig
 
 
@@ -496,3 +496,61 @@ def test_build_store_offline_missing_cache_raises_not_silently_swallowed(tmp_pat
         build_store([str(path)], str(out), event_table=None,
                     cfg=IngestConfig(validate_prior=False),
                     cache_dir=tmp_path / "empty_cache", offline=True)
+
+
+# ==========================================================================
+# 7. p_astro / pastro: one quantity, both columns (GW-14)
+# ==========================================================================
+def test_p_astro_only_table_populates_both_columns(tmp_path, monkeypatch):
+    """A manifest/override supplying `p_astro` -- the key this package's own
+    documentation uses -- must reach the legacy `pastro` column too.
+
+    It used to be stored under `p_astro` alone, leaving `pastro` NaN, and
+    ``select(pastro_min=...)`` read only `pastro`: the whole event set dropped
+    out of the selection.
+    """
+    path = _one_event_store(tmp_path, monkeypatch, "GW992222_000001", seed=4)
+    event_table, _ = assemble_event_metadata(
+        ["GW992222_000001"],
+        manifest_defaults={"p_astro": 0.999})
+
+    out = tmp_path / "store.h5"
+    build_store([str(path)], str(out), event_table=event_table,
+                cfg=IngestConfig(validate_prior=False))
+
+    cat = GWCatalog(str(out))
+    assert cat.meta["p_astro"][0] == pytest.approx(0.999)
+    assert cat.meta["pastro"][0] == pytest.approx(0.999)
+    assert cat.select(pastro_min=0.9).n_events == 1
+
+
+def test_pastro_only_table_populates_both_columns(tmp_path, monkeypatch):
+    """Symmetrically: the GWOSC fetch layer's `pastro` key fills `p_astro`."""
+    path = _one_event_store(tmp_path, monkeypatch, "GW993333_000001", seed=5)
+    event_table, _ = assemble_event_metadata(
+        ["GW993333_000001"],
+        online_table={"GW993333_000001": {"far": 1e-8, "pastro": 0.88}})
+
+    out = tmp_path / "store.h5"
+    build_store([str(path)], str(out), event_table=event_table,
+                cfg=IngestConfig(validate_prior=False))
+
+    cat = GWCatalog(str(out))
+    assert cat.meta["p_astro"][0] == pytest.approx(0.88)
+    assert cat.meta["pastro"][0] == pytest.approx(0.88)
+
+
+def test_override_beats_online_across_spellings(tmp_path):
+    """Precedence is over layers, not over spellings: an override written as
+    `p_astro` must beat an online table written as `pastro`, and vice versa."""
+    ev = ["GW994444_000001"]
+    table, diag = assemble_event_metadata(
+        ev, online_table={ev[0]: {"pastro": 0.5}},
+        user_overrides={ev[0]: {"p_astro": 0.99}})
+    assert resolve_pastro(table[ev[0]]) == pytest.approx(0.99)
+    assert diag[ev[0]]["pastro"]["source"] == "user_override"
+
+    table2, _ = assemble_event_metadata(
+        ev, online_table={ev[0]: {"p_astro": 0.5}},
+        user_overrides={ev[0]: {"pastro": 0.99}})
+    assert resolve_pastro(table2[ev[0]]) == pytest.approx(0.99)

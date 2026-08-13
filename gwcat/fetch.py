@@ -61,6 +61,7 @@ from urllib.request import urlopen, Request
 from urllib.error import HTTPError
 
 from . import fetch_cache
+from .event_metadata import resolve_pastro
 from .manifests import (
     ManifestValidationError,
     ReleaseManifest,
@@ -743,7 +744,10 @@ def _parse_gwosc_event_table_page(data: dict, table: dict) -> None:
         # response has no "parameters" key and does carry e.g.
         # far=140.0, p_astro=0.61501 at the top level.
         far = _coerce_float(info.get("far"))
-        pastro = _coerce_float(info.get("p_astro"))
+        # Either spelling of the one quantity (GW-14): the live API says
+        # `p_astro`, a recorded/older payload may say `pastro`, and the table
+        # this builds is keyed `pastro` for every downstream reader.
+        pastro = resolve_pastro(info)
         # Keep the legacy sub-dict as a fallback so a future API shape (or a
         # recorded old payload) still parses, but never let it override a real
         # top-level value.
@@ -755,7 +759,7 @@ def _parse_gwosc_event_table_page(data: dict, table: dict) -> None:
                 if not np.isfinite(far):
                     far = _coerce_float(pset.get("far"))
                 if not np.isfinite(pastro):
-                    pastro = _coerce_float(pset.get("p_astro"))
+                    pastro = resolve_pastro(pset)
         # A later page for the same event must not clobber a finite value with
         # a NaN (the cumulative and per-catalog endpoints overlap).
         prev = table.get(clean)
@@ -763,7 +767,7 @@ def _parse_gwosc_event_table_page(data: dict, table: dict) -> None:
             if not np.isfinite(far):
                 far = prev.get("far", float("nan"))
             if not np.isfinite(pastro):
-                pastro = prev.get("pastro", float("nan"))
+                pastro = resolve_pastro(prev)
         table[clean] = {"far": far, "pastro": pastro}
 
 

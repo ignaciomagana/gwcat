@@ -275,3 +275,65 @@ def test_homogeneity_comes_from_the_policy_not_name_uniqueness(tmp_path):
     with h5py.File(out, "r") as f:
         assert (bool(f.attrs["homogeneous_sample_sets"])
                 is bool(sub._homogeneous_sample_sets))
+
+
+# ── p_astro / pastro: one quantity, two spellings (GW-14) ───────────────────
+PASTRO_EVENTS = [
+    # populated ONLY under the `p_astro` spelling -- what a manifest or
+    # override file following this package's own documented example produces.
+    {"name": "GW930001_000001", "source_class": "BBH", "far": 1e-3,
+     "p_astro": 0.999},
+    {"name": "GW930002_000002", "source_class": "BBH", "far": 5e-4,
+     "p_astro": 0.4},
+]
+
+
+def test_pastro_min_reads_the_p_astro_spelling(tmp_path):
+    """A store whose event table used `p_astro` is still selectable.
+
+    The cut used to read `meta/pastro` alone, so this store -- populated by the
+    documented override key -- returned zero events with no error at all.
+    """
+    cat = GWCatalog(build_mixed_store(tmp_path, PASTRO_EVENTS,
+                                      name="pastro_only.h5"))
+    assert np.all(np.isnan(np.asarray(cat.meta["pastro"], dtype=float)))
+    sub = cat.select(pastro_min=0.9)
+    assert list(sub.event_names) == ["GW930001_000001"]
+
+
+def test_pastro_min_prefers_a_finite_value_row_by_row(tmp_path):
+    """Resolution is per row: one event under each spelling, both selectable."""
+    events = [dict(PASTRO_EVENTS[0]),
+              {"name": "GW930003_000003", "source_class": "BBH", "far": 1e-3,
+               "pastro": 0.95}]
+    cat = GWCatalog(build_mixed_store(tmp_path, events, name="both.h5"))
+    sub = cat.select(pastro_min=0.9)
+    assert set(sub.event_names) == {"GW930001_000001", "GW930003_000003"}
+
+
+def test_pastro_min_still_cuts_and_warns_on_partial_absence(tmp_path):
+    events = [dict(PASTRO_EVENTS[0]),
+              {"name": "GW930004_000004", "source_class": "BBH", "far": 1e-3}]
+    cat = GWCatalog(build_mixed_store(tmp_path, events, name="partial.h5"))
+    with pytest.warns(UserWarning, match="no p_astro under either spelling"):
+        sub = cat.select(pastro_min=0.9)
+    assert list(sub.event_names) == ["GW930001_000001"]
+
+
+def test_all_nan_pastro_raises_not_warns(tmp_path):
+    """A threshold crossed with an all-absent column is a config error.
+
+    Every event NaN under both spellings used to yield an empty catalog and a
+    warning that could not even fire (it was issued after the cut that removed
+    the NaN rows it described).
+    """
+    cat = GWCatalog(build_mixed_store(tmp_path, FAR_EVENTS, name="nopa.h5"))
+    with pytest.raises(ValueError, match="carries no p_astro at all"):
+        cat.select(pastro_min=0.5)
+
+
+def test_pastro_summary_shows_the_resolved_value(tmp_path, capsys):
+    cat = GWCatalog(build_mixed_store(tmp_path, PASTRO_EVENTS,
+                                      name="pastro_summary.h5"))
+    cat.summary()
+    assert "0.999" in capsys.readouterr().out

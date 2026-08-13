@@ -66,17 +66,21 @@ def _build_store(path, events, H0=67.74, Om0=0.3089, candidate_params=None,
 
     events : list of dicts with keys
         name (str), params (list of param names this event provides), and
-        optionally source_class (str).
+        optionally source_class (str), sample_set (str, the row's
+        ``sample_set_name``) and pastro/p_astro (float).
     """
     rng = np.random.default_rng(seed)
     records, names, offsets = [], [], [0]
-    classes = []
+    classes, sample_sets, pastros, p_astros = [], [], [], []
     for ev in events:
         sd = _rand_event(rng, n, ev["params"])
         records.append((ev["name"], n, sd))
         names.append(ev["name"])
         offsets.append(offsets[-1] + n)
         classes.append(ev.get("source_class", ""))
+        sample_sets.append(ev.get("sample_set", ""))
+        pastros.append(float(ev.get("pastro", np.nan)))
+        p_astros.append(float(ev.get("p_astro", np.nan)))
 
     if candidate_params is None:
         candidate_params = []
@@ -93,6 +97,9 @@ def _build_store(path, events, H0=67.74, Om0=0.3089, candidate_params=None,
     meta["dL_prior_Om0"] = [Om0] * len(names)
     meta["source_class"] = list(classes)
     meta["compact_type"] = list(classes)
+    meta["sample_set_name"] = list(sample_sets)
+    meta["pastro"] = list(pastros)
+    meta["p_astro"] = list(p_astros)
 
     _write_store(str(path), union_params, columns, offsets, names, avail, meta,
                  IngestConfig())
@@ -299,6 +306,102 @@ def test_merge_stores_skips_duplicate_events(tmp_path):
         merge_stores(store_a, store_b, str(out))
     cat = GWCatalog(str(out))
     assert list(cat.event_names) == ["GWdup", "GWa2", "GWb2"]
+
+
+# ==========================================================================
+# 5b. merge_stores keys rows on (event_name, sample_set_name) (GW-14)
+# ==========================================================================
+def _sample_sets_of(cat):
+    return list(np.asarray(cat.meta["sample_set_name"]))
+
+
+def test_merge_adds_second_sample_set(tmp_path):
+    """A second waveform's samples for an existing event are ADDED, not dropped.
+
+    Row identity is the (event, sample set) pair the module documents; keying
+    the dedupe on the name alone silently discarded exactly the rows the
+    multi-sample-set workflow exists to produce.
+    """
+    store_a = _build_store(tmp_path / "a.h5",
+                           [{"name": "GWms", "params": _CORE,
+                             "sample_set": "C01:IMRPhenomXPHM"}], seed=1)
+    store_b = _build_store(tmp_path / "b.h5",
+                           [{"name": "GWms", "params": _CORE,
+                             "sample_set": "C01:SEOBNRv4PHM"}], seed=2)
+    out = tmp_path / "m.h5"
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")           # no duplicate warning at all
+        merge_stores(store_a, store_b, str(out))
+    cat = GWCatalog(str(out))
+    assert cat.n_events == 2                     # rows, one per sample set
+    assert list(cat.event_names) == ["GWms", "GWms"]
+    assert _sample_sets_of(cat) == ["C01:IMRPhenomXPHM", "C01:SEOBNRv4PHM"]
+    # Both rows' samples survive, and they are the two distinct sets.
+    m1 = cat.get(["mass_1"], per_event=True)["mass_1"]
+    assert not np.allclose(m1[0], m1[1])
+
+
+def test_merge_refreshes_matching_key(tmp_path):
+    """on_duplicate_key='refresh' replaces one sample set's row in place."""
+    store_a = _build_store(tmp_path / "a.h5",
+                           [{"name": "GWref", "params": _CORE,
+                             "sample_set": "C01:IMRPhenomXPHM"},
+                            {"name": "GWother", "params": _CORE,
+                             "sample_set": "C01:IMRPhenomXPHM"}], seed=1)
+    store_b = _build_store(tmp_path / "b.h5",
+                           [{"name": "GWref", "params": _CORE,
+                             "sample_set": "C01:IMRPhenomXPHM"}], seed=99)
+    old = GWCatalog(store_a).get(["mass_1"], per_event=True)["mass_1"][0]
+    new = GWCatalog(store_b).get(["mass_1"], per_event=True)["mass_1"][0]
+
+    out = tmp_path / "m.h5"
+    with pytest.warns(UserWarning, match="Refreshed from the second store"):
+        merge_stores(store_a, store_b, str(out), on_duplicate_key="refresh")
+    cat = GWCatalog(str(out))
+    # No duplicate row: the refreshed key appears exactly once.
+    assert cat.n_events == 2
+    assert sorted(cat.event_names) == ["GWother", "GWref"]
+    i = list(cat.event_names).index("GWref")
+    got = cat.get(["mass_1"], per_event=True)["mass_1"][i]
+    np.testing.assert_allclose(got, new)
+    assert not np.allclose(got, old)
+
+
+def test_merge_skips_only_the_matching_sample_set(tmp_path):
+    """One duplicate key skipped; the other sample set of the same event kept."""
+    store_a = _build_store(tmp_path / "a.h5",
+                           [{"name": "GWmix", "params": _CORE,
+                             "sample_set": "C01:IMRPhenomXPHM"}], seed=1)
+    store_b = _build_store(tmp_path / "b.h5",
+                           [{"name": "GWmix", "params": _CORE,
+                             "sample_set": "C01:IMRPhenomXPHM"},   # duplicate key
+                            {"name": "GWmix", "params": _CORE,
+                             "sample_set": "C01:SEOBNRv4PHM"}],     # new set
+                           seed=2)
+    out = tmp_path / "m.h5"
+    with pytest.warns(UserWarning,
+                      match=r"Duplicate events skipped.*GWmix\[C01:IMRPhenomXPHM\]"):
+        merge_stores(store_a, store_b, str(out))
+    cat = GWCatalog(str(out))
+    assert _sample_sets_of(cat) == ["C01:IMRPhenomXPHM", "C01:SEOBNRv4PHM"]
+
+
+def test_merge_resolves_pastro_across_spellings(tmp_path):
+    """A `pastro`-only store merged with a `p_astro`-only one: both columns
+    carry the resolved value, so neither reader is told 'absent' (GW-14)."""
+    store_a = _build_store(tmp_path / "a.h5",
+                           [{"name": "GWpa", "params": _CORE, "pastro": 0.97}],
+                           seed=1)
+    store_b = _build_store(tmp_path / "b.h5",
+                           [{"name": "GWpb", "params": _CORE, "p_astro": 0.93}],
+                           seed=2)
+    out = tmp_path / "m.h5"
+    merge_stores(store_a, store_b, str(out))
+    cat = GWCatalog(str(out))
+    for col in ("pastro", "p_astro"):
+        np.testing.assert_allclose(np.asarray(cat.meta[col], dtype=float),
+                                   [0.97, 0.93])
+    assert cat.select(pastro_min=0.95).n_events == 1
 
 
 # ==========================================================================

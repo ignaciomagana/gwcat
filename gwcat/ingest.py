@@ -48,6 +48,7 @@ from .cosmology import (make_cosmology, uniform_source_frame_prob,
 from .source_class import (normalize_source_class, classify_by_mass,
                           DEFAULT_NSBH_MASS_THRESHOLD)
 from .spin import chi_p_from_components
+from .event_metadata import PASTRO_KEYS, resolve_pastro, resolve_pastro_column
 
 # --------------------------------------------------------------------------
 # Parameter sets
@@ -1535,8 +1536,13 @@ def build_store(paths, out_path, params=None, extra_params=None,
             # it).
             far_available = 1.0 if np.isfinite(far_val) else 0.0
             # p_astro / component probabilities come from the event table when
-            # present; otherwise stay NaN (explicit absence).
-            p_astro = float(et.get("p_astro", et.get("pastro", np.nan)))
+            # present; otherwise stay NaN (explicit absence).  The two spellings
+            # are one quantity (see event_metadata.PASTRO_KEYS): resolve once
+            # and write BOTH columns, so a table carrying only `p_astro` -- the
+            # spelling the override/manifest documentation uses -- is not stored
+            # as an absent `pastro` that every legacy reader then reads as
+            # "unknown" (GW-14).
+            p_astro = resolve_pastro(et)
             # metadata_source: an assembled event_table (PR 8, see
             # gwcat.event_metadata.assemble_event_metadata) may supply a richer
             # provenance string (e.g. "online+user_override", "absent") directly;
@@ -1599,7 +1605,7 @@ def build_store(paths, out_path, params=None, extra_params=None,
             meta["p_bns"].append(float(et.get("p_bns", np.nan)))
             meta["p_terr"].append(float(et.get("p_terr", np.nan)))
             meta["far"].append(far_val)
-            meta["pastro"].append(float(et.get("pastro", np.nan)))
+            meta["pastro"].append(p_astro)
             meta["snr_med"].append(snr)
             meta["m1_src_med"].append(m1s)
             meta["m2_src_med"].append(m2s)
@@ -1983,8 +1989,23 @@ def _subset_store(S, keep):
                 avail=avail, meta=meta, n_events=len(keep))
 
 
+def _row_keys(S):
+    """The identity of each row of an in-memory store: ``(name, sample_set)``.
+
+    A row of the ragged store is one ``(event, sample_set)`` pair -- that is the
+    uniqueness the sample-set contract declares (see SAMPLE_SET_STR_FIELDS) and
+    what ``sample_sets="all"`` produces.  Stores written before the contract, and
+    the single-sample-set default, carry ``sample_set_name = ""`` for every row,
+    so keying on the pair reduces to keying on the name for them.
+    """
+    ss = S["meta"].get("sample_set_name") or [""] * S["n_events"]
+    return [(n, str(ss[i]) if i < len(ss) else "")
+            for i, n in enumerate(S["names"])]
+
+
 def merge_stores(store_a, store_b, out_path, cfg: Optional[IngestConfig] = None,
-                 skip_duplicates: bool = True):
+                 skip_duplicates: bool = True,
+                 on_duplicate_key: Optional[str] = None):
     """Merge two existing store.h5 files, PRESERVING the union of parameters.
 
     A parameter present in only one store becomes a full column in the output:
@@ -1993,22 +2014,52 @@ def merge_stores(store_a, store_b, out_path, cfg: Optional[IngestConfig] = None,
     store is missing it.  Meta fields merge as a union too, with explicit-absence
     defaults (NaN for floats, "" for strings).
 
-    Events in ``store_b`` whose names already appear in ``store_a`` are skipped
-    when ``skip_duplicates`` is True (a warning is emitted).
+    Row identity is ``(event_name, sample_set_name)`` -- the key the sample-set
+    contract declares -- NOT the event name.  A ``store_b`` row whose event
+    already appears in ``store_a`` under a DIFFERENT sample set is therefore
+    added, not dropped: that is how a second waveform's samples enter an
+    existing catalog (GW-14).
+
+    on_duplicate_key : {"skip", "refresh", "keep"} or None
+        What to do with a ``store_b`` row whose full key matches a ``store_a``
+        row.  ``"skip"`` drops it and warns (the historical behaviour, and the
+        default).  ``"refresh"`` REPLACES the matching ``store_a`` row with
+        ``store_b``'s -- how one sample set's samples or metadata are updated
+        without re-ingesting the whole catalog; the refreshed row moves to the
+        end of the store, which is positional only (rows are addressed by key).
+        ``"keep"`` appends both, leaving two rows with the same key -- a store
+        state the readers treat as duplicate and which is only ever what you
+        want mid-pipeline.  ``None`` derives it from the legacy
+        ``skip_duplicates`` flag (True -> "skip", False -> "keep").
 
     Returns the output path.
     """
     cfg = cfg or IngestConfig()
+    if on_duplicate_key is None:
+        on_duplicate_key = "skip" if skip_duplicates else "keep"
+    if on_duplicate_key not in ("skip", "refresh", "keep"):
+        raise ValueError(
+            f"on_duplicate_key={on_duplicate_key!r} is invalid; use 'skip', "
+            f"'refresh' or 'keep'")
     A = _read_store(store_a)
     B = _read_store(store_b)
 
-    if skip_duplicates:
-        dupes = set(A["names"]) & set(B["names"])
+    if on_duplicate_key != "keep":
+        a_keys = _row_keys(A)
+        b_keys = _row_keys(B)
+        dupes = set(a_keys) & set(b_keys)
         if dupes:
-            warnings.warn(f"Duplicate events skipped from the second store: "
-                          f"{sorted(dupes)}")
-            keep = [i for i, n in enumerate(B["names"]) if n not in dupes]
-            B = _subset_store(B, keep)
+            listed = sorted(f"{n}[{s}]" if s else n for n, s in dupes)
+            if on_duplicate_key == "skip":
+                warnings.warn(f"Duplicate events skipped from the second "
+                              f"store: {listed}")
+                B = _subset_store(B, [i for i, k in enumerate(b_keys)
+                                      if k not in dupes])
+            else:
+                warnings.warn(f"Refreshed from the second store (the first "
+                              f"store's rows are replaced): {listed}")
+                A = _subset_store(A, [i for i, k in enumerate(a_keys)
+                                      if k not in dupes])
 
     # Union parameter order: store A's columns first, then B's new columns.
     union_params = list(A["params"]) + [p for p in B["params"]
@@ -2051,6 +2102,15 @@ def merge_stores(store_a, store_b, out_path, cfg: Optional[IngestConfig] = None,
     for k in META_STR_FIELDS:
         merged_meta.setdefault(k, [""] * n_total)
 
+    # p_astro / pastro are one quantity under two spellings (GW-14).  A store
+    # ingested before both columns were written -- or from a table that used
+    # only one key -- contributes NaN under the other, and the merged file must
+    # not present that NaN as knowledge it does not have when the value is
+    # sitting in the sibling column of the same row.
+    resolved_pastro = resolve_pastro_column(merged_meta, n_total)
+    for k in PASTRO_KEYS:
+        merged_meta[k] = list(resolved_pastro)
+
     _write_store(out_path, union_params, columns, offsets, names, avail,
                  merged_meta, cfg)
     print(f"Merged stores: {A['n_events']} + {B['n_events']} = {n_total} "
@@ -2065,7 +2125,8 @@ def merge_store(existing_path: str, new_paths, out_path: str = None,
                 cfg: Optional[IngestConfig] = None, event_table=None,
                 extra_params=None, sample_sets="preferred",
                 file_provenance: Optional[dict] = None, cache_dir=None,
-                offline: Optional[bool] = None):
+                offline: Optional[bool] = None,
+                on_duplicate_key: str = "skip"):
     """Append new events to an existing store without re-ingesting everything.
 
     Schema-preserving (PR 5): the merged store holds the UNION of parameters.
@@ -2083,6 +2144,14 @@ def merge_store(existing_path: str, new_paths, out_path: str = None,
         Output path.  None → overwrite existing_path (via a temp file for safety).
     cfg, event_table, extra_params, file_provenance, cache_dir, offline :
         Same as build_store.  event_table=None auto-fetches from GWOSC.
+    on_duplicate_key : {"skip", "refresh"}
+        What to do when a new file yields a row whose
+        ``(event_name, sample_set_name)`` already exists in ``existing_path``.
+        ``"skip"`` (default) keeps the existing row; ``"refresh"`` replaces it
+        with the newly ingested one -- the way to update one waveform's samples
+        without re-ingesting the catalog.  Note that a new SAMPLE SET for an
+        event already in the store is not a duplicate at all: it is added under
+        either setting (GW-14).
 
     Returns
     -------
@@ -2116,7 +2185,7 @@ def merge_store(existing_path: str, new_paths, out_path: str = None,
 
         tmp_merged = os.path.join(tmpdir, "merged.h5")
         merge_stores(existing_path, tmp_new, tmp_merged, cfg=cfg,
-                     skip_duplicates=True)
+                     on_duplicate_key=on_duplicate_key)
         shutil.move(tmp_merged, out_path)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

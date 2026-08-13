@@ -114,6 +114,18 @@ class GWCatalog:
             return np.isfinite(np.asarray(self.meta["far"], dtype=float))
         return np.zeros(len(self.names), dtype=bool)
 
+    def _pastro_column(self):
+        """Per-row astrophysical probability, resolved across both spellings.
+
+        ``p_astro`` and ``pastro`` are the same quantity (see
+        :data:`gwcat.event_metadata.PASTRO_KEYS`); which column a store
+        populated depends on which key its event table used and on when it was
+        ingested.  Every consumer of a p_astro reads this, so none of them can
+        report "absent" about a value the store holds under the other name.
+        """
+        from .event_metadata import resolve_pastro_column
+        return resolve_pastro_column(self.meta, len(self.names))
+
     def select(self, compact_type=None, far_max=None, pastro_min=None,
                snr_min=None, z_max=None, m1_src_range=None, m2_src_range=None,
                sky_area_max=None, names=None, allowed_names=None,
@@ -137,6 +149,14 @@ class GWCatalog:
             (``far_available=False``).  ``require_far=True`` fails loudly;
             ``allow_missing_far=True`` keeps the event, warns, and records the
             absence; the default drops missing-FAR events (legacy behavior).
+        pastro_min : float or None
+            Threshold on the event's astrophysical probability, read from
+            whichever of the ``p_astro`` / ``pastro`` meta columns carries a
+            finite value for that row (they are one quantity under two
+            spellings).  Events with neither are dropped, with a warning naming
+            them; a store where NO candidate event has either raises, because a
+            threshold crossed with an all-absent column is a configuration
+            error, not a selection (GW-14).
 
         Waveform / sample-set policy (PR 6)
         -----------------------------------
@@ -187,8 +207,33 @@ class GWCatalog:
             allowed_classes = resolve_filter_classes(source_class)
             m &= np.isin(self.source_class, list(allowed_classes))
         if pastro_min is not None:
-            pa = self.meta["pastro"]
-            m &= np.where(np.isnan(pa), False, pa >= pastro_min)
+            # Read the RESOLVED value, not one spelling of it: a store whose
+            # event table used `p_astro` (the documented override key) holds a
+            # NaN `pastro` column, and reading only that turned a populated
+            # catalog into an empty selection (GW-14).
+            pa = self._pastro_column()
+            in_scope = m & np.isin(np.arange(len(self.names)), self._sel)
+            nan_pa = np.isnan(pa)
+            if in_scope.any() and nan_pa[in_scope].all():
+                raise ValueError(
+                    f"select(pastro_min={pastro_min}) would exclude all "
+                    f"{int(in_scope.sum())} candidate event(s) because this "
+                    f"store carries no p_astro at all: both the 'p_astro' and "
+                    f"the 'pastro' meta columns are NaN for every one of them. "
+                    f"A threshold crossed with an all-absent column is a "
+                    f"configuration error, not a selection -- populate "
+                    f"p_astro via the event_table/override file at ingest (see "
+                    f"gwcat.event_metadata.assemble_event_metadata), or drop "
+                    f"pastro_min.")
+            n_nan = int(nan_pa[in_scope].sum())
+            if n_nan:
+                warnings.warn(
+                    f"pastro_min={pastro_min} drops {n_nan} event(s) with no "
+                    f"p_astro under either spelling: "
+                    f"{sorted(self.names[in_scope & nan_pa].tolist())}. "
+                    f"Populate p_astro via event_table at ingest to use this "
+                    f"cut on them.")
+            m &= np.where(nan_pa, False, pa >= pastro_min)
         if snr_min is not None:
             m &= np.where(np.isnan(self.meta["snr_med"]), False,
                           self.meta["snr_med"] >= snr_min)
@@ -278,13 +323,9 @@ class GWCatalog:
                 m &= below
                 far_policy = "drop_missing"
 
-        if pastro_min is not None and "pastro" in self.meta:
-            sel_pre = np.nonzero(m & np.isin(np.arange(len(self.names)),
-                                             self._sel))[0]
-            if np.isnan(np.asarray(self.meta["pastro"], dtype=float)[sel_pre]).any():
-                warnings.warn("p_astro NaN for some events; populate via "
-                              "event_table at ingest to use these cuts.")
-
+        # (The p_astro-absence warning used to live here, after the cut it was
+        # meant to describe had already removed every NaN row from `m` -- so it
+        # could never fire.  It is issued at the cut itself now.)
         sel = np.nonzero(m & np.isin(np.arange(len(self.names)), self._sel))[0]
 
         # ── Waveform / sample-set policy resolution (PR 6) ────────────────────
@@ -1054,6 +1095,7 @@ class GWCatalog:
         print(hdr)
         print("-" * len(hdr))
         ns = self.nsamp_per_event
+        pastro_col = self._pastro_column()
         for j, i in enumerate(self._sel):
             name = self.names[i]
             cat = self.meta["catalog"][i] if "catalog" in self.meta else "?"
@@ -1062,7 +1104,7 @@ class GWCatalog:
             m2 = self.meta["m2_src_med"][i] if "m2_src_med" in self.meta else np.nan
             ct = self.meta["compact_type"][i] if "compact_type" in self.meta else "?"
             far = self.meta["far"][i] if "far" in self.meta else np.nan
-            pa = self.meta["pastro"][i] if "pastro" in self.meta else np.nan
+            pa = pastro_col[i]
 
             far_s = f"{far:.2e}" if np.isfinite(far) else "NaN"
             pa_s = f"{pa:.3f}" if np.isfinite(pa) else "NaN"

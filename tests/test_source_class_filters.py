@@ -29,14 +29,18 @@ def build_mixed_store(tmp_path, events, H0=67.74, Om0=0.3089, seed=7,
 
     events : list of dicts, each with keys:
         name (str), source_class (str), far (float, np.nan = missing),
-        and optionally n (int, samples per event).
+        and optionally n (int, samples per event), pastro (float) and/or
+        p_astro (float).  The ``p_astro`` meta column is written only when at
+        least one event supplies that spelling, so the default fixture stays a
+        ``pastro``-only store (GW-14).
     """
     rng = np.random.default_rng(seed)
     offsets = [0]
     cols = {p: [] for p in DARKSIRENS_PARAMS}
     meta = {k: [] for k in
             ["source_class", "compact_type", "far", "far_available", "pastro",
-             "dL_prior_H0", "dL_prior_Om0"]}
+             "p_astro", "dL_prior_H0", "dL_prior_Om0"]}
+    has_p_astro = any("p_astro" in ev for ev in events)
     names = []
     for ev in events:
         n = int(ev.get("n", 15))
@@ -57,6 +61,7 @@ def build_mixed_store(tmp_path, events, H0=67.74, Om0=0.3089, seed=7,
         meta["far"].append(far)
         meta["far_available"].append(1.0 if np.isfinite(far) else 0.0)
         meta["pastro"].append(float(ev.get("pastro", np.nan)))
+        meta["p_astro"].append(float(ev.get("p_astro", np.nan)))
         meta["dL_prior_H0"].append(H0)
         meta["dL_prior_Om0"].append(Om0)
 
@@ -71,7 +76,10 @@ def build_mixed_store(tmp_path, events, H0=67.74, Om0=0.3089, seed=7,
         mg = f.create_group("meta")
         for k in ["source_class", "compact_type"]:
             mg.create_dataset(k, data=np.array(meta[k], dtype=h5py.string_dtype()))
-        for k in ["far", "pastro", "dL_prior_H0", "dL_prior_Om0"]:
+        float_cols = ["far", "pastro", "dL_prior_H0", "dL_prior_Om0"]
+        if has_p_astro:
+            float_cols.append("p_astro")
+        for k in float_cols:
             mg.create_dataset(k, data=np.asarray(meta[k], dtype="f8"))
         if include_far_available:
             mg.create_dataset("far_available",

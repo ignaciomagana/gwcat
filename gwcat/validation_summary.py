@@ -184,11 +184,11 @@ def summarize_catalog(cat, parameter_space: str = None) -> Dict[str, Any]:
         far_missing = (int((~np.isfinite(np.asarray(far, dtype=float))).sum())
                        if far is not None else n_events)
 
-    p_astro = _meta_col("p_astro")
-    if p_astro is None:
-        p_astro = _meta_col("pastro")
-    p_astro_available = (int(np.isfinite(np.asarray(p_astro, dtype=float)).sum())
-                         if p_astro is not None else 0)
+    # Resolved per ROW, not per column: an older store populated `pastro` and
+    # left `p_astro` NaN, and a column-level fallback that only fires when the
+    # whole `p_astro` column is ABSENT reported "no p_astro" for every one of
+    # those events (GW-14).
+    p_astro_available = int(np.isfinite(cat._pastro_column()[sel]).sum())
 
     stored = list(cat.params)
     if parameter_space is None:

@@ -47,9 +47,12 @@ import yaml
 
 __all__ = [
     "DEFAULT_METADATA_FIELDS",
+    "PASTRO_KEYS",
     "load_user_overrides",
     "metadata_diagnostics",
     "assemble_event_metadata",
+    "resolve_pastro",
+    "resolve_pastro_column",
 ]
 
 #: Per-event scalar metadata fields tracked by default.  ``far``/``pastro``
@@ -63,6 +66,19 @@ DEFAULT_METADATA_FIELDS: Tuple[str, ...] = (
     "far", "pastro", "p_astro", "p_bbh", "p_nsbh", "p_bns", "p_terr",
     "source_class",
 )
+
+#: The two spellings of the SAME quantity -- the astrophysical probability of
+#: an event -- that this package has to accept.  ``pastro`` is the historical
+#: key returned by :func:`gwcat.fetch.fetch_event_table_gwosc` and the legacy
+#: store column; ``p_astro`` is the GWOSC field name, the spelling this
+#: module's own documented override example uses, and the source-class-contract
+#: column.  They are ONE number: nothing anywhere writes two different values,
+#: and no consumer wants "the p_astro one" as opposed to "the pastro one".
+#: Resolution is therefore symmetric everywhere -- first finite value wins, in
+#: this order -- and both columns are written with the resolved value, so a
+#: reader that knows only one spelling cannot be told "absent" about a value
+#: the store holds under the other (GW-14).
+PASTRO_KEYS: Tuple[str, ...] = ("p_astro", "pastro")
 
 _SOURCES_ABSENT = "absent"
 _SOURCE_ONLINE = "online"
@@ -79,6 +95,69 @@ def _is_present(value: Any) -> bool:
     if isinstance(value, float) and math.isnan(value):
         return False
     return True
+
+
+def _field_spellings(field: str) -> Tuple[str, ...]:
+    """Every key one metadata field may be written under, most-preferred first."""
+    return PASTRO_KEYS if field in PASTRO_KEYS else (field,)
+
+
+def _layer_value(layer: Mapping[str, Any], field: str):
+    """The value one precedence layer supplies for ``field``, or None."""
+    for key in _field_spellings(field):
+        if key in layer and _is_present(layer[key]):
+            return layer[key]
+    return None
+
+
+def resolve_pastro(mapping: Optional[Mapping[str, Any]]) -> float:
+    """The event's astrophysical probability under either spelling.
+
+    Reads ``p_astro`` then ``pastro`` from a per-event mapping (an
+    ``event_table`` entry, a user-override record) and returns the first finite
+    value, or NaN when neither spelling carries one.  Use this instead of
+    ``et.get("pastro")``: a manifest or override file that supplies only
+    ``p_astro`` -- the spelling this module documents -- must not read as
+    "absent" (GW-14).
+    """
+    if not mapping:
+        return float("nan")
+    for key in PASTRO_KEYS:
+        if key not in mapping:
+            continue
+        try:
+            val = float(mapping[key])
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(val):
+            return val
+    return float("nan")
+
+
+def resolve_pastro_column(meta: Optional[Mapping[str, Any]], n: int):
+    """Element-wise :func:`resolve_pastro` over a store's ``meta`` columns.
+
+    ``meta`` is a mapping of column name -> per-row values (a ``GWCatalog.meta``
+    or a merge's in-memory meta dict).  Returns a length-``n`` float array whose
+    row *i* is the first finite of ``p_astro[i]``, ``pastro[i]`` -- NaN when the
+    store holds neither.  A store written before one of the columns existed, or
+    an ingest that only ever saw one spelling, therefore still answers a
+    p_astro question correctly.
+    """
+    import numpy as np
+
+    out = np.full(int(n), np.nan, dtype=float)
+    if not meta:
+        return out
+    for key in reversed(PASTRO_KEYS):        # later keys overwritten by earlier
+        if key not in meta:
+            continue
+        col = np.asarray(meta[key], dtype=float)
+        if col.size != out.size:
+            continue
+        finite = np.isfinite(col)
+        out[finite] = col[finite]
+    return out
 
 
 def _coerce_scalar(value: str):
@@ -228,14 +307,22 @@ def metadata_diagnostics(
 
         per_field: Dict[str, Dict[str, Any]] = {}
         for field in fields:
-            if field in override_ev and _is_present(override_ev[field]):
-                per_field[field] = {"value": override_ev[field],
+            # Precedence is over LAYERS, so a layer must be searched under every
+            # spelling of the field before dropping to the next one: an override
+            # file saying `p_astro` has to beat an online table saying `pastro`,
+            # and vice versa, or the layering silently depends on which key each
+            # source happened to use (GW-14).
+            override_v = _layer_value(override_ev, field)
+            online_v = _layer_value(online_ev, field)
+            manifest_v = _layer_value(manifest_ev, field)
+            if override_v is not None:
+                per_field[field] = {"value": override_v,
                                     "source": _SOURCE_USER_OVERRIDE}
-            elif field in online_ev and _is_present(online_ev[field]):
-                per_field[field] = {"value": online_ev[field],
+            elif online_v is not None:
+                per_field[field] = {"value": online_v,
                                     "source": _SOURCE_ONLINE}
-            elif field in manifest_ev and _is_present(manifest_ev[field]):
-                per_field[field] = {"value": manifest_ev[field],
+            elif manifest_v is not None:
+                per_field[field] = {"value": manifest_v,
                                     "source": _SOURCE_MANIFEST}
             else:
                 per_field[field] = {"value": None, "source": _SOURCES_ABSENT}
