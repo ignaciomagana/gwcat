@@ -612,10 +612,19 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             [v for v in swap_violations if not v.get("verified")])
     elif spin_basis == "component":
         attrs["spin_prior_mode"] = "component"
+        # Stated False, not omitted: darksirens' loader REQUIRES this attr, so
+        # omission made the file fail to load -- the exact defect GW-21 fixed
+        # for chi_eff_in_p_pe on the PE side. False is also the truth: the 1-D
+        # chi_eff swap is not applied; the exact component draw is retained.
+        attrs["chi_eff_swap_applied"] = False
         attrs["chi_eff_prior_applied_to_pdraw"] = False
         attrs["component_spin_draw_retained"] = True
     else:  # chieff_chip
         attrs["spin_prior_mode"] = "include"
+        # False for the same reason as the component branch: the attr means
+        # THE 1-D chi_eff swap specifically, and here the joint (chi_eff,
+        # chi_p) swap is applied instead -- recorded on its own attr below.
+        attrs["chi_eff_swap_applied"] = False
         attrs["chi_eff_chi_p_swap_applied"] = True
         attrs["chi_eff_chi_p_prior_applied_to_pdraw"] = True
         attrs["chi_eff_amax"] = float(amax)

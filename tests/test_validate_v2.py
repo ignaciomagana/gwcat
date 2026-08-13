@@ -683,3 +683,44 @@ def test_rectangular_file_passes_the_new_check(tmp_path):
     GWCatalog(st).to_darksirens(str(out), nsamp=16, seed=0, cosmology=_COSMO)
     results = validate_export(str(out))
     assert results["pe_rectangular"] is True
+
+
+def test_cli_routes_21_pair_to_the_v2_validator(tmp_path, capsys):
+    """`gwcat validate` on a 2.1 pair must reach validate_export_v2.
+
+    The CLI kept its own _V2_FORMATS copy without the 2.1 strings, so a 2.1
+    pair mapped to "unknown" and silently fell through to the FROZEN V1
+    validator -- which then failed it on v1-only expectations
+    (sel_chi_eff_swap_flag, strict spin_prior_mode equality).  Fifth instance
+    of the hardcoded-currently-known-values bug shape.
+    """
+    pe, sel = _pair_21(tmp_path)
+    rc = main(["validate", str(pe), str(sel)])
+    out = capsys.readouterr().out
+    assert "Validating gwcat-2.0 PE export:" in out
+    assert rc == 0
+
+
+def test_cli_unknown_format_version_is_a_clear_error(tmp_path, capsys):
+    pe, sel = _pair_21(tmp_path)
+    with h5py.File(pe, "r+") as f:
+        f.attrs["format_version"] = "gwcat-pe-9.9"
+    rc = main(["validate", str(pe), str(sel)])
+    assert rc == 1
+    assert "unrecognised format_version" in capsys.readouterr().err
+
+
+def test_selection_products_state_the_swap_flag_for_every_basis(tmp_path):
+    """chi_eff_swap_applied is stated truthfully on ALL bases, never omitted.
+
+    darksirens' loader REQUIRES the attr, so the component product's omission
+    made the file fail to load -- the exact defect GW-21 fixed for
+    chi_eff_in_p_pe on the PE side, surviving on the selection side.
+    """
+    inj = write_o4_full(tmp_path / "swapinj.hdf", n=60, amax=(0.9, 0.9),
+                        seed=6)
+    for basis, expect in (("component", False), ("chieff", True)):
+        out = tmp_path / f"swap_{basis}.h5"
+        SelectionSet(inj).export(str(out), spin_basis=basis)
+        with h5py.File(out, "r") as f:
+            assert bool(f.attrs["chi_eff_swap_applied"]) is expect, basis

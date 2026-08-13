@@ -541,7 +541,16 @@ def _cmd_selection(args) -> int:
 
 #: format_version prefixes that route to each validator generation.
 _V1_FORMATS = ("gwcat-1.0", "gwcat-selection-1.0")
-_V2_FORMATS = ("gwcat-pe-2.0", "gwcat-selection-2.0")
+
+
+def _v2_formats() -> tuple:
+    # Read from the v2 validator, which is the authority on what it validates.
+    # This module kept its own copy and the copy was missing the 2.1 strings,
+    # so `gwcat validate` silently routed 2.1 files to the FROZEN V1 VALIDATOR
+    # -- which then failed them on v1-only expectations (fifth instance of the
+    # hardcoded-currently-known-values bug shape; see the GW-22b notes).
+    from .export.validate import _PE_FORMATS, _SEL_FORMATS
+    return tuple(_PE_FORMATS) + tuple(_SEL_FORMATS)
 
 
 def _read_format_version(path: str) -> Optional[str]:
@@ -559,7 +568,7 @@ def _validator_generation(version: Optional[str]) -> str:
     """Map a ``format_version`` to ``"v1"`` / ``"v2"`` / ``"unknown"``."""
     if version in _V1_FORMATS:
         return "v1"
-    if version in _V2_FORMATS:
+    if version in _v2_formats():
         return "v2"
     return "unknown"
 
@@ -582,6 +591,16 @@ def _cmd_validate(args) -> int:
                   f"gwcat-selection-2.0); the two generations cannot be paired.",
                   file=sys.stderr)
             return 1
+
+    if "unknown" in {pe_gen, sel_gen} - {None}:
+        # Unknown used to fall through to the frozen v1 validator, which then
+        # failed the file on v1-only expectations -- a misleading verdict about
+        # a format this gwcat simply does not know.
+        print(f"validate: FAILED: unrecognised format_version (PE={pe_gen}, "
+              f"selection={sel_gen}); this gwcat validates "
+              f"{_V1_FORMATS + _v2_formats()}. Upgrade gwcat or check the "
+              f"file.", file=sys.stderr)
+        return 1
 
     generation = "v2" if pe_gen == "v2" else "v1"
     if generation == "v2":
