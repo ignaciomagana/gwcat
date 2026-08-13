@@ -322,3 +322,68 @@ def test_v1_writers_stamp_the_cosmology_pdraw_used(tmp_path):
         assert len(src) == 2 and "file" in src
         H0pc = np.asarray(f.attrs["cosmology_H0_per_campaign"], dtype=float)
         assert not np.isfinite(H0pc[src.index("file")])
+
+
+def _strip_sky(path):
+    """Remove ra/dec columns from an events-format file (semianalytic O1/O2)."""
+    with h5py.File(path, "r+") as f:
+        ev = f["events"]
+        if isinstance(ev, h5py.Dataset):
+            keep = [n for n in ev.dtype.names
+                    if n not in ("right_ascension", "declination")]
+            sub = np.zeros(ev.shape, dtype=[(n, ev.dtype[n]) for n in keep])
+            for n in keep:
+                sub[n] = ev[n]
+            del f["events"]
+            f.create_dataset("events", data=sub)
+        else:
+            for n in ("right_ascension", "declination"):
+                if n in ev:
+                    del ev[n]
+    return path
+
+
+def test_v1_writers_record_sky_availability(tmp_path):
+    """GW-10, v1 half: the writers must say when ra/dec are declared-NaN.
+
+    The v2 builder has recorded sky_position_available since GW-20; the v1
+    exporters wrote the NaN sky columns with no provenance flag at all, so a
+    consumer could not tell declared-absent from corrupt.
+    """
+    from gwcat.selection import SelectionSet, CombinedSelectionSet
+
+    nosky = _strip_sky(write_o4_full(tmp_path / "sky0.hdf", n=200))
+    sky = write_o4_full(tmp_path / "sky1.hdf", n=200)
+
+    out1 = tmp_path / "sky_single.h5"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        SelectionSet(str(nosky)).to_darksirens(str(out1))
+    with h5py.File(out1, "r") as f:
+        assert bool(f.attrs["sky_position_available"]) is False
+
+    out2 = tmp_path / "sky_comb.h5"
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        CombinedSelectionSet([SelectionSet(str(nosky)), SelectionSet(str(sky))]
+                             ).to_darksirens(str(out2))
+    assert any("WITHOUT drawn sky positions" in str(x.message) for x in w)
+    with h5py.File(out2, "r") as f:
+        got = np.asarray(f.attrs["sky_position_available"], dtype=bool)
+        assert got.tolist() == [False, True]
+
+
+def test_v2_builder_warns_on_mixed_sky_availability(tmp_path):
+    from gwcat.selection import SelectionSet
+    from gwcat.export.selection_builder import build_selection_product
+
+    nosky = _strip_sky(write_o4_full(tmp_path / "v2sky0.hdf", n=200))
+    sky = write_o4_full(tmp_path / "v2sky1.hdf", n=200)
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        p = build_selection_product(
+            [SelectionSet(str(nosky)), SelectionSet(str(sky))],
+            spin_basis="component")
+    assert any("WITHOUT drawn sky positions" in str(x.message) for x in w)
+    got = np.asarray(p.attrs["sky_position_available"], dtype=bool)
+    assert got.tolist() == [False, True]

@@ -579,9 +579,7 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         # False for campaigns whose rows carry no drawn sky position (the
         # semianalytic O1/O2 entries of the cumulative mixtures); their
         # exported ra/dec are NaN.
-        "sky_position_available": np.array(
-            [bool(getattr(s, "_sky_position_available", True))
-             for s in set_list], dtype=bool),
+        "sky_position_available": _sky_availability(set_list),
         "component_columns_emitted": bool(extras_available),
         # ── Spin-removal amax provenance (GW-19) ─────────────────────────────
         # The cartesian/polar prior-REMOVAL step has to assume a ceiling before
@@ -685,6 +683,27 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
 
 
 
+
+
+def _sky_availability(set_list):
+    """Per-campaign sky availability, warning when NaN-sky meets real-sky.
+
+    NaN-sky campaigns (the semianalytic O1/O2 mixture rows) may legitimately be
+    concatenated with real-sky ones, but a consumer doing sky work will
+    silently lose the NaN campaigns' injections, so mixing deserves a warning
+    at build time, not only a per-campaign flag in the attrs (GW-10).
+    """
+    sky = np.array([bool(getattr(s, "_sky_position_available", True))
+                    for s in set_list], dtype=bool)
+    if sky.any() and not sky.all():
+        warnings.warn(
+            f"concatenating campaign(s) WITHOUT drawn sky positions (exported "
+            f"ra/dec are NaN) with campaign(s) that have them: "
+            f"sky_position_available per campaign = {sky.tolist()}. Any "
+            f"sky-dependent selection use will silently drop the NaN "
+            f"campaigns' injections; cut on campaign, not on finiteness, if "
+            f"that is not intended.")
+    return sky
 
 
 def _amax_pair(amax_detected):

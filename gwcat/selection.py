@@ -1438,6 +1438,14 @@ class SelectionSet:
             f.attrs["cosmology_Om0"] = _cosmo_or_nan(self,
                                                      "_cosmology_used_Om0")
             f.attrs["cosmology_source"] = str(self._cosmology_source)
+            # False when this campaign's rows carry no drawn sky position (the
+            # semianalytic O1/O2 entries of the cumulative mixtures): its
+            # exported ra/dec are NaN, and a consumer that feeds them to
+            # hp.ang2pix must know that is declared, not corrupt (GW-10; the
+            # v2 builder has recorded this since GW-20, the v1 writer never
+            # did).
+            f.attrs["sky_position_available"] = bool(
+                getattr(self, "_sky_position_available", True))
             f.attrs["chi_eff_swap_applied"] = True
             f.attrs["chi_eff_amax"] = float(amax)
             # ── Spin-prior contract provenance (PR 3) ──────────────────────
@@ -1789,6 +1797,22 @@ class CombinedSelectionSet:
                 "cosmology_Om0_per_campaign",
                 np.array([_cosmo_or_nan(s, "_cosmology_used_Om0")
                           for s in self._sets], dtype=float))
+            # Per-campaign sky availability (GW-10): NaN-sky campaigns (the
+            # semianalytic O1/O2 mixture rows) may be legitimately concatenated
+            # with real-sky ones, but the file must say WHICH rows are which
+            # class -- and mixing deserves a warning, because a consumer doing
+            # sky work will silently lose the NaN campaigns' injections.
+            _sky = np.array([bool(getattr(s, "_sky_position_available", True))
+                             for s in self._sets], dtype=bool)
+            f.attrs.create("sky_position_available", _sky)
+            if _sky.any() and not _sky.all():
+                warnings.warn(
+                    f"{out_path}: concatenating campaign(s) WITHOUT drawn sky "
+                    f"positions (exported ra/dec are NaN) with campaign(s) "
+                    f"that have them: sky_position_available per campaign = "
+                    f"{_sky.tolist()}. Any sky-dependent selection use will "
+                    f"silently drop the NaN campaigns' injections; cut on "
+                    f"campaign, not on finiteness, if that is not intended.")
             f.attrs["chi_eff_swap_applied"] = True
             f.attrs["chi_eff_amax"] = float(amax)
             # ── Spin-prior contract provenance (PR 3) ──────────────────────
