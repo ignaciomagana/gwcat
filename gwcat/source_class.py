@@ -137,6 +137,188 @@ def canonical_classes_from_mass(m1_source, m2_source,
     return np.array([normalize_source_class(x) for x in np.atleast_1d(labels)])
 
 
+# ── Which QUANTITY the source-class cut was applied to (GW-12) ───────────────
+#
+# `classify_by_mass` is the single classifier and `DEFAULT_NSBH_MASS_THRESHOLD`
+# the single threshold, so the two sides of an export pair cannot disagree about
+# *where* the class boundary is.  They can still disagree about *what they put
+# through it*, and they did: PE events are classified from the POSTERIOR MEDIAN
+# source-frame masses (gwcat.ingest, `_classify` on `np.median(mass_i_source)`)
+# while injections are classified from their INJECTED TRUE masses
+# (SelectionSet.source_class_mask).  Sharing a threshold is not sharing a cut.
+#
+# The consequence is Essick & Fishbach's event-selection requirement, in its
+# source-class form: beta must be the detection probability of the SAME
+# procedure that produced the event list.  A median is a noisy estimator of the
+# mass it estimates, so near the NS/BH boundary a fraction of true-NSBH systems
+# have median m2 >= thr and enter a "BBH" event list, while true-BBH systems
+# with median m2 < thr leave it -- and the two fractions do not cancel, because
+# the mass distribution is not flat across the boundary and the measurement
+# error is not symmetric in the source frame (it is inherited from a detector-
+# frame mass divided by a redshift that is itself uncertain).  Cutting the
+# injections on truth reproduces neither fraction, so the exported beta is the
+# selection function of a cut nobody applied.  The bias is concentrated
+# entirely in the boundary events, which is where NSBH/BNS science lives.
+#
+# There is no cheap fix available at export time: reproducing the median cut on
+# the injection side needs a per-injection mock point estimate, which needs a
+# measurement-error model this package does not have and would be a fabricated
+# one if it invented it.  So the estimator is RECORDED on both sides instead,
+# and the paired-file validators refuse a pair whose two sides used different
+# estimators.  See :func:`assess_cut_estimator_pair`.
+
+#: No source-class restriction was applied on this side.
+CUT_ESTIMATOR_NONE = "none"
+#: Events classified from posterior MEDIAN source-frame masses (PE side).
+CUT_ESTIMATOR_POSTERIOR_MEDIAN = "posterior_median_mass"
+#: Events selected by name from an explicit list (PE side).  Membership in a
+#: fixed list is not a mass cut: it is reproducible on the injection side by
+#: construction, so it does not carry the boundary bias above.
+CUT_ESTIMATOR_NAME_WHITELIST = "name_whitelist"
+#: Injections classified from their INJECTED TRUE masses (selection side).
+CUT_ESTIMATOR_INJECTED_TRUTH = "injected_truth"
+
+#: The attr both sides write.
+CUT_ESTIMATOR_ATTR = "source_class_cut_estimator"
+
+
+def pe_cut_estimator(source_class, event_list=None) -> str:
+    """The estimator a PE export's source-class restriction was applied to.
+
+    ``source_class`` is resolved by ``GWCatalog.select`` against the store's
+    ``source_class`` column, which ingest fills from ``classify_by_mass`` on the
+    posterior MEDIAN source-frame masses -- so any non-``None`` request is a
+    median-based cut, and takes precedence in the record even when an event list
+    is also supplied (the median cut is the part that cannot be reproduced).
+
+    An ``event_list`` alone restricts by NAME.  That is membership in a fixed
+    list, not a cut on a noisy statistic, so it is recorded distinctly and the
+    pairing check treats it as reproducible.
+    """
+    if source_class is not None:
+        return CUT_ESTIMATOR_POSTERIOR_MEDIAN
+    if event_list is not None:
+        return CUT_ESTIMATOR_NAME_WHITELIST
+    return CUT_ESTIMATOR_NONE
+
+
+def selection_cut_estimator(source_class) -> str:
+    """The estimator a selection export's source-class restriction was applied to.
+
+    ``SelectionSet.source_class_mask`` classifies injections from the campaign's
+    own injected source-frame masses, which are exact by construction.
+    """
+    return (CUT_ESTIMATOR_NONE if source_class is None
+            else CUT_ESTIMATOR_INJECTED_TRUTH)
+
+
+def _estimator_str(raw) -> str:
+    """Read a ``source_class_cut_estimator`` attr, tolerating bytes/numpy.str_."""
+    if raw is None:
+        return ""
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "replace")
+    return str(raw).strip()
+
+
+#: The escape hatches named in the refusal, kept in one place so the two
+#: validators and the export-time warning cannot drift apart.
+CUT_ESTIMATOR_REMEDY = (
+    "Either (1) select the events by NAME instead -- pass event_list= (CLI: "
+    "--event-list) with the names you mean and drop --source-class from the PE "
+    "side; list membership is reproducible on the injection side, so a "
+    "whitelisted pair is accepted -- or (2) drop the source-class filter from "
+    "BOTH sides and model the classes in the population instead of cutting on "
+    "them.")
+
+
+def assess_cut_estimator_pair(pe_estimator, sel_estimator,
+                              pe_filtered: bool, sel_filtered: bool):
+    """Judge a PE/selection pair on which quantity each side's class cut used.
+
+    Parameters are the two ``source_class_cut_estimator`` attrs (``None`` when
+    the attr is absent, i.e. a file written before GW-12) and whether each side
+    carries a real, non-empty ``source_class_filter``.
+
+    Returns ``(verdict, message)`` with ``verdict`` in ``{"pass", "warn",
+    "fail"}``.  The caller owns how a warn is emitted and how a fail is raised,
+    so the v1 and v2 validators can share this judgement without sharing their
+    reporting machinery.
+    """
+    pe = _estimator_str(pe_estimator)
+    sel = _estimator_str(sel_estimator)
+
+    if pe == CUT_ESTIMATOR_NAME_WHITELIST:
+        # The PE restriction is membership in a fixed list of names, not a cut
+        # on a measured quantity, so there is no point estimate to disagree
+        # about: whatever the injection side cuts on, it is not being asked to
+        # reproduce a median.  This is the shipped BBH-whitelist configuration
+        # and it is unaffected by GW-12.
+        return "pass", ""
+
+    if not pe_filtered and not sel_filtered:
+        return "pass", ""
+
+    if not pe_filtered or not sel_filtered:
+        # One-sided statement.  xcheck_source_class already governs whether a
+        # one-sided class filter is legal at all; this check only reports that
+        # there is nothing here to compare, following the same warn-not-fail
+        # convention _xcheck_detection_cut uses for a one-sided cut.
+        return "warn", (
+            "source-class cut stated on one side only (PE estimator="
+            f"{pe or 'unknown'!r}, selection estimator={sel or 'unknown'!r}); "
+            "the files cannot show that the two selections agree.")
+
+    if not pe or not sel:
+        # Absent attr on a pre-GW-12 file.  "Unknown" is not "compatible", but
+        # it is also not evidence of a mismatch, so warn rather than condemn a
+        # pair that may well have been built the right way.
+        return "warn", (
+            f"{CUT_ESTIMATOR_ATTR} missing on "
+            + ("both files" if not pe and not sel
+               else ("the PE file" if not pe else "the selection file"))
+            + " (PE=" + (pe or "unknown") + ", selection=" + (sel or "unknown")
+            + "); this pair predates the record, so which quantity each "
+              "source-class cut was applied to cannot be checked. Re-export to "
+              "make it verifiable.")
+
+    if pe == CUT_ESTIMATOR_POSTERIOR_MEDIAN and sel == CUT_ESTIMATOR_INJECTED_TRUTH:
+        return "fail", (
+            "the event source-class cut and the injection source-class cut use "
+            "the same threshold on DIFFERENT quantities: the PE events were "
+            f"classified from posterior MEDIAN source-frame masses ({pe!r}) "
+            "while the injections were classified from their injected TRUE "
+            f"masses ({sel!r}). A hard cut on a noisy point estimate is not "
+            "reproduced by the same cut on true values -- systems scatter "
+            "across the NS/BH mass boundary in both directions and the two "
+            "fractions do not cancel -- so the exported selection function does "
+            "not describe the cut that produced this event list, and it is "
+            "biased exactly at the boundary where NSBH/BNS science lives "
+            "(Essick & Fishbach; GW-12). " + CUT_ESTIMATOR_REMEDY)
+
+    if pe == sel:
+        return "pass", ""
+
+    return "warn", (
+        f"unrecognised {CUT_ESTIMATOR_ATTR} pair (PE={pe!r}, "
+        f"selection={sel!r}); this checker knows "
+        f"{[CUT_ESTIMATOR_NONE, CUT_ESTIMATOR_POSTERIOR_MEDIAN, CUT_ESTIMATOR_NAME_WHITELIST, CUT_ESTIMATOR_INJECTED_TRUTH]} "
+        "and cannot judge whether these two cuts select the same systems.")
+
+
+#: Warning text the PE exporters emit when a median-based class cut is built.
+#: Stated at export time so the failure is understood before the paired
+#: validator refuses the product, not after.
+PE_MEDIAN_CUT_WARNING = (
+    "source_class= applies a hard cut on POSTERIOR MEDIAN source-frame masses, "
+    "but the paired selection export cuts its injections on their injected TRUE "
+    "masses. The same threshold on different quantities is not the same cut: it "
+    "biases the selection function at the class boundary (Essick & Fishbach; "
+    "GW-12), and validate_export/validate_pair will REFUSE this pair "
+    f"({CUT_ESTIMATOR_ATTR}='{CUT_ESTIMATOR_POSTERIOR_MEDIAN}' vs "
+    f"'{CUT_ESTIMATOR_INJECTED_TRUTH}'). " + CUT_ESTIMATOR_REMEDY)
+
+
 def _compact_key(label) -> str:
     if label is None:
         return ""

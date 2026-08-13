@@ -332,7 +332,7 @@ def test_none_and_cbc_agree_for_all_bbh(tmp_path):
 # ==========================================================================
 def _make_pe_export(tmp_path, events=None, cosmology=(_H0, _Om0),
                     spin_prior_mode="include", source_class=None,
-                    name="pe.h5", seed=7):
+                    event_list=None, name="pe.h5", seed=7):
     if events is None:
         events = [{"name": "GW900001_000001", "source_class": "BBH"},
                   {"name": "GW900002_000002", "source_class": "BBH"}]
@@ -341,7 +341,8 @@ def _make_pe_export(tmp_path, events=None, cosmology=(_H0, _Om0),
     out = tmp_path / name
     GWCatalog(store).to_darksirens(
         str(out), nsamp=8, seed=0, cosmology=cosmology,
-        spin_prior_mode=spin_prior_mode, source_class=source_class)
+        spin_prior_mode=spin_prior_mode, source_class=source_class,
+        event_list=event_list)
     return str(out)
 
 
@@ -396,11 +397,89 @@ def test_validate_fails_on_source_class_mismatch(tmp_path):
         validate_export(pe, sel)
 
 
-def test_validate_source_class_match_passes(tmp_path):
+# ==========================================================================
+# GW-12: matching class SETS is not matching class CUTS
+# ==========================================================================
+def test_validate_source_class_match_fails_on_estimator(tmp_path):
+    """A matched 'bbh'/'bbh' pair is exactly the defect, not the happy path.
+
+    The two sides agree on the class set and on the mass threshold, but the PE
+    events went through it on their posterior MEDIAN masses and the injections
+    on their injected TRUE masses.  This test used to assert that pair passes.
+    """
     pe = _make_pe_export(tmp_path, source_class="bbh")
     sel = _make_combined_selection(tmp_path, source_class="bbh")
+    with pytest.raises(ValueError,
+                       match="xcheck_source_class_estimator"):
+        validate_export(pe, sel)
+
+
+def test_validate_source_class_estimator_message_names_the_escape_hatch(
+        tmp_path):
+    pe = _make_pe_export(tmp_path, source_class="bbh", name="pe_msg.h5")
+    sel = _make_combined_selection(tmp_path, source_class="bbh",
+                                   name="sel_msg.h5")
+    with pytest.raises(ValueError) as exc:
+        validate_export(pe, sel)
+    msg = str(exc.value)
+    assert "posterior_median_mass" in msg and "injected_truth" in msg
+    assert "Essick" in msg
+    assert "event_list" in msg
+
+
+def test_validate_name_whitelist_pair_passes(tmp_path):
+    """Selecting the events by NAME is membership, not a mass cut, so the
+    injection set (which applies no class cut) models the same event list."""
+    events = [{"name": "GW900001_000001", "source_class": "BBH"},
+              {"name": "GW900002_000002", "source_class": "NSBH"}]
+    pe = _make_pe_export(tmp_path, events=events,
+                         event_list=["GW900001_000001"], name="pe_wl.h5")
+    sel = _make_combined_selection(tmp_path, source_class=None,
+                                   name="sel_wl.h5")
     results = validate_export(pe, sel)
-    assert results["xcheck_source_class"] is True
+    assert results["xcheck_source_class_estimator"] is True
+    assert all(results.values())
+    with h5py.File(pe, "r") as f:
+        assert f.attrs["source_class_cut_estimator"] == "name_whitelist"
+
+
+def test_validate_unfiltered_pair_passes(tmp_path):
+    pe = _make_pe_export(tmp_path, name="pe_nf.h5")
+    sel = _make_combined_selection(tmp_path, name="sel_nf.h5")
+    results = validate_export(pe, sel)
+    assert results["xcheck_source_class_estimator"] is True
+    with h5py.File(pe, "r") as f:
+        assert f.attrs["source_class_cut_estimator"] == "none"
+    with h5py.File(sel, "r") as f:
+        assert f.attrs["source_class_cut_estimator"] == "none"
+
+
+def test_v1_estimator_provenance_round_trips(tmp_path):
+    pe = _make_pe_export(tmp_path, source_class="bbh", name="pe_rt.h5")
+    sel = _make_combined_selection(tmp_path, source_class="bbh",
+                                   name="sel_rt.h5")
+    with h5py.File(pe, "r") as f:
+        assert f.attrs["source_class_cut_estimator"] == "posterior_median_mass"
+    with h5py.File(sel, "r") as f:
+        assert f.attrs["source_class_cut_estimator"] == "injected_truth"
+
+
+def test_v1_estimator_absent_warns_not_fails(tmp_path):
+    """A pre-GW-12 file carries no estimator attr; unknown is not a mismatch."""
+    pe = _make_pe_export(tmp_path, source_class="bbh", name="pe_old.h5")
+    sel = _make_combined_selection(tmp_path, source_class="bbh",
+                                   name="sel_old.h5")
+    for path in (pe, sel):
+        with h5py.File(path, "a") as f:
+            del f.attrs["source_class_cut_estimator"]
+    with pytest.warns(UserWarning, match="predates the record"):
+        results = validate_export(pe, sel)
+    assert results["xcheck_source_class_estimator"] is True
+
+
+def test_v1_pe_export_warns_on_median_class_cut(tmp_path):
+    with pytest.warns(UserWarning, match="POSTERIOR MEDIAN"):
+        _make_pe_export(tmp_path, source_class="bbh", name="pe_warn.h5")
 
 
 # ==========================================================================

@@ -302,6 +302,30 @@ def test_selection_combined_multiple_files(tmp_path):
 # validate
 # ==========================================================================
 def test_validate_happy_path(tmp_path):
+    # The BBH events are selected by NAME, not by a mass cut on their posterior
+    # medians (GW-12): a name whitelist is membership, so the paired injection
+    # set -- which applies no class cut at all -- models the same event list.
+    # Selecting with --source-class on both sides is the refused pair below.
+    store = _build_mixed_store(tmp_path, MIXED_EVENTS)
+    names = tmp_path / "bbh_names.txt"
+    names.write_text("GW910001_000001\nGW910002_000002\n")
+    pe = tmp_path / "gw_bbh.h5"
+    assert main(["export-darksirens", store, "--out", str(pe),
+                "--event-list", str(names), "--cosmology", "67.74,0.3089",
+                "--nsamp", "8", "--seed", "0", "--no-summary",
+                "--allow-missing-far"]) == 0
+
+    inj = _write_o4_injections(tmp_path / "inj.hdf", {"BBH": 4})
+    sel = tmp_path / "sel.h5"
+    assert main(["selection", "--injections", inj, "--out", str(sel),
+                "--H0", "67.74", "--Om0", "0.3089", "--no-summary"]) == 0
+
+    assert main(["validate", str(pe), str(sel)]) == 0
+
+
+def test_validate_rejects_median_vs_truth_class_cut(tmp_path):
+    """--source-class on BOTH sides is a matched class set applied to two
+    different quantities (GW-12), and `validate` must exit nonzero on it."""
     store = _build_mixed_store(tmp_path, MIXED_EVENTS)
     pe = tmp_path / "gw_bbh.h5"
     assert main(["export-darksirens", store, "--out", str(pe),
@@ -314,7 +338,7 @@ def test_validate_happy_path(tmp_path):
                 "--source-class", "bbh", "--H0", "67.74", "--Om0", "0.3089",
                 "--no-summary"]) == 0
 
-    assert main(["validate", str(pe), str(sel)]) == 0
+    assert main(["validate", str(pe), str(sel)]) == 1
 
 
 def test_validate_mismatch_returns_nonzero(tmp_path):

@@ -53,7 +53,8 @@ import h5py
 from .cosmology import PLANCK15
 from .source_class import (classify_by_mass, normalize_source_class,
                            resolve_filter_classes, format_source_class_filter,
-                           DEFAULT_NSBH_MASS_THRESHOLD)
+                           DEFAULT_NSBH_MASS_THRESHOLD,
+                           CUT_ESTIMATOR_ATTR, selection_cut_estimator)
 from . import selection_spin as _sspin
 from .spin import chi_p_from_components
 
@@ -160,6 +161,12 @@ def _selection_provenance_dict(source_class, nsbh_mass_threshold,
     d["source_class_filter"] = format_source_class_filter(source_class)
     d["source_class_method"] = (
         "none" if source_class is None else "mass_threshold")
+    # WHICH masses went through that threshold (GW-12).  source_class_method
+    # records the classifier; this records the quantity, and the two sides of an
+    # export pair shared the former while differing on the latter.  The paired
+    # validators refuse a median-vs-truth pair; see
+    # gwcat.source_class.assess_cut_estimator_pair.
+    d[CUT_ESTIMATOR_ATTR] = selection_cut_estimator(source_class)
     d["nsbh_mass_threshold"] = float(nsbh_mass_threshold)
     d["n_injections_before_filter"] = int(n_before)
     d["n_injections_after_filter"] = int(n_after)
@@ -1483,6 +1490,7 @@ class SelectionSet:
                 "source_class_filter": (
                     None if source_class is None
                     else format_source_class_filter(source_class)),
+                CUT_ESTIMATOR_ATTR: selection_cut_estimator(source_class),
                 "source_class_counts_detected": (
                     value_counts([normalize_source_class(c) for c in classes_det])),
                 "cosmology_H0": _cosmo_or_nan(self, "_cosmology_used_H0"),
@@ -1836,6 +1844,7 @@ class CombinedSelectionSet:
                 "source_class_filter": (
                     None if source_class is None
                     else format_source_class_filter(source_class)),
+                CUT_ESTIMATOR_ATTR: selection_cut_estimator(source_class),
                 "source_class_counts_detected": (
                     value_counts([normalize_source_class(c) for c in classes_det])),
                 "cosmology_H0": (

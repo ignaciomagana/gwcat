@@ -274,3 +274,63 @@ def test_empty_requests_are_refused():
     # file describing itself, not a caller making a request.
     assert parse_source_class_filter("") == ()
     assert parse_source_class_filter(",") == ()
+
+
+# ==========================================================================
+# GW-12: the classifier is shared; the QUANTITY it classifies is not
+# ==========================================================================
+def test_event_and_injection_cuts_use_same_estimator():
+    """The two sides declare which masses went through the shared threshold.
+
+    ``classify_by_mass`` and ``DEFAULT_NSBH_MASS_THRESHOLD`` are shared, so the
+    two paths cannot disagree about WHERE the boundary is -- but PE events go
+    through it on posterior median masses and injections on injected truth, and
+    nothing in the files said so.  These are the values that say so.
+    """
+    from gwcat.source_class import pe_cut_estimator, selection_cut_estimator
+
+    assert pe_cut_estimator(None, None) == "none"
+    assert pe_cut_estimator(None, ["GW150914"]) == "name_whitelist"
+    assert pe_cut_estimator("bbh", None) == "posterior_median_mass"
+    # A median cut plus a whitelist is still a median cut: the unreproducible
+    # half is what the record must name.
+    assert pe_cut_estimator("bbh", ["GW150914"]) == "posterior_median_mass"
+
+    assert selection_cut_estimator(None) == "none"
+    assert selection_cut_estimator("bbh") == "injected_truth"
+
+
+def test_assess_cut_estimator_pair_verdicts():
+    from gwcat.source_class import (assess_cut_estimator_pair,
+                                    CUT_ESTIMATOR_NONE,
+                                    CUT_ESTIMATOR_POSTERIOR_MEDIAN,
+                                    CUT_ESTIMATOR_NAME_WHITELIST,
+                                    CUT_ESTIMATOR_INJECTED_TRUTH)
+
+    # The defect: same class set, same threshold, different quantity.
+    verdict, msg = assess_cut_estimator_pair(
+        CUT_ESTIMATOR_POSTERIOR_MEDIAN, CUT_ESTIMATOR_INJECTED_TRUTH,
+        True, True)
+    assert verdict == "fail"
+    assert "Essick" in msg and "event_list" in msg
+
+    # A name whitelist is membership, not a cut on a noisy statistic.
+    assert assess_cut_estimator_pair(
+        CUT_ESTIMATOR_NAME_WHITELIST, CUT_ESTIMATOR_INJECTED_TRUTH,
+        False, True)[0] == "pass"
+
+    # No class filter anywhere: nothing to compare, nothing to say.
+    assert assess_cut_estimator_pair(
+        CUT_ESTIMATOR_NONE, CUT_ESTIMATOR_NONE, False, False) == ("pass", "")
+
+    # A pre-GW-12 file warns rather than condemning a pair it cannot judge.
+    assert assess_cut_estimator_pair(
+        None, CUT_ESTIMATOR_INJECTED_TRUTH, True, True)[0] == "warn"
+    assert assess_cut_estimator_pair(
+        CUT_ESTIMATOR_POSTERIOR_MEDIAN, "", True, True)[0] == "warn"
+
+    # One-sided statement: the same warn-not-fail convention the detection-cut
+    # check uses.
+    assert assess_cut_estimator_pair(
+        CUT_ESTIMATOR_POSTERIOR_MEDIAN, CUT_ESTIMATOR_NONE,
+        True, False)[0] == "warn"

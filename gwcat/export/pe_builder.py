@@ -76,7 +76,8 @@ import numpy as np
 
 from ..cosmology import make_cosmology, z_of_dL
 from ..params import DEFAULT_PARAMETER_SPACE, get_space
-from ..source_class import format_source_class_filter
+from ..source_class import (format_source_class_filter, CUT_ESTIMATOR_ATTR,
+                            pe_cut_estimator, PE_MEDIAN_CUT_WARNING)
 from .product import ExportProduct
 
 
@@ -251,6 +252,13 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         raise ValueError(
             f"chi_p_definition must be 'schmidt_recomputed' or 'file'; got "
             f"{chi_p_definition!r}.")
+
+    # ── The class cut the paired selection file cannot reproduce (GW-12) ────
+    # Said here, at build time, rather than only by the validator that will
+    # refuse the finished pair: the cheap alternative (event_list=) is a choice
+    # about how to build THIS product, and it is useless advice after the fact.
+    if source_class is not None:
+        warnings.warn(PE_MEDIAN_CUT_WARNING)
 
     space = get_space(spin_basis)
     # Whether this space needs per-sample spin columns beyond the legacy set.
@@ -870,6 +878,11 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         "pe_cosmology_H0": pe_H0,
         "pe_cosmology_Om0": pe_Om0,
         "source_class_filter": format_source_class_filter(source_class),
+        # WHICH masses the class threshold was applied to (GW-12): the store's
+        # source_class column is classify_by_mass() of the POSTERIOR MEDIAN
+        # source-frame masses, while the paired selection file cuts injections
+        # on injected truth.  The pairing validator refuses that combination.
+        CUT_ESTIMATOR_ATTR: pe_cut_estimator(source_class, event_list),
         "event_list_filter": (
             "" if event_list is None
             else (str(event_list) if isinstance(event_list, (str, bytes))
@@ -926,6 +939,7 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         "spin_basis": spin_basis,
         "source_class_filter": (None if source_class is None
                                 else format_source_class_filter(source_class)),
+        CUT_ESTIMATOR_ATTR: pe_cut_estimator(source_class, event_list),
         "event_list_filter": (
             None if event_list is None
             else (str(event_list)

@@ -408,6 +408,67 @@ def test_source_class_legacy_repr_is_refused_not_silently_passed(tmp_path):
     assert "xcheck_source_class" in str(ei.value)
 
 
+# ======================================================================
+# GW-12: the class cut's ESTIMATOR, on the v2 path
+# ======================================================================
+def test_v2_estimator_provenance_round_trips(tmp_path):
+    with pytest.warns(UserWarning, match="POSTERIOR MEDIAN"):
+        pe = _pe_component(tmp_path, name="pe_est.h5", source_class="bbh")
+    sel = _sel(tmp_path, name="sel_est.h5", source_class="bbh")
+    with h5py.File(pe, "r") as f:
+        assert f.attrs["source_class_cut_estimator"] == "posterior_median_mass"
+    with h5py.File(sel, "r") as f:
+        assert f.attrs["source_class_cut_estimator"] == "injected_truth"
+
+
+def test_v2_unfiltered_pair_records_none_and_passes(tmp_path):
+    pe = _pe_component(tmp_path, name="pe_none.h5")
+    sel = _sel(tmp_path, name="sel_none.h5")
+    with h5py.File(pe, "r") as f:
+        assert f.attrs["source_class_cut_estimator"] == "none"
+    with h5py.File(sel, "r") as f:
+        assert f.attrs["source_class_cut_estimator"] == "none"
+    results = validate_export_v2(str(pe), str(sel))
+    assert results["xcheck_source_class_estimator"] is True
+
+
+def test_v2_median_vs_truth_class_cut_fails(tmp_path):
+    """Matched class SETS, mismatched class CUTS: refused (GW-12)."""
+    with pytest.warns(UserWarning, match="POSTERIOR MEDIAN"):
+        pe = _pe_component(tmp_path, name="pe_mvt.h5", source_class="bbh")
+    sel = _sel(tmp_path, name="sel_mvt.h5", source_class="bbh")
+    with pytest.raises(ValueError) as ei:
+        validate_export_v2(str(pe), str(sel))
+    msg = str(ei.value)
+    assert "xcheck_source_class_estimator" in msg
+    assert "posterior_median_mass" in msg and "injected_truth" in msg
+    assert "Essick" in msg and "event_list" in msg
+
+
+def test_v2_name_whitelist_pair_passes(tmp_path):
+    """The PE side restricted by NAME carries no median cut to reproduce."""
+    pe = _pe_component(tmp_path, name="pe_wl.h5",
+                       event_list=["GWv0_000001"])
+    sel = _sel(tmp_path, name="sel_wl.h5")
+    with h5py.File(pe, "r") as f:
+        assert f.attrs["source_class_cut_estimator"] == "name_whitelist"
+    results = validate_export_v2(str(pe), str(sel))
+    assert results["xcheck_source_class_estimator"] is True
+
+
+def test_v2_estimator_absent_warns_not_fails(tmp_path):
+    """A pre-GW-12 file: unknown is not evidence of a mismatch."""
+    with pytest.warns(UserWarning, match="POSTERIOR MEDIAN"):
+        pe = _pe_component(tmp_path, name="pe_old.h5", source_class="bbh")
+    sel = _sel(tmp_path, name="sel_old.h5", source_class="bbh")
+    for path in (pe, sel):
+        with h5py.File(path, "r+") as f:
+            del f.attrs["source_class_cut_estimator"]
+    with pytest.warns(UserWarning, match="predates the record"):
+        results = validate_export_v2(str(pe), str(sel))
+    assert results["xcheck_source_class_estimator"] is True
+
+
 def test_detection_cut_mismatch_fails(tmp_path):
     """Two stated FAR thresholds that differ is a hard failure."""
     pe = _pe_component(tmp_path)

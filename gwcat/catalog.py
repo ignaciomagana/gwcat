@@ -21,7 +21,9 @@ import h5py
 from .cosmology import make_cosmology, z_of_dL
 from .source_class import (normalize_source_class, resolve_filter_classes,
                            format_source_class_filter, load_event_list,
-                           SOURCE_CLASSES)
+                           SOURCE_CLASSES, CUT_ESTIMATOR_ATTR,
+                           pe_cut_estimator, assess_cut_estimator_pair,
+                           PE_MEDIAN_CUT_WARNING)
 
 
 class GWCatalog:
@@ -592,6 +594,12 @@ class GWCatalog:
                 f"of {valid_spin_modes}. 'passthrough' is not offered because "
                 f"the store keeps a spin-prior-agnostic p_dL_pe, so 'exclude' "
                 f"already means 'no chi_eff prior applied'.")
+        # ── The class cut the paired selection file cannot reproduce (GW-12) ─
+        # Warned here, at export time, rather than only by the validator that
+        # will refuse the finished pair: the cheap alternative (event_list=) is
+        # a choice about how to build THIS product.
+        if source_class is not None:
+            warnings.warn(PE_MEDIAN_CUT_WARNING)
         sub = self.select(compact_type=compact_type, far_max=far_max,
                           pastro_min=pastro_min, allowed_names=allowed_names,
                           allowed_names_authoritative=allowed_names_authoritative,
@@ -860,6 +868,15 @@ class GWCatalog:
             # --- Source-class / FAR-policy provenance (PR 2) ---
             f.attrs["source_class_filter"] = format_source_class_filter(
                 source_class)
+            # WHICH masses the class threshold was applied to (GW-12).  The
+            # store's source_class column is classify_by_mass() of the POSTERIOR
+            # MEDIAN source-frame masses, while the paired selection file cuts
+            # its injections on injected truth -- the same threshold on two
+            # different quantities.  Recording it is what lets the paired-file
+            # validator refuse that combination instead of shipping a beta that
+            # describes a cut nobody applied.
+            f.attrs[CUT_ESTIMATOR_ATTR] = pe_cut_estimator(
+                source_class, event_list)
             f.attrs["event_list_filter"] = (
                 "" if event_list is None
                 else (str(event_list) if isinstance(event_list, (str, bytes))
@@ -933,6 +950,7 @@ class GWCatalog:
                 "source_class_filter": (
                     None if source_class is None
                     else format_source_class_filter(source_class)),
+                CUT_ESTIMATOR_ATTR: pe_cut_estimator(source_class, event_list),
                 "event_list_filter": (
                     None if event_list is None
                     else (str(event_list)
@@ -1090,7 +1108,10 @@ def validate_export(gw_path: str, selection_path: str = None, strict: bool = Fal
       (c) source-class compatibility: the PE ``source_class_filter`` and the
           selection ``source_class_filter`` must resolve to the same canonical
           class set (the injections must cover the same source class(es) as the
-          PE events).
+          PE events), and their ``source_class_cut_estimator`` must agree when
+          both sides really do carry a class filter -- a median-based event cut
+          paired with a truth-based injection cut is the same threshold on a
+          different quantity, and biases beta at the class boundary (GW-12).
 
     Returns a dict of {check_name: passed_bool}.  If strict=True, raises on
     the first internal-consistency failure; the cross-validation contract
@@ -1288,6 +1309,31 @@ def validate_export(gw_path: str, selection_path: str = None, strict: bool = Fal
                       f"{sorted(sel_classes)}. The selection injections must "
                       f"cover the same source class(es) as the PE events.")
             results["xcheck_source_class"] = True
+
+            # (c2) The class cut's ESTIMATOR (GW-12).  The check above proves
+            # the two sides asked for the same CLASSES; it cannot see that they
+            # asked different questions to get them -- PE events are classified
+            # from posterior median source-frame masses, injections from
+            # injected truth.  Same threshold, different quantity, and the
+            # exported selection function then describes a cut nobody applied.
+            # Kept in lockstep with gwcat.export.validate's v2 twin: fixing
+            # only the v2 path is the recurring failure mode here (GW-25).
+            def _filtered(raw):
+                from .source_class import parse_source_class_filter
+                try:
+                    return bool(parse_source_class_filter(raw))
+                except ValueError:
+                    return False
+
+            verdict, msg = assess_cut_estimator_pair(
+                _sattr(fg, CUT_ESTIMATOR_ATTR, None),
+                _sattr(fs, CUT_ESTIMATOR_ATTR, None),
+                _filtered(pe_scf), _filtered(sel_scf))
+            if verdict == "fail":
+                _fail("xcheck_source_class_estimator", msg)
+            if verdict == "warn":
+                warnings.warn(msg)
+            results["xcheck_source_class_estimator"] = True
 
     n_pass = sum(results.values())
     n_total = len(results)

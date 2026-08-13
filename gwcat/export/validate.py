@@ -148,7 +148,11 @@ def validate_export_v2(pe_path, selection_path=None, strict=False):
         the v1 tolerances ``|dH0| >= 1.0`` / ``|dOm0| >= 0.05``; per-event PE
         cosmologies are each compared against the single selection cosmology).
       * Source class: the PE and selection ``source_class_filter`` must resolve
-        to the same canonical class set.
+        to the same canonical class set, and -- when both sides really do carry
+        a class filter -- their ``source_class_cut_estimator`` must agree.  A
+        median-based event cut paired with a truth-based injection cut is
+        refused: same threshold, different quantity, biased at the boundary
+        (GW-12).
 
     The chieff_chip amax cross-check -- why the two amax are NOT required to match
     -----------------------------------------------------------------------------
@@ -465,6 +469,9 @@ def validate_export_v2(pe_path, selection_path=None, strict=False):
                   f"the same source class(es) as the PE events.")
         results["xcheck_source_class"] = True
 
+        # (d2) The class cut's ESTIMATOR: same threshold, same quantity (GW-12).
+        _xcheck_source_class_estimator(_fail, results, pe_attrs, sel_attrs)
+
         # (e) The detection cut: same statistic, same threshold.
         _xcheck_detection_cut(_fail, results, pe_attrs, sel_attrs)
 
@@ -498,6 +505,43 @@ def validate_export_v2(pe_path, selection_path=None, strict=False):
     status = "ALL PASSED" if n_pass == n_total else f"{n_total - n_pass} FAILED"
     print(f"  {n_pass}/{n_total} checks: {status}")
     return results
+
+
+def _xcheck_source_class_estimator(_fail, results, pe_attrs, sel_attrs):
+    """The two source-class cuts must act on the same quantity (GW-12).
+
+    ``xcheck_source_class`` proves the two sides asked for the same CLASSES;
+    it cannot see that they asked different questions to get them.  PE events
+    are classified from posterior median source-frame masses and injections
+    from injected truth, so a shared threshold is not a shared cut, and the
+    selection function that ships describes a cut nobody applied.  See
+    :func:`gwcat.source_class.assess_cut_estimator_pair` for the mechanism.
+
+    Absent attrs (a file written before this record existed) warn rather than
+    fail, the same convention ``_xcheck_detection_cut`` uses for a cut stated on
+    one side only: unknown is not evidence of a mismatch.
+    """
+    from ..source_class import (parse_source_class_filter, CUT_ESTIMATOR_ATTR,
+                                assess_cut_estimator_pair)
+
+    def _filtered(raw):
+        try:
+            return bool(parse_source_class_filter(raw))
+        except ValueError:
+            # Unparseable: xcheck_source_class has already failed on it, and a
+            # repr nobody can read is not a filter this check can judge.
+            return False
+
+    verdict, msg = assess_cut_estimator_pair(
+        pe_attrs.get(CUT_ESTIMATOR_ATTR),
+        sel_attrs.get(CUT_ESTIMATOR_ATTR),
+        _filtered(pe_attrs.get("source_class_filter", "")),
+        _filtered(sel_attrs.get("source_class_filter", "")))
+    if verdict == "fail":
+        _fail("xcheck_source_class_estimator", msg)
+    if verdict == "warn":
+        warnings.warn(msg)
+    results["xcheck_source_class_estimator"] = True
 
 
 def _xcheck_detection_cut(_fail, results, pe_attrs, sel_attrs):
