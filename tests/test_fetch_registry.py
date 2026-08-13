@@ -17,6 +17,7 @@ load from manifests" with unchanged fetch behavior.
 from __future__ import annotations
 
 import re
+import warnings
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
@@ -394,3 +395,204 @@ def test_a_later_nan_page_does_not_clobber_a_finite_value():
     _parse_gwosc_event_table_page(
         {"events": {"GW3-v3": {"far": 2.0, "p_astro": 0.95}}}, table)
     assert table["GW3"]["far"] == 2.0
+
+
+# ==========================================================================
+# GW-15b: the BBH query must be restricted to the LVK GWTC catalogs
+#
+# The fixture below is SYNTHETIC but modelled on the live response the review
+# recorded (review/findings/fetch.md, finding 2, adversarially CONFIRMED):
+# the unfiltered query returns 286 names across eight catalogs --
+#   {GWTC-5.0: 104, GWTC-4.1: 86, IAS-O3a: 41, GWTC-3-confident: 32,
+#    GWTC-2.1-confident: 20, O4_Discovery_Papers: 1, O3_IMBH_marginal: 1,
+#    GWTC-2: 1}
+# -- and under `lastver=true` the 41 IAS-O3a entries SUPERSEDE the LVK version
+# of those same O3a events, so their m2 > 3 admission decision is made from IAS
+# PE rather than the LVK PE this package ingests.  The fixture reproduces that
+# structure with real event names (LVK names drawn from the curated population
+# lists, the O3a events appearing ONLY under IAS-O3a), plus the two junk names
+# the review named: `200114_020818` (an IMBH marginal candidate that is not a
+# GWTC event name at all) and `GW190814_192009` (the IAS spelling of the
+# deliberately-excluded lower-mass-gap system, caught by neither exclusion
+# list).  No network is touched: the pages are handed to the parser through the
+# monkeypatched `_gwosc_json`.
+# ==========================================================================
+from gwcat.bbh_allowed_names import (BBH_O1O2, BBH_O3A, BBH_O3B, BBH_O4A,
+                                     BBH_O4B)
+
+_IAS_SUPERSEDED_O3A = BBH_O3A[1:]          # only IAS has these under lastver
+_LVK_ENTRIES = (
+    [("GWTC-5.0", n) for n in BBH_O4B]
+    + [("GWTC-4.1", n) for n in BBH_O4A]
+    + [("GWTC-3-confident", n) for n in BBH_O3B]
+    + [("GWTC-2.1-confident", n) for n in BBH_O1O2]
+    + [("GWTC-2.1-confident", "GW190814")]   # curated non-BBH, LVK spelling
+    + [("GWTC-2", BBH_O3A[0])]
+)
+_NON_LVK_ENTRIES = (
+    [("IAS-O3a", n) for n in _IAS_SUPERSEDED_O3A]
+    + [("IAS-O3a", "GW190814_192009")]       # third spelling of the mass gap
+    + [("O3_IMBH_marginal", "200114_020818")]
+    + [("O4_Discovery_Papers", "GW260101_000000")]
+)
+
+#: What a correctly filtered query must return from the fixture: the LVK BBH
+#: names, with the mass-gap system excluded.
+_EXPECTED_LVK_BBH = sorted(BBH_O4B + BBH_O4A + BBH_O3B + BBH_O1O2 + [BBH_O3A[0]])
+
+
+def _bbh_pages(entries, m2=30.0):
+    """One page of GWOSC event-versions results for (catalog, name) pairs."""
+    return [{
+        "results": [
+            {"name": f"{name}-v1", "catalog": catalog,
+             "default_parameters": [{"name": "mass_2_source", "best": m2}]}
+            for catalog, name in entries
+        ],
+        "next": None,
+    }]
+
+
+def _patch_bbh_pages(monkeypatch, entries):
+    pages = _bbh_pages(entries)
+    monkeypatch.setattr(fetch, "_gwosc_json", lambda url, timeout: pages[0])
+
+
+def _run_bbh_query(monkeypatch, entries):
+    """Run the query over a synthetic payload, ignoring the count guard."""
+    _patch_bbh_pages(monkeypatch, entries)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        return fetch.fetch_bbh_names_gwosc(verbose=False)
+
+
+def test_bbh_query_filters_to_lvk_catalogs(monkeypatch):
+    names = _run_bbh_query(monkeypatch, _LVK_ENTRIES + _NON_LVK_ENTRIES)
+
+    assert names == _EXPECTED_LVK_BBH
+    # the 35 O3a events whose only surviving version is the IAS one are gone:
+    # admitting them would have made the m2 > 3 decision on IAS PE
+    assert not (set(names) & set(_IAS_SUPERSEDED_O3A))
+    # ... and so is every non-GWTC name the unfiltered query used to admit
+    assert "GW190814_192009" not in names       # mass gap, third spelling
+    assert "200114_020818" not in names         # not a GWTC event name
+    assert "GW260101_000000" not in names       # discovery-paper collection
+    assert "GW190814" not in names              # mass gap, LVK spelling
+
+
+def test_the_259_guard_was_silent_only_because_of_the_contamination(monkeypatch):
+    """The old guard fired when the list was SHORTER than the 259-event GWTC-5
+    population sample -- and the contamination made it longer, so it never
+    fired.  Correctly filtered, the same response is well short of 259 and the
+    guard now says so."""
+    entries = _LVK_ENTRIES + _NON_LVK_ENTRIES
+
+    # what the old, unfiltered logic kept: everything with m2 > 3 except the
+    # names spelled exactly as the old hardcoded non-BBH set spelled them
+    old_kept = {name for _cat, name in entries} - {"GW190814"}
+    assert len(old_kept) > 259, "fixture must reproduce the silent-guard state"
+
+    _patch_bbh_pages(monkeypatch, entries)
+    with pytest.warns(RuntimeWarning, match="were expected"):
+        names = fetch.fetch_bbh_names_gwosc(verbose=False)
+    assert len(names) < 259
+
+
+def test_the_guard_is_two_sided(monkeypatch):
+    """Exactly the expected number of LVK names is silent; one more warns.
+
+    A one-sided ``len < expected`` guard is what let 286 contaminated names
+    pass as healthy.
+    """
+    expected = fetch._GWOSC_BBH_EXPECTED_NAMES
+    lvk = [("GWTC-5.0", f"GW24{i:04d}_000000") for i in range(expected)]
+
+    pages = _bbh_pages(lvk)
+    monkeypatch.setattr(fetch, "_gwosc_json", lambda url, timeout: pages[0])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")          # any warning fails the test
+        assert len(fetch.fetch_bbh_names_gwosc(verbose=False)) == expected
+
+    _patch_bbh_pages(monkeypatch, lvk + [("GWTC-5.0", "GW250101_000000")])
+    with pytest.warns(RuntimeWarning, match="as many as"):
+        fetch.fetch_bbh_names_gwosc(verbose=False)
+
+
+def test_mass_gap_is_excluded_under_every_spelling():
+    """GWOSC carries three spellings of the lower-mass-gap system: GW190814,
+    GW190814_211039 (curated) and GW190814_192009 (IAS).  The fetch layer used
+    to keep its own hand-copied exclusion set, which spelled it GW190814 while
+    the curated data file spelled it GW190814_211039 -- so the third spelling
+    matched neither."""
+    for spelling in ("GW190814", "GW190814_211039", "GW190814_192009"):
+        assert fetch._is_non_bbh_name(spelling), spelling
+
+
+def test_the_stem_rule_never_drops_a_curated_bbh():
+    """Matching non-BBH names on the date stem must not cost a genuine event
+    that merely shares a day with an excluded one (GW190828_063405 /
+    GW190828_065509 is the shape of that hazard)."""
+    from gwcat.bbh_allowed_names import BBH_ALL
+
+    assert [n for n in BBH_ALL if fetch._is_non_bbh_name(n)] == []
+
+
+def test_a_catalogless_response_is_an_error_not_an_empty_whitelist(monkeypatch):
+    """If GWOSC stops labelling entries with their catalog, the restriction
+    cannot be applied.  Returning an empty list would be indistinguishable from
+    a legitimately empty query."""
+    page = {"results": [{"name": "GW150914-v3", "default_parameters": [
+        {"name": "mass_2_source", "best": 30.0}]}], "next": None}
+    monkeypatch.setattr(fetch, "_gwosc_json", lambda url, timeout: page)
+    with pytest.raises(RuntimeError, match="catalog label"):
+        fetch.fetch_bbh_names_gwosc(verbose=False)
+
+
+@pytest.mark.parametrize("label,expected", [
+    ("GWTC-2", True),
+    ("GWTC-2.1-confident", True),
+    ("GWTC-3-confident", True),
+    ("GWTC-4.1", True),
+    ("GWTC-5.0", True),
+    ("GWTC-6.0", True),          # a future LVK release, admitted automatically
+    ("IAS-O3a", False),
+    ("OGC-4", False),
+    ("O4_Discovery_Papers", False),
+    ("O3_IMBH_marginal", False),
+    ("GWTC-3-marginal", False),  # sub-threshold candidates, not the BBH sample
+    (None, False),
+])
+def test_lvk_catalog_predicate(label, expected):
+    assert fetch._is_lvk_gwtc_catalog(label) is expected
+
+
+# ==========================================================================
+# GW-15d: injection releases are not PE files, and membership -- not a name
+# prefix -- is what says so
+# ==========================================================================
+def test_injection_release_rejected_by_fetch_and_build():
+    with pytest.raises(ValueError, match="injection"):
+        fetch.fetch_and_build(["GWTC-3", "injections-O3-BBH"], out="unused.h5")
+
+
+def test_injection_rejection_is_by_membership_not_name_prefix(monkeypatch):
+    """An injection manifest whose release name does not start with
+    "injections" must still be rejected: the guard was a prefix test on the
+    name, which stops holding the moment the release set is generalized."""
+    info = fetch.INJECTION_RELEASES["injections-O3-BBH"]
+    monkeypatch.setitem(fetch.INJECTION_RELEASES, "sensitivity-O5", info)
+    monkeypatch.setitem(fetch.RELEASES, "sensitivity-O5", info)
+
+    assert fetch.is_injection_catalog("sensitivity-O5")
+    assert not fetch.is_injection_catalog("GWTC-5")
+    pe, injections = fetch.split_pe_and_injection_catalogs(
+        ["GWTC-5", "sensitivity-O5"])
+    assert pe == ["GWTC-5"] and injections == ["sensitivity-O5"]
+
+    with pytest.raises(ValueError, match="sensitivity-O5"):
+        fetch.fetch_and_build(["GWTC-5", "sensitivity-O5"], out="unused.h5")
+
+
+def test_injection_aliases_are_injections_too():
+    for name, info in fetch.INJECTION_RELEASES.items():
+        assert fetch.is_injection_catalog(name), name

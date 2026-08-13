@@ -4,7 +4,10 @@ Two modes of operation
 ----------------------
 1. **Dynamic** (preferred): call `fetch_bbh_list()` at runtime, which queries
    the GWOSC v2 API for all events with source-frame secondary mass above the
-   selected threshold, then applies the explicit non-BBH exclusion guard.
+   selected threshold, restricted to the LVK GWTC catalogs, then applies the
+   explicit non-BBH exclusion guard.  It falls back to the static list when the
+   network fails; `fetch_bbh_list_with_source()` returns which of the two you
+   got, and `require_live=True` turns a failure into an error instead.
 
 2. **Static fallback**: use `BBH_ALL` directly when offline or for
    reproducibility. The static list is populated from the GWTC-3/GWTC-4.1/
@@ -112,10 +115,20 @@ BBH_ALL: list[str] = _unique_sorted_bbh_names(
 # Backward-compatible alias for dynamic cache/store discovery guards.
 KNOWN_NON_BBH_NAMES = NON_BBH_EXCLUSIONS
 
+#: Size of the curated GWTC-5.0 BBH population sample (O1-O4b), and the one
+#: place this package spells that number: it was a default in two separate
+#: signatures that happened to agree.  It is also recorded in
+#: ``data/event_lists/provenance.yaml`` (``expected.bbh_all_total``), which is
+#: the data files' own description of themselves; a test asserts the two agree.
+EXPECTED_BBH_TOTAL = 259
+
+#: Number of non-excluded O4b names in the official Event_list/GWTC5_BBH.txt.
+EXPECTED_O4B_COUNT = 104
+
 
 def validate_bbh_allowed_names(
-    expected_total: int = 259,
-    expected_o4b_count: int = 104,
+    expected_total: int = EXPECTED_BBH_TOTAL,
+    expected_o4b_count: int = EXPECTED_O4B_COUNT,
 ) -> None:
     """Validate the static BBH whitelist against GWTC-5 expectations.
 
@@ -288,7 +301,7 @@ def get_bbh_allowed_names(
     data_dir: Union[str, Path] = "./GWTC",
     store_path: Optional[Union[str, Path]] = None,
     prefer_gwosc: bool = True,
-    expected: int = 259,
+    expected: int = EXPECTED_BBH_TOTAL,
 ) -> list[str]:
     """Return the best available BBH allowed-name list for catalog selection.
 
@@ -300,8 +313,19 @@ def get_bbh_allowed_names(
 
     If ``store_path`` is supplied, names in ``index/event_names`` whose matching
     ``meta/catalog`` entry identifies GWTC-5/O4b are also added.  Finally, when
-    ``prefer_gwosc`` is true, the live GWOSC BBH list is used only if it returns
-    at least as many names as the static/cache/store combination.
+    ``prefer_gwosc`` is true, the live GWOSC BBH list replaces the curated
+    combination only when it is a strict superset of it -- i.e. it adds events
+    without dropping any curated population member.
+
+    That condition is the point (GW-15).  It used to be ``len(gwosc) >=
+    len(combined)``: a live list merely *as long* as the curated one replaced
+    it wholesale, so a live list that had swapped k curated events for k others
+    silently redefined the population sample, and the curated GWTC-5 membership
+    list -- which is authoritative for population membership, and is not
+    reproducible by reapplying a mass threshold to PE point estimates -- lost
+    to a coincidence of length.  A live list that genuinely extends the sample
+    (a new observing run) still wins; anything else warns and names what it
+    would have dropped.
 
     A warning is emitted whenever the final count differs from ``expected``;
     the warning includes per-source counts to aid cache/GWOSC debugging.
@@ -324,10 +348,24 @@ def get_bbh_allowed_names(
     final = set(combined)
     if prefer_gwosc:
         try:
-            gwosc_names = set(fetch_bbh_list(verbose=False)) - NON_BBH_EXCLUSIONS
-            if len(gwosc_names) >= len(combined):
-                final = set(gwosc_names)
-                gwosc_used = True
+            live_names, source = fetch_bbh_list_with_source(verbose=False)
+            if source == "gwosc":
+                gwosc_names = set(live_names) - NON_BBH_EXCLUSIONS
+                dropped = combined - gwosc_names
+                if not dropped:
+                    final = set(gwosc_names)
+                    gwosc_used = True
+                else:
+                    warnings.warn(
+                        "get_bbh_allowed_names: keeping the curated BBH list; "
+                        f"the live GWOSC list ({len(gwosc_names)} names) is "
+                        f"missing {len(dropped)} curated population member(s) "
+                        f"(e.g. {sorted(dropped)[:5]}), so it would redefine "
+                        "the sample rather than extend it."
+                    )
+            # source == "static": the live query failed and fetch_bbh_list
+            # substituted BBH_ALL, which has already warned.  It is NOT a
+            # GWOSC result and must never be recorded as one.
         except Exception as exc:
             warnings.warn(f"get_bbh_allowed_names: GWOSC BBH query failed ({exc})")
 
@@ -346,14 +384,20 @@ def get_bbh_allowed_names(
 
 
 # ── Dynamic loader ────────────────────────────────────────────────────────────
-def fetch_bbh_list(m2_min: float = 3.0, verbose: bool = True) -> list:
-    """Return the live BBH event list from GWOSC (requires network).
+def fetch_bbh_list_with_source(
+    m2_min: float = 3.0,
+    verbose: bool = True,
+    require_live: bool = False,
+) -> tuple[list, str]:
+    """Return ``(names, source)`` for the BBH list, saying where it came from.
 
-    Queries the GWOSC v2 API for all events with m2_source > m2_min Msun and
-    PE measurements present. Explicitly known non-BBH exclusions are removed
-    from the returned live list.
-
-    Falls back to the static BBH_ALL if the network is unavailable.
+    ``source`` is ``"gwosc"`` when the live query succeeded and ``"static"``
+    when it failed and the curated :data:`BBH_ALL` list was substituted.  The
+    caller needs that distinction: :func:`fetch_bbh_list` used to swallow its
+    own network error and return ``BBH_ALL``, which
+    :func:`get_bbh_allowed_names` then recorded as ``GWOSC_used=True`` -- the
+    static list masquerading as a live one, in the very diagnostic meant to
+    tell the two apart (GW-15).
 
     Parameters
     ----------
@@ -361,35 +405,65 @@ def fetch_bbh_list(m2_min: float = 3.0, verbose: bool = True) -> list:
         Secondary mass threshold in Msun (default 3.0 = LVK BBH threshold).
     verbose : bool
         Print progress.
+    require_live : bool
+        When true, a failed live query raises instead of falling back: a caller
+        that asked for live data gets an error, not a silent substitution.
+    """
+    try:
+        from .fetch import fetch_bbh_names_gwosc
+        names = fetch_bbh_names_gwosc(m2_min=m2_min, verbose=verbose)
+        return sorted(set(names) - NON_BBH_EXCLUSIONS), "gwosc"
+    except Exception as e:
+        if require_live:
+            raise
+        warnings.warn(
+            f"fetch_bbh_list: GWOSC query failed ({e}); using static BBH_ALL "
+            f"({len(BBH_ALL)} events). Run refresh_bbh_list() when online to update."
+        )
+        return list(BBH_ALL), "static"
+
+
+def fetch_bbh_list(m2_min: float = 3.0, verbose: bool = True,
+                   require_live: bool = False) -> list:
+    """Return the live BBH event list from GWOSC (requires network).
+
+    Queries the GWOSC v2 API for all events with m2_source > m2_min Msun and
+    PE measurements present, restricted to the LVK GWTC catalogs. Explicitly
+    known non-BBH exclusions are removed from the returned live list.
+
+    Falls back to the static BBH_ALL (with a warning) if the network is
+    unavailable, unless ``require_live=True``.  Callers that must not confuse
+    the two should use :func:`fetch_bbh_list_with_source`, which says which one
+    they got.
 
     Returns
     -------
     list of str : sorted event names.
     """
-    try:
-        from .fetch import fetch_bbh_names_gwosc
-        names = fetch_bbh_names_gwosc(m2_min=m2_min, verbose=verbose)
-        return sorted(set(names) - NON_BBH_EXCLUSIONS)
-    except Exception as e:
-        import warnings
-        warnings.warn(
-            f"fetch_bbh_list: GWOSC query failed ({e}); using static BBH_ALL "
-            f"({len(BBH_ALL)} events). Run refresh_bbh_list() when online to update."
-        )
-        return list(BBH_ALL)
+    names, _source = fetch_bbh_list_with_source(
+        m2_min=m2_min, verbose=verbose, require_live=require_live)
+    return names
 
 
 def refresh_bbh_list(m2_min: float = 3.0) -> list:
     """Query GWOSC, print the result as Python code, and return the list.
 
-    Run this once when online after GWOSC indexes GWTC-5.0 to get the full
-    259-event list you can paste back into BBH_O4B above.
+    Run this once when online after GWOSC indexes GWTC-5.0 to get the list you
+    can paste back into BBH_O4B above.
+
+    Raises rather than falling back to the static list if the query fails: this
+    function exists to replace the static list, so silently printing the static
+    list back is the one output that must never happen (GW-15).
+
+    Since GW-15 the live query is restricted to the LVK GWTC catalogs, so it
+    returns the LVK-only sample (~244 names) rather than the 286 that
+    third-party catalogs inflated it to.
 
     Example::
 
         python -c "from gwcat.bbh_allowed_names import refresh_bbh_list; refresh_bbh_list()"
     """
-    names = fetch_bbh_list(m2_min=m2_min, verbose=True)
+    names = fetch_bbh_list(m2_min=m2_min, verbose=True, require_live=True)
     names = sorted(set(names) - NON_BBH_EXCLUSIONS)
     # Separate out O4b events (GW24* and GW25*)
     o4b = sorted(n for n in names if n.startswith(("GW240", "GW241", "GW242", "GW250", "GW251")))

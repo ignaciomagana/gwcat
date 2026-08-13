@@ -41,6 +41,12 @@ instead of making any network call -- raising a clear error naming the
 missing cache file if it was never populated.  Neither argument changes
 default (``cache_dir=None, offline=None/False``) behavior: no cache_dir means
 no caching side effect, exactly as before this PR.
+
+Reproducibility extends to *which Zenodo records* a run used: with
+``resolve=True`` those are whatever each concept DOI pointed at when the online
+run ran, so the resolution is cached alongside the file listings and read back
+offline.  Offline mode therefore replays the online run's records rather than
+the registry's pinned ones (GW-15).
 """
 from __future__ import annotations
 
@@ -52,6 +58,7 @@ import sys
 import time
 import warnings
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Union
 from urllib.parse import urlencode
@@ -346,6 +353,65 @@ def _resolve_record_ids(info: ReleaseInfo, catalog: str) -> List[int]:
     return resolved
 
 
+def _cache_record_resolution(
+    cache_dir: Union[str, Path],
+    catalog: str,
+    info: ReleaseInfo,
+    rids: Sequence[int],
+    resolved: bool,
+) -> None:
+    """Record which Zenodo records this run actually used (GW-15).
+
+    Which records an online run used is part of what that run did: with
+    ``resolve=True`` (the default) they are whatever each concept DOI pointed
+    at *at that moment*, which is not recoverable from the registry pins
+    afterwards.  Caching it is what lets an offline replay read the same
+    records instead of silently falling back to the pins.
+    """
+    fetch_cache.write_metadata_cache(
+        cache_dir,
+        fetch_cache.resolution_cache_key(catalog),
+        {
+            "catalog": catalog,
+            "record_ids": [int(r) for r in rids],
+            "resolved_latest": bool(resolved),
+            "pinned_record_ids": [int(r) for r in info.record_ids],
+            "concept_ids": list(info.concept_ids),
+        },
+    )
+
+
+def _cached_resolved_record_ids(
+    catalog: str, cache_dir: Union[str, Path]
+) -> List[int]:
+    """Return the record IDs an earlier online run resolved for ``catalog``.
+
+    Offline mode used to fall back to ``info.record_ids`` -- the *pinned*
+    records -- while an online run with the default ``resolve=True`` had
+    followed each concept DOI to whatever was latest.  As soon as any release
+    is versioned past its pin (exactly what ``resolve_latest`` exists for), the
+    offline replay looked for a different ``zenodo_<rid>.json`` than the online
+    run cached: either a spurious cache miss, or a silent replay of an older
+    file set.  Reading the resolution back from the cache is what makes offline
+    replay reproduce the online run.
+
+    Raises :class:`gwcat.fetch_cache.OfflineCacheMissError` (naming the file)
+    when the resolution was never cached or the cache is truncated -- never a
+    silent fallback to the pins.
+    """
+    payload = fetch_cache.read_metadata_cache(
+        cache_dir, fetch_cache.resolution_cache_key(catalog))
+    rids = payload.get("record_ids") if isinstance(payload, dict) else None
+    if not rids:
+        raise fetch_cache.OfflineCacheMissError(
+            f"Offline mode: the cached record resolution for {catalog!r} in "
+            f"{str(cache_dir)!r} records no record_ids. Re-run the fetch once "
+            "online with the same cache_dir, or pass resolve=False to use the "
+            "pinned record IDs deliberately."
+        )
+    return [int(r) for r in rids]
+
+
 # ---------------------------------------------------------------------------
 # Public API: fetch one catalog
 # ---------------------------------------------------------------------------
@@ -374,16 +440,21 @@ def fetch_catalog(
     resolve : bool
         If True (default), query Zenodo for the latest version of each
         concept DOI.  Set False to use pinned records without network.
-        Ignored (treated as False) when ``offline`` is true, since resolving
-        the latest version always requires a network call.
+        Offline it selects *which records the earlier online run used*: the
+        resolution is read back from ``cache_dir`` (a missing/truncated one
+        raises :class:`~gwcat.fetch_cache.OfflineCacheMissError`), so an
+        offline replay reproduces the online file set instead of silently
+        falling back to the pins.  ``resolve=False`` offline is the deliberate
+        opt-in to the pinned records.
     show_progress : bool
         Show tqdm progress bars during download.
     dry_run : bool
         List files that would be downloaded without actually downloading.
     cache_dir : str or Path, optional
         Passed to :func:`list_files` to cache/read the raw Zenodo file-listing
-        response (see :mod:`gwcat.fetch_cache`).  ``None`` (default) disables
-        caching -- unchanged, byte-identical default behavior.
+        response (see :mod:`gwcat.fetch_cache`), and used to cache/read the
+        record-ID resolution itself.  ``None`` (default) disables caching --
+        unchanged, byte-identical default behavior.
     offline : bool, optional
         If true (or ``GWCAT_OFFLINE`` is set), never make a network call:
         file listings come from ``cache_dir`` (required in that case) and
@@ -418,13 +489,25 @@ def fetch_catalog(
 
     info = RELEASES[catalog]
     if offline_mode:
-        # Resolving the latest version always requires a network call;
-        # offline mode uses the pinned/explicit record IDs unconditionally.
-        rids = record_ids or list(info.record_ids)
+        # Resolving the latest version always requires a network call, so an
+        # offline run reads back WHICH RECORDS THE ONLINE RUN RESOLVED (GW-15).
+        # Falling back to the pinned records here -- as this did -- means an
+        # offline replay looks for a different Zenodo record than the online
+        # run cached the moment any release is versioned past its pin.
+        # resolve=False is the deliberate opt-in to the pins.
+        if record_ids:
+            rids = list(record_ids)
+        elif resolve:
+            rids = _cached_resolved_record_ids(catalog, cache_dir)
+        else:
+            rids = list(info.record_ids)
     else:
         rids = record_ids or (
             _resolve_record_ids(info, catalog) if resolve else list(info.record_ids)
         )
+        if cache_dir is not None:
+            _cache_record_resolution(cache_dir, catalog, info, rids,
+                                     resolved=bool(resolve and not record_ids))
 
     dest_dir = Path(data_dir) / catalog.replace(".", "p")  # GWTC-4.1 → GWTC-4p1
     all_paths = []
@@ -497,6 +580,39 @@ def fetch_catalog(
     return sorted(all_paths)
 
 
+def is_injection_catalog(catalog: str) -> bool:
+    """True when ``catalog`` names an injection/selection-function release.
+
+    Membership in :data:`INJECTION_RELEASES` -- which is built from the
+    injection manifests and registers their aliases too -- not a
+    ``startswith("injections")`` test on the name (GW-15).  Injection files are
+    not PESummary per-event files, so handing them to ``build_store`` crashes
+    in ``_read_event_pesummary``; a name-shaped guard silently stops holding
+    the moment a manifest declares a release (or alias) that does not happen to
+    start with "injections".
+    """
+    if catalog in INJECTION_RELEASES:
+        return True
+    # Defence in depth: a key registered in RELEASES that *is* one of the
+    # injection ReleaseInfo objects (e.g. via some future aliasing path).
+    info = RELEASES.get(catalog)
+    return info is not None and any(info is i for i in INJECTION_RELEASES.values())
+
+
+def split_pe_and_injection_catalogs(
+    catalogs: Sequence[str],
+) -> tuple[List[str], List[str]]:
+    """Split requested catalog names into (PE releases, injection releases).
+
+    One shared classifier for every caller that must not feed injection files
+    to ``build_store``: the library entry point (:func:`fetch_and_build`) and
+    the CLI used to carry two different, drifting guards.
+    """
+    pe = [c for c in catalogs if not is_injection_catalog(c)]
+    injections = [c for c in catalogs if is_injection_catalog(c)]
+    return pe, injections
+
+
 # ---------------------------------------------------------------------------
 # Public API: fetch + build in one shot
 # ---------------------------------------------------------------------------
@@ -539,6 +655,23 @@ def fetch_and_build(
     """
     from .ingest import build_store, IngestConfig
 
+    # Injection releases are in RELEASES so fetch_catalog can find them, but
+    # their files are search-sensitivity sets, not PESummary per-event files:
+    # build_store would hand them to _read_event_pesummary and crash after
+    # downloading tens of GB.  Reject by registry membership (GW-15) -- a
+    # public path such as fetch_and_build(list_releases()) walks straight into
+    # it, and a name-prefix guard would stop holding on the first injection
+    # manifest not named "injections-*".
+    _, injections = split_pe_and_injection_catalogs(catalogs)
+    if injections:
+        raise ValueError(
+            f"fetch_and_build builds a PE store, but {sorted(injections)} "
+            f"{'are' if len(injections) > 1 else 'is'} injection/selection "
+            "release(s) whose files are not per-event PE files. Fetch them "
+            "separately with fetch_catalog(), and build the selection function "
+            "from them with gwcat.selection."
+        )
+
     cfg = ingest_cfg or IngestConfig()
     all_paths = []
     for cat in catalogs:
@@ -563,23 +696,112 @@ def fetch_and_build(
 # GWOSC.  See the module docstring and gwcat.event_metadata for how callers
 # combine this raw metadata with manifest defaults / user overrides.
 # ---------------------------------------------------------------------------
-_GWOSC_BBH_EXPECTED_NAMES = 259
-_GWOSC_KNOWN_NON_BBH = {
-    # BNS / NSBH / mass-gap candidates that may appear in broad GWOSC
-    # mass-threshold queries. Keep this lower-level guard in sync with
-    # gwcat.bbh_allowed_names.NON_BBH_EXCLUSIONS so callers of
-    # fetch_bbh_names_gwosc() and fetch_bbh_list() get the same BBH selection.
-    "GW170817",
-    "GW190425",
-    "GW190425_232155",
-    "GW190426_152155",
-    "GW190814",
-    "GW190917_114630",
-    "GW200105_162426",
-    "GW200115_042309",
-    "GW230518_125908",
-    "GW230529_181500",
-}
+#: How many BBH names the LVK-only GWOSC query is expected to return.
+#:
+#: This used to be 259 -- the size of the curated GWTC-5 BBH *population*
+#: sample -- and it silently passed only because the query was contaminated
+#: (GW-15).  Unfiltered, the live query returns 286 names across eight
+#: catalogs, 41 of them third-party IAS-O3a entries that supersede the LVK
+#: version of the same event under ``lastver=true``.  Restricted to LVK GWTC
+#: catalogs the same query returns ~244 (the review measured 244; an
+#: independent re-run of the identical filter measured 243) -- fewer than the
+#: curated population sample, because the population sample is a curated
+#: membership list, not "every GWOSC event with a PE mass_2_source above 3
+#: Msun".  The guard is two-sided against this number: *fewer* means an
+#: incomplete live index, *more* means entries the LVK-catalog filter did not
+#: expect to admit.  It is a warning, not an assertion: it exists to be noticed
+#: and re-baselined by whoever re-runs the query, which is exactly what the old
+#: one-sided 259 could never do.
+_GWOSC_BBH_EXPECTED_NAMES = 244
+
+#: GWOSC catalog labels the BBH query accepts: the LVK GWTC releases, in any of
+#: the spellings GWOSC uses ("GWTC-2", "GWTC-2.1-confident", "GWTC-4.1",
+#: "GWTC-5.0").  Deliberately a *pattern* and not a hardcoded list, so a future
+#: "GWTC-6.0" is admitted automatically while third-party catalogs (IAS-O3a,
+#: OGC-*), marginal-candidate catalogs (O3_IMBH_marginal, GWTC-*-marginal) and
+#: discovery-paper collections (O4_Discovery_Papers) stay out.
+_GWOSC_LVK_CATALOG_RE = re.compile(r"GWTC-\d+(?:\.\d+)?(?:-CONFIDENT)?")
+
+#: A GWOSC name is only usable as an LVK event name in this package's canonical
+#: form (``GW230529`` / ``GW230529_181500``).  Anything else -- e.g. the IMBH
+#: marginal candidate ``200114_020818`` -- is not a GWTC event name and must
+#: never enter the whitelist.
+_GWOSC_EVENT_NAME_RE = re.compile(r"GW\d{6}(?:_\d{6})?$")
+
+
+def _is_lvk_gwtc_catalog(label: object) -> bool:
+    """True when a GWOSC catalog label identifies an LVK GWTC release."""
+    if label is None:
+        return False
+    normalized = re.sub(r"\s+", "", str(label)).upper()
+    return bool(_GWOSC_LVK_CATALOG_RE.fullmatch(normalized))
+
+
+def _gwosc_event_catalog(event: dict) -> Optional[str]:
+    """Return the catalog label of one GWOSC event-versions entry, if any.
+
+    GWOSC has spelled this field several ways across API versions; a dict-valued
+    catalog (``{"name": ...}``) is unwrapped.  ``None`` means the entry carries
+    no catalog information at all, which is treated as "not an LVK entry" --
+    and, if *no* entry in a whole response carries it, as an API shape change
+    worth failing on rather than silently returning an empty whitelist.
+    """
+    for key in ("catalog", "catalog_shortName", "catalogShortName",
+                "catalog_name", "release"):
+        value = event.get(key)
+        if isinstance(value, dict):
+            value = (value.get("shortName") or value.get("short_name")
+                     or value.get("name"))
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+@lru_cache(maxsize=1)
+def _curated_bbh_names() -> frozenset:
+    """The curated BBH population whitelist, as a set (cached)."""
+    from .bbh_allowed_names import BBH_ALL
+
+    return frozenset(BBH_ALL)
+
+
+@lru_cache(maxsize=1)
+def _non_bbh_name_stems() -> frozenset:
+    """Date stems (``GW190814``) of every curated non-BBH exclusion.
+
+    Derived from :data:`gwcat.bbh_allowed_names.NON_BBH_EXCLUSIONS` -- the one
+    curated source, kept as a bundled data file -- instead of the second
+    hand-copied set that used to live here.  The two lists had already drifted:
+    this one spelled the lower-mass-gap system ``GW190814`` and the curated one
+    ``GW190814_211039``, so the third spelling GWOSC also carries for it,
+    ``GW190814_192009``, matched neither and entered the BBH whitelist.
+    Matching on the stem catches every spelling of the same event.
+    """
+    from .bbh_allowed_names import NON_BBH_EXCLUSIONS
+
+    return frozenset(_gwosc_name_stem(name) for name in NON_BBH_EXCLUSIONS)
+
+
+def _gwosc_name_stem(name: str) -> str:
+    """``GW190814_192009`` -> ``GW190814`` (the GPS-time suffix removed)."""
+    return re.sub(r"_\d{6}$", "", str(name))
+
+
+def _is_non_bbh_name(name: str) -> bool:
+    """True when ``name`` is any spelling of a curated non-BBH event.
+
+    Exact membership first, then the date stem -- but never for a name the
+    curated BBH population list itself contains, so a genuine second event on
+    the same day as an excluded one (GW190828_063405 / GW190828_065509 is the
+    shape of it) can never be dropped by the stem rule.
+    """
+    from .bbh_allowed_names import NON_BBH_EXCLUSIONS
+
+    if name in NON_BBH_EXCLUSIONS:
+        return True
+    if name in _curated_bbh_names():
+        return False
+    return _gwosc_name_stem(name) in _non_bbh_name_stems()
 
 
 def _clean_gwosc_event_name(name: object) -> str:
@@ -629,9 +851,20 @@ def fetch_bbh_names_gwosc(
 
     The GWOSC endpoint is filtered for the latest event version with a
     secondary source-frame mass above ``m2_min`` and default parameters included.
-    Events are kept only when the returned default PE parameters contain
-    ``mass_2_source`` (or the legacy alias ``m2_source``) above the threshold.
-    Known BNS/NSBH events are explicitly removed as a safety guard.
+    Events are kept only when they come from an **LVK GWTC catalog**, carry a
+    canonical GWTC event name, are not a curated non-BBH event under any
+    spelling, and the returned default PE parameters contain ``mass_2_source``
+    (or the legacy alias ``m2_source``) above the threshold.
+
+    The catalog restriction is the point (GW-15).  GWOSC indexes third-party
+    catalogs beside GWTC, and under ``lastver=true`` a non-LVK version
+    *supersedes* the LVK one for the same event: the unfiltered query returns
+    286 names across eight catalogs, and 41 O3a events were being admitted on
+    the IAS pipeline's ``mass_2_source`` rather than on the LVK PE this package
+    actually ingests.  Filtering is done client-side on each entry's catalog
+    label rather than by adding a ``catalog=`` query parameter, so a change in
+    what the server accepts can only ever make this stricter, never silently
+    return an unfiltered list.
 
     cache_dir / offline : see :mod:`gwcat.fetch_cache`.  ``None``/unset (the
     defaults) disable caching/offline-mode entirely -- unchanged, byte-identical
@@ -681,14 +914,32 @@ def fetch_bbh_names_gwosc(
                 cache_dir, key, {"m2_min": m2_min, "pages": pages})
 
     names: set[str] = set()
+    n_entries = 0
+    n_with_catalog = 0
+    dropped_catalogs: Dict[str, int] = {}
+    dropped_names: set[str] = set()
     for data in pages:
         for event in data.get("results", []):
             if not isinstance(event, dict):
                 continue
+            n_entries += 1
+
+            catalog = _gwosc_event_catalog(event)
+            if catalog is not None:
+                n_with_catalog += 1
+            if not _is_lvk_gwtc_catalog(catalog):
+                label = catalog or "<no catalog field>"
+                dropped_catalogs[label] = dropped_catalogs.get(label, 0) + 1
+                continue
+
             name = _clean_gwosc_event_name(
                 event.get("name") or event.get("shortName") or event.get("grace_id")
             )
-            if not name or name in _GWOSC_KNOWN_NON_BBH:
+            if not name or not _GWOSC_EVENT_NAME_RE.fullmatch(name):
+                if name:
+                    dropped_names.add(name)
+                continue
+            if _is_non_bbh_name(name):
                 continue
 
             params = event.get("default_parameters")
@@ -697,16 +948,43 @@ def fetch_bbh_names_gwosc(
                 continue
             names.add(name)
 
+    if n_entries and not n_with_catalog:
+        # Every entry lacking a catalog label means the response shape changed,
+        # not that GWOSC published nothing from GWTC.  Failing here is the only
+        # honest outcome: silently returning an empty whitelist would look like
+        # a legitimately empty query.
+        raise RuntimeError(
+            f"GWOSC returned {n_entries} event-version entries, none of which "
+            "carries a catalog label, so the LVK-catalog restriction cannot be "
+            "applied. The event-versions API shape has changed; update "
+            "gwcat.fetch._gwosc_event_catalog before trusting this list."
+        )
+
     result = sorted(names)
     if verbose:
-        print(f"fetch_bbh_names_gwosc: selected {len(result)} BBH candidates")
-    if len(result) < _GWOSC_BBH_EXPECTED_NAMES:
+        print(f"fetch_bbh_names_gwosc: selected {len(result)} BBH candidates "
+              f"from {n_entries} GWOSC entries")
+        if dropped_catalogs:
+            summary = ", ".join(
+                f"{label}: {count}"
+                for label, count in sorted(dropped_catalogs.items())
+            )
+            print(f"fetch_bbh_names_gwosc: dropped non-LVK catalogs ({summary})")
+        if dropped_names:
+            print("fetch_bbh_names_gwosc: dropped non-GWTC event names "
+                  f"({sorted(dropped_names)})")
+    if len(result) != _GWOSC_BBH_EXPECTED_NAMES:
+        direction = ("only " if len(result) < _GWOSC_BBH_EXPECTED_NAMES
+                     else "as many as ")
+        cause = ("Callers may be relying on an incomplete live GWOSC index."
+                 if len(result) < _GWOSC_BBH_EXPECTED_NAMES else
+                 "More names than the LVK GWTC catalogs were expected to "
+                 "supply -- check for catalog contamination (see GW-15) or "
+                 "re-baseline against a new observing run.")
         warnings.warn(
-            "GWOSC returned only "
-            f"{len(result)} BBH names with PE mass_2_source > {m2_min}; "
-            f"GWTC-5-era data are expected to contain at least "
-            f"{_GWOSC_BBH_EXPECTED_NAMES}. Callers may be relying on an "
-            "incomplete live GWOSC index.",
+            f"GWOSC returned {direction}"
+            f"{len(result)} LVK BBH names with PE mass_2_source > {m2_min}; "
+            f"{_GWOSC_BBH_EXPECTED_NAMES} were expected. {cause}",
             RuntimeWarning,
             stacklevel=2,
         )
@@ -937,7 +1215,7 @@ def _cli(
             offline=offline,
         )
         all_paths.extend(paths)
-        if not cat.startswith("injections"):
+        if not is_injection_catalog(cat):   # membership, not a name prefix
             pe_paths.extend(paths)
 
     if args.dry_run:

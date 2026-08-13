@@ -224,12 +224,14 @@ def test_fetch_event_table_gwosc_offline_missing_cache_raises(tmp_path):
 
 
 def test_fetch_bbh_names_gwosc_cache_and_offline(tmp_path, monkeypatch):
+    # Every entry carries its catalog, as the live event-versions API does:
+    # the LVK-catalog restriction (GW-15) is applied to it.
     page = {
         "results": [
-            {"name": "GW150914-v3", "default_parameters": [
-                {"name": "mass_2_source", "best": 30.0}]},
-            {"name": "GW170817-v2", "default_parameters": [
-                {"name": "mass_2_source", "best": 1.3}]},  # below threshold
+            {"name": "GW150914-v3", "catalog": "GWTC-2.1-confident",
+             "default_parameters": [{"name": "mass_2_source", "best": 30.0}]},
+            {"name": "GW170817-v2", "catalog": "GWTC-2.1-confident",
+             "default_parameters": [{"name": "mass_2_source", "best": 1.3}]},
         ],
         "next": None,
     }
@@ -554,3 +556,195 @@ def test_override_beats_online_across_spellings(tmp_path):
         ev, online_table={ev[0]: {"p_astro": 0.5}},
         user_overrides={ev[0]: {"pastro": 0.99}})
     assert resolve_pastro(table2[ev[0]]) == pytest.approx(0.99)
+
+
+# ==========================================================================
+# 8. Offline replays the record the ONLINE run resolved (GW-15)
+# ==========================================================================
+_GWTC21_PINNED = 6513631
+_GWTC21_LATEST = 99999999      # what the concept DOI resolves to "today"
+
+
+def _staged_listing(monkeypatch, seen):
+    """Fake list_files that records which record id it was asked for."""
+    files = [{"key": "IGWN-GWTC2p1-v2-GW150914_095045_cosmo.h5", "size": 1,
+              "checksum": "md5:abc", "links": {"self": "http://example/x"}}]
+
+    def fake_list_files(record_id, **kw):
+        seen.append(record_id)
+        return files
+
+    monkeypatch.setattr(fetch, "list_files", fake_list_files)
+
+
+def test_offline_uses_the_resolved_record(tmp_path, monkeypatch):
+    """Online, resolve=True follows the concept DOI to whatever is latest.
+    Offline used to fall back to the PINNED record, so as soon as a release was
+    versioned past its pin the replay looked for a different Zenodo record than
+    the online run had cached: a spurious cache miss, or -- with an older
+    --no-resolve download on disk -- a silent replay of an older file set."""
+    cache_dir = tmp_path / "cache"
+    seen: list = []
+    _staged_listing(monkeypatch, seen)
+    monkeypatch.setattr(fetch, "resolve_latest", lambda cid: _GWTC21_LATEST)
+
+    fetch.fetch_catalog("GWTC-2.1", data_dir=str(tmp_path), dry_run=True,
+                        cache_dir=cache_dir)
+    assert seen == [_GWTC21_LATEST]
+
+    # the resolution itself is cached, not just the file listing
+    resolution = json.loads(
+        (cache_dir / "metadata" / "resolution_GWTC-2.1.json").read_text())
+    assert resolution["payload"]["record_ids"] == [_GWTC21_LATEST]
+    assert resolution["payload"]["pinned_record_ids"] == [_GWTC21_PINNED]
+
+    def _boom(cid):
+        raise AssertionError("resolve_latest must not be called offline")
+    monkeypatch.setattr(fetch, "resolve_latest", _boom)
+
+    seen.clear()
+    fetch.fetch_catalog("GWTC-2.1", data_dir=str(tmp_path), dry_run=True,
+                        cache_dir=cache_dir, offline=True)
+    assert seen == [_GWTC21_LATEST], "offline replayed a different record"
+
+
+def test_offline_without_a_cached_resolution_raises(tmp_path, monkeypatch):
+    """A cache that never recorded a resolution is a cache miss, named as one
+    -- never a silent fallback to the pinned record."""
+    seen: list = []
+    _staged_listing(monkeypatch, seen)
+    with pytest.raises(fetch_cache.OfflineCacheMissError) as ei:
+        fetch.fetch_catalog("GWTC-2.1", data_dir=str(tmp_path), dry_run=True,
+                            cache_dir=tmp_path / "empty", offline=True)
+    assert "resolution_GWTC-2.1.json" in str(ei.value)
+    assert seen == []
+
+
+def test_offline_no_resolve_is_the_deliberate_opt_in_to_the_pins(tmp_path,
+                                                                 monkeypatch):
+    seen: list = []
+    _staged_listing(monkeypatch, seen)
+    fetch.fetch_catalog("GWTC-2.1", data_dir=str(tmp_path), dry_run=True,
+                        cache_dir=tmp_path / "empty", offline=True,
+                        resolve=False)
+    assert seen == [_GWTC21_PINNED]
+
+
+def test_a_truncated_cache_is_a_cache_miss_not_a_json_error(tmp_path):
+    cache_dir = tmp_path / "cache"
+    fetch_cache.write_metadata_cache(cache_dir, "zenodo_777", {"files": []})
+    path = cache_dir / "metadata" / "zenodo_777.json"
+    text = path.read_text()
+    path.write_text(text[:len(text) // 2])          # interrupted write
+
+    with pytest.raises(fetch_cache.OfflineCacheMissError, match="truncated"):
+        fetch_cache.read_metadata_cache(cache_dir, "zenodo_777")
+
+    path.write_text('{"key": "zenodo_777"}')        # no payload
+    with pytest.raises(fetch_cache.OfflineCacheMissError, match="payload"):
+        fetch_cache.read_metadata_cache(cache_dir, "zenodo_777")
+
+
+def test_metadata_cache_writes_are_atomic(tmp_path):
+    """The record is renamed into place, so a reader never sees a partial
+    file and no temporary file is left behind."""
+    cache_dir = tmp_path / "cache"
+    path = fetch_cache.write_metadata_cache(cache_dir, "zenodo_778", {"a": 1})
+    assert json.loads(path.read_text())["payload"] == {"a": 1}
+    assert sorted(p.name for p in path.parent.iterdir()) == ["zenodo_778.json"]
+
+    fetch_cache.write_metadata_cache(cache_dir, "zenodo_778", {"a": 2})
+    assert json.loads(path.read_text())["payload"] == {"a": 2}
+    assert sorted(p.name for p in path.parent.iterdir()) == ["zenodo_778.json"]
+
+
+# ==========================================================================
+# 9. BBH whitelist provenance: a failed live query is never "live" (GW-15)
+# ==========================================================================
+def _fail_gwosc(monkeypatch):
+    def _boom(*a, **k):
+        raise OSError("no route to host")
+    monkeypatch.setattr(fetch, "fetch_bbh_names_gwosc", _boom)
+
+
+def test_network_failure_is_not_recorded_as_a_gwosc_result(tmp_path, monkeypatch):
+    """fetch_bbh_list swallowed its own network error and returned the static
+    BBH_ALL; get_bbh_allowed_names then reported GWOSC_used=True -- the static
+    list masquerading as live in the one diagnostic meant to tell them apart."""
+    from gwcat import bbh_allowed_names as ban
+
+    _fail_gwosc(monkeypatch)
+    with pytest.warns(UserWarning) as records:
+        names = ban.get_bbh_allowed_names(
+            data_dir=str(tmp_path), prefer_gwosc=True, expected=0)
+
+    messages = [str(r.message) for r in records]
+    assert any("GWOSC_used=False" in m for m in messages), messages
+    assert not any("GWOSC_used=True" in m for m in messages), messages
+    assert names == sorted(ban.BBH_ALL)
+
+
+def test_fetch_bbh_list_says_which_list_it_returned(monkeypatch):
+    from gwcat import bbh_allowed_names as ban
+
+    _fail_gwosc(monkeypatch)
+    with pytest.warns(UserWarning, match="GWOSC query failed"):
+        names, source = ban.fetch_bbh_list_with_source(verbose=False)
+    assert source == "static" and names == list(ban.BBH_ALL)
+
+    monkeypatch.setattr(fetch, "fetch_bbh_names_gwosc",
+                        lambda **kw: ["GW150914_095045", "GW170817"])
+    names, source = ban.fetch_bbh_list_with_source(verbose=False)
+    assert source == "gwosc"
+    assert names == ["GW150914_095045"]     # exclusions still applied
+
+
+def test_a_caller_that_demanded_live_data_gets_an_error(monkeypatch):
+    from gwcat import bbh_allowed_names as ban
+
+    _fail_gwosc(monkeypatch)
+    with pytest.raises(OSError):
+        ban.fetch_bbh_list(verbose=False, require_live=True)
+
+
+def test_an_equally_long_live_list_does_not_replace_the_curated_one(tmp_path,
+                                                                    monkeypatch):
+    """The condition was ``len(live) >= len(curated)``: a live list that had
+    swapped k curated events for k others replaced the authoritative GWTC-5
+    population sample on a coincidence of length."""
+    from gwcat import bbh_allowed_names as ban
+
+    swapped = sorted(set(ban.BBH_ALL) - {ban.BBH_ALL[0]} | {"GW260101_000000"})
+    assert len(swapped) == len(ban.BBH_ALL)
+    monkeypatch.setattr(fetch, "fetch_bbh_names_gwosc", lambda **kw: swapped)
+
+    with pytest.warns(UserWarning, match="would redefine the sample"):
+        names = ban.get_bbh_allowed_names(data_dir=str(tmp_path),
+                                          prefer_gwosc=True)
+    assert names == sorted(ban.BBH_ALL)
+    assert "GW260101_000000" not in names
+
+
+def test_a_live_list_that_extends_the_sample_is_adopted(tmp_path, monkeypatch):
+    from gwcat import bbh_allowed_names as ban
+
+    extended = sorted(set(ban.BBH_ALL) | {"GW260101_000000"})
+    monkeypatch.setattr(fetch, "fetch_bbh_names_gwosc", lambda **kw: extended)
+
+    with pytest.warns(UserWarning, match="GWOSC_used=True"):
+        names = ban.get_bbh_allowed_names(data_dir=str(tmp_path),
+                                          prefer_gwosc=True)
+    assert names == extended
+
+
+def test_expected_bbh_total_matches_the_data_files_own_provenance():
+    """One number, in one place: the count the code checks and the count the
+    bundled event lists declare must not drift apart."""
+    import yaml
+
+    from gwcat import bbh_allowed_names as ban
+
+    provenance = yaml.safe_load(
+        (ban._event_list_path("provenance.yaml")).read_text())
+    assert provenance["expected"]["bbh_all_total"] == ban.EXPECTED_BBH_TOTAL
+    assert provenance["expected"]["o4b_non_excluded"] == ban.EXPECTED_O4B_COUNT
