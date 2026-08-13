@@ -74,6 +74,45 @@ def package_version() -> str:
         return "unknown"
 
 
+_GWCAT_COMMIT_CACHE = None
+
+
+def gwcat_commit() -> str:
+    """The git commit of the gwcat writing this file, or ``"unknown"``.
+
+    For an editable install (the deployment mode here) the package directory IS
+    a git checkout, and *which commit was imported at write time* is the
+    provenance a consumer actually needs -- the version string does not move
+    between commits.  Appends ``-dirty`` when the worktree has uncommitted
+    changes to gwcat/ itself, because a hash that silently describes different
+    code is worse than none.  Never raises; a non-git install returns
+    ``"unknown"``.  Cached per process (attrs are stamped per export, and the
+    answer cannot change mid-process for an already-imported package).
+    """
+    global _GWCAT_COMMIT_CACHE
+    if _GWCAT_COMMIT_CACHE is not None:
+        return _GWCAT_COMMIT_CACHE
+    import os
+    import subprocess
+    pkg_dir = os.path.dirname(os.path.abspath(__file__))
+    try:
+        commit = subprocess.run(
+            ["git", "-C", pkg_dir, "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        if not commit:
+            _GWCAT_COMMIT_CACHE = "unknown"
+            return _GWCAT_COMMIT_CACHE
+        dirty = subprocess.run(
+            ["git", "-C", pkg_dir, "status", "--porcelain", "--", "."],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        _GWCAT_COMMIT_CACHE = commit + ("-dirty" if dirty else "")
+    except Exception:
+        _GWCAT_COMMIT_CACHE = "unknown"
+    return _GWCAT_COMMIT_CACHE
+
+
 def _norm_label(x: Any) -> str:
     if isinstance(x, (bytes, bytearray)):
         x = x.decode()

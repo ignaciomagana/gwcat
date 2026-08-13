@@ -416,3 +416,59 @@ def test_combined_selection_set_write_summary(tmp_path):
     assert summary["n_campaigns"] == 2
     assert summary["n_detected"] == 7
     assert summary["campaign_ndraws"] == [1000, 1000]
+
+
+def test_every_writer_stamps_writer_commit(tmp_path):
+    """All five writers (v1 PE, v1 single/combined selection, v2 PE, v2
+    selection) record WHICH gwcat wrote the file (DS-10).
+
+    An editable install moves per commit while the version string stands
+    still, so `writer_commit` is the provenance a consumer can actually act
+    on; `writer_version` rides along.  On this checkout the value must be the
+    live HEAD hash (optionally -dirty), not "unknown".
+    """
+    import os
+    import re
+    import subprocess
+    import warnings
+
+    import h5py
+
+    from gwcat.catalog import GWCatalog
+    from gwcat.selection import SelectionSet, CombinedSelectionSet
+    from gwcat.validation_summary import gwcat_commit
+
+    from test_source_class_filters import build_mixed_store, MIXED_EVENTS
+    from test_selection_spin import write_endo3_full, write_o4_full
+
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], capture_output=True, text=True,
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    ).stdout.strip()
+    assert re.fullmatch(rf"{head}(-dirty)?", gwcat_commit())
+
+    cat = GWCatalog(build_mixed_store(tmp_path, MIXED_EVENTS))
+    e3 = write_endo3_full(tmp_path / "wc_e3.hdf", n=200)
+    o4 = write_o4_full(tmp_path / "wc_o4.hdf", n=200)
+
+    outs = []
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        outs.append(cat.to_darksirens(str(tmp_path / "wc_v1pe.h5"), nsamp=8,
+                                      seed=0, cosmology=(67.74, 0.3089)))
+        outs.append(cat.export(str(tmp_path / "wc_v2pe.h5"), nsamp=8, seed=0,
+                               spin_basis="chieff",  # fixture has no a_1/a_2
+                               cosmology=(67.74, 0.3089)))
+        outs.append(SelectionSet(str(e3)).to_darksirens(
+            str(tmp_path / "wc_v1sel.h5")))
+        outs.append(CombinedSelectionSet(
+            [SelectionSet(str(e3)), SelectionSet(str(o4))]
+        ).to_darksirens(str(tmp_path / "wc_v1comb.h5")))
+        outs.append(SelectionSet(str(e3)).export(str(tmp_path / "wc_v2sel.h5")))
+
+    for out in outs:
+        with h5py.File(out, "r") as f:
+            got = f.attrs["writer_commit"]
+            got = got.decode() if isinstance(got, bytes) else str(got)
+            assert re.fullmatch(rf"{head}(-dirty)?", got), out
+            assert "writer_version" in f.attrs, out

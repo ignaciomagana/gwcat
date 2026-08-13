@@ -201,6 +201,18 @@ class ChiEffPrior:
         weight and collapsing the event's Monte-Carlo integral to a single
         sample.  Out of support is now exactly zero density (GW-03); callers
         must count those samples rather than clip them back up.
+
+        CAVEAT on the support boundary: this method applies no explicit
+        ``|chi_eff| > amax`` mask of its own.  The grid interpolation clamps a
+        beyond-``amax`` query to the boundary column, whose tabulated density
+        is *positive at ~1e-12* for many q rows, so ``logprob`` there returns
+        ~``-25``, not ``-inf`` -- "-inf outside the support" holds only where
+        the interpolated density is exactly zero.  This is by design: callers
+        are expected to gate on :meth:`support` first (as the export builders
+        do), which is what makes out-of-support counts reportable rather than
+        discovered as infinities.  darksirens' bit-for-bit port of this class
+        pins the current behavior, so do not "fix" the clamp here without
+        coordinating a paired change there (DS-06).
         """
         p = self.prob(chi_eff, m1, m2)
         with np.errstate(divide="ignore", invalid="ignore"):

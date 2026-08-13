@@ -69,6 +69,14 @@ def write_pe_gwcat2(product, out_path, *, write_summary: bool = False,
         # Format version is the writer's, never the builder's.
         f.attrs["format_version"] = "gwcat-pe-2.0"
 
+        # Which gwcat wrote this file (GW-22 rider / DS-10): the commit is the
+        # provenance that matters for an editable install, where the version
+        # string does not move between commits.  "unknown" for a non-git
+        # install; "-dirty" when the worktree had uncommitted gwcat changes.
+        from ..validation_summary import gwcat_commit, package_version
+        f.attrs["writer_commit"] = gwcat_commit()
+        f.attrs["writer_version"] = package_version()
+
         # Legacy-compat spin attrs.  chieff keeps the historical values; every
         # other basis states the truth explicitly rather than omitting them
         # (GW-21).  Two reasons the omission was not safe:
@@ -163,6 +171,14 @@ def write_selection_gwcat2(product, out_path, *, write_summary: bool = False,
 
         # Format version is the writer's, never the builder's.
         f.attrs["format_version"] = "gwcat-selection-2.0"
+
+        # Which gwcat wrote this file (GW-22 rider / DS-10): the commit is the
+        # provenance that matters for an editable install, where the version
+        # string does not move between commits.  "unknown" for a non-git
+        # install; "-dirty" when the worktree had uncommitted gwcat changes.
+        from ..validation_summary import gwcat_commit, package_version
+        f.attrs["writer_commit"] = gwcat_commit()
+        f.attrs["writer_version"] = package_version()
 
         # Datasets (gzip, like the legacy selection exporter).  Legacy order
         # first (stable), then any extra columns a basis added.

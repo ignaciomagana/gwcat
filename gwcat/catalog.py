@@ -875,6 +875,13 @@ class GWCatalog:
             f.attrs["mock_data"] = False
             # --- Provenance (gwcat-specific) ---
             f.attrs["format_version"] = "gwcat-1.0"
+
+            # Which gwcat wrote this file (DS-10 provenance; also on the v2
+            # writers).  Commit, not version: an editable install moves per
+            # commit while the version string stands still.
+            from .validation_summary import gwcat_commit, package_version as _pkg_version
+            f.attrs["writer_commit"] = gwcat_commit()
+            f.attrs["writer_version"] = _pkg_version()
             f.attrs["compact_type"] = ("" if compact_type is None
                                        else str(compact_type))
             f.attrs["mass_prior_basis"] = "uniform_detector_frame"

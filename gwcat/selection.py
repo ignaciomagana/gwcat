@@ -1423,6 +1423,13 @@ class SelectionSet:
 
         with h5py.File(out_path, "w") as f:
             f.attrs["format_version"] = "gwcat-selection-1.0"
+
+            # Which gwcat wrote this file (DS-10 provenance; also on the v2
+            # writers).  Commit, not version: an editable install moves per
+            # commit while the version string stands still.
+            from .validation_summary import gwcat_commit, package_version as _pkg_version
+            f.attrs["writer_commit"] = gwcat_commit()
+            f.attrs["writer_version"] = _pkg_version()
             f.attrs["ndraw"] = self._ndraw
             f.attrs["T_obs_yr"] = float(self._T_yr)
             f.attrs["far_threshold"] = float(far_threshold)
@@ -1767,6 +1774,13 @@ class CombinedSelectionSet:
         # Write
         with h5py.File(out_path, "w") as f:
             f.attrs["format_version"] = "gwcat-selection-1.0"
+
+            # Which gwcat wrote this file (DS-10 provenance; also on the v2
+            # writers).  Commit, not version: an editable install moves per
+            # commit while the version string stands still.
+            from .validation_summary import gwcat_commit, package_version as _pkg_version
+            f.attrs["writer_commit"] = gwcat_commit()
+            f.attrs["writer_version"] = _pkg_version()
             f.attrs["ndraw"] = ndraw_total
             f.attrs["T_obs_yr"] = float(sum(s._T_yr for s in self._sets))
             f.attrs["far_threshold"] = float(far_threshold)
