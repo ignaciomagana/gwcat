@@ -12,7 +12,10 @@
 """
 from __future__ import annotations
 
+import contextlib
+import json
 import warnings
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
@@ -24,6 +27,439 @@ from .source_class import (normalize_source_class, resolve_filter_classes,
                            SOURCE_CLASSES, CUT_ESTIMATOR_ATTR,
                            pe_cut_estimator, assess_cut_estimator_pair,
                            PE_MEDIAN_CUT_WARNING)
+
+
+class UnpairableSelectionCut(ValueError):
+    """An event cut for which the paired injection campaign has no equivalent.
+
+    Raised by the exporters, not by :meth:`GWCatalog.select`: cutting a view is
+    always legal, and the cut only becomes a defect when the resulting event
+    list is handed to a selection function that cannot reproduce it.
+    """
+
+
+def _tighter_upper(a, b):
+    """The tighter of two upper bounds (``None`` = no bound)."""
+    if a is None:
+        return None if b is None else float(b)
+    return float(a) if b is None else float(min(float(a), float(b)))
+
+
+def _tighter_lower(a, b):
+    """The tighter of two lower bounds (``None`` = no bound)."""
+    if a is None:
+        return None if b is None else float(b)
+    return float(a) if b is None else float(max(float(a), float(b)))
+
+
+def _intersect_range(a, b):
+    """The intersection of two ``(lo, hi)`` windows (``None`` = no window)."""
+    if a is None:
+        return None if b is None else (float(b[0]), float(b[1]))
+    if b is None:
+        return (float(a[0]), float(a[1]))
+    return (max(float(a[0]), float(b[0])), min(float(a[1]), float(b[1])))
+
+
+def _round(x):
+    """A float rounded to the digest's precision, or ``None``."""
+    return None if x is None else round(float(x), 10)
+
+
+@dataclass(frozen=True)
+class SelectionSpec:
+    """The EFFECTIVE event selection behind a view: every cut, accumulated.
+
+    :meth:`GWCatalog.select` intersects rows correctly -- it always ANDs its
+    mask with the view it was called on -- but the provenance it attached used
+    to describe only the LAST call's arguments.  Export then calls ``select()``
+    once more with its own (defaulted) arguments, so a product built from
+    ``cat.select(source_class="bbh")`` kept all 273 BBH rows while recording an
+    empty ``source_class_filter``, no cut estimator and no event list: a
+    filtered file advertising itself as unfiltered, which a paired selection
+    function has no way to contradict.
+
+    The spec is immutable and composable.  :meth:`refine` returns a NEW spec --
+    this one intersected with one further ``select()`` call -- so the effective
+    cut survives any chain of views:
+
+      * thresholds compose to the TIGHTER value, because that is the cut the
+        surviving rows actually reflect (two chained ``far_max`` cuts leave the
+        smaller one standing);
+      * ``source_class`` composes to the intersection of the resolved class
+        sets, and an EMPTY intersection raises rather than serialising to the
+        "" that every reader takes as "no restriction";
+      * every name filter -- ``allowed_names``, the legacy ``names``, and
+        ``event_list`` -- normalises into ONE set of names, also intersected, so
+        the three spellings cannot describe three different things.
+
+    Nothing here is a measurement of the resulting rows; it is the declaration
+    of what was asked for.  ``n_missing_far`` is the one exception, kept
+    alongside the FAR cut it belongs to.
+    """
+
+    #: Every ``compact_type`` gate actually applied, in call order.
+    compact_type: tuple = ()
+    #: Canonical class labels the composed request resolves to, or ``None``.
+    source_class: Optional[tuple] = None
+    #: Whether a class filter was requested at all (``"cbc"`` resolves to every
+    #: class, which is not the same as never having asked).
+    source_class_requested: bool = False
+    far_max: Optional[float] = None
+    snr_min: Optional[float] = None
+    pastro_min: Optional[float] = None
+    sky_area_max: Optional[float] = None
+    m1_src_range: Optional[tuple] = None
+    m2_src_range: Optional[tuple] = None
+    #: The intersection of every name whitelist, sorted; ``None`` = none given.
+    allowed_names: Optional[tuple] = None
+    #: Labels of the name filters applied, in call order: ``"allowed_names"``,
+    #: ``"names"``, or ``"event_list:<path-or-custom_sequence>"``.
+    name_filters: tuple = ()
+    allowed_names_authoritative: bool = True
+    far_policy: str = "none"
+    n_missing_far: int = 0
+    allow_missing_far: bool = False
+    require_far: bool = False
+    waveform_policy: str = "preferred"
+    approximant: Optional[str] = None
+
+    # ---- composition ----------------------------------------------------
+    def refine(self, *, compact_type=None, source_class=None, far_max=None,
+               snr_min=None, pastro_min=None, sky_area_max=None,
+               m1_src_range=None, m2_src_range=None, name_filters=(),
+               allowed_names_authoritative=True, far_policy="none",
+               n_missing_far=0, allow_missing_far=False, require_far=False,
+               waveform_policy="preferred", approximant=None):
+        """This spec intersected with one further ``select()`` call.
+
+        ``name_filters`` is a sequence of ``(label, names)`` pairs -- one per
+        name filter the call applied, already resolved to names.
+        """
+        classes, requested = self.source_class, self.source_class_requested
+        if source_class is not None:
+            resolved = resolve_filter_classes(source_class)
+            new = tuple(c for c in SOURCE_CLASSES if c in resolved)
+            if classes is None:
+                classes = new
+            else:
+                merged = tuple(c for c in classes if c in set(new))
+                if not merged:
+                    raise ValueError(
+                        f"source_class={source_class!r} selects "
+                        f"{list(new)}, but this view is already restricted to "
+                        f"{list(classes)}: the two share no class, so the "
+                        f"selection is empty. An empty class restriction "
+                        f"serialises identically to 'no restriction', so it "
+                        f"would be exported as an UNFILTERED file holding zero "
+                        f"events -- refusing instead. Select the classes you "
+                        f"mean in one call.")
+                classes = merged
+            requested = True
+
+        names, labels = self.allowed_names, self.name_filters
+        authoritative = self.allowed_names_authoritative
+        for label, seq in name_filters:
+            new_names = tuple(sorted({str(x) for x in seq}))
+            names = (new_names if names is None
+                     else tuple(n for n in names if n in set(new_names)))
+            labels = labels + (str(label),)
+            authoritative = bool(allowed_names_authoritative)
+
+        compact = self.compact_type
+        if compact_type is not None and str(compact_type) not in compact:
+            compact = compact + (str(compact_type),)
+
+        # The FAR policy, the missing-FAR count and the two policy flags belong
+        # to the call that actually applied a FAR cut; a later, FAR-less
+        # select() must not overwrite them with its own defaults.
+        if far_max is not None:
+            far, policy = _tighter_upper(self.far_max, far_max), str(far_policy)
+            n_miss = int(n_missing_far)
+            allow_mf, req_far = bool(allow_missing_far), bool(require_far)
+        elif self.far_max is not None:
+            far, policy, n_miss = self.far_max, self.far_policy, self.n_missing_far
+            allow_mf, req_far = self.allow_missing_far, self.require_far
+        else:
+            far, policy, n_miss = None, "none", 0
+            allow_mf, req_far = bool(allow_missing_far), bool(require_far)
+
+        return SelectionSpec(
+            compact_type=compact,
+            source_class=classes,
+            source_class_requested=requested,
+            far_max=far,
+            snr_min=_tighter_lower(self.snr_min, snr_min),
+            pastro_min=_tighter_lower(self.pastro_min, pastro_min),
+            sky_area_max=_tighter_upper(self.sky_area_max, sky_area_max),
+            m1_src_range=_intersect_range(self.m1_src_range, m1_src_range),
+            m2_src_range=_intersect_range(self.m2_src_range, m2_src_range),
+            allowed_names=names,
+            name_filters=labels,
+            allowed_names_authoritative=authoritative,
+            far_policy=policy,
+            n_missing_far=n_miss,
+            allow_missing_far=allow_mf,
+            require_far=req_far,
+            waveform_policy=str(waveform_policy),
+            approximant=None if approximant is None else str(approximant),
+        )
+
+    # ---- derived views --------------------------------------------------
+    @property
+    def is_filtered(self) -> bool:
+        """Whether ANY event cut is in effect (policies alone do not count)."""
+        return bool(self.compact_type or self.source_class_requested
+                    or self.name_filters
+                    or self.far_max is not None or self.snr_min is not None
+                    or self.pastro_min is not None
+                    or self.sky_area_max is not None
+                    or self.m1_src_range is not None
+                    or self.m2_src_range is not None)
+
+    @property
+    def source_class_filter(self) -> str:
+        """The composed class request, in the round-trippable attr spelling."""
+        if not self.source_class_requested or not self.source_class:
+            return ""
+        return format_source_class_filter(list(self.source_class))
+
+    @property
+    def event_list_filter(self) -> str:
+        """The ``event_list=`` sources, in the legacy attr spelling."""
+        return ";".join(lab.split(":", 1)[1] for lab in self.name_filters
+                        if lab.startswith("event_list:"))
+
+    @property
+    def allowed_names_filter(self) -> str:
+        """Which direct name-whitelist spellings were used (``""`` if none)."""
+        return ";".join(lab for lab in self.name_filters
+                        if not lab.startswith("event_list:"))
+
+    @property
+    def allowed_names_digest(self) -> str:
+        """A deterministic digest of the composed name whitelist."""
+        from .export.contract import event_list_digest
+        return event_list_digest(self.allowed_names)
+
+    @property
+    def cut_estimator(self) -> str:
+        """WHICH quantity the class restriction was applied to (GW-12).
+
+        Every name filter counts as a whitelist, not only ``event_list=``: an
+        ``allowed_names=`` selection is the same "membership in a fixed list"
+        the pairing check treats as reproducible, and recording it as ``"none"``
+        described a filtered file as unfiltered.
+        """
+        return pe_cut_estimator(
+            self.source_class if self.source_class_requested else None,
+            self.allowed_names if self.name_filters else None)
+
+    # ---- serialisation --------------------------------------------------
+    def to_dict(self) -> dict:
+        """A JSON-able, deterministic record of the effective selection.
+
+        The whitelist itself is summarised by count + digest rather than
+        written out: the events actually exported are already listed in
+        ``event_names``, and a 259-name list in an HDF5 attr helps nobody.
+        """
+        return {
+            "compact_type": list(self.compact_type),
+            "source_class": (list(self.source_class)
+                             if self.source_class_requested else None),
+            "far_max": _round(self.far_max),
+            "snr_min": _round(self.snr_min),
+            "pastro_min": _round(self.pastro_min),
+            "sky_area_max": _round(self.sky_area_max),
+            "m1_src_range": (None if self.m1_src_range is None
+                             else [_round(v) for v in self.m1_src_range]),
+            "m2_src_range": (None if self.m2_src_range is None
+                             else [_round(v) for v in self.m2_src_range]),
+            "name_filters": list(self.name_filters),
+            "n_allowed_names": (-1 if self.allowed_names is None
+                                else len(self.allowed_names)),
+            "allowed_names_digest": self.allowed_names_digest,
+            "allowed_names_authoritative": bool(
+                self.allowed_names_authoritative),
+            "far_policy": str(self.far_policy),
+            "n_events_missing_far": int(self.n_missing_far),
+            "allow_missing_far": bool(self.allow_missing_far),
+            "require_far": bool(self.require_far),
+            "waveform_policy": str(self.waveform_policy),
+            "approximant": (None if self.approximant is None
+                            else str(self.approximant)),
+            "cut_estimator": self.cut_estimator,
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), sort_keys=True,
+                          separators=(",", ":"))
+
+    def digest(self) -> str:
+        """A short digest of the whole effective spec."""
+        from .export.contract import stable_digest
+        return stable_digest(self.to_json())
+
+    def to_attrs(self) -> dict:
+        """The provenance attrs both writers stamp on an export.
+
+        Every exporter writes these from the EFFECTIVE spec, never from its own
+        keyword arguments, so the file states the selection it actually holds.
+        A cut with no value is NaN rather than a missing attr: HDF5 has no null,
+        and "no cut on this statistic" has to be distinguishable from "this file
+        predates the record".
+        """
+        def _cut(x):
+            return float("nan") if x is None else float(x)
+
+        return {
+            "selection_spec": self.to_json(),
+            "selection_spec_digest": self.digest(),
+            "selection_filtered": bool(self.is_filtered),
+            "compact_type": ",".join(self.compact_type),
+            "source_class_filter": self.source_class_filter,
+            CUT_ESTIMATOR_ATTR: self.cut_estimator,
+            "event_list_filter": self.event_list_filter,
+            "allowed_names_filter": self.allowed_names_filter,
+            "n_allowed_names": (-1 if self.allowed_names is None
+                                else len(self.allowed_names)),
+            "allowed_names_digest": self.allowed_names_digest,
+            "far_max": _cut(self.far_max),
+            "snr_min": _cut(self.snr_min),
+            "pastro_min": _cut(self.pastro_min),
+            "sky_area_max": _cut(self.sky_area_max),
+            "far_policy": str(self.far_policy),
+            "n_events_missing_far": int(self.n_missing_far),
+            "allow_missing_far": bool(self.allow_missing_far),
+            "require_far": bool(self.require_far),
+            "waveform_policy": str(self.waveform_policy),
+            "approximant": "" if self.approximant is None else str(
+                self.approximant),
+        }
+
+    # ---- pairing ---------------------------------------------------------
+    def check_pairable(self, *, allow_unpaired_pastro_min: bool = False):
+        """Refuse the cuts no injection campaign can reproduce.
+
+        ``pastro_min`` is the one that exists today.  Every selection export
+        records ``p_astro_available=False``, because the campaigns carry no
+        per-injection p_astro at all: there is no injection-side threshold that
+        reproduces an event-side p_astro cut, so beta would describe a
+        different selection than the one that produced the event list -- the
+        Essick & Fishbach failure, and invisible in the files until the cut
+        started being recorded.
+        """
+        if self.pastro_min is None or allow_unpaired_pastro_min:
+            return
+        raise UnpairableSelectionCut(
+            f"pastro_min={self.pastro_min} was applied to the events, but the "
+            f"injection side has no equivalent: every selection export records "
+            f"p_astro_available=False because the campaigns carry no "
+            f"per-injection p_astro, so no injection cut reproduces this one "
+            f"and the exported beta would describe a different selection than "
+            f"the event list it is paired with (Essick & Fishbach; GW-33).\n"
+            f"\n"
+            f"Cut on FAR instead (far_max=, CLI --far-max: the statistic the "
+            f"campaigns threshold on directly), or select the events by name "
+            f"(event_list= / allowed_names=, which is membership rather than a "
+            f"cut on a statistic). Pass allow_unpaired_pastro_min=True to write "
+            f"the file anyway -- it is then NOT usable with a selection "
+            f"function.")
+
+
+class _SampleReader:
+    """Per-event, per-row posterior reads against ONE open handle on a store.
+
+    Why this exists (GW-32).  :meth:`GWCatalog.get` is a whole-selection read:
+    it returns every row of every selected event, so an exporter that keeps
+    ``nsamp`` rows per event had to materialise the entire posterior first --
+    6.88M rows read to emit 1.16M on the shipped store.  A reader inverts the
+    order: :meth:`counts` answers "how many rows does event ``e`` have?" with no
+    sample read at all (the offsets are already in memory), the caller draws its
+    indices, and :meth:`read` fetches only those.
+
+    Why a SPAN read and not fancy indexing.  ``d[a + rows]`` (an h5py point
+    selection) is the obvious way to read exactly the drawn rows, and it is
+    catastrophically slow: on the shipped store, drawing 5000 of ~24k rows for
+    30 events took 6.18 s as a point selection versus 0.019 s reading the
+    enclosing span and indexing in memory -- HDF5 issues per-point I/O, and the
+    span costs no extra chunks anyway (a uniform draw touches them all).  So the
+    span is read, indexed, and dropped; what is RETAINED is only the drawn rows,
+    which is where the memory goes.
+    """
+
+    def __init__(self, cat, f):
+        self._cat = cat
+        self._f = f
+        self._sl = cat._slices()
+        # Dataset handles, opened once each.  A per-event loop asks for the same
+        # column hundreds of times, and re-resolving "samples/<p>" every time
+        # costs more than the reads do.
+        self._ds = {}
+
+    def _dataset(self, p):
+        d = self._ds.get(p)
+        if d is None:
+            d = self._ds[p] = self._f[f"samples/{p}"]
+        return d
+
+    def counts(self):
+        """Rows behind each selected event, without touching the sample data."""
+        return np.array([b - a for (a, b) in self._sl], dtype=np.int64)
+
+    def read(self, e, params, rows=None, required=True, fill_value=np.nan):
+        """Columns for selected event ``e``, restricted to ``rows``.
+
+        ``rows`` are indices INTO THE EVENT's own slice (as
+        :meth:`GWCatalog.get` ``per_event=True`` would return it); they may
+        repeat and need not be sorted, and the result is exactly
+        ``get(params, per_event=True)[p][e][rows]`` -- negative indices count
+        from the end and an out-of-range one raises, as numpy's would.
+        ``rows=None`` reads the whole slice.  ``required``/``fill_value``
+        follow :meth:`GWCatalog.get`.
+        """
+        from .schema import MissingParameterError
+        cat = self._cat
+        params = [params] if isinstance(params, str) else list(params)
+        a, b = self._sl[e]
+        if rows is None:
+            take = None
+            n_out = b - a
+        else:
+            rows = np.asarray(rows, dtype=np.intp)
+            n_out = rows.size
+            if n_out:
+                n_slice = b - a
+                if (rows < 0).any():
+                    rows = np.where(rows < 0, rows + n_slice, rows)
+                lo = int(rows.min())
+                hi = int(rows.max())
+                if lo < 0 or hi >= n_slice:
+                    raise IndexError(
+                        f"row index out of range for selected event {e}, "
+                        f"which has {n_slice} sample(s)")
+                take = (lo, hi, rows - lo)
+            else:
+                take = (0, -1, rows)
+        out = {}
+        for p in params:
+            if p not in cat._param_index:
+                if required:
+                    raise MissingParameterError(
+                        f"required parameter {p!r} is not in the store; "
+                        f"stored parameters are {cat.params}. Pass "
+                        f"required=False for a {fill_value}-filled column.")
+                out[p] = np.full(n_out, fill_value)
+                continue
+            d = self._dataset(p)
+            if take is None:
+                out[p] = d[a:b]
+            elif take[1] < take[0]:      # rows is empty
+                out[p] = np.empty(0, dtype=d.dtype)
+            else:
+                lo, hi, local = take
+                out[p] = d[a + lo:a + hi + 1][local]
+        return out
 
 
 class GWCatalog:
@@ -63,6 +499,11 @@ class GWCatalog:
         self._n_missing_far = 0
         self._selection_source_class = None
         self._selection_event_list = None
+        # The EFFECTIVE selection: every cut this view accumulated, across
+        # however many select() calls produced it.  The per-call attributes
+        # above describe only the last one, which is what let a filtered export
+        # advertise itself as unfiltered (GW-33).
+        self._selection_spec = SelectionSpec()
         # Waveform / sample-set policy provenance (PR 6).  Defaults describe a
         # fresh view with no policy applied yet.  NOTE: _homogeneous_sample_sets
         # = True here is a placeholder, not a measurement -- a fresh multi-set
@@ -74,6 +515,16 @@ class GWCatalog:
         self._homogeneous_sample_sets = True
 
     # ---- selection (operates on metadata only; cheap) --------------------
+    @property
+    def selection_spec(self) -> SelectionSpec:
+        """The EFFECTIVE :class:`SelectionSpec` behind this view.
+
+        Composed across every :meth:`select` call that produced it, so it
+        describes the events the view actually holds -- not the arguments of
+        whichever call came last.  This is what the exporters record.
+        """
+        return self._selection_spec
+
     @property
     def n_events(self):
         return len(self._sel)
@@ -174,6 +625,14 @@ class GWCatalog:
         approximant : str or None
             Required approximant for ``waveform_policy="strict-approximant"``;
             matched against each row's ``approximant`` or ``waveform`` family.
+
+        Effective selection provenance (GW-33)
+        --------------------------------------
+        The returned view carries :attr:`selection_spec`, the EFFECTIVE
+        :class:`SelectionSpec`: this call composed with the spec of the view it
+        was called on, exactly as the rows are composed.  The exporters record
+        that spec rather than their own arguments, so a product built from an
+        already-filtered view states the filter it actually holds.
         """
         import warnings
         if require_far and allow_missing_far:
@@ -198,11 +657,16 @@ class GWCatalog:
                 "campaign can reproduce.")
 
         m = np.ones(len(self.names), dtype=bool)
+        # What this call actually applies, for the effective spec below: a
+        # compact_type that allowed_names overrules is NOT a cut this view made.
+        applied_compact_type = None
+        name_filters = []
         if compact_type is not None:
             apply_compact_type = (allowed_names is None or
                                   not allowed_names_authoritative)
             if apply_compact_type:
                 m &= (self.meta["compact_type"] == compact_type)
+                applied_compact_type = compact_type
         if source_class is not None:
             allowed_classes = resolve_filter_classes(source_class)
             m &= np.isin(self.source_class, list(allowed_classes))
@@ -269,11 +733,21 @@ class GWCatalog:
                         f"{sorted(dropped.tolist())}"
                     )
             m &= np.isin(self.names, _whitelist_arr)
+            # Both spellings are the same filter -- membership in a fixed list
+            # of names -- and normalise into the one whitelist the spec keeps.
+            name_filters.append(
+                ("allowed_names" if allowed_names is not None else "names",
+                 [str(x) for x in _whitelist_arr.tolist()]))
 
         # User event-list file / sequence (additional intersection gate).
         if event_list is not None:
             listed = load_event_list(event_list)
             listed_arr = np.asarray(listed)
+            name_filters.append(
+                ("event_list:" + (str(event_list)
+                                  if isinstance(event_list, (str, bytes))
+                                  else "custom_sequence"),
+                 [str(x) for x in listed]))
             missing_ev = set(listed_arr) - set(self.names)
             if missing_ev:
                 warnings.warn(
@@ -336,7 +810,26 @@ class GWCatalog:
             self.names, sel, self.meta, policy=waveform_policy,
             approximant=approximant)
 
+        # ── The EFFECTIVE selection (GW-33) ───────────────────────────────────
+        # Composed with the spec of the view this call was made on, because the
+        # ROWS are composed the same way (`m` is ANDed with self._sel above).
+        # Recording only this call's arguments is what let an export from
+        # cat.select(source_class="bbh") keep every BBH row while writing an
+        # empty source_class_filter.
+        spec = self._selection_spec.refine(
+            compact_type=applied_compact_type,
+            source_class=source_class,
+            far_max=far_max, snr_min=snr_min, pastro_min=pastro_min,
+            sky_area_max=sky_area_max,
+            m1_src_range=m1_src_range, m2_src_range=m2_src_range,
+            name_filters=name_filters,
+            allowed_names_authoritative=allowed_names_authoritative,
+            far_policy=far_policy, n_missing_far=n_missing_far,
+            allow_missing_far=allow_missing_far, require_far=require_far,
+            waveform_policy=waveform_policy, approximant=approximant)
+
         result = GWCatalog(self.path, _sel=kept)
+        result._selection_spec = spec
         result._far_policy = far_policy
         result._n_missing_far = n_missing_far
         # The detection cut, numerically.  Essick & Fishbach require the EVENT
@@ -396,6 +889,26 @@ class GWCatalog:
         if per_event:
             return out
         return {p: np.concatenate(v) if v else np.array([]) for p, v in out.items()}
+
+    @contextlib.contextmanager
+    def sample_reader(self):
+        """One open handle on the store, for per-event / per-row sample reads.
+
+        The counterpart to :meth:`get` for a consumer that decides WHICH rows it
+        will keep before it wants their values -- the downsampling exporters.
+        ``get`` must read every selected slice in full, so the PE export
+        materialised 6.88M rows to emit 1.16M and peaked at 1.20 GiB; a reader
+        streams one event at a time and retains only the drawn rows.
+
+        Usage::
+
+            with cat.sample_reader() as rd:
+                n = rd.counts()                      # no sample read at all
+                rows = rng.choice(n[0], size=5000)
+                d = rd.read(0, ["mass_1"], rows=rows)
+        """
+        with h5py.File(self.path, "r") as f:
+            yield _SampleReader(self, f)
 
     def param_available(self, param):
         """Boolean per-event availability of ``param`` for the current selection.
@@ -519,7 +1032,8 @@ class GWCatalog:
                       waveform_policy="preferred", approximant=None,
                       write_summary: bool = False,
                       summary_context: Optional[dict] = None,
-                      allow_zero_p_pe: bool = False):
+                      allow_zero_p_pe: bool = False,
+                      allow_unpaired_pastro_min: bool = False):
         """Write an HDF5 consumable by darksirens.gw.utils.load_gw_samples.
 
         p_pe convention (spin-prior contract)
@@ -627,6 +1141,21 @@ class GWCatalog:
         summary_context : dict, optional
             Extra fields merged into the written summary. Never populated
             automatically.
+        allow_unpaired_pastro_min : bool, default False
+            Write the file even though a ``pastro_min`` cut is in effect.  The
+            campaigns carry no per-injection p_astro (every selection export
+            records ``p_astro_available=False``), so no injection-side cut
+            reproduces it and the pair is not usable; see
+            :meth:`SelectionSpec.check_pairable`.
+
+        Provenance (GW-33)
+        ------------------
+        The selection attrs are written from the EFFECTIVE
+        :attr:`selection_spec` of the exported view -- this call's filters
+        composed with those of the view it was called on -- so exporting from
+        ``cat.select(source_class="bbh")`` records the BBH filter instead of
+        this call's defaults.  ``event_list_digest`` identifies the events
+        written, independently of how they were spelled.
         """
         valid_spin_modes = ("include", "exclude")
         if spin_prior_mode not in valid_spin_modes:
@@ -635,12 +1164,6 @@ class GWCatalog:
                 f"of {valid_spin_modes}. 'passthrough' is not offered because "
                 f"the store keeps a spin-prior-agnostic p_dL_pe, so 'exclude' "
                 f"already means 'no chi_eff prior applied'.")
-        # ── The class cut the paired selection file cannot reproduce (GW-12) ─
-        # Warned here, at export time, rather than only by the validator that
-        # will refuse the finished pair: the cheap alternative (event_list=) is
-        # a choice about how to build THIS product.
-        if source_class is not None:
-            warnings.warn(PE_MEDIAN_CUT_WARNING)
         sub = self.select(compact_type=compact_type, far_max=far_max,
                           pastro_min=pastro_min, allowed_names=allowed_names,
                           allowed_names_authoritative=allowed_names_authoritative,
@@ -649,6 +1172,21 @@ class GWCatalog:
                           require_far=require_far,
                           waveform_policy=waveform_policy,
                           approximant=approximant)
+        # The EFFECTIVE selection: this call's filters composed with those the
+        # exported view already carried (GW-33).  Everything this exporter
+        # records about the selection comes from here, and the cut no injection
+        # campaign can reproduce is refused before any samples are read.
+        spec = sub.selection_spec
+        spec.check_pairable(
+            allow_unpaired_pastro_min=allow_unpaired_pastro_min)
+        # ── The class cut the paired selection file cannot reproduce (GW-12) ─
+        # Warned here, at export time, rather than only by the validator that
+        # will refuse the finished pair: the cheap alternative (event_list=) is
+        # a choice about how to build THIS product.  Asked of the EFFECTIVE
+        # spec, so a view that was already class-filtered warns too -- that is
+        # the case where nothing else would have said it (GW-33).
+        if spec.source_class_requested:
+            warnings.warn(PE_MEDIAN_CUT_WARNING)
         from .schema import DARKSIRENS_REQUIRED
         need = list(DARKSIRENS_REQUIRED)
         # Required-parameter contract (PR 5): fail loudly -- naming the missing
@@ -882,8 +1420,6 @@ class GWCatalog:
             from .validation_summary import gwcat_commit, package_version as _pkg_version
             f.attrs["writer_commit"] = gwcat_commit()
             f.attrs["writer_version"] = _pkg_version()
-            f.attrs["compact_type"] = ("" if compact_type is None
-                                       else str(compact_type))
             f.attrs["mass_prior_basis"] = "uniform_detector_frame"
             # ── Spin-prior contract provenance (PR 3) ──────────────────────
             chi_eff_included = (spin_prior_mode == "include")
@@ -913,27 +1449,24 @@ class GWCatalog:
             # per-event array above when cosmology_per_event_varies=True).
             f.attrs["pe_cosmology_H0"] = pe_H0
             f.attrs["pe_cosmology_Om0"] = pe_Om0
-            # --- Source-class / FAR-policy provenance (PR 2) ---
-            f.attrs["source_class_filter"] = format_source_class_filter(
-                source_class)
-            # WHICH masses the class threshold was applied to (GW-12).  The
-            # store's source_class column is classify_by_mass() of the POSTERIOR
-            # MEDIAN source-frame masses, while the paired selection file cuts
-            # its injections on injected truth -- the same threshold on two
-            # different quantities.  Recording it is what lets the paired-file
-            # validator refuse that combination instead of shipping a beta that
-            # describes a cut nobody applied.
-            f.attrs[CUT_ESTIMATOR_ATTR] = pe_cut_estimator(
-                source_class, event_list)
-            f.attrs["event_list_filter"] = (
-                "" if event_list is None
-                else (str(event_list) if isinstance(event_list, (str, bytes))
-                      else "custom_sequence"))
-            f.attrs["far_policy"] = getattr(sub, "_far_policy", "none")
-            f.attrs["allow_missing_far"] = bool(allow_missing_far)
-            f.attrs["require_far"] = bool(require_far)
-            f.attrs["n_events_missing_far"] = int(
-                getattr(sub, "_n_missing_far", 0))
+            # --- Effective event selection (PR 2, GW-12, GW-33) ---
+            # From the EFFECTIVE spec of the exported view, never from this
+            # call's arguments: the rows are the intersection of every select()
+            # that produced `sub`, so the provenance has to be too. Includes the
+            # composed source_class_filter, every numeric cut (NaN = no cut on
+            # that statistic), the name-filter digest, the FAR policy, and
+            # CUT_ESTIMATOR_ATTR -- WHICH masses the class threshold was applied
+            # to (GW-12): the store's source_class column is classify_by_mass()
+            # of the POSTERIOR MEDIAN source-frame masses, while the paired
+            # selection file cuts its injections on injected truth. Recording it
+            # is what lets the paired-file validator refuse that combination
+            # instead of shipping a beta that describes a cut nobody applied.
+            for _k, _v in spec.to_attrs().items():
+                f.attrs[_k] = _v
+            # WHICH events this file holds, independent of how they were
+            # spelled: a sorted, de-duplicated digest of the written names.
+            from .export.contract import event_list_digest
+            f.attrs["event_list_digest"] = event_list_digest(kept)
             # --- Waveform / sample-set provenance (PR 6) ---
             # homogeneous_sample_sets describes the SELECTED VIEW: False iff it
             # holds more than one sample set of one event (only possible under
@@ -995,19 +1528,18 @@ class GWCatalog:
                 "n_events_skipped_after_selection": int(sub.n_events - nobs),
                 "event_names_exported": [str(k) for k in kept],
                 "nsamp_per_event": int(nsamp),
-                "source_class_filter": (
-                    None if source_class is None
-                    else format_source_class_filter(source_class)),
-                CUT_ESTIMATOR_ATTR: pe_cut_estimator(source_class, event_list),
-                "event_list_filter": (
-                    None if event_list is None
-                    else (str(event_list)
-                          if isinstance(event_list, (str, bytes))
-                          else "custom_sequence")),
-                "far_policy": getattr(sub, "_far_policy", "none"),
-                "allow_missing_far": bool(allow_missing_far),
-                "require_far": bool(require_far),
-                "n_events_missing_far": int(getattr(sub, "_n_missing_far", 0)),
+                # The EFFECTIVE selection (GW-33), the same record the file's
+                # attrs carry.
+                "selection_spec": spec.to_dict(),
+                "selection_spec_digest": spec.digest(),
+                "event_list_digest": event_list_digest(kept),
+                "source_class_filter": spec.source_class_filter or None,
+                CUT_ESTIMATOR_ATTR: spec.cut_estimator,
+                "event_list_filter": spec.event_list_filter or None,
+                "far_policy": spec.far_policy,
+                "allow_missing_far": bool(spec.allow_missing_far),
+                "require_far": bool(spec.require_far),
+                "n_events_missing_far": int(spec.n_missing_far),
                 "spin_prior_mode": spin_prior_mode,
                 "chi_eff_prior_applied_to_p_pe": bool(chi_eff_included),
                 "cosmology_mode": cosmology_mode,
@@ -1125,17 +1657,41 @@ class GWCatalog:
               f"{int(ns.sum())} total samples")
 
 
+#: Datasets the ``gwcat-1.0`` PE schema MANDATES -- exactly what
+#: :meth:`GWCatalog.to_darksirens` writes and what darksirens' loader reads.
+#: Their presence is checked, not assumed: the loop below used to say
+#: ``if ds in f`` and skip the check when the dataset was absent, so a file
+#: missing p_pe / the masses / the sky produced no failure at all.
+V1_PE_REQUIRED = ("ra", "dec", "m1det", "m2det", "chieff", "dL", "p_pe",
+                  "redshift", "m1src", "m2src")
+
+#: Datasets the ``gwcat-selection-1.0`` schema MANDATES (what
+#: ``SelectionSet``/``CombinedSelectionSet.to_darksirens`` write).
+V1_SELECTION_REQUIRED = ("m1det", "m2det", "dL", "chieff", "ra", "dec",
+                         "m1src", "m2src", "redshift", "pdraw")
+
+
 def validate_export(gw_path: str, selection_path: str = None, strict: bool = False):
     """Check a darksirens PE export (and optionally a selection export) for
     internal consistency.
 
+    This is the FROZEN v1 validator, and it validates the ``gwcat-1.0`` /
+    ``gwcat-selection-1.0`` contract only.  The public entry point is
+    :func:`gwcat.validate_export` (i.e.
+    :func:`gwcat.export.validate.validate_export_any`), which dispatches on
+    each file's ``format_version`` and sends v2 files to
+    :func:`gwcat.export.validate_export_v2`.
+
     Checks:
+      * every dataset the gwcat-1.0 schema mandates is PRESENT
+        (:data:`V1_PE_REQUIRED`, :data:`V1_SELECTION_REQUIRED`) -- an absent
+        one is a failed check, not a skipped one
       * array lengths == nobs * nsamp
       * p_pe finite and STRICTLY positive -- an exact zero is a hard failure
         (GW-01), not a documented "distance-prior tail"
       * source masses <= detector masses
       * redshift non-negative
-      * format_version present
+      * format_version present and a v1 one
       * if selection_path: cosmology consistent, pdraw finite/positive,
         ndraw > n_detected, chi_eff_swap_applied flag present
 
@@ -1183,11 +1739,25 @@ def validate_export(gw_path: str, selection_path: str = None, strict: bool = Fal
         nsamp = int(f.attrs.get("nsamp", 0))
         expected = nobs * nsamp
 
-        _check("pe_format_version", "format_version" in f.attrs)
+        pe_version = f.attrs.get("format_version")
+        pe_version = (pe_version.decode()
+                      if isinstance(pe_version, (bytes, bytearray))
+                      else pe_version)
+        _check("pe_format_version", pe_version == "gwcat-1.0",
+               f"format_version={pe_version!r} is not 'gwcat-1.0'; this is the "
+               f"frozen v1 validator. Call gwcat.validate_export, which "
+               f"dispatches on format_version.")
         _check("pe_mock_data_attr", "mock_data" in f.attrs)
         _check("pe_cosmology_H0", "pe_cosmology_H0" in f.attrs)
 
-        for ds in ["m1det", "m2det", "dL", "chieff", "ra", "dec", "p_pe"]:
+        # Presence FIRST: a mandated dataset that is absent is a failure, not a
+        # check that quietly does not run.
+        for ds in V1_PE_REQUIRED:
+            _check(f"pe_has_{ds}", ds in f,
+                   f"dataset {ds!r} missing; the gwcat-1.0 PE schema mandates "
+                   f"{list(V1_PE_REQUIRED)}")
+
+        for ds in V1_PE_REQUIRED:
             if ds in f:
                 _check(f"pe_{ds}_length", f[ds].shape[0] == expected,
                        f"{f[ds].shape[0]} != {expected}")
@@ -1237,8 +1807,22 @@ def validate_export(gw_path: str, selection_path: str = None, strict: bool = Fal
     if selection_path is not None:
         print(f"Validating selection export: {selection_path}")
         with h5py.File(selection_path, "r") as f:
-            _check("sel_format_version", "format_version" in f.attrs)
+            sel_version = f.attrs.get("format_version")
+            sel_version = (sel_version.decode()
+                           if isinstance(sel_version, (bytes, bytearray))
+                           else sel_version)
+            _check("sel_format_version",
+                   sel_version == "gwcat-selection-1.0",
+                   f"format_version={sel_version!r} is not "
+                   f"'gwcat-selection-1.0'; this is the frozen v1 validator. "
+                   f"Call gwcat.validate_export, which dispatches on "
+                   f"format_version.")
             _check("sel_chi_eff_swap_flag", "chi_eff_swap_applied" in f.attrs)
+
+            for ds in V1_SELECTION_REQUIRED:
+                _check(f"sel_has_{ds}", ds in f,
+                       f"dataset {ds!r} missing; the gwcat-selection-1.0 "
+                       f"schema mandates {list(V1_SELECTION_REQUIRED)}")
 
             ndraw = int(f.attrs.get("ndraw", 0))
             n_det = int(f.attrs.get("n_detected", 0))

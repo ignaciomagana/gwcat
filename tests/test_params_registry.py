@@ -160,6 +160,32 @@ def test_chieff_and_chip_are_advisory_in_the_component_space():
     assert "chieff" in get_space("chieff").fit_columns
 
 
+def test_the_mass_density_coordinate_is_q_not_m2det():
+    """The exported ``m1det`` factor IS ``|d(m1det,m2det)/d(m1det,q)|``, so the
+    density it belongs to is a density in ``(m1det, q)``.
+
+    Publishing ``(m1det, m2det)`` as the fit columns while carrying the
+    ``(m1det, q)`` measure let a generic contract consumer integrate the
+    exported weights against the wrong one -- with no field anywhere in the file
+    disagreeing with it.
+    """
+    mass = BLOCKS["mass.det_pair"]
+    assert "q" in mass.columns
+    assert "m2det" in mass.advisory_columns
+    assert "m2det" not in mass.columns
+    for name in list_spaces():
+        sp = get_space(name)
+        assert "q" in sp.fit_columns, name
+        assert "m2det" in sp.advisory_columns, name
+        assert "m2det" not in sp.fit_columns, name
+    # ...and q is a ratio, so a store handing over m1det/m2det swapped is out of
+    # the declared range rather than merely surprising.
+    q = mass.ranges["q"]
+    assert bool(q.contains(0.5)) and bool(q.contains(1.0))
+    assert not bool(q.contains(1.7))
+    assert not bool(q.contains(0.0))
+
+
 def test_sky_is_in_every_space_unconditionally():
     for name in list_spaces():
         assert "ra" in get_space(name).fit_columns
@@ -264,6 +290,71 @@ def test_mass_block_jacobian_and_its_gate():
     with pytest.raises(ValueError, match="Jacobian"):
         BLOCKS["mass.det_pair"].ln_prior_pe(
             cols, PEContext(mass_prior_kind="uniform_chirp_mass"))
+    # the gate names the event, because the operator has to know WHICH row
+    with pytest.raises(ValueError, match="GW150914"):
+        BLOCKS["mass.det_pair"].ln_prior_pe(
+            cols, PEContext(event_name="GW150914",
+                            mass_prior_kind="uniform_chirp_mass"))
+
+
+def test_mass_prior_classes_are_verified_assumed_or_refused():
+    """Three states, not two.  Collapsing "assumed" into "verified" is how 9 of
+    the 282 shipped rows came to be exported as verified uniform priors;
+    collapsing it into "refused" would throw those events away over a missing
+    priors group in the release."""
+    from gwcat.params.blocks.mass import classify_mass_prior
+
+    assert classify_mass_prior("uniform_detector_frame") == "verified"
+    assert classify_mass_prior("assumed_default") == "assumed"
+    assert classify_mass_prior("unstated") == "assumed"
+    assert classify_mass_prior("") == "assumed"
+    assert classify_mass_prior(None) == "assumed"
+    assert classify_mass_prior("unrecognized") == "unsupported"
+    assert classify_mass_prior("uniform_chirp_mass") == "unsupported"
+
+
+def test_the_mass_factor_is_exact_in_linear_space():
+    """A builder composing the block must not perturb a single float: the chieff
+    PE export is contractually byte-identical to the frozen v1 exporter, and
+    ``exp(log(m1det)) != m1det`` for most float64 masses."""
+    from gwcat.params import PEContext, block_prior_factor_pe
+
+    ctx = PEContext(mass_prior_kind="uniform_detector_frame")
+    m1 = np.random.default_rng(0).uniform(5.0, 60.0, 5000)
+    cols = {"m1det": m1, "q": np.full(m1.size, 0.5)}
+    factor = block_prior_factor_pe(BLOCKS["mass.det_pair"], cols, ctx)
+    np.testing.assert_array_equal(factor, m1)
+    # the log form agrees to an ulp -- which is exactly why it cannot be used
+    lnp = BLOCKS["mass.det_pair"].ln_prior_pe(cols, ctx)
+    np.testing.assert_allclose(np.exp(lnp), m1, rtol=1e-15)
+    assert not np.array_equal(np.exp(lnp), m1)
+
+
+def test_the_composer_runs_the_blocks_gates():
+    """Going through the block is the point: the gate travels with the factor,
+    so a builder cannot obtain the density without it."""
+    from gwcat.params import PEContext, block_prior_factor_pe
+
+    cols = {"m1det": np.array([30.0]), "q": np.array([0.5])}
+    with pytest.raises(ValueError, match="Jacobian"):
+        block_prior_factor_pe(BLOCKS["mass.det_pair"], cols,
+                              PEContext(mass_prior_kind="uniform_chirp_mass"))
+
+
+def test_the_composer_falls_back_to_the_log_form():
+    """A block that declares only ``ln_prior_pe`` is still composable -- the
+    linear form exists for parity, not as a second contract."""
+    from gwcat.params import PEContext, block_prior_factor_pe
+
+    ctx = PEContext(amax_1=0.99, amax_2=0.5)
+    got = block_prior_factor_pe(BLOCKS["spin.component_polar"], {}, ctx)
+    assert got == pytest.approx(1.0 / (4.0 * 0.99 * 0.5))
+
+    from gwcat.params import ParameterBlock
+    with pytest.raises(ValueError, match="declares no PE prior"):
+        block_prior_factor_pe(
+            ParameterBlock(name="spin.silent", kind="spin", columns=("x",)),
+            {}, ctx)
 
 
 def test_sky_measure_is_declared_on_both_sides():
@@ -309,6 +400,12 @@ def test_the_pe_builder_now_drives_itself_from_the_registry():
     assert 'need = list(DARKSIRENS_REQUIRED)' not in src
     # and the extras gate is derived, not asserted
     assert 'need_extras = spin_basis != "chieff"' not in src
+    # GW-34: the requirements were driven by the registry while the NUMBERS
+    # still were not -- the mass density was written out by hand and the basis
+    # stamped as a constant, so the block's gate never ran.
+    assert "block_prior_factor_pe(" in src
+    assert "p_pe = m1 * p_dL" not in src
+    assert '"mass_prior_basis": "uniform_detector_frame"' not in src
 
 
 # --------------------------------------------------------------------------

@@ -8,7 +8,9 @@
                                   source classes
     gwcat export-darksirens ...  GWCatalog.to_darksirens
     gwcat selection ...          SelectionSet/CombinedSelectionSet.to_darksirens
-    gwcat validate ...           gwcat.catalog.validate_export
+    gwcat validate ...           gwcat.export.validate.validate_export_any
+                                  (the format dispatcher behind
+                                  ``gwcat.validate_export``)
 
 This module intentionally contains no scientific logic of its own: every
 subcommand either (a) delegates argument parsing AND execution wholesale to
@@ -227,14 +229,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_pe.add_argument("--nsamp", type=int, default=4096)
     p_pe.add_argument("--seed", type=int, default=0)
     p_pe.add_argument("--z-max", type=float, default=None)
-    p_pe.add_argument("--amax", type=float, default=0.99,
-                      help="chieff-basis chi_eff-prior spin amax "
-                           "(ignored by the component / chieff_chip bases, "
-                           "which read a per-event amax from the store).")
+    p_pe.add_argument("--amax", default="auto", metavar="AMAX",
+                      help="Spin-prior ceiling: 'auto' (default) reads each "
+                           "event's own spin_amax_1/2 from the store, a number "
+                           "forces one ceiling on every event.")
     p_pe.add_argument("--amax-fallback", type=float, default=0.99,
-                      help="component / chieff_chip fallback spin amax for "
-                           "events whose store meta lacks spin_amax_1/2 "
-                           "(NaN); default 0.99.")
+                      help="Fallback spin amax for events whose store meta "
+                           "lacks spin_amax_1/2 (NaN); default 0.99.")
     p_pe.add_argument("--no-summary", action="store_true",
                       help="Skip writing validation_summary.json/.md "
                            "next to --out.")
@@ -255,10 +256,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_xsel.add_argument("--source-class", default=None,
                         help="bbh / nsbh / bns / massgap / cbc, or a canonical "
                              "class name.")
-    p_xsel.add_argument("--amax", type=float, default=0.99,
-                        help="chieff-basis chi_eff-prior spin amax (ignored by "
-                             "'component'; 'chieff_chip' uses each campaign's "
-                             "detected amax).")
+    p_xsel.add_argument("--amax", default="auto", metavar="AMAX",
+                        help="chieff-basis chi_eff-prior spin ceiling: 'auto' "
+                             "(default) uses each campaign's own DETECTED "
+                             "injected amax, a number forces one ceiling. "
+                             "Ignored by 'component'; 'chieff_chip' always "
+                             "uses the detected amax.")
     p_xsel.add_argument("--snr-threshold", type=float, default=None,
                         metavar="SNR",
                         help="Optional OR-branch: detection = far-detected OR "
@@ -539,78 +542,18 @@ def _cmd_selection(args) -> int:
     return 0
 
 
-#: format_version prefixes that route to each validator generation.
-_V1_FORMATS = ("gwcat-1.0", "gwcat-selection-1.0")
-
-
-def _v2_formats() -> tuple:
-    # Read from the v2 validator, which is the authority on what it validates.
-    # This module kept its own copy and the copy was missing the 2.1 strings,
-    # so `gwcat validate` silently routed 2.1 files to the FROZEN V1 VALIDATOR
-    # -- which then failed them on v1-only expectations (fifth instance of the
-    # hardcoded-currently-known-values bug shape; see the GW-22b notes).
-    from .export.validate import _PE_FORMATS, _SEL_FORMATS
-    return tuple(_PE_FORMATS) + tuple(_SEL_FORMATS)
-
-
-def _read_format_version(path: str) -> Optional[str]:
-    """Return a file's ``format_version`` attr (decoded), or ``None``."""
-    import h5py
-
-    with h5py.File(path, "r") as f:
-        v = f.attrs.get("format_version")
-    if isinstance(v, bytes):
-        v = v.decode()
-    return None if v is None else str(v)
-
-
-def _validator_generation(version: Optional[str]) -> str:
-    """Map a ``format_version`` to ``"v1"`` / ``"v2"`` / ``"unknown"``."""
-    if version in _V1_FORMATS:
-        return "v1"
-    if version in _v2_formats():
-        return "v2"
-    return "unknown"
-
-
 def _cmd_validate(args) -> int:
-    # Auto-detect the export generation from format_version and dispatch to the
-    # matching validator. v1 files (gwcat-1.0 / gwcat-selection-1.0) go to the
-    # frozen gwcat.catalog.validate_export unchanged; v2 files (gwcat-pe-2.0 /
-    # gwcat-selection-2.0) go to gwcat.export.validate_export_v2. A mixed v1/v2
-    # pair is rejected with a clear message.
-    pe_gen = _validator_generation(_read_format_version(args.pe_path))
-    sel_gen = None
-    if args.selection_path is not None:
-        sel_gen = _validator_generation(_read_format_version(args.selection_path))
-        if {pe_gen, sel_gen} == {"v1", "v2"}:
-            print(f"validate: FAILED: mixed export generations -- PE is {pe_gen} "
-                  f"but selection is {sel_gen}. Validate a v1 PE file against a "
-                  f"v1 selection file (gwcat-1.0 / gwcat-selection-1.0) or a v2 "
-                  f"PE file against a v2 selection file (gwcat-pe-2.0 / "
-                  f"gwcat-selection-2.0); the two generations cannot be paired.",
-                  file=sys.stderr)
-            return 1
-
-    if "unknown" in {pe_gen, sel_gen} - {None}:
-        # Unknown used to fall through to the frozen v1 validator, which then
-        # failed the file on v1-only expectations -- a misleading verdict about
-        # a format this gwcat simply does not know.
-        print(f"validate: FAILED: unrecognised format_version (PE={pe_gen}, "
-              f"selection={sel_gen}); this gwcat validates "
-              f"{_V1_FORMATS + _v2_formats()}. Upgrade gwcat or check the "
-              f"file.", file=sys.stderr)
-        return 1
-
-    generation = "v2" if pe_gen == "v2" else "v1"
-    if generation == "v2":
-        from .export import validate_export_v2 as validator
-    else:
-        from .catalog import validate_export as validator
+    # One dispatcher, shared with the public `gwcat.validate_export`: v1 files
+    # (gwcat-1.0 / gwcat-selection-1.0) go to the frozen
+    # gwcat.catalog.validate_export, v2 files (gwcat-pe-2.x /
+    # gwcat-selection-2.x) to gwcat.export.validate_export_v2, and a mixed or
+    # unrecognised pair is refused. The routing used to live HERE only, so the
+    # library entry point validated every file against the v1 contract.
+    from .export.validate import validate_export_any
 
     try:
-        results = validator(args.pe_path, args.selection_path,
-                            strict=args.strict)
+        results = validate_export_any(args.pe_path, args.selection_path,
+                                      strict=args.strict)
     except (ValueError, AssertionError) as e:
         print(f"validate: FAILED: {e}", file=sys.stderr)
         return 1

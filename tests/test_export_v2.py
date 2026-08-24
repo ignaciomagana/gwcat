@@ -227,14 +227,34 @@ def test_attr_contract_matches_legacy(tmp_path):
         assert bool(fb.attrs["chi_eff_prior_applied_to_p_pe"]) is True
         assert bool(fb.attrs["chi_eff_in_p_pe"]) is True
 
-        # Every legacy attr except format_version must match.
+        # mass_prior_basis is the ONE legacy attr the v2 file deliberately
+        # states differently (GW-34).  The frozen v1 writer stamps the constant
+        # "uniform_detector_frame" on every file regardless of what was
+        # ingested; v2 reports the class the store actually carries -- here
+        # nothing, because this synthetic store predates the mass-prior ingest.
+        # A file may only claim the verified basis when every row it holds
+        # carries it.
+        assert fa.attrs["mass_prior_basis"] == "uniform_detector_frame"
+        assert fb.attrs["mass_prior_basis"] == "unstated"
+        assert bool(fb.attrs["mass_prior_verified"]) is False
+
+        # Every other legacy attr except format_version must match.  NaN is a
+        # VALUE here, not a missing one -- "no cut on this statistic" is written
+        # as NaN because HDF5 has no null -- so the two sides agreeing on NaN is
+        # agreement, which bare `==` would call a difference.
         for key in fa.attrs:
-            if key == "format_version":
+            if key in ("format_version", "mass_prior_basis"):
                 continue
             assert key in fb.attrs, f"v2 file missing legacy attr {key!r}"
             va, vb = fa.attrs[key], fb.attrs[key]
             if isinstance(va, np.ndarray) or isinstance(vb, np.ndarray):
-                assert np.array_equal(np.asarray(va), np.asarray(vb)), (
+                assert np.array_equal(np.asarray(va), np.asarray(vb),
+                                      equal_nan=False
+                                      if np.asarray(va).dtype.kind not in "fc"
+                                      else True), (
+                    f"attr {key!r} differs: {va!r} vs {vb!r}")
+            elif isinstance(va, float) and np.isnan(va):
+                assert isinstance(vb, float) and np.isnan(vb), (
                     f"attr {key!r} differs: {va!r} vs {vb!r}")
             else:
                 assert va == vb, f"attr {key!r} differs: {va!r} vs {vb!r}"
@@ -624,3 +644,36 @@ def test_every_no_argument_export_path_agrees_on_the_default():
                       seen.__setitem__(key, kw.get("spin_basis", "MISSING")))
         export_mod.export(obj, "o.h5")
     assert seen == {"pe": None, "sel": None}
+
+
+def test_v1_required_datasets_match_what_the_v1_writer_emits(tmp_path):
+    """The v1 validator's mandated list must be exactly what the v1 writers
+    emit -- the same "does the checker know what the builder writes?" pin as
+    :func:`test_validator_known_bases_match_the_builders`.
+
+    Before GW-9 the validator had no mandated list at all: it checked a
+    required dataset only when it happened to exist, so a file missing p_pe,
+    the masses or the sky produced no failure.
+    """
+    from gwcat.catalog import V1_PE_REQUIRED
+
+    store = _build_store(tmp_path, name="v1req_store.h5")
+    out = tmp_path / "v1req.h5"
+    GWCatalog(store).to_darksirens(str(out), nsamp=8, seed=0)
+    with h5py.File(out, "r") as f:
+        assert set(f.keys()) == set(V1_PE_REQUIRED)
+
+
+def test_public_validate_export_accepts_a_freshly_built_v2_export(tmp_path):
+    """gwcat.validate_export dispatches on format_version, so a gwcat-2.0 file
+    is checked against the v2 schema instead of the v1 one."""
+    import gwcat
+
+    store = _build_store(tmp_path, name="pubval_store.h5")
+    out = tmp_path / "pubval.h5"
+    GWCatalog(store).export(str(out), format="gwcat2", spin_basis="chieff",
+                            nsamp=8, seed=0)
+    results = gwcat.validate_export(str(out))
+    assert all(results.values()), \
+        f"unexpected failures: {[k for k, v in results.items() if not v]}"
+    assert "pe_has_p_pe" in results        # the v2 schema's presence checks ran

@@ -141,6 +141,213 @@ def _h5_first_field(table, names, dtype=float):
     )
 
 
+# ── The events-format FIELD PLAN (GW-32) ──────────────────────────────────────
+# The O4 campaigns ship ``events`` as ONE compound dataset of 119 columns and
+# 994 bytes per record (2.8 GB for the clipped set).  h5py serves
+# ``dset["column"]`` by reading the whole RECORD off disk and keeping one field
+# of it, so the loader's ~35 column reads were ~35 passes over those 2.8 GB:
+# 16.5 s and 1.01 GiB to load one file.  The plan below states, up front, every
+# column the loader may ask for, so :class:`_PlannedFields` can fetch them
+# together in ONE chunked ``Dataset.fields(...)`` pass (measured 4.8x faster on
+# a 6-column subset of the real file: 0.47 s versus 2.24 s).
+#
+# The plan is a PERFORMANCE hint and never a correctness constraint: a column it
+# missed is still served, by the direct read it always was.  It is grouped by
+# the branch of the loader that wants it so the two cannot drift silently.
+
+#: Masses, distance, sky, redshift, the draw weights and the shipped Jacobian.
+_EVENTS_CORE_FIELDS = (
+    "mass1_source", "mass2_source", "luminosity_distance",
+    "right_ascension", "declination", "z", "redshift",
+    "mass1_detector", "mass2_detector", "chi_eff", "weights",
+    "dluminosity_distance_dredshift",
+)
+#: Cartesian spin components (read verbatim when the file ships them).
+_EVENTS_SPIN_CARTESIAN = ("spin1x", "spin1y", "spin1z",
+                          "spin2x", "spin2y", "spin2z")
+#: Polar spin magnitude/tilt, preferred by :meth:`SelectionSet._read_spin_polar`.
+_EVENTS_SPIN_POLAR = ("spin1_magnitude", "spin1_polar_angle",
+                      "spin2_magnitude", "spin2_polar_angle")
+#: Spin azimuths -- needed ONLY to rebuild cartesian components from polar ones.
+_EVENTS_SPIN_AZIMUTH = ("spin1_azimuthal_angle", "spin2_azimuthal_angle")
+
+#: The joint (masses, redshift, cartesian spins) log draw density.
+_JOINT_CART_FIELD = (
+    "lnpdraw_mass1_source_mass2_source_redshift_"
+    "spin1x_spin1y_spin1z_spin2x_spin2y_spin2z"
+)
+#: The same density in polar spin coordinates (Format-C polar flavour).
+_JOINT_POLAR_FIELD = (
+    "lnpdraw_mass1_source_mass2_source_redshift_"
+    "spin1_magnitude_spin1_polar_angle_spin1_azimuthal_angle_"
+    "spin2_magnitude_spin2_polar_angle_spin2_azimuthal_angle"
+)
+#: A joint density that already excludes the spins.
+_JOINT_NO_SPIN_FIELDS = ("lnpdraw_mass1_source_mass2_source_redshift",
+                         "lnpdraw_mass1_source_mass2_source_z")
+#: The factored public-O4 spin-free density.
+_EVENTS_FACTORED_FIELDS = ("lnpdraw_mass1_source",
+                           "lnpdraw_mass2_source_GIVEN_mass1_source",
+                           "lnpdraw_z", "lnpdraw_redshift")
+#: Columns only the component-basis spin state (PR4) reads.
+_EVENTS_SPIN_STATE_FIELDS = (
+    "chi_p",
+    "lnpdraw_spin1_magnitude", "lnpdraw_spin2_magnitude",
+    "lnpdraw_spin1_polar_angle", "lnpdraw_spin2_polar_angle",
+    "lnpdraw_spin1_azimuthal_angle", "lnpdraw_spin2_azimuthal_angle",
+)
+
+#: Rows per ``Dataset.fields(...)`` block.  ~36 MB of transient buffer for a
+#: 35-column plan, so the peak does not scale with the file.
+_EVENTS_READ_BLOCK = 1 << 17
+
+
+def _search_names(f):
+    """The search pipelines an injection file declares, as a list of names."""
+    try:
+        raw = f.attrs["searches"]
+    except Exception:
+        return []
+    if isinstance(raw, np.ndarray):
+        return [x.decode() if isinstance(x, bytes) else str(x) for x in raw.flat]
+    if isinstance(raw, (list, tuple)):
+        return [x.decode() if isinstance(x, bytes) else str(x) for x in raw]
+    if isinstance(raw, bytes):
+        return [raw.decode()]
+    if isinstance(raw, str):
+        return [raw]
+    return [str(raw)]
+
+
+def _events_far_columns(table, f):
+    """The FAR columns the events loader will threshold on, in its own order.
+
+    One declared search contributes one column (``<search>_far`` or
+    ``far_<search>``); a file that declares none falls back to every column that
+    looks like a FAR.  Shared with :func:`_events_field_plan` so the plan asks
+    for exactly the columns the read will use.
+    """
+    have = _h5_field_names(table)
+    columns = []
+    for s in _search_names(f):
+        for col in (s + "_far", "far_" + s):
+            if col in have:
+                columns.append(col)
+                break
+    if not columns:
+        columns = [key for key in have
+                   if isinstance(key, str)
+                   and (key.endswith("_far") or key.startswith("far_"))]
+    return columns
+
+
+def _events_field_plan(table, f):
+    """Every column :meth:`SelectionSet._read_events` may read from ``table``."""
+    have = _h5_field_names(table)
+    candidates = (_EVENTS_CORE_FIELDS + _EVENTS_SPIN_CARTESIAN
+                  + _EVENTS_SPIN_POLAR + (_JOINT_CART_FIELD, _JOINT_POLAR_FIELD)
+                  + _JOINT_NO_SPIN_FIELDS + _EVENTS_FACTORED_FIELDS
+                  + _EVENTS_SPIN_STATE_FIELDS)
+    # The azimuths are read only to REBUILD the cartesian components, so a file
+    # that ships those components is never asked for them.
+    if not all(n in have for n in _EVENTS_SPIN_CARTESIAN):
+        candidates = candidates + _EVENTS_SPIN_AZIMUTH
+    plan = [n for n in candidates if n in have]
+    plan += [c for c in _events_far_columns(table, f) if c not in plan]
+    return plan
+
+
+class _PlannedFields:
+    """Read-through view over a compound dataset, filled in ONE chunked pass.
+
+    Serves the :func:`_events_field_plan` columns from memory after a single
+    ``Dataset.fields(plan)`` sweep, and anything else by the direct read it
+    always was -- so the plan can only make the load faster, never wrong.  It
+    exposes just the two things ``_h5_field_names`` / ``_h5_read_field`` need
+    (``keys`` and ``__getitem__``), so the loader below is unchanged.
+
+    A served column is DROPPED from the cache: ``_h5_read_field`` hands the
+    array itself to the loader (``np.asarray`` of a float64 array is that
+    array), so what the loader keeps is what stays alive and the prefetch does
+    not add a second copy of the whole plan to the peak.  A column asked for
+    twice therefore costs the second read it always did.
+    """
+
+    def __init__(self, dset, plan, block=_EVENTS_READ_BLOCK):
+        self._dset = dset
+        self._names = set(dset.dtype.names)
+        # File order, so the one pass reads each record's fields in place.
+        want = [n for n in dset.dtype.names if n in set(plan)]
+        n = dset.shape[0]
+        cache = {k: np.empty(n, dtype=dset.dtype[k]) for k in want}
+        if want:
+            view = dset.fields(want)
+            for i in range(0, n, block):
+                j = min(i + block, n)
+                chunk = view[i:j]
+                for k in want:
+                    cache[k][i:j] = chunk[k]
+        self._cache = cache
+
+    def keys(self):
+        return set(self._names)
+
+    def __getitem__(self, name):
+        try:
+            return self._cache.pop(name)
+        except KeyError:
+            return self._dset[name]
+
+
+def _planned_events_table(table, f):
+    """``table``, wrapped for one-pass reads when it is a compound dataset.
+
+    An ``events/`` GROUP already stores one dataset per column, so a read of it
+    touches only that column and there is nothing to plan.
+    """
+    if isinstance(table, h5py.Dataset) and table.dtype.names is not None:
+        return _PlannedFields(table, _events_field_plan(table, f))
+    return table
+
+
+def _require_positive_finite(value, field, path, note=None):
+    """Return ``value`` after refusing any non-finite or non-positive entry.
+
+    Every quantity the draw-density arithmetic multiplies or divides by -- the
+    injected mass/redshift sampling PDFs, the mixture weights, the observing
+    time, ``total_generated``, and the final ``pdraw`` itself -- must be a
+    finite, strictly positive number.  A zero, a negative, a NaN or an infinity
+    in any of them is a MALFORMED FILE, not a small number: flooring it (the
+    pre-GW-28 ``np.maximum(p, 1e-300)``) fabricates a density that was never
+    drawn, and dividing by it propagates ``inf``/``NaN`` into ``mu`` and
+    silently through every posterior built on it.  So it is refused here, by
+    name, before the arithmetic rather than after.
+
+    Raises
+    ------
+    ValueError
+        Naming ``field``, the file, how many entries are bad, and the first
+        offending index/value so the malformed rows can be found.
+    """
+    arr = np.asarray(value, dtype=float)
+    bad = ~np.isfinite(arr) | (arr <= 0)
+    n_bad = int(np.count_nonzero(bad))
+    if n_bad:
+        flat = np.atleast_1d(bad).ravel()
+        first = int(np.flatnonzero(flat)[0])
+        vals = np.atleast_1d(arr).ravel()
+        n_total = int(flat.size)
+        raise ValueError(
+            f"{path}: {field!r} is not finite and strictly positive -- "
+            f"{n_bad} of {n_total} entries are invalid (first at index "
+            f"{first}, value {vals[first]!r}). The selection maths multiplies "
+            f"or divides by this quantity, so a zero/negative/NaN/inf here "
+            f"makes pdraw meaningless; it is refused rather than floored or "
+            f"divided through."
+            + (f" {note}" if note else ""))
+    return arr if arr.ndim else float(arr)
+
+
 def _selection_provenance_dict(source_class, nsbh_mass_threshold,
                                n_before, n_after, far_columns, far_threshold):
     """Return the PR9 pdraw / source-class / significance provenance as a dict.
@@ -538,6 +745,17 @@ class SelectionSet:
                     f"Unrecognised injection format in {self.path}: "
                     "expected 'events/' or 'injections/' group."
                 )
+        # The single choke point for the finished draw density (GW-28): every
+        # exporter -- the v1 to_darksirens pair and the v2 builder alike --
+        # starts from self._pdraw, so validating it here covers all of them
+        # before anything is written or returned.  The exporters re-check the
+        # array they actually write, because the chi_eff swap and the Essick
+        # N_k/N_total rescaling touch it again afterwards.
+        _require_positive_finite(
+            self._pdraw, "pdraw", self.path,
+            note="pdraw is the per-injection draw density; the selection "
+                 "integral divides by it, so a zero row is an infinite weight "
+                 "in mu and a non-finite row poisons the whole sum.")
         self._loaded = True
 
     def _check_removal_amax(self):
@@ -637,8 +855,12 @@ class SelectionSet:
         The O4 Zenodo files store ``events`` as a single compound HDF5
         dataset, while some downstream/older files expose the same columns as
         datasets in an ``events/`` group.  Support both layouts here.
+
+        The compound layout is read through :class:`_PlannedFields` (GW-32), so
+        the column reads below cost ONE pass over the dataset between them
+        instead of one pass each.  Nothing in the body changes because of it.
         """
-        ev = f["events"]
+        ev = _planned_events_table(f["events"], f)
 
         # Source-frame parameters.  The O4 release also stores detector-frame
         # masses and redshift directly; use them when present so that we do not
@@ -696,19 +918,11 @@ class SelectionSet:
         # the public O4ab clipped release instead stores factored log-density
         # columns, including spin magnitudes/angles.  In the factored case we
         # simply omit all spin terms so darksirens can apply its chi_eff prior.
-        joint_cart = (
-            "lnpdraw_mass1_source_mass2_source_redshift_"
-            "spin1x_spin1y_spin1z_spin2x_spin2y_spin2z"
-        )
-        joint_polar = (
-            "lnpdraw_mass1_source_mass2_source_redshift_"
-            "spin1_magnitude_spin1_polar_angle_spin1_azimuthal_angle_"
-            "spin2_magnitude_spin2_polar_angle_spin2_azimuthal_angle"
-        )
-        joint_no_spin_names = [
-            "lnpdraw_mass1_source_mass2_source_redshift",
-            "lnpdraw_mass1_source_mass2_source_z",
-        ]
+        # The names live at module scope so the field plan asks for exactly the
+        # columns this branch chain reads (GW-32).
+        joint_cart = _JOINT_CART_FIELD
+        joint_polar = _JOINT_POLAR_FIELD
+        joint_no_spin_names = list(_JOINT_NO_SPIN_FIELDS)
         # Track the spin format and the joint log density (when present) for the
         # additive component-basis spin state computed after this chain.
         spin_fmt = None
@@ -805,50 +1019,33 @@ class SelectionSet:
 
         # Time normalisation and mixture/month weights.  The O4 examples keep
         # weights in the numerator of importance-sampling sums; equivalently,
-        # divide the stored draw density by weights.
-        T_yr = f.attrs["total_analysis_time"] / (3600 * 24 * 365.25)
+        # divide the stored draw density by weights.  Both divisors are checked
+        # first (GW-28): dividing by an unvalidated weight or observing time is
+        # how an inf/NaN gets into pdraw without anything saying so.
+        T_yr = _require_positive_finite(
+            f.attrs["total_analysis_time"], "total_analysis_time",
+            self.path) / (3600 * 24 * 365.25)
         pdraw /= T_yr
+        _require_positive_finite(weights, "weights", self.path)
         pdraw /= weights
 
-        ndraw = int(f.attrs["total_generated"])
+        ndraw = int(_require_positive_finite(
+            f.attrs["total_generated"], "total_generated", self.path,
+            note="It is the campaign's ndraw, the denominator of the "
+                 "selection integral and of detection_efficiency()."))
 
         # FAR: discover search pipelines from the file, and handle both O4
-        # names (e.g. "pycbc_far", "cwb-bbh_far") and older names.
-        try:
-            raw = f.attrs["searches"]
-            if isinstance(raw, np.ndarray):
-                search_list = [x.decode() if isinstance(x, bytes) else str(x)
-                               for x in raw.flat]
-            elif isinstance(raw, (list, tuple)):
-                search_list = [x.decode() if isinstance(x, bytes) else str(x)
-                               for x in raw]
-            elif isinstance(raw, bytes):
-                search_list = [raw.decode()]
-            elif isinstance(raw, str):
-                search_list = [raw]
-            else:
-                search_list = [str(raw)]
-        except Exception:
-            search_list = []
-
+        # names (e.g. "pycbc_far", "cwb-bbh_far") and older names.  The
+        # discovery is _events_far_columns, shared with the field plan so the
+        # one-pass read asks for exactly these columns (GW-32).
         fars_per_search = []
         far_columns = []
-        for s in search_list:
-            for col in (s + "_far", "far_" + s):
-                if _h5_has_field(ev, col):
-                    fars_per_search.append(_h5_read_field(ev, col))
-                    far_columns.append(col)
-                    break
-        if not fars_per_search:
-            for key in _h5_field_names(ev):
-                if (isinstance(key, str)
-                        and (key.endswith("_far")
-                             or key.startswith("far_"))):
-                    try:
-                        fars_per_search.append(_h5_read_field(ev, key))
-                        far_columns.append(key)
-                    except Exception:
-                        pass
+        for col in _events_far_columns(ev, f):
+            try:
+                fars_per_search.append(_h5_read_field(ev, col))
+                far_columns.append(col)
+            except Exception:
+                pass
         self._fars = np.column_stack(fars_per_search) if fars_per_search else None
         self._far_columns = far_columns
 
@@ -1065,10 +1262,18 @@ class SelectionSet:
         s2z = np.asarray(inj["spin2z"], float)
         chieff = (m1src * s1z + m2src * s2z) / (m1src + m2src)
 
-        # Spin-free draw PDF from factored components
-        p_mass = np.asarray(inj["mass1_source_mass2_source_sampling_pdf"], float)
-        p_z = np.asarray(inj["redshift_sampling_pdf"], float)
-        ln_pdraw_no_spin = np.log(np.maximum(p_mass * p_z, 1e-300))
+        # Spin-free draw PDF from factored components.  Both factors are
+        # required to be finite and strictly positive (GW-28); this used to
+        # floor the product at 1e-300, which turned a malformed (zero or
+        # negative) density into a fabricated ~1e-300 one that then sailed
+        # through every downstream check as a merely improbable injection.
+        p_mass = _require_positive_finite(
+            np.asarray(inj["mass1_source_mass2_source_sampling_pdf"], float),
+            "mass1_source_mass2_source_sampling_pdf", self.path)
+        p_z = _require_positive_finite(
+            np.asarray(inj["redshift_sampling_pdf"], float),
+            "redshift_sampling_pdf", self.path)
+        ln_pdraw_no_spin = np.log(p_mass * p_z)
 
         # Jacobian: (m1src, m2src, z) → (m1det, q, dL)
         H0_j, Om0_j = self._resolve_jacobian_cosmology(z, dL)
@@ -1081,12 +1286,15 @@ class SelectionSet:
         if T_s is None:
             raise RuntimeError(
                 f"No analysis_time_s attribute found in {self.path}")
-        T_yr = float(T_s) / (3600 * 24 * 365.25)
+        T_yr = _require_positive_finite(
+            T_s, "analysis_time_s", self.path) / (3600 * 24 * 365.25)
         pdraw /= T_yr
 
         # Injection weights (mixture_weight = 1.0 for single-subpop files)
         if "mixture_weight" in inj:
-            weights = np.asarray(inj["mixture_weight"], float)
+            weights = _require_positive_finite(
+                np.asarray(inj["mixture_weight"], float),
+                "mixture_weight", self.path)
             pdraw /= weights
         else:
             weights = np.ones_like(pdraw)
@@ -1096,9 +1304,15 @@ class SelectionSet:
         # every one of its injections to Lambda/0 = inf -- a silently ruined mu
         # from a missing attribute.
         if "total_generated" in f.attrs:
-            ndraw = int(f.attrs["total_generated"])
+            ndraw = int(_require_positive_finite(
+                f.attrs["total_generated"], "total_generated", self.path,
+                note="It is the campaign's ndraw, the denominator of the "
+                     "selection integral and of detection_efficiency()."))
         elif "total_generated" in inj.attrs:
-            ndraw = int(inj.attrs["total_generated"])
+            ndraw = int(_require_positive_finite(
+                inj.attrs["total_generated"], "total_generated", self.path,
+                note="It is the campaign's ndraw, the denominator of the "
+                     "selection integral and of detection_efficiency()."))
         else:
             raise RuntimeError(
                 f"{self.path}: no 'total_generated' attribute on the file or "
@@ -1179,8 +1393,11 @@ class SelectionSet:
         if have_cart and "sampling_pdf" in inj:
             # Component density straight from the joint sampling_pdf (exact even
             # for mixtures): ln p_comp = ln(joint) + 2 ln 2π + 2 ln a1 + 2 ln a2.
-            ln_joint = np.log(np.maximum(
-                np.asarray(inj["sampling_pdf"], float), 1e-300))
+            # Validated, not floored, for the same reason as the mass/redshift
+            # factors above (GW-28): a zero joint density is a malformed row.
+            ln_joint = np.log(_require_positive_finite(
+                np.asarray(inj["sampling_pdf"], float),
+                "sampling_pdf", self.path))
             ln_p_comp = _sspin.ln_p_component_joint_cartesian(
                 ln_joint, self._a1, self._a2)
             ln_spin = ln_p_comp - ln_pdraw_no_spin
@@ -1266,13 +1483,50 @@ class SelectionSet:
     # Properties
     # ------------------------------------------------------------------
     @property
-    def n_injections(self) -> int:
+    def n_retained(self) -> int:
+        """Number of injection rows the FILE actually carries.
+
+        This is NOT the campaign's draw count.  A clipped release keeps only
+        the rows that survived a pre-selection -- the O4ab clipped file carries
+        2,959,534 rows out of 870,454,872 generated draws -- so this number is
+        a property of the distribution, not of the detectors.  Use it for
+        bookkeeping (array shapes, memory); never as an efficiency denominator.
+        """
         self._load()
         return len(self._m1det)
 
+    @property
+    def n_generated(self) -> int:
+        """Total draws the campaign generated (the file's ``total_generated``).
+
+        The authoritative ``ndraw``: the denominator of the selection integral
+        mu, and of :meth:`detection_efficiency`.
+        """
+        self._load()
+        return int(self._ndraw)
+
+    @property
+    def n_injections(self) -> int:
+        """Alias of :attr:`n_retained`, kept for backward compatibility.
+
+        Prefer the explicit :attr:`n_retained` / :attr:`n_generated` pair: this
+        name reads like the campaign's draw count and is not (GW-28).
+        """
+        return self.n_retained
+
     def detection_efficiency(self, far_threshold: float = 1.0) -> float:
-        """Fraction of injections detected at the given FAR threshold."""
-        return self.detected_mask(far_threshold).sum() / self.n_injections
+        """Fraction of the campaign's GENERATED draws detected at this FAR.
+
+        The denominator is :attr:`n_generated` (``total_generated``), not the
+        number of rows the file retained.  Dividing by the retained rows (the
+        pre-GW-28 behavior) reports the detected fraction OF THE CLIP, which on
+        the O4ab clipped campaign is 986,829/2,959,534 = 0.3334 against a true
+        generated-draw efficiency of 986,829/870,454,872 = 0.0011337 -- high by
+        a factor of 294.  The detected fraction of the retained rows is
+        available as ``detected_mask(far).sum() / n_retained`` for anyone who
+        wants it.
+        """
+        return self.detected_mask(far_threshold).sum() / self.n_generated
 
     # ── PR4 component-basis spin accessors (additive, read-only) ───────────
     @property
@@ -1420,6 +1674,12 @@ class SelectionSet:
                 f"component basis, which is exact for any campaign.")
         with np.errstate(over="ignore"):
             pdraw_det = self._pdraw[keep] * np.exp(logp_chi)
+        # The array that is about to be written (GW-28).  _load already vetted
+        # the base density; the chi_eff swap multiplied it again, so re-check
+        # the product rather than assume the multiply was harmless.
+        _require_positive_finite(
+            pdraw_det, "pdraw (after the chi_eff swap)", self.path,
+            note=f"amax={amax}, far_threshold={far_threshold}.")
 
         with h5py.File(out_path, "w") as f:
             f.attrs["format_version"] = "gwcat-selection-1.0"
@@ -1492,7 +1752,7 @@ class SelectionSet:
                 "package_version": package_version(),
                 "schema_version": "gwcat-selection-1.0",
                 "n_campaigns": 1,
-                "n_injections_total": int(self.n_injections),
+                "n_injections_total": int(self.n_retained),
                 "n_injections_before_filter": n_before,
                 "n_injections_after_filter": n_after,
                 "n_detected": n_det,
@@ -1595,12 +1855,25 @@ class CombinedSelectionSet:
         return len(self._sets)
 
     @property
+    def n_retained(self) -> int:
+        """Injection rows carried by the campaign files, summed."""
+        return sum(s.n_retained for s in self._sets)
+
+    @property
+    def n_generated(self) -> int:
+        """Combined ``ndraw`` = sum of the per-campaign ``total_generated``."""
+        return sum(s.n_generated for s in self._sets)
+
+    @property
     def n_injections(self) -> int:
-        return sum(s.n_injections for s in self._sets)
+        """Alias of :attr:`n_retained`, kept for backward compatibility."""
+        return self.n_retained
 
     def detection_efficiency(self, far_threshold: float = 1.0) -> float:
+        """Detected fraction of the combined GENERATED draws (see the
+        single-campaign twin: the denominator is ndraw, not retained rows)."""
         n_det = sum(int(s.detected_mask(far_threshold).sum()) for s in self._sets)
-        return n_det / self.n_injections
+        return n_det / self.n_generated
 
     # ── PR4 per-campaign component-basis spin access ───────────────────────
     @property
@@ -1765,6 +2038,13 @@ class CombinedSelectionSet:
                 f"export in the component basis.")
         with np.errstate(over="ignore"):
             data["pdraw"] *= np.exp(logp_chi)
+        # The array that is about to be written (GW-28); the Essick N_k/N_total
+        # rescaling and the chi_eff swap both touched it since _load vetted it.
+        _require_positive_finite(
+            data["pdraw"], "pdraw (after the chi_eff swap and the Essick "
+            "N_k/N_total rescaling)",
+            " + ".join(s.path for s in self._sets),
+            note=f"amax={amax}, far_threshold={far_threshold}.")
 
         # An override that reached only SOME campaigns corrupts the combined
         # pdraw exactly as it does on the v2 path (GW-09); this exporter has
@@ -1869,7 +2149,7 @@ class CombinedSelectionSet:
                 "n_campaigns": len(self._sets),
                 "campaign_paths": [s.path for s in self._sets],
                 "campaign_ndraws": list(ndraw_per),
-                "n_injections_total": int(self.n_injections),
+                "n_injections_total": int(self.n_retained),
                 "n_injections_before_filter": n_before_total,
                 "n_injections_after_filter": n_after_total,
                 "n_detected": n_det_total,

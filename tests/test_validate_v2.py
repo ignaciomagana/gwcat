@@ -125,22 +125,59 @@ def test_corrupted_a1_out_of_amax_fails(tmp_path):
 # ======================================================================
 # 4. chieff amax cross-check + chieff_chip amax is recorded, not failed
 # ======================================================================
-def test_chieff_amax_mismatch_raises(tmp_path):
+def test_chieff_amax_difference_is_recorded_not_failed(tmp_path):
+    """GW-31: the two ceilings are DIFFERENT quantities, so they may differ.
+
+    The PE side divides out the events' own sampling prior (0.99 here); the
+    selection side swaps each campaign's injected draw, whose ceiling is the
+    campaign's (0.9). The validator used to REFUSE that pair, which is only
+    survivable while both sides use one wrong shared number.
+    """
     events = [{"name": "GWv1_000001"}, {"name": "GWv1_000002"}]
     store, _ = _build_spin_store(tmp_path, events, name="ce_store.h5")
     cat = GWCatalog(store)
     pe = tmp_path / "ce_pe.h5"
     cat.export(str(pe), format="gwcat2", spin_basis="chieff", nsamp=32, seed=0,
-               cosmology=_COSMO, amax=0.99)
-    inj = write_o4_full(tmp_path / "ce_inj.hdf", n=40, seed=6)
+               cosmology=_COSMO)
+    inj = write_o4_full(tmp_path / "ce_inj.hdf", n=40, amax=(0.9, 0.9), seed=6)
     sel = tmp_path / "ce_sel.h5"
-    SelectionSet(inj).export(str(sel), spin_basis="chieff", amax=0.95)
+    SelectionSet(inj).export(str(sel), spin_basis="chieff")
 
-    with pytest.raises(ValueError, match="chi_eff_amax"):
-        validate_export_v2(str(pe), str(sel))
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        results = validate_export_v2(str(pe), str(sel))
+    assert results["xcheck_chieff_amax_recorded"] is True
+    assert results["xcheck_chieff_pe_amax_finite"] is True
+    assert results["xcheck_chieff_sel_amax_finite"] is True
+    # The selection ceiling is checked against ITS OWN provenance instead.
+    assert results["xcheck_chieff_sel_amax_matches_detected"] is True
+    assert all(results.values())
+    # The difference is explained rather than refused.
+    assert any("do not 'fix' it" in str(w.message) for w in rec)
 
 
-def test_chieff_amax_match_passes(tmp_path):
+def test_chieff_sel_amax_must_match_its_own_detected_provenance(tmp_path):
+    """A 'detected' ceiling that is not the detected value is a broken file."""
+    events = [{"name": "GWv4_000001"}]
+    store, _ = _build_spin_store(tmp_path, events, name="ce4_store.h5")
+    cat = GWCatalog(store)
+    pe = tmp_path / "ce4_pe.h5"
+    cat.export(str(pe), format="gwcat2", spin_basis="chieff", nsamp=16, seed=0,
+               cosmology=_COSMO)
+    inj = write_o4_full(tmp_path / "ce4_inj.hdf", n=40, amax=(0.9, 0.9), seed=6)
+    sel = tmp_path / "ce4_sel.h5"
+    SelectionSet(inj).export(str(sel), spin_basis="chieff")
+    with h5py.File(sel, "r+") as f:
+        f.attrs["chi_eff_amax_per_campaign"] = np.array([[0.7, 0.7]])
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        results = validate_export_v2(str(pe), str(sel))
+    assert results["xcheck_chieff_sel_amax_matches_detected"] is False
+
+
+def test_chieff_nonfinite_ceiling_fails_on_its_own_side(tmp_path):
+    """Each ceiling is checked against ITS OWN provenance, not the other file."""
     events = [{"name": "GWv2_000001"}, {"name": "GWv2_000002"}]
     store, _ = _build_spin_store(tmp_path, events, name="ce2_store.h5")
     cat = GWCatalog(store)
@@ -151,8 +188,16 @@ def test_chieff_amax_match_passes(tmp_path):
     sel = tmp_path / "ce2_sel.h5"
     SelectionSet(inj).export(str(sel), spin_basis="chieff", amax=0.99)
     results = validate_export_v2(str(pe), str(sel))
-    assert results["xcheck_chieff_amax"] is True
+    assert results["xcheck_chieff_amax_recorded"] is True
     assert all(results.values())
+
+    # Corrupt only the PE side's recorded ceiling: that side fails, and the
+    # failure names the PE attr rather than a comparison with the other file.
+    with h5py.File(pe, "r+") as f:
+        f.attrs["chi_eff_amax_1_per_event"] = np.array([np.nan, 0.99])
+    results = validate_export_v2(str(pe), str(sel))
+    assert results["xcheck_chieff_pe_amax_finite"] is False
+    assert results["xcheck_chieff_sel_amax_finite"] is True
 
 
 def test_chieff_chip_amax_recorded_not_failed(tmp_path):
@@ -724,3 +769,144 @@ def test_selection_products_state_the_swap_flag_for_every_basis(tmp_path):
         SelectionSet(inj).export(str(out), spin_basis=basis)
         with h5py.File(out, "r") as f:
             assert bool(f.attrs["chi_eff_swap_applied"]) is expect, basis
+
+
+# ======================================================================
+# GW-9: gwcat.validate_export is the FORMAT DISPATCHER, and the frozen v1
+#       validator REQUIRES the datasets its schema mandates.
+#
+# The public entry point used to be the v1 validator itself, and the v1
+# validator checked a required dataset only ``if ds in f`` -- so a
+# gwcat-2.0 file missing p_pe, the masses and the sky came back
+# "4/4 checks: ALL PASSED" through ``gwcat.validate_export``.  Only the CLI
+# dispatched by format, so the library entry point was the one that could
+# bless a file no consumer can read.
+# ======================================================================
+def test_public_validate_export_is_the_dispatcher():
+    import gwcat
+    from gwcat.catalog import validate_export as v1_validator
+    from gwcat.export.validate import validate_export_any
+
+    assert gwcat.validate_export is validate_export_any
+    assert gwcat.validate_export is not v1_validator
+
+
+def test_public_entry_fails_v2_missing_p_pe(tmp_path):
+    """The regression: a v2 PE export with no p_pe must NOT validate."""
+    import gwcat
+
+    pe = _pe_component(tmp_path)
+    with h5py.File(pe, "r+") as f:
+        del f["p_pe"]
+
+    results = gwcat.validate_export(str(pe))
+    assert results["pe_has_p_pe"] is False
+    assert not all(results.values())
+    with pytest.raises(AssertionError, match="pe_has_p_pe"):
+        gwcat.validate_export(str(pe), strict=True)
+
+
+def test_public_entry_fails_v2_missing_sky_and_masses(tmp_path):
+    import gwcat
+
+    pe = _pe_component(tmp_path)
+    with h5py.File(pe, "r+") as f:
+        for ds in ("ra", "dec", "m1src", "m2src"):
+            del f[ds]
+
+    results = gwcat.validate_export(str(pe))
+    for ds in ("ra", "dec", "m1src", "m2src"):
+        assert results[f"pe_has_{ds}"] is False, ds
+    assert not all(results.values())
+
+
+def test_public_entry_routes_v2_pair_to_v2_validator(tmp_path, capsys):
+    import gwcat
+
+    pe = _pe_component(tmp_path)
+    sel = _sel(tmp_path)
+    results = gwcat.validate_export(str(pe), str(sel))
+    assert all(results.values())
+    assert "Validating gwcat-2.0 PE export:" in capsys.readouterr().out
+
+
+def test_public_entry_routes_v1_pair_to_v1_validator(tmp_path, capsys):
+    import gwcat
+
+    v1pe, v1sel = _v1_pair(tmp_path)
+    results = gwcat.validate_export(str(v1pe), str(v1sel))
+    assert all(results.values())
+    out = capsys.readouterr().out
+    assert "Validating PE export:" in out and "gwcat-2.0" not in out
+
+
+def test_public_entry_refuses_mixed_generations(tmp_path):
+    import gwcat
+
+    v1pe, _ = _v1_pair(tmp_path, tag="mix")
+    sel_v2 = _sel(tmp_path, name="mixsel.h5")
+    with pytest.raises(ValueError, match="mixed export generations"):
+        gwcat.validate_export(str(v1pe), str(sel_v2))
+
+
+def test_public_entry_refuses_unknown_format(tmp_path):
+    import gwcat
+
+    pe = _pe_component(tmp_path)
+    with h5py.File(pe, "r+") as f:
+        f.attrs["format_version"] = "gwcat-pe-9.9"
+    with pytest.raises(ValueError, match="unrecognised format_version"):
+        gwcat.validate_export(str(pe))
+
+
+def _v1_pair(tmp_path, tag="v1"):
+    """A clean gwcat-1.0 PE + gwcat-selection-1.0 pair."""
+    st = _build_store(tmp_path, name=f"{tag}_store.h5")
+    pe = tmp_path / f"{tag}pe.h5"
+    GWCatalog(st).to_darksirens(str(pe), cosmology=_COSMO, nsamp=16, seed=0)
+    inj = write_o4_full(tmp_path / f"{tag}inj.hdf", n=40, seed=6)
+    sel = tmp_path / f"{tag}sel.h5"
+    SelectionSet(inj).to_darksirens(str(sel), far_threshold=1.0)
+    return pe, sel
+
+
+def test_v1_validator_fails_on_missing_pe_datasets(tmp_path):
+    """The frozen v1 validator skipped the check when the dataset was absent."""
+    from gwcat.catalog import validate_export as v1_validator
+
+    v1pe, _ = _v1_pair(tmp_path, tag="v1miss")
+    with h5py.File(v1pe, "r+") as f:
+        del f["p_pe"]
+        del f["m1det"]
+        del f["dec"]
+
+    results = v1_validator(str(v1pe))
+    for ds in ("p_pe", "m1det", "dec"):
+        assert results[f"pe_has_{ds}"] is False, ds
+    assert not all(results.values())
+    with pytest.raises(AssertionError, match="pe_has_"):
+        v1_validator(str(v1pe), strict=True)
+
+
+def test_v1_validator_fails_on_missing_selection_datasets(tmp_path):
+    from gwcat.catalog import validate_export as v1_validator
+
+    v1pe, v1sel = _v1_pair(tmp_path, tag="v1smiss")
+    with h5py.File(v1sel, "r+") as f:
+        del f["pdraw"]
+        del f["ra"]
+
+    results = v1_validator(str(v1pe), str(v1sel))
+    assert results["sel_has_pdraw"] is False
+    assert results["sel_has_ra"] is False
+    assert not all(results.values())
+
+
+def test_v1_validator_refuses_a_v2_file_outright(tmp_path):
+    """Reached directly (not via the dispatcher), it says so instead of
+    reporting a v1 verdict on a v2 contract."""
+    from gwcat.catalog import validate_export as v1_validator
+
+    pe = _pe_component(tmp_path, name="v2_for_v1.h5")
+    results = v1_validator(str(pe))
+    assert results["pe_format_version"] is False

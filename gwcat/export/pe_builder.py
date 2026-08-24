@@ -33,11 +33,22 @@ bit-for-bit identical it mirrors, in order:
     call -- empty, fully z_max-cut, or under-sampled with ``replace=False`` --
     consume no random state in either implementation),
   * the same per-event cosmology resolution and ``z_of_dL`` inversion,
-  * the same ``p_pe = m1det * p_dL_pe`` mass Jacobian, and (chieff basis always
+  * the same ``p_pe = m1det * p_dL_pe`` mass Jacobian -- since GW-34 obtained
+    from ``mass.det_pair`` through the block composer rather than written out
+    here, in LINEAR space precisely so the factor is the same float it always
+    was (``exp(log(m1det))`` differs from ``m1det`` for 68% of samples) -- and
+    (chieff basis always
     uses "include" semantics) the same 1-D chi_eff prior factor applied to the
     concatenated ``p_pe`` -- since GW-03 with NO floor on the log-density, in
     both this builder and the frozen v1 twin, so the parity still holds -- and
   * the same concatenation order.
+
+Since GW-31 the chi_eff factor is evaluated at each EVENT's own prior ceiling
+rather than at one caller-supplied ``amax``, so array parity with the frozen v1
+exporter holds for identical kwargs *including an explicit numeric* ``amax=``
+(which forces the single-ceiling behaviour the v1 exporter has).  With the
+default ``amax="auto"`` the two agree whenever the store's declared ceilings
+equal the v1 default -- and where they do not, v1 is the one that is wrong.
 
 The only spin-basis-specific step -- the output columns plus the ``p_pe`` spin
 factor -- is isolated in :func:`_apply_chieff_basis` (and, for PR 6, in
@@ -74,21 +85,17 @@ import warnings
 
 import numpy as np
 
+# Re-exported so a caller catching this builder's refusals can import them all
+# from one place (SelectionSpec.check_pairable raises it).
+from ..catalog import UnpairableSelectionCut  # noqa: F401
 from ..cosmology import make_cosmology, z_of_dL
-from ..params import DEFAULT_PARAMETER_SPACE, get_space
-from ..source_class import (format_source_class_filter, CUT_ESTIMATOR_ATTR,
-                            pe_cut_estimator, PE_MEDIAN_CUT_WARNING)
+from ..params import (DEFAULT_PARAMETER_SPACE, PEContext,
+                      block_prior_factor_pe, get_space)
+from ..params.blocks.mass import UNSTATED_MASS_PRIOR, classify_mass_prior
+from ..source_class import CUT_ESTIMATOR_ATTR, PE_MEDIAN_CUT_WARNING
+from ..spin import AMAX_AUTO, parse_amax_option
+from .contract import event_list_digest
 from .product import ExportProduct
-
-
-def _cut_value(x):
-    """A detection-cut threshold as a float, with NaN for "no cut".
-
-    HDF5 has no null, so an absent cut is NaN rather than a missing attr: the
-    paired-file check must be able to tell "no cut on this statistic" apart from
-    "this file predates the check".
-    """
-    return float("nan") if x is None else float(x)
 
 
 def space_ordered_required(space, spin_basis):
@@ -184,13 +191,14 @@ class ChiPDefinitionError(ValueError):
 def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                      nsamp=4096, seed=0,
                      far_max=None, pastro_min=None, z_max=None,
-                     replace="auto", cosmology=None, amax=0.99,
+                     replace="auto", cosmology=None, amax=AMAX_AUTO,
                      amax_fallback=0.99,
                      allowed_names=None, allowed_names_authoritative=True,
                      source_class=None, event_list=None,
                      allow_missing_far=False, require_far=False,
                      waveform_policy="preferred", approximant=None,
                      allow_zero_p_pe=False,
+                     allow_unpaired_pastro_min=False,
                      chi_p_definition="schmidt_recomputed",
                      chi_p_def_tol=1e-6,
                      max_out_of_support_frac=0.0,
@@ -204,10 +212,15 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     here -- it belongs to the writer.
 
     The ``"component"`` and ``"chieff_chip"`` bases add spin-basis-specific
-    output columns and ``p_pe`` factors (see the module docstring).  ``amax`` is
-    only used by the chieff basis; the new bases read a per-event ``amax`` from
-    the store meta (``spin_amax_1``/``spin_amax_2``), falling back to
-    ``amax_fallback`` (with a warning) when it is NaN (old stores).
+    output columns and ``p_pe`` factors (see the module docstring).
+
+    ``amax`` -- the ceiling of the spin prior this export divides out -- defaults
+    to ``"auto"``: EVERY basis, chieff included, then reads the ceiling from the
+    event's own prior provenance (``spin_amax_1``/``spin_amax_2`` in the store
+    meta), falling back to ``amax_fallback`` (with a warning) when it is NaN (old
+    stores).  Pass a number to force one ceiling on every event; that is what the
+    chieff basis used to do unconditionally, which stamped the caller's default
+    0.99 on events whose sampling prior said something else (GW-31).
 
     The assembled ``p_pe`` must be finite and strictly positive (GW-01); a zero
     weight means the store's ``p_dL_pe`` was written by a pre-GW-01 ingest that
@@ -225,6 +238,26 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
       GWTC-2.1/3 ``C01:Mixed`` events the stored column is not the Schmidt chi_p
       of the store's own components, so half the column would be evaluated under
       a prior that does not describe it.
+
+    The mass density, composed from its block (GW-34)
+    -------------------------------------------------
+    ``p_pe``'s mass factor is obtained from ``mass.det_pair`` rather than written
+    out here, so the block's gate runs on every event: an event sampled under a
+    prior that is not flat in the detector-frame component masses is REFUSED
+    (the ``m1det`` factor is not its Jacobian), and one whose prior was never
+    parsed exports with ``mass_prior_basis="assumed_default"`` and
+    ``mass_prior_verified=False`` instead of being stamped as verified.  The
+    file publishes ``q = m2det/m1det`` -- the coordinate the Jacobian belongs to
+    -- with ``m2det`` kept as a derived, advisory column.
+
+    Effective-selection provenance (GW-33)
+    --------------------------------------
+    Every selection attr is written from ``sub.selection_spec`` -- ``cat``'s own
+    accumulated cuts composed with this call's -- so a product built from
+    ``cat.select(source_class="bbh")`` records the BBH filter instead of this
+    call's defaults.  ``pastro_min`` (from either side) is REFUSED unless
+    ``allow_unpaired_pastro_min=True``: the injection campaigns carry no
+    per-injection p_astro, so no selection function can reproduce that cut.
     """
     if spin_basis not in _KNOWN_SPIN_BASES:
         raise ValueError(
@@ -253,17 +286,20 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             f"chi_p_definition must be 'schmidt_recomputed' or 'file'; got "
             f"{chi_p_definition!r}.")
 
-    # ── The class cut the paired selection file cannot reproduce (GW-12) ────
-    # Said here, at build time, rather than only by the validator that will
-    # refuse the finished pair: the cheap alternative (event_list=) is a choice
-    # about how to build THIS product, and it is useless advice after the fact.
-    if source_class is not None:
-        warnings.warn(PE_MEDIAN_CUT_WARNING)
-
     space = get_space(spin_basis)
     # Whether this space needs per-sample spin columns beyond the legacy set.
     # Derived from the registry rather than asserted (GW-18).
     need_extras = bool(space.store_params_fetched)
+    # ── The ceiling of the prior being divided out (GW-31) ──────────────────
+    # `None` = resolve it per event from the store's own prior provenance; a
+    # float = the caller forces one ceiling on every event.  The chieff basis
+    # took the forced path unconditionally, so a caller-default 0.99 was applied
+    # to events whose sampling prior declared a different ceiling -- and the
+    # chi_eff density depends on that ceiling in a chi_eff-DEPENDENT way, so the
+    # error does not cancel in any per-event normalisation.
+    forced_amax = parse_amax_option(amax, what="amax")
+    # Every basis that divides out a SPIN prior needs a ceiling; nospin does not.
+    need_amax = need_extras or spin_basis == "chieff"
 
     # chieff basis ALWAYS uses "include" semantics: the 1-D chi_eff prior is
     # multiplied into p_pe here (Mode A), matching the legacy default.  The
@@ -298,6 +334,21 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                      waveform_policy=waveform_policy,
                      approximant=approximant)
 
+    # The EFFECTIVE selection (GW-33): this call's filters composed with those
+    # `cat` already carried.  `select()` intersects rows with the view it is
+    # called on, so building the product from THIS call's arguments described a
+    # filtered file as unfiltered.  Everything below records `spec`.
+    spec = sub.selection_spec
+    spec.check_pairable(allow_unpaired_pastro_min=allow_unpaired_pastro_min)
+    # ── The class cut the paired selection file cannot reproduce (GW-12) ────
+    # Said here, at build time, rather than only by the validator that will
+    # refuse the finished pair: the cheap alternative (event_list=) is a choice
+    # about how to build THIS product, and it is useless advice after the fact.
+    # Asked of the EFFECTIVE spec: a view that was already class-filtered gets
+    # the warning too, which is the case nothing else would have caught.
+    if spec.source_class_requested:
+        warnings.warn(PE_MEDIAN_CUT_WARNING)
+
     # ── Required-parameter checks, driven by the space (GW-18) ──────────────
     # The three-branch ladder is gone: what a space requires is now a property
     # of its blocks (gwcat.params), and schema.EXPORT_REQUIREMENTS is a
@@ -311,7 +362,6 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     if space.store_alternatives:
         sub._require_alternatives(space.store_alternatives, export=label)
 
-    per = sub.get(need, per_event=True)
     rng = np.random.default_rng(seed)
 
     # Extra per-sample columns.  The gate is the space's declared
@@ -321,8 +371,29 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     # whole reason the chieff export stays byte-identical to to_darksirens.
     extra_params = [p for p in space.store_params_fetched
                     if p in sub._param_index]
-    per_extra = (sub.get(extra_params, per_event=True)
-                 if extra_params else {})
+
+    # ── What the loop reads, and WHEN (GW-32) ──────────────────────────────
+    # It used to be one ``sub.get(need, per_event=True)`` (plus a second for the
+    # extras) BEFORE the rng draw, i.e. every row of every selected event was
+    # materialised so that ``nsamp`` of them could be indexed out: 6.88M rows
+    # read to emit 1.16M on the shipped store, 1.20 GiB peak.  The draw does not
+    # depend on the values -- only on the row COUNT, and (with z_max) on
+    # luminosity_distance -- so the indices are chosen first and only they are
+    # read.  The rng stream is untouched by this: the same rng.choice calls
+    # happen in the same order with the same arguments, so the drawn rows, and
+    # therefore every exported value, are identical.
+    #
+    # An extra column that is NaN-filled for an event is not read for it either:
+    # every consumer of the extras below is already gated on
+    # ``param_available``, so an unavailable column is fetched and then never
+    # looked at.  (The required set cannot be in that state -- _require_params
+    # refuses a NaN-filled required column outright.)
+    extra_avail = {p: sub.param_available(p) for p in extra_params}
+
+    def _read_plan(e):
+        """The columns event ``e`` will actually be asked for."""
+        return need + [p for p in extra_params
+                       if p not in need and extra_avail[p][e]]
 
     # ── Resolve cosmology: per-event (default) or a single override ─────────
     sel_idx = np.asarray(sub._sel)
@@ -366,17 +437,63 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             _cosmo_cache[key] = c
         return c
 
-    cols = {k: [] for k in ["m1det", "m2det", "dL", "ra", "dec",
+    # ── The ingested mass-prior class, per selected event (GW-34) ───────────
+    # The m1det factor in p_pe is the (m1det, q) Jacobian, and it describes the
+    # posterior ONLY if that posterior's mass prior is flat in the detector-frame
+    # components.  The builder used to multiply it in unconditionally and stamp
+    # mass_prior_basis="uniform_detector_frame" on every file it wrote -- so the
+    # 9 of 282 rows in the shipped store whose prior was never parsed
+    # ("assumed_default") were exported as verified uniform priors, and the
+    # block's gate on the class never ran at all.  The class now travels with the
+    # event: into mass.det_pair's gate below, and onto the file.
+    mass_block = space.mass_block
+    raw_mass_kind = sub.meta.get("mass_prior_kind")
+    sel_mass_kind = (np.asarray(raw_mass_kind)[sel_idx]
+                     if raw_mass_kind is not None else None)
+
+    def _mass_kind(e):
+        """The parsed mass-prior class of selected event ``e``."""
+        if sel_mass_kind is None:
+            return UNSTATED_MASS_PRIOR
+        v = sel_mass_kind[e]
+        v = v.decode() if isinstance(v, (bytes, bytearray)) else str(v)
+        return v or UNSTATED_MASS_PRIOR
+
+    # Refuse the whole build, naming EVERY offending event, rather than letting
+    # the per-event gate stop at the first: the remedy is to exclude them (or
+    # re-ingest), and an operator cannot act on a list discovered one run at a
+    # time.  The rule is the block's own classifier, so the two cannot diverge.
+    unsupported_mass = [(str(sub.event_names[e]), _mass_kind(e))
+                        for e in range(sub.n_events)
+                        if classify_mass_prior(_mass_kind(e)) == "unsupported"]
+    if unsupported_mass:
+        listed = ", ".join(f"{n}: {k!r}" for n, k in unsupported_mass[:10])
+        more = ("" if len(unsupported_mass) <= 10
+                else f", ... (+{len(unsupported_mass) - 10} more)")
+        raise ValueError(
+            f"{len(unsupported_mass)} of {sub.n_events} selected event(s) were "
+            f"sampled under a mass prior that is NOT uniform in the "
+            f"detector-frame component masses, so the |dm2det/dq| = m1det "
+            f"Jacobian this export applies is not their Jacobian and the error "
+            f"does not cancel in any per-event normalisation: {listed}{more}. "
+            f"Exclude them (event_list= / allowed_names=), or re-ingest so the "
+            f"analytic (chirp_mass, mass_ratio) prior is parsed.")
+
+    cols = {k: [] for k in ["m1det", "m2det", "q", "dL", "ra", "dec",
                             "chieff", "p_pe", "redshift", "m1src", "m2src"]}
     kept = []
+    kept_mass_kind = []
     kept_H0, kept_Om0 = [], []
     kept_ss_name, kept_ss_approx, kept_ss_reason = [], [], []
     # Resampling provenance (GW-13), aligned with ``kept``.
     n_unique_per_event, upsampled_events = [], []
 
-    # ── Non-chieff spin scaffolding (empty / unused for chieff) ─────────────
+    # ── Per-event spin-prior ceiling scaffolding (every spin basis) ─────────
     # Per-event spin amax from the store meta (aligned with selected events).
-    if need_extras:
+    # This is a META read, not a sample read: it fetches nothing through
+    # ``sub.get`` and so cannot perturb the default_rng(seed) stream, which is
+    # what keeps the chieff basis's resample identical to the frozen v1 one.
+    if need_amax:
         def _meta_sel(name, dtype=float):
             v = sub.meta.get(name)
             if v is None:
@@ -389,6 +506,12 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         sel_kind = (np.asarray(raw_kind)[sel_idx] if raw_kind is not None
                     else None)
 
+        kept_amax1, kept_amax2 = [], []
+        amax_src1_list, amax_src2_list, amax_infl_list = [], [], []
+        samples_bound_events = []
+        fallback_events, unrecognized_events, mismatch_events = [], [], []
+
+    if need_extras:
         avail_a1 = sub.param_available("a_1")
         avail_a2 = sub.param_available("a_2")
         avail_cos1 = sub.param_available("cos_tilt_1")
@@ -404,244 +527,273 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                        and _group_available_all(sub, "cos_tilt_1", "tilt_1")
                        and _group_available_all(sub, "cos_tilt_2", "tilt_2"))
 
-        kept_amax1, kept_amax2 = [], []
         a1_list, a2_list, cost1_list, cost2_list, chip_list = [], [], [], [], []
         chip_src_list = []
         chip_maxdiff_list = []
         chip_mismatch_events, chip_no_ingredient_events = [], []
-        amax_src1_list, amax_src2_list, amax_infl_list = [], [], []
-        samples_bound_events = []
-        fallback_events, unrecognized_events, mismatch_events = [], [], []
 
     def _resolve_cost(e, avail_cos, avail_tilt, cos_name, tilt_name):
-        """cos_tilt samples for event ``e`` (idx_orig applied by caller):
+        """cos_tilt samples for the rows already drawn for event ``e``:
         prefer the stored cos_tilt, else cos(stored tilt), else None."""
         if avail_cos[e]:
-            return per_extra[cos_name][e]
+            return drawn[cos_name]
         if avail_tilt[e]:
-            return np.cos(per_extra[tilt_name][e])
+            return np.cos(drawn[tilt_name])
         return None
 
     sel_rows = np.asarray(sub._sel)
     reasons_arr = getattr(sub, "_selection_reasons", None)
-    for e in range(sub.n_events):
-        n = len(per["luminosity_distance"][e])
-        if n == 0:
-            continue
-
-        cosmo_e = _cosmo_for(e)
-
-        dL_e = per["luminosity_distance"][e]
-        m1_e = per["mass_1"][e]
-        m2_e = per["mass_2"][e]
-
-        # Per-sample z_max cut
-        if z_max is not None:
-            z_e = z_of_dL(dL_e, cosmo_e)
-            keep = z_e <= z_max
-            if not keep.any():
+    # One open handle on the store for the whole loop; ``drawn`` holds the rows
+    # of the event being processed and nothing else.
+    drawn: dict = {}
+    with sub.sample_reader() as reader:
+        sample_counts = reader.counts()
+        for e in range(sub.n_events):
+            # The slice LENGTH, from the store's offsets -- no posterior read.
+            n = int(sample_counts[e])
+            if n == 0:
                 continue
-            dL_e = dL_e[keep]
-            m1_e = m1_e[keep]
-            m2_e = m2_e[keep]
-            idx_map = np.nonzero(keep)[0]
-        else:
-            idx_map = np.arange(n)
 
-        n_kept = len(idx_map)
-        rep = (n_kept < nsamp) if replace == "auto" else bool(replace)
-        if n_kept < nsamp and not rep:
-            warnings.warn(f"Event {sub.event_names[e]}: only {n_kept} samples "
-                          f"after z_max cut, but replace=False and nsamp={nsamp}. "
-                          f"Skipping.")
-            continue
-        idx_local = rng.choice(n_kept, size=nsamp, replace=rep)
-        idx_orig = idx_map[idx_local]
-        # Distinct posterior samples behind this event's nsamp rows.  Without
-        # it a bootstrapped event's per-event ESS reads high by the duplication
-        # factor -- the very diagnostic that should flag it as unusable.
-        n_unique_per_event.append(int(np.unique(idx_orig).size))
-        if rep and n_kept < nsamp:
-            upsampled_events.append(str(sub.event_names[e]))
+            cosmo_e = _cosmo_for(e)
 
-        m1 = per["mass_1"][e][idx_orig]
-        m2 = per["mass_2"][e][idx_orig]
-        dL = per["luminosity_distance"][e][idx_orig]
-        p_dL = per["p_dL_pe"][e][idx_orig]
+            # Per-sample z_max cut.  This is the one place the draw depends on
+            # sample VALUES, so it (and only it) reads a full column, and only when
+            # a cut was asked for.  ``mass_1``/``mass_2`` used to be read in full
+            # and subset here too; both subsets were dead -- the kept rows are
+            # re-indexed from the store below -- so they are no longer read at all.
+            if z_max is not None:
+                dL_e = reader.read(e, "luminosity_distance")["luminosity_distance"]
+                z_e = z_of_dL(dL_e, cosmo_e)
+                keep = z_e <= z_max
+                if not keep.any():
+                    continue
+                idx_map = np.nonzero(keep)[0]
+            else:
+                idx_map = np.arange(n)
 
-        # Jacobian: uniform detector-frame component-mass prior
-        p_pe = m1 * p_dL
+            n_kept = len(idx_map)
+            rep = (n_kept < nsamp) if replace == "auto" else bool(replace)
+            if n_kept < nsamp and not rep:
+                warnings.warn(f"Event {sub.event_names[e]}: only {n_kept} samples "
+                              f"after z_max cut, but replace=False and nsamp={nsamp}. "
+                              f"Skipping.")
+                continue
+            idx_local = rng.choice(n_kept, size=nsamp, replace=rep)
+            idx_orig = idx_map[idx_local]
+            # Distinct posterior samples behind this event's nsamp rows.  Without
+            # it a bootstrapped event's per-event ESS reads high by the duplication
+            # factor -- the very diagnostic that should flag it as unusable.
+            n_unique_per_event.append(int(np.unique(idx_orig).size))
+            if rep and n_kept < nsamp:
+                upsampled_events.append(str(sub.event_names[e]))
 
-        # Redshift and source masses under THIS event's PE cosmology
-        z = z_of_dL(dL, cosmo_e)
+            # The draw is settled: NOW read, and read only the rows it kept.
+            drawn = reader.read(e, _read_plan(e), rows=idx_orig)
 
-        cols["m1det"].append(m1)
-        cols["m2det"].append(m2)
-        cols["dL"].append(dL)
-        cols["ra"].append(per["ra"][e][idx_orig])
-        cols["dec"].append(per["dec"][e][idx_orig])
-        cols["chieff"].append(per["chi_eff"][e][idx_orig])
-        cols["p_pe"].append(p_pe)
-        cols["redshift"].append(z)
-        cols["m1src"].append(m1 / (1 + z))
-        cols["m2src"].append(m2 / (1 + z))
-        kept.append(sub.event_names[e])
-        kept_H0.append(float(per_event_H0[e]))
-        kept_Om0.append(float(per_event_Om0[e]))
-        row = sel_rows[e]
-        kept_ss_name.append(_ss_meta(sub, row, "sample_set_name"))
-        kept_ss_approx.append(_ss_meta(sub, row, "approximant"))
-        kept_ss_reason.append(
-            str(reasons_arr[e]) if reasons_arr is not None
-            and e < len(reasons_arr) else "")
+            m1 = drawn["mass_1"]
+            m2 = drawn["mass_2"]
+            dL = drawn["luminosity_distance"]
+            p_dL = drawn["p_dL_pe"]
 
-        # ── Non-chieff per-event spin columns + amax resolution ─────────────
-        if need_extras:
-            name = sub.event_names[e]
+            # ── The mass block's density, COMPOSED rather than written out here ──
+            # p_pe = |d(m1det,m2det)/d(m1det,q)| * p(dL) = m1det * p_dL_pe.  The
+            # factor comes from mass.det_pair through the block composer, so the
+            # block's gate on THIS event's ingested prior class is what decides
+            # whether the Jacobian may be applied to it -- the declaration and the
+            # arithmetic are one thing now instead of two that agreed by habit.
+            # (The distance term is the store's p_dL_pe, materialized at ingest by
+            # the same function distance.dl calls; see gwcat.params.compose.)
+            mass_kind_e = _mass_kind(e)
+            q = m2 / m1
+            ctx_e = PEContext(event_name=str(sub.event_names[e]),
+                              m1det=m1, m2det=m2, dL=dL, cosmology=cosmo_e,
+                              mass_prior_kind=mass_kind_e)
+            p_pe = block_prior_factor_pe(
+                mass_block, {"m1det": m1, "m2det": m2, "q": q}, ctx_e) * p_dL
 
-            # Resolve per-event amax (NaN -> fallback, recorded).
-            a1max = (float(sel_amax1[e]) if sel_amax1 is not None
-                     else float("nan"))
-            a2max = (float(sel_amax2[e]) if sel_amax2 is not None
-                     else float("nan"))
-            used_fallback = False
-            if not np.isfinite(a1max):
-                a1max = float(amax_fallback)
-                used_fallback = True
-            if not np.isfinite(a2max):
-                a2max = float(amax_fallback)
-                used_fallback = True
-            if used_fallback:
-                fallback_events.append(str(name))
+            # Redshift and source masses under THIS event's PE cosmology
+            z = z_of_dL(dL, cosmo_e)
 
-            # np.isclose, not exact float equality (GW-04): a single injected
-            # ceiling round-trips as 0.9980000000000001 vs 0.9979999999999999
-            # through the numerical amax resolution, so `!=` fired on files with
-            # no real prior asymmetry and buried the case that matters (a genuine
-            # NSBH prior with amax_2 ~ 0.05).
-            if (spin_basis == "chieff_chip"
-                    and not np.isclose(a1max, a2max, rtol=1e-9, atol=1e-12)):
-                mismatch_events.append(str(name))
+            cols["m1det"].append(m1)
+            cols["m2det"].append(m2)
+            cols["q"].append(q)
+            cols["dL"].append(dL)
+            cols["ra"].append(drawn["ra"])
+            cols["dec"].append(drawn["dec"])
+            cols["chieff"].append(drawn["chi_eff"])
+            cols["p_pe"].append(p_pe)
+            cols["redshift"].append(z)
+            cols["m1src"].append(m1 / (1 + z))
+            cols["m2src"].append(m2 / (1 + z))
+            kept.append(sub.event_names[e])
+            kept_mass_kind.append(mass_kind_e)
+            kept_H0.append(float(per_event_H0[e]))
+            kept_Om0.append(float(per_event_Om0[e]))
+            row = sel_rows[e]
+            kept_ss_name.append(_ss_meta(sub, row, "sample_set_name"))
+            kept_ss_approx.append(_ss_meta(sub, row, "approximant"))
+            kept_ss_reason.append(
+                str(reasons_arr[e]) if reasons_arr is not None
+                and e < len(reasons_arr) else "")
 
-            # spin_prior_kind provenance (flat/joint assumption may not hold).
-            if sel_kind is not None:
-                k = str(sel_kind[e])
-                if k and k not in ("uniform_magnitude_isotropic",
-                                   "assumed_default"):
-                    unrecognized_events.append(str(name))
+            # ── Per-event spin-prior ceiling + (non-chieff) spin columns ────────
+            if need_amax:
+                name = sub.event_names[e]
 
-            # Component pieces for this event (None where unavailable).
-            a1_e = (per_extra["a_1"][e][idx_orig]
-                    if avail_a1[e] else None)
-            a2_e = (per_extra["a_2"][e][idx_orig]
-                    if avail_a2[e] else None)
+                # Resolve per-event amax.  A forced (numeric) `amax` overrides the
+                # store for every event -- the caller has said which ceiling to use.
+                # Otherwise it comes from THIS event's prior provenance, and only a
+                # missing/NaN one falls back (recorded, and warned about below).
+                used_fallback = False
+                if forced_amax is not None:
+                    a1max = a2max = float(forced_amax)
+                else:
+                    a1max = (float(sel_amax1[e]) if sel_amax1 is not None
+                             else float("nan"))
+                    a2max = (float(sel_amax2[e]) if sel_amax2 is not None
+                             else float("nan"))
+                    if not np.isfinite(a1max):
+                        a1max = float(amax_fallback)
+                        used_fallback = True
+                    if not np.isfinite(a2max):
+                        a2max = float(amax_fallback)
+                        used_fallback = True
+                    if used_fallback:
+                        fallback_events.append(str(name))
 
-            # ── Resolved-amax provenance (GW-04) ────────────────────────────
-            # "analytic"      the ingested analysis's own prior covers its
-            #                 samples -- the honest case;
-            # "samples_bound" the parsed prior does NOT cover the samples, so
-            #                 the ceiling is raised to max|a_i| and the
-            #                 inflation is recorded;
-            # "fallback"      no stored amax at all, a fabricated ceiling.
-            #
-            # samples_bound is not a nicety: the GWTC analytic priors declare
-            # amax = 0.99 for all 282 rows while the posteriors reach 0.9996+,
-            # so 1810 of 1.16M samples (71 of 282 events) sit outside the
-            # declared box.  Under GW-03 those get p_pe = 0 and the export
-            # refuses -- correctly, because a ceiling that excludes real samples
-            # is wrong.  Raising it to cover them is exact for the COMPONENT
-            # basis, whose density is a flat box: widening the box changes only
-            # the per-event constant 1/(4*amax_1*amax_2), which cancels in the
-            # per-event normalisation the consumer applies.
-            src1 = src2 = "fallback" if used_fallback else "analytic"
-            infl1 = infl2 = 0.0
-            # ONLY for a flat-box (bijection-like) prior.  Widening the box
-            # changes just the per-event constant 1/(4*amax_1*amax_2), which
-            # cancels in the consumer's per-event normalisation -- so it is
-            # exact.  For a PROJECTION (chieff / chieff_chip) the entire density
-            # p(chi_eff[, chi_p] | amax) depends on the ceiling, so raising it
-            # would silently change the physics rather than fix a bookkeeping
-            # bound.  Those bases keep the declared amax and are refused by the
-            # GW-03 support gate instead, which is the honest outcome: a
-            # projection cannot be built against a prior whose support does not
-            # contain the samples.
-            if spin_basis == "component" and a1_e is not None and np.size(a1_e):
-                s1 = float(np.nanmax(np.abs(np.asarray(a1_e, float))))
-                if np.isfinite(s1) and s1 > a1max:
-                    infl1 = s1 / a1max - 1.0
-                    a1max = s1 * (1.0 + 1e-6)
-                    src1 = "samples_bound"
-            if spin_basis == "component" and a2_e is not None and np.size(a2_e):
-                s2 = float(np.nanmax(np.abs(np.asarray(a2_e, float))))
-                if np.isfinite(s2) and s2 > a2max:
-                    infl2 = s2 / a2max - 1.0
-                    a2max = s2 * (1.0 + 1e-6)
-                    src2 = "samples_bound"
-            if "samples_bound" in (src1, src2):
-                samples_bound_events.append(
-                    (str(name), max(infl1, infl2)))
-            amax_src1_list.append(src1)
-            amax_src2_list.append(src2)
-            amax_infl_list.append(max(infl1, infl2))
+                # np.isclose, not exact float equality (GW-04): a single injected
+                # ceiling round-trips as 0.9980000000000001 vs 0.9979999999999999
+                # through the numerical amax resolution, so `!=` fired on files with
+                # no real prior asymmetry and buried the case that matters (a genuine
+                # NSBH prior with amax_2 ~ 0.05).
+                if (spin_basis == "chieff_chip"
+                        and not np.isclose(a1max, a2max, rtol=1e-9, atol=1e-12)):
+                    mismatch_events.append(str(name))
 
-            kept_amax1.append(a1max)
-            kept_amax2.append(a2max)
-            cost1_full = _resolve_cost(e, avail_cos1, avail_tilt1,
-                                       "cos_tilt_1", "tilt_1")
-            cost2_full = _resolve_cost(e, avail_cos2, avail_tilt2,
-                                       "cos_tilt_2", "tilt_2")
-            cost1_e = None if cost1_full is None else cost1_full[idx_orig]
-            cost2_e = None if cost2_full is None else cost2_full[idx_orig]
+                # spin_prior_kind provenance (flat/joint assumption may not hold).
+                if sel_kind is not None:
+                    k = str(sel_kind[e])
+                    if k and k not in ("uniform_magnitude_isotropic",
+                                       "assumed_default"):
+                        unrecognized_events.append(str(name))
 
-            # chip resolution (GW-08).  ``chi_p_definition`` decides whether the
-            # exported column is the Schmidt chi_p of the store's OWN
-            # (a_i, cos_tilt_i, m_i) -- the definition ChiEffChiPPrior is built
-            # for -- or the release's stored column, which for six GWTC-2.1/3
-            # C01:Mixed events is a different quantity.
-            have_ingredients = (a1_e is not None and a2_e is not None
-                                and cost1_e is not None and cost2_e is not None)
-            chip_from_file = None
-            if avail_chip[e]:
-                chip_from_file = per_extra["chi_p"][e][idx_orig]
-            chip_derived = None
-            if have_ingredients:
-                from ..spin import chi_p_from_components
-                chip_derived = chi_p_from_components(a1_e, a2_e, cost1_e,
-                                                     cost2_e, m1, m2)
+                # Component pieces for this event (None where unavailable).
+                a1_e = a2_e = None
+                if need_extras:
+                    a1_e = (drawn["a_1"]
+                            if avail_a1[e] else None)
+                    a2_e = (drawn["a_2"]
+                            if avail_a2[e] else None)
 
-            # Definition-consistency diagnostic, whenever both are available.
-            maxdiff = np.nan
-            if chip_from_file is not None and chip_derived is not None:
-                maxdiff = float(np.max(np.abs(
-                    np.asarray(chip_from_file, float) - chip_derived)))
-            chip_maxdiff_list.append(maxdiff)
+                # ── Resolved-amax provenance (GW-04) ────────────────────────────
+                # "analytic"      the ingested analysis's own prior covers its
+                #                 samples -- the honest case;
+                # "samples_bound" the parsed prior does NOT cover the samples, so
+                #                 the ceiling is raised to max|a_i| and the
+                #                 inflation is recorded;
+                # "fallback"      no stored amax at all, a fabricated ceiling;
+                # "caller"        a numeric `amax=` overrode the store (GW-31).
+                #
+                # samples_bound is not a nicety: the GWTC analytic priors declare
+                # amax = 0.99 for all 282 rows while the posteriors reach 0.9996+,
+                # so 1810 of 1.16M samples (71 of 282 events) sit outside the
+                # declared box.  Under GW-03 those get p_pe = 0 and the export
+                # refuses -- correctly, because a ceiling that excludes real samples
+                # is wrong.  Raising it to cover them is exact for the COMPONENT
+                # basis, whose density is a flat box: widening the box changes only
+                # the per-event constant 1/(4*amax_1*amax_2), which cancels in the
+                # per-event normalisation the consumer applies.
+                src1 = src2 = ("caller" if forced_amax is not None
+                               else "fallback" if used_fallback else "analytic")
+                infl1 = infl2 = 0.0
+                # ONLY for a flat-box (bijection-like) prior.  Widening the box
+                # changes just the per-event constant 1/(4*amax_1*amax_2), which
+                # cancels in the consumer's per-event normalisation -- so it is
+                # exact.  For a PROJECTION (chieff / chieff_chip) the entire density
+                # p(chi_eff[, chi_p] | amax) depends on the ceiling, so raising it
+                # would silently change the physics rather than fix a bookkeeping
+                # bound.  Those bases keep the declared amax and are refused by the
+                # GW-03 support gate instead, which is the honest outcome: a
+                # projection cannot be built against a prior whose support does not
+                # contain the samples.
+                if spin_basis == "component" and a1_e is not None and np.size(a1_e):
+                    s1 = float(np.nanmax(np.abs(np.asarray(a1_e, float))))
+                    if np.isfinite(s1) and s1 > a1max:
+                        infl1 = s1 / a1max - 1.0
+                        a1max = s1 * (1.0 + 1e-6)
+                        src1 = "samples_bound"
+                if spin_basis == "component" and a2_e is not None and np.size(a2_e):
+                    s2 = float(np.nanmax(np.abs(np.asarray(a2_e, float))))
+                    if np.isfinite(s2) and s2 > a2max:
+                        infl2 = s2 / a2max - 1.0
+                        a2max = s2 * (1.0 + 1e-6)
+                        src2 = "samples_bound"
+                if "samples_bound" in (src1, src2):
+                    samples_bound_events.append(
+                        (str(name), max(infl1, infl2)))
+                amax_src1_list.append(src1)
+                amax_src2_list.append(src2)
+                amax_infl_list.append(max(infl1, infl2))
 
-            if chi_p_definition == "schmidt_recomputed":
-                if chip_derived is not None:
-                    chip_e, chip_src = chip_derived, "schmidt_recomputed"
-                elif chip_from_file is not None:
-                    chip_e, chip_src = chip_from_file, "file_no_ingredients"
-                    chip_no_ingredient_events.append(str(sub.event_names[e]))
-                else:  # pragma: no cover - guarded by requirement checks
-                    chip_e, chip_src = None, ""
-            else:  # "file"
-                if chip_from_file is not None:
-                    chip_e, chip_src = chip_from_file, "file"
-                    if np.isfinite(maxdiff) and maxdiff > chi_p_def_tol:
-                        chip_mismatch_events.append(
-                            (str(sub.event_names[e]), maxdiff))
-                elif chip_derived is not None:
-                    chip_e, chip_src = chip_derived, "derived"
-                else:  # pragma: no cover
-                    chip_e, chip_src = None, ""
-            chip_list.append(chip_e)
-            chip_src_list.append(chip_src)
+                kept_amax1.append(a1max)
+                kept_amax2.append(a2max)
 
-            if emit_extras:
-                a1_list.append(a1_e)
-                a2_list.append(a2_e)
-                cost1_list.append(cost1_e)
-                cost2_list.append(cost2_e)
+            # ── Non-chieff per-event spin columns (chi_p and its ingredients) ────
+            if need_extras:
+                cost1_e = _resolve_cost(e, avail_cos1, avail_tilt1,
+                                        "cos_tilt_1", "tilt_1")
+                cost2_e = _resolve_cost(e, avail_cos2, avail_tilt2,
+                                        "cos_tilt_2", "tilt_2")
+
+                # chip resolution (GW-08).  ``chi_p_definition`` decides whether the
+                # exported column is the Schmidt chi_p of the store's OWN
+                # (a_i, cos_tilt_i, m_i) -- the definition ChiEffChiPPrior is built
+                # for -- or the release's stored column, which for six GWTC-2.1/3
+                # C01:Mixed events is a different quantity.
+                have_ingredients = (a1_e is not None and a2_e is not None
+                                    and cost1_e is not None and cost2_e is not None)
+                chip_from_file = None
+                if avail_chip[e]:
+                    chip_from_file = drawn["chi_p"]
+                chip_derived = None
+                if have_ingredients:
+                    from ..spin import chi_p_from_components
+                    chip_derived = chi_p_from_components(a1_e, a2_e, cost1_e,
+                                                         cost2_e, m1, m2)
+
+                # Definition-consistency diagnostic, whenever both are available.
+                maxdiff = np.nan
+                if chip_from_file is not None and chip_derived is not None:
+                    maxdiff = float(np.max(np.abs(
+                        np.asarray(chip_from_file, float) - chip_derived)))
+                chip_maxdiff_list.append(maxdiff)
+
+                if chi_p_definition == "schmidt_recomputed":
+                    if chip_derived is not None:
+                        chip_e, chip_src = chip_derived, "schmidt_recomputed"
+                    elif chip_from_file is not None:
+                        chip_e, chip_src = chip_from_file, "file_no_ingredients"
+                        chip_no_ingredient_events.append(str(sub.event_names[e]))
+                    else:  # pragma: no cover - guarded by requirement checks
+                        chip_e, chip_src = None, ""
+                else:  # "file"
+                    if chip_from_file is not None:
+                        chip_e, chip_src = chip_from_file, "file"
+                        if np.isfinite(maxdiff) and maxdiff > chi_p_def_tol:
+                            chip_mismatch_events.append(
+                                (str(sub.event_names[e]), maxdiff))
+                    elif chip_derived is not None:
+                        chip_e, chip_src = chip_derived, "derived"
+                    else:  # pragma: no cover
+                        chip_e, chip_src = None, ""
+                chip_list.append(chip_e)
+                chip_src_list.append(chip_src)
+
+                if emit_extras:
+                    a1_list.append(a1_e)
+                    a2_list.append(a2_e)
+                    cost1_list.append(cost1_e)
+                    cost2_list.append(cost2_e)
 
     nobs = len(kept)
     data = {k: np.concatenate(v) if v else np.array([])
@@ -657,15 +809,25 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
 
     # ── Spin-basis-specific step (columns + p_pe spin factor) ───────────────
     spin_attrs: dict = {}
-    if spin_basis == "chieff":
-        columns = _apply_chieff_basis(data, amax=amax)
-    elif spin_basis == "nospin":
-        columns = _apply_nospin_basis(data)
-    else:
+    # Per-event ceilings, resolved above, broadcast to one value per sample.
+    # The chieff basis needs them too now (GW-31): its 1-D chi_eff prior is a
+    # PROJECTION whose whole shape depends on the ceiling, so evaluating it at a
+    # caller default rather than at the event's own prior ceiling is wrong by a
+    # chi_eff-dependent factor that no per-event normalisation removes.
+    if need_amax:
         amax1_arr = np.asarray(kept_amax1, dtype=float)
         amax2_arr = np.asarray(kept_amax2, dtype=float)
         amax1_ps = (np.repeat(amax1_arr, nsamp) if nobs else np.array([]))
         amax2_ps = (np.repeat(amax2_arr, nsamp) if nobs else np.array([]))
+        #: The file-level chi_eff support bound: max(amax_1, amax_2) over events.
+        amax_bound = (float(max(amax1_arr.max(), amax2_arr.max()))
+                      if nobs else float(forced_amax if forced_amax is not None
+                                         else amax_fallback))
+    if spin_basis == "chieff":
+        columns = _apply_chieff_basis(data, amax1_ps, amax2_ps)
+    elif spin_basis == "nospin":
+        columns = _apply_nospin_basis(data)
+    else:
         chip = (np.concatenate(chip_list) if chip_list else np.array([]))
         extras = None
         if emit_extras and nobs:
@@ -685,17 +847,6 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             columns = _apply_chieff_chip_basis(data, amax1_ps, chip, extras)
 
         # Emit warnings once (after the loop).
-        if fallback_events:
-            warnings.warn(
-                f"spin_basis={spin_basis!r}: {len(fallback_events)} event(s) "
-                f"have no stored spin amax (spin_amax_1/2 NaN); using "
-                f"amax_fallback={amax_fallback}: {fallback_events}")
-        if unrecognized_events:
-            warnings.warn(
-                f"spin_basis={spin_basis!r}: {len(unrecognized_events)} "
-                f"event(s) have spin_prior_kind != "
-                f"'uniform_magnitude_isotropic' (the flat/joint spin-prior "
-                f"assumption may not hold): {unrecognized_events}")
         if spin_basis == "chieff_chip" and mismatch_events:
             warnings.warn(
                 f"spin_basis='chieff_chip': {len(mismatch_events)} event(s) "
@@ -741,7 +892,8 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                 f"recorded as 'file_no_ingredients': "
                 f"{chip_no_ingredient_events}")
 
-        # Basis-specific provenance attrs (never written for chieff).
+        # Basis-specific provenance attrs (the chieff basis records the same
+        # ceilings under its own chi_eff_* names below).
         spin_attrs = {
             "spin_amax_1_per_event": amax1_arr,
             "spin_amax_2_per_event": amax2_arr,
@@ -770,6 +922,49 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             spin_attrs["chi_eff_chi_p_amax_per_event"] = amax1_arr
             spin_attrs["spin_amax_mismatch_events"] = np.array(
                 mismatch_events, dtype=_str)
+
+    # ── Ceiling warnings + provenance shared by every spin basis (GW-31) ────
+    # These used to live in the non-chieff branch, so the ONE basis that ships
+    # said nothing about where its ceiling came from.
+    if need_amax:
+        if fallback_events:
+            warnings.warn(
+                f"spin_basis={spin_basis!r}: {len(fallback_events)} event(s) "
+                f"have no stored spin amax (spin_amax_1/2 NaN); using "
+                f"amax_fallback={amax_fallback}: {fallback_events}")
+        if unrecognized_events:
+            warnings.warn(
+                f"spin_basis={spin_basis!r}: {len(unrecognized_events)} "
+                f"event(s) have spin_prior_kind != "
+                f"'uniform_magnitude_isotropic' (the flat/joint spin-prior "
+                f"assumption may not hold): {unrecognized_events}")
+        if spin_basis == "chieff":
+            spin_attrs.update({
+                # WHICH ceiling the 1-D chi_eff prior was evaluated at, per
+                # event, and how it was resolved ("analytic" = the event's own
+                # sampling prior, "fallback" = amax_fallback because the store
+                # declares none, "caller" = a numeric amax= overrode both).
+                "chi_eff_amax_1_per_event": amax1_arr,
+                "chi_eff_amax_2_per_event": amax2_arr,
+                "chi_eff_amax_source_per_event": np.array(amax_src1_list,
+                                                          dtype=_str),
+                "chi_eff_amax_mode": ("fixed" if forced_amax is not None
+                                      else "per_event"),
+                "spin_amax_fallback": float(amax_fallback),
+                "spin_amax_fallback_events": np.array(fallback_events,
+                                                      dtype=_str),
+                "spin_prior_unrecognized_events": np.array(
+                    unrecognized_events, dtype=_str),
+            })
+
+    # ── The published mass density coordinate (GW-34) ───────────────────────
+    # p_pe is a density in (m1det, q, ...): the m1det factor above IS
+    # |d(m1det,m2det)/d(m1det,q)|.  Every export nevertheless published
+    # (m1det, m2det) as its fit columns, so a consumer reading the contract off
+    # the file could integrate these weights against the wrong measure.  q is
+    # written as the fit coordinate; m2det is kept -- every consumer and every
+    # plot uses it -- but is DERIVED (m2det = q * m1det) and advisory.
+    columns["q"] = data["q"]
 
     # ── Prior support accounting (GW-03) ────────────────────────────────────
     # The basis helpers return the per-sample support mask alongside the
@@ -851,6 +1046,32 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     # writer used the view made the two writers disagree on the same input.
     homogeneous = bool(getattr(sub, "_homogeneous_sample_sets", True))
 
+    # ── The mass prior as it was actually INGESTED, not as it was assumed ────
+    # One string for the file when every kept event agrees, "mixed" when they do
+    # not, plus the per-event classes and the list of events whose prior was
+    # never verified.  "uniform_detector_frame" is now a claim the file can only
+    # make when every row it holds carries that parsed class.
+    mass_kinds = [str(k) for k in kept_mass_kind]
+    uniq_mass_kinds = sorted(set(mass_kinds))
+    mass_prior_basis = (uniq_mass_kinds[0] if len(uniq_mass_kinds) == 1
+                        else ("mixed" if uniq_mass_kinds
+                              else UNSTATED_MASS_PRIOR))
+    mass_unverified = [str(n) for n, k in zip(kept, mass_kinds)
+                       if classify_mass_prior(k) != "verified"]
+    mass_prior_verified = bool(mass_kinds) and not mass_unverified
+    if mass_unverified:
+        warnings.warn(
+            f"{len(mass_unverified)} of {nobs} exported event(s) carry no "
+            f"VERIFIED uniform detector-frame mass prior (classes "
+            f"{uniq_mass_kinds}), so the m1det Jacobian is assumed for them "
+            f"rather than parsed from the release: "
+            f"{mass_unverified[:10]}"
+            + ("" if len(mass_unverified) <= 10
+               else f", ... (+{len(mass_unverified) - 10} more)")
+            + f". The file records mass_prior_basis={mass_prior_basis!r} and "
+              f"mass_prior_verified=False; it is NOT stamped as a verified "
+              f"uniform prior.")
+
     # ── Provenance attrs (everything the legacy exporter records EXCEPT ──────
     # format_version, which is the writer's; plus the new spin_basis). The two
     # legacy-compat spin attrs (spin_prior_mode / chi_eff_prior_applied_to_p_pe
@@ -864,9 +1085,18 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         # spin basis (new in v2)
         "spin_basis": spin_basis,
         # provenance
-        "compact_type": "",
-        "mass_prior_basis": "uniform_detector_frame",
+        # The mass prior AS INGESTED (GW-34), never a constant string: a row
+        # whose analytic prior was never parsed says so, and the file says
+        # whether the m1det Jacobian is verified or merely assumed.
+        "mass_prior_basis": mass_prior_basis,
+        "mass_prior_verified": bool(mass_prior_verified),
+        "mass_prior_kind_per_event": np.array(mass_kinds, dtype=_str),
+        "mass_prior_unverified_events": np.array(mass_unverified, dtype=_str),
+        "n_events_mass_prior_unverified": int(len(mass_unverified)),
         "mass_jacobian_applied": True,
+        # WHICH coordinates p_pe is a density in: the m1det factor is the
+        # (m1det, q) Jacobian, and m2det = q * m1det is derived from them.
+        "mass_density_coordinates": "m1det,q",
         "distance_prior_removed": False,
         "cosmology_mode": cosmology_mode,
         "cosmology_override_used": bool(cosmology is not None),
@@ -874,29 +1104,15 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         "cosmology_per_event_varies": bool(cosmology_per_event_varies),
         "cosmology_H0_per_event": kept_H0_arr,
         "cosmology_Om0_per_event": kept_Om0_arr,
-        "chi_eff_amax": float(amax),
+        # The file-level chi_eff support bound actually in force: max over the
+        # exported events of max(amax_1, amax_2).  It is NO LONGER simply the
+        # caller's argument -- with amax="auto" each event uses its own prior's
+        # ceiling, and this scalar is the envelope of those (GW-31).
+        "chi_eff_amax": (float(amax_bound) if need_amax else
+                         float(forced_amax if forced_amax is not None
+                               else amax_fallback)),
         "pe_cosmology_H0": pe_H0,
         "pe_cosmology_Om0": pe_Om0,
-        "source_class_filter": format_source_class_filter(source_class),
-        # WHICH masses the class threshold was applied to (GW-12): the store's
-        # source_class column is classify_by_mass() of the POSTERIOR MEDIAN
-        # source-frame masses, while the paired selection file cuts injections
-        # on injected truth.  The pairing validator refuses that combination.
-        CUT_ESTIMATOR_ATTR: pe_cut_estimator(source_class, event_list),
-        "event_list_filter": (
-            "" if event_list is None
-            else (str(event_list) if isinstance(event_list, (str, bytes))
-                  else "custom_sequence")),
-        "far_policy": getattr(sub, "_far_policy", "none"),
-        # The event-side detection cut, as numbers the paired selection file can
-        # be checked against.  NaN means "no cut on this statistic".
-        "far_max": _cut_value(getattr(sub, "_far_max", None)),
-        "snr_min": _cut_value(getattr(sub, "_snr_min", None)),
-        "allow_missing_far": bool(allow_missing_far),
-        "require_far": bool(require_far),
-        "n_events_missing_far": int(getattr(sub, "_n_missing_far", 0)),
-        "waveform_policy": str(waveform_policy),
-        "approximant": "" if approximant is None else str(approximant),
         "homogeneous_sample_sets": homogeneous,
         "n_unique_samples_per_event": np.asarray(n_unique_per_event,
                                                  dtype=np.int64),
@@ -921,6 +1137,14 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         "max_out_of_support_frac": float(max_out_of_support_frac),
         "out_of_support_allowed": bool(allow_out_of_support),
     }
+    # ── The EFFECTIVE event selection (GW-33) ───────────────────────────────
+    # The composed source_class_filter and cut estimator (GW-12: WHICH masses
+    # the class threshold was applied to), every numeric cut as a number the
+    # paired selection file can be checked against (NaN = no cut on that
+    # statistic), the normalised name-filter digest, and the FAR policy.
+    attrs.update(spec.to_attrs())
+    # WHICH events this file holds, independent of how they were spelled.
+    attrs["event_list_digest"] = event_list_digest(kept)
     attrs.update(spin_attrs)
     # Per-sample support mask, written as uint8 so the consumer can mask without
     # re-deriving the prior.
@@ -937,20 +1161,24 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         "event_names_exported": [str(k) for k in kept],
         "nsamp_per_event": int(nsamp),
         "spin_basis": spin_basis,
-        "source_class_filter": (None if source_class is None
-                                else format_source_class_filter(source_class)),
-        CUT_ESTIMATOR_ATTR: pe_cut_estimator(source_class, event_list),
-        "event_list_filter": (
-            None if event_list is None
-            else (str(event_list)
-                  if isinstance(event_list, (str, bytes))
-                  else "custom_sequence")),
-        "far_policy": getattr(sub, "_far_policy", "none"),
-        "allow_missing_far": bool(allow_missing_far),
-        "require_far": bool(require_far),
-        "n_events_missing_far": int(getattr(sub, "_n_missing_far", 0)),
+        # The EFFECTIVE selection (GW-33), the same record the attrs carry.
+        "selection_spec": spec.to_dict(),
+        "selection_spec_digest": spec.digest(),
+        "event_list_digest": event_list_digest(kept),
+        "source_class_filter": spec.source_class_filter or None,
+        CUT_ESTIMATOR_ATTR: spec.cut_estimator,
+        "event_list_filter": spec.event_list_filter or None,
+        "far_policy": spec.far_policy,
+        "allow_missing_far": bool(spec.allow_missing_far),
+        "require_far": bool(spec.require_far),
+        "n_events_missing_far": int(spec.n_missing_far),
         "spin_prior_mode": spin_prior_mode,
         "chi_eff_prior_applied_to_p_pe": bool(chi_eff_included),
+        # The mass prior behind the m1det Jacobian (GW-34), so a summary reader
+        # sees an unverified prior without opening the file's attrs.
+        "mass_prior_basis": mass_prior_basis,
+        "mass_prior_verified": bool(mass_prior_verified),
+        "n_events_mass_prior_unverified": int(len(mass_unverified)),
         "cosmology_mode": cosmology_mode,
         "cosmology_override_used": bool(cosmology is not None),
         "cosmology_per_event_varies": bool(cosmology_per_event_varies),
@@ -981,7 +1209,7 @@ def _ss_meta(sub, row, field):
     return x.decode() if isinstance(x, (bytes, bytearray)) else str(x)
 
 
-def _apply_chieff_basis(data, *, amax):
+def _apply_chieff_basis(data, amax1_ps, amax2_ps):
     """chieff-basis output columns + the 1-D chi_eff prior factor on p_pe.
 
     This is the single spin-basis-specific step.  ``data`` already carries the
@@ -989,19 +1217,37 @@ def _apply_chieff_basis(data, *, amax):
     the 1-D isotropic chi_eff prior is multiplied into ``p_pe`` (chieff basis
     is always "include"), and the legacy 10 columns are returned in order.
 
+    The ceiling is per-sample (per-event-constant, like the other bases), so an
+    event whose sampling prior declares ``a_2 ~ U(0, 0.05)`` gets ITS density,
+    not the caller's default (GW-31).  Unique ``(amax_1, amax_2)`` pairs are
+    grouped so one prior table serves every event that shares a ceiling; with a
+    single pair this is one call on the whole array, i.e. bit-identical to the
+    previous single-amax evaluation.
+
     The ``clip(logp, -50, None)`` guard is gone (GW-03): an out-of-support sample
     now gets ``p_pe = 0`` and is counted, rather than a floored ``2e-22`` that
-    dominates every downstream weight.  ``in_support`` comes back alongside the
-    columns so the caller can account for it.
+    dominates every downstream weight.  Support is the prior's own
+    :meth:`~gwcat.spin.ChiEffPrior.support` predicate, NOT ``isfinite(logp)``:
+    the grid clamp returns a finite ~1e-12 density beyond ``amax`` (2.73e-12 at
+    ``amax=0.99, chi_eff=0.995, m1=50, m2=25``), so the finiteness test admitted
+    excluded samples with an inverse weight ~1e12 too large.  ``in_support``
+    comes back alongside the columns so the caller can account for it.
     """
     p_pe = data["p_pe"]
     in_support = np.ones(p_pe.shape, dtype=bool)
     if data["chieff"].size > 0:
-        from ..spin import chi_eff_prior_logprob
-        logp_chi = np.asarray(
-            chi_eff_prior_logprob(data["chieff"], data["m1src"],
-                                  data["m2src"], amax=amax), dtype=float)
-        in_support = np.isfinite(logp_chi)
+        from ..spin import chi_eff_prior_logprob_in_support
+        logp_chi = np.empty(p_pe.shape, dtype=float)
+        pairs = np.unique(np.stack([np.asarray(amax1_ps, dtype=float),
+                                    np.asarray(amax2_ps, dtype=float)],
+                                   axis=1), axis=0)
+        for a1, a2 in pairs:
+            m = (amax1_ps == a1) & (amax2_ps == a2)
+            lp, sup = chi_eff_prior_logprob_in_support(
+                data["chieff"][m], data["m1src"][m], data["m2src"][m],
+                amax=float(a1), amax_2=float(a2))
+            logp_chi[m] = lp
+            in_support[m] = sup
         with np.errstate(over="ignore"):
             p_pe = p_pe * np.exp(logp_chi)
         p_pe = np.where(in_support, p_pe, 0.0)
@@ -1107,20 +1353,23 @@ def _apply_chieff_chip_basis(data, amax1_ps, chip, extras):
     the assumed ceiling on real data where chi_eff does not, so a handful of
     floored samples captured essentially all of an event's ``1/p_pe`` weight
     (measured ESS = 1.0 out of 3337 on GW150914).  Out of support is now zero
-    density, counted and reported.
+    density, counted and reported -- and taken from the prior's own
+    :meth:`~gwcat.spin.ChiEffChiPPrior.support` predicate rather than inferred
+    from ``isfinite(logp)`` (GW-31).  The two agree numerically for the joint
+    prior; the point is that the builder no longer relies on them agreeing.
     """
     p_pe = data["p_pe"]
     in_support = np.ones(p_pe.shape, dtype=bool)
     if p_pe.size > 0:
-        from ..spin import chi_eff_chi_p_prior_logprob
+        from ..spin import chi_eff_chi_p_prior_logprob_in_support
         logp = np.empty(p_pe.shape, dtype=float)
         for a in np.unique(amax1_ps):
             m = amax1_ps == a
-            lp = chi_eff_chi_p_prior_logprob(
+            lp, sup = chi_eff_chi_p_prior_logprob_in_support(
                 data["chieff"][m], chip[m], data["m1src"][m], data["m2src"][m],
                 amax=float(a))
-            logp[m] = np.asarray(lp, dtype=float)
-        in_support = np.isfinite(logp)
+            logp[m] = lp
+            in_support[m] = sup
         with np.errstate(over="ignore"):
             p_pe = p_pe * np.exp(logp)
         p_pe = np.where(in_support, p_pe, 0.0)

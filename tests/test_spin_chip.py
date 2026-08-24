@@ -393,6 +393,54 @@ def test_chieff_logprob_is_neg_inf_outside_support():
     assert not np.any(np.isnan(lp))
 
 
+# ==========================================================================
+# GW-31: "finite log-density" is NOT "in support"
+# ==========================================================================
+def test_finite_logprob_just_outside_amax_is_not_in_support():
+    """The exact reproduction from the review, pinned.
+
+    ``ChiEffPrior.logprob`` deliberately leaves the support unmasked, and the
+    grid clamp hands back a small but FINITE density beyond ``amax``.  Anything
+    that reads support off ``isfinite(logprob)`` therefore accepts a sample the
+    prior excludes -- carrying a density ~1e12 too small into a DENOMINATOR.
+    """
+    from gwcat.spin import ChiEffPrior
+
+    prior = ChiEffPrior(amax=0.99)
+    lp = prior.logprob(0.995, 50.0, 25.0)
+    assert np.isfinite(lp)                       # the trap ...
+    assert np.exp(lp) == pytest.approx(2.73e-12, rel=0.05)
+    assert not prior.support(0.995)              # ... and the truth
+
+
+def test_logprob_in_support_applies_the_support_mask():
+    from gwcat.spin import chi_eff_prior_logprob_in_support
+
+    chi = np.array([0.0, 0.5, 0.995, 1.5, -0.995])
+    lp, sup = chi_eff_prior_logprob_in_support(chi, 50.0, 25.0, amax=0.99)
+    assert list(sup) == [True, True, False, False, False]
+    assert np.all(np.isfinite(lp[sup]))
+    assert np.all(lp[~sup] == -np.inf)
+    # exp(-inf) is exactly zero density, not a small one
+    assert np.all(np.exp(lp[~sup]) == 0.0)
+
+
+def test_logprob_in_support_carries_the_per_body_ceilings():
+    """A restricted secondary must not be widened to the primary's ceiling."""
+    from gwcat.spin import ChiEffPrior, chi_eff_prior_logprob_in_support
+
+    chi = np.array([0.1, 0.3])
+    lp, sup = chi_eff_prior_logprob_in_support(chi, 40.0, 10.0,
+                                               amax=0.99, amax_2=0.05)
+    ref = ChiEffPrior(amax=0.99, amax_2=0.05)
+    np.testing.assert_allclose(lp, ref.logprob(chi, 40.0, 10.0), rtol=0,
+                               atol=0)
+    assert bool(sup.all())
+    # ... and that is NOT the symmetric-ceiling density.
+    sym = ChiEffPrior(amax=0.99).logprob(chi, 40.0, 10.0)
+    assert not np.allclose(lp, sym, rtol=1e-6)
+
+
 def test_no_minus_fifty_sentinel_survives_anywhere():
     """The floor was a magic -50 in two prior classes and four call sites; a
     grep-level guard is the cheapest way to stop it coming back."""

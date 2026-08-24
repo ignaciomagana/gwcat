@@ -132,15 +132,28 @@ _SHARED_COLS = ["m1det", "m2det", "dL", "chieff", "ra", "dec",
 
 
 def test_chieff_parity_single(tmp_path):
+    """v1 parity, for identical kwargs INCLUDING the ceiling.
+
+    The v1 exporter has exactly one caller-level ``amax``; the v2 default now
+    resolves each campaign's own detected ceiling (GW-31), so the two agree
+    bit-for-bit precisely when the caller forces the same single ceiling -- which
+    is what "identical keyword arguments" means once the argument can also say
+    "auto".
+    """
     path = write_o4_full(tmp_path / "o4.hdf", n=70, amax=(0.9, 0.7), seed=3)
     v1 = tmp_path / "v1.h5"
     v2 = tmp_path / "v2.h5"
-    SelectionSet(path).to_darksirens(str(v1), far_threshold=1.0)
-    SelectionSet(path).export(str(v2), spin_basis="chieff", far_threshold=1.0)
+    SelectionSet(path).to_darksirens(str(v1), far_threshold=1.0, amax=0.99)
+    SelectionSet(path).export(str(v2), spin_basis="chieff", far_threshold=1.0,
+                              amax=0.99)
     with h5py.File(v1, "r") as a, h5py.File(v2, "r") as b:
         np.testing.assert_array_equal(b["pdraw"][:], a["pdraw"][:])
         for c in _SHARED_COLS:
             np.testing.assert_array_equal(b[c][:], a[c][:])
+        assert b.attrs["chi_eff_amax_mode"] == "fixed"
+        srcs = [s.decode() if isinstance(s, bytes) else s
+                for s in b.attrs["chi_eff_amax_source_per_campaign"]]
+        assert srcs == ["caller"]
 
 
 def test_chieff_parity_combined(tmp_path):
@@ -149,13 +162,88 @@ def test_chieff_parity_combined(tmp_path):
     v1 = tmp_path / "cv1.h5"
     v2 = tmp_path / "cv2.h5"
     CombinedSelectionSet([SelectionSet(o3), SelectionSet(o4)]).to_darksirens(
-        str(v1), far_threshold=1.0)
+        str(v1), far_threshold=1.0, amax=0.99)
     CombinedSelectionSet([SelectionSet(o3), SelectionSet(o4)]).export(
-        str(v2), spin_basis="chieff", far_threshold=1.0)
+        str(v2), spin_basis="chieff", far_threshold=1.0, amax=0.99)
     with h5py.File(v1, "r") as a, h5py.File(v2, "r") as b:
         np.testing.assert_array_equal(b["pdraw"][:], a["pdraw"][:])
         for c in _SHARED_COLS:
             np.testing.assert_array_equal(b[c][:], a[c][:])
+
+
+# ======================================================================
+# 2b. GW-31: the chieff swap uses each campaign's OWN detected ceiling
+# ======================================================================
+def test_chieff_swap_uses_the_campaigns_detected_amax(tmp_path):
+    """The swap replaces THIS campaign's spin draw, so it needs THIS ceiling.
+
+    The campaign injects ``a ~ U(0, 0.9)``; the old code evaluated the analytic
+    chi_eff marginal at the caller default 0.99 instead, which is wrong by a
+    chi_eff-DEPENDENT factor (so it does not cancel anywhere).
+    """
+    from gwcat.spin import chi_eff_prior_logprob
+
+    path = write_o4_full(tmp_path / "o4.hdf", n=60, amax=(0.9, 0.9), seed=21)
+    s = SelectionSet(path)
+    s._load()
+    assert s.spin_meta["amax_detected"][0] == pytest.approx(0.9, rel=1e-12)
+
+    out = tmp_path / "sel.h5"
+    SelectionSet(path).export(str(out), spin_basis="chieff", far_threshold=1.0)
+
+    detected = s._pdraw * np.exp(chi_eff_prior_logprob(
+        s._chieff, s._m1src, s._m2src, amax=0.9))
+    old = s._pdraw * np.exp(chi_eff_prior_logprob(
+        s._chieff, s._m1src, s._m2src, amax=0.99))
+    with h5py.File(out, "r") as f:
+        np.testing.assert_allclose(f["pdraw"][:], detected, rtol=1e-12)
+        # ... and that is NOT what the old single-amax path wrote.
+        assert not np.allclose(f["pdraw"][:], old, rtol=1e-6)
+        assert float(f.attrs["chi_eff_amax"]) == pytest.approx(0.9, rel=1e-12)
+        np.testing.assert_allclose(
+            np.asarray(f.attrs["chi_eff_amax_per_campaign"]), [[0.9, 0.9]],
+            rtol=1e-12)
+        srcs = [x.decode() if isinstance(x, bytes) else x
+                for x in f.attrs["chi_eff_amax_source_per_campaign"]]
+        assert srcs == ["detected"]
+        assert f.attrs["chi_eff_amax_mode"] == "per_campaign"
+
+
+def test_chieff_amax_is_per_campaign_not_global(tmp_path):
+    """Two campaigns with DIFFERENT injected ceilings, one export.
+
+    No single caller ``amax`` can be right for both, which is the whole point:
+    each campaign's block of pdraw must carry its own ceiling's marginal.
+    """
+    from gwcat.spin import chi_eff_prior_logprob
+
+    o3 = write_endo3_full(tmp_path / "endo3.hdf", n=50, max_spin=0.998, seed=10)
+    o4 = write_o4_full(tmp_path / "o4.hdf", n=60, amax=(0.9, 0.9), seed=32)
+    out = tmp_path / "sel.h5"
+    CombinedSelectionSet([SelectionSet(o3), SelectionSet(o4)]).export(
+        str(out), spin_basis="chieff", far_threshold=1.0)
+
+    expected = []
+    loaded = []
+    for p in (o3, o4):
+        st = SelectionSet(p)
+        st._load()
+        loaded.append(st)
+    ndraw_total = sum(int(st._ndraw) for st in loaded)
+    for st in loaded:
+        keep = st.detected_mask(1.0)
+        amax_k = float(st.spin_meta["amax_detected"][0])
+        frac = int(st._ndraw) / ndraw_total
+        expected.append(st._pdraw[keep] * frac * np.exp(chi_eff_prior_logprob(
+            st._chieff[keep], st._m1src[keep], st._m2src[keep], amax=amax_k)))
+    expected = np.concatenate(expected)
+
+    with h5py.File(out, "r") as f:
+        np.testing.assert_allclose(f["pdraw"][:], expected, rtol=1e-12)
+        pairs = np.asarray(f.attrs["chi_eff_amax_per_campaign"])
+        assert pairs.shape == (2, 2)
+        assert pairs[0, 0] == pytest.approx(0.998, rel=1e-6)
+        assert pairs[1, 0] == pytest.approx(0.9, rel=1e-9)
 
 
 # ======================================================================
