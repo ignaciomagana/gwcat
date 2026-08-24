@@ -312,7 +312,7 @@ def test_z_of_dL_in_range_is_unchanged_and_silent():
 # --------------------------------------------------------------------------
 from gwcat.cosmology import (  # noqa: E402  (grouped with the GW-01 tests)
     DistancePriorImplError, resolve_usf_impl, uniform_source_frame_prob,
-    _usf_grid,
+    _usf_grid, _usf_z_grid, _USF_NEAR_ZERO_STEP, _USF_NEAR_ZERO_ZMIN,
 )
 
 
@@ -485,12 +485,16 @@ def test_bilby_prob_would_zero_out_of_bounds_samples():
 # --- E(z) comes from the cosmology object, not a hardcoded form -------------
 def _old_hardcoded_grid(cosmology, zmax=10.0, ngrid=4000):
     """The pre-GW-01 astropy fallback: comoving_distance from the cosmology
-    object but E(z) hardcoded as sqrt(Om0(1+z)^3 + 1-Om0)."""
+    object but E(z) hardcoded as sqrt(Om0(1+z)^3 + 1-Om0).
+
+    Evaluated on whatever z grid the current code uses, so these tests stay
+    about E(z) and not about the grid layout (GW-29 refined it near z=0).
+    """
     import astropy.units as u
 
     c_kms = 299792.458
     dH = c_kms / cosmology.H0.value
-    z = np.expm1(np.linspace(np.log(1.0), np.log(1.0 + zmax), ngrid))
+    z = _usf_z_grid(zmax, ngrid)
     DC = cosmology.comoving_distance(z).to(u.Mpc).value
     E = np.sqrt(cosmology.Om0 * (1 + z) ** 3 + (1.0 - cosmology.Om0))
     dL_grid = (1 + z) * DC
@@ -523,3 +527,111 @@ def test_usf_grid_efunc_differs_for_a_cosmology_with_radiation():
     # both densities are identically zero.)
     rel = np.abs(p_new[1:] / p_old[1:] - 1.0)
     assert np.max(rel) > 1e-4, f"max rel diff {np.max(rel):.3e}"
+
+
+# --------------------------------------------------------------------------
+# GW-29: the fallback must be accurate over the SUPPORTED prior-bound range
+# --------------------------------------------------------------------------
+# The production store records dL prior bounds as low as dmin = 1 Mpc, but the
+# fallback's log-(1+z) grid put its first non-zero node at dL ~ 2.6 Mpc.  Since
+# p(dL) propto dL^2 near the origin, linearly interpolating across that bin was
+# +164% high at 1 Mpc, +32% at 2 Mpc, +2.8% at 5 Mpc and +1.2% at 10 Mpc.
+def _exact_usf_density(cosmology, z, *, time_dilation=True):
+    """(dL, p(dL)) EXACTLY at the given redshifts -- no grid, no interpolation.
+
+    This is the same closed form the fallback interpolates, evaluated at the
+    requested z, so it is an independent reference for the grid's interpolation
+    error (up to the same arbitrary constant).
+    """
+    import astropy.units as u
+
+    z = np.asarray(z, dtype=float)
+    DC = cosmology.comoving_distance(z).to(u.Mpc).value
+    E = np.asarray(cosmology.efunc(z), dtype=float)
+    dH = float(cosmology.hubble_distance.to(u.Mpc).value)
+    ddL_dz = DC + (1 + z) * dH / E
+    p = DC ** 2 / E / ddL_dz
+    if time_dilation:
+        p = p / (1 + z)
+    return (1 + z) * DC, p
+
+
+def _z_of_dL_exact(cosmology, dL_mpc):
+    import astropy.units as u
+    from astropy.cosmology import z_at_value
+
+    return np.array([float(z_at_value(cosmology.luminosity_distance,
+                                      float(d) * u.Mpc, zmin=1e-12).value)
+                     for d in dL_mpc])
+
+
+@pytest.mark.parametrize("time_dilation", [True, False])
+def test_astropy_fallback_shape_is_accurate_from_one_mpc(time_dilation):
+    """1-10 Mpc is inside the supported bound range, not an academic corner."""
+    cosmo = make_cosmology(67.9, 0.3065)
+    dmin, dmax = 1.0, 10000.0          # the widest bounds the store records
+    probe = np.array([1.0, 2.0, 5.0, 10.0, 40.0, 100.0, 1000.0])
+    z = _z_of_dL_exact(cosmo, probe)
+    dL, p_exact = _exact_usf_density(cosmo, z, time_dilation=time_dilation)
+
+    p = uniform_source_frame_prob(dL, cosmo, dmin, dmax, impl="astropy",
+                                  time_dilation=time_dilation)
+    # Only the SHAPE matters downstream (the normalisation is a per-event
+    # constant), so compare ratios anchored on the far point.
+    shape = p / p_exact
+    shape = shape / shape[-1]
+    np.testing.assert_allclose(shape, 1.0, rtol=1e-3)
+
+
+def test_astropy_fallback_matches_a_dense_reference_grid_near_zero():
+    """The reviewer's measurement: the default grid against the same formula on
+    a 100x denser one, at 1-10 Mpc."""
+    import gwcat.cosmology as gc
+
+    cosmo = make_cosmology(67.9, 0.3065)
+    dL = np.array([1.0, 2.0, 5.0, 10.0, 1000.0])
+    p = gc._usf_prob_astropy(dL, cosmo, 1.0, 10000.0)
+    p_dense = gc._usf_prob_astropy(dL, cosmo, 1.0, 10000.0, 400000)
+    shape = p / p_dense
+    shape = shape / shape[-1]
+    np.testing.assert_allclose(shape, 1.0, rtol=1e-3)
+
+
+def test_usf_z_grid_keeps_the_backbone_and_bounds_the_relative_step():
+    zmax, ngrid = 10.0, 4000
+    backbone = np.expm1(np.linspace(np.log(1.0), np.log(1.0 + zmax), ngrid))
+    z = _usf_z_grid(zmax, ngrid)
+
+    # np.interp needs a strictly increasing x, and z=0 must stay the first node.
+    assert np.all(np.diff(z) > 0)
+    assert z[0] == 0.0
+    assert z[-1] == pytest.approx(zmax)
+    # Every backbone node survives, so nothing above the switch point moves.
+    assert np.all(np.isin(backbone, z))
+    # Below the switch the RELATIVE step -- which is what bounds the
+    # interpolation error of a quadratic -- is held at the target.
+    z_switch = backbone[1] / _USF_NEAR_ZERO_STEP
+    low = z[(z > 0) & (z <= z_switch)]
+    assert low.size > 100
+    assert low[0] == pytest.approx(_USF_NEAR_ZERO_ZMIN)
+    assert np.max(np.diff(low) / low[:-1]) < 1.05 * _USF_NEAR_ZERO_STEP
+
+
+@pytest.mark.parametrize("cosmo_name", ["flat_lcdm", "planck15", "extreme"])
+def test_usf_grid_is_monotonic_below_the_micro_mpc_floor(cosmo_name):
+    """The refinement reaches below the 1e-6 Mpc floor uniform_source_frame_prob
+    clamps its evaluation range to, and astropy's comoving_distance is still
+    monotonic there -- a non-monotonic x would make np.interp return garbage."""
+    from astropy.cosmology import Planck15
+
+    cosmo = {"flat_lcdm": make_cosmology(67.9, 0.3065),
+             "planck15": Planck15,
+             "extreme": make_cosmology(20.0, 0.9)}[cosmo_name]
+    dH = float(cosmo.hubble_distance.to("Mpc").value)
+    dL, p = _usf_grid(cosmo, 10.0, 4000)
+    assert np.all(np.diff(dL) > 0)
+    # The first refined node sits at dL ~ dH * zmin -- 4e-7 Mpc for a realistic
+    # Hubble distance, i.e. below the 1e-6 Mpc evaluation floor.
+    assert dL[0] == 0.0
+    assert dL[1] == pytest.approx(dH * _USF_NEAR_ZERO_ZMIN, rel=1e-3)
+    assert np.all(p[1:] > 0) and np.all(np.isfinite(p))
