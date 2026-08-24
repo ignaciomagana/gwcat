@@ -384,3 +384,36 @@ def test_closed_form_kinds_report_analytic_impl():
                             dmin=10.0, dmax=4000.0, return_info=True)
     assert info["impl"] == "analytic"
     assert info["widened"] is False
+
+
+# --------------------------------------------------------------------------
+# GW-29: every dispatched kind is accurate at the SMALLEST recorded bound
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize("kind", ["UniformSourceFrame", "UniformComovingVolume"])
+def test_cosmological_kinds_are_accurate_at_the_smallest_recorded_dmin(kind):
+    """The production store records ``dmin`` down to 1 Mpc (191 of 282 rows sit
+    below 20 Mpc), and the fallback's grid used to start at dL ~ 2.6 Mpc: at
+    1 Mpc it returned a density 2.6x too large, at 2 Mpc 1.3x.  Compare against
+    the exact closed form (no grid) over the bounds the files actually use."""
+    import astropy.units as u
+    from astropy.cosmology import z_at_value
+
+    cosmo = LAL_PLANCK15
+    lo, hi = 1.0, 10000.0
+    probe = np.array([1.0, 2.0, 5.0, 10.0, 1000.0])
+    z = np.array([float(z_at_value(cosmo.luminosity_distance, float(d) * u.Mpc,
+                                   zmin=1e-12).value) for d in probe])
+    DC = cosmo.comoving_distance(z).to(u.Mpc).value
+    E = np.asarray(cosmo.efunc(z), dtype=float)
+    dH = float(cosmo.hubble_distance.to(u.Mpc).value)
+    p_exact = DC ** 2 / E / (DC + (1 + z) * dH / E)
+    if kind == "UniformSourceFrame":
+        p_exact = p_exact / (1 + z)
+    dL = (1 + z) * DC
+
+    p = dL_prior_prob(dL, kind=kind, cosmology=cosmo, dmin=lo, dmax=hi,
+                      impl="astropy")
+    assert np.all(p > 0) and np.all(np.diff(p) > 0)
+    shape = p / p_exact
+    shape = shape / shape[-1]     # normalisation is a per-event constant
+    np.testing.assert_allclose(shape, 1.0, rtol=1e-3)

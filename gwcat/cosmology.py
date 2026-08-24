@@ -27,8 +27,11 @@ provenance and the count of samples outside them is reported so the mismatch is
 visible rather than silently destructive.
 
 Note on implementation choice: bilby and the astropy fallback do NOT agree to
-machine precision (they differ by ~3% at the low-distance end), and that
-difference does not cancel in the per-event normalisation.  Which one produced a
+machine precision (they differ by ~3% at the low-distance end, and by far more
+below ~10 Mpc, where bilby's own interpolant -- built across the recorded
+[dmin, dmax] -- is coarse while the fallback is refined there, see
+``_usf_z_grid``), and that difference does not cancel in the per-event
+normalisation.  Which one produced a
 given ``p_dL_pe`` is therefore part of the provenance, returned as
 ``info["impl"]`` and stored per row as ``dL_prior_impl``.  There is no silent
 fallback: only a missing bilby install falls back to astropy, and any other
@@ -237,9 +240,50 @@ def _usf_prob_bilby(dL, cosmology, dmin, dmax, *,
     return np.asarray(prior.prob(dL), dtype=float)
 
 
+#: Near-zero refinement of the fallback's redshift grid (GW-29).  A log-(1+z)
+#: grid is uniformly spaced in ``z`` near the origin: its step is
+#: ``h = log(1+zmax)/(ngrid-1) ~ 6e-4`` (``dL ~ 2.6 Mpc``) for the default
+#: ``zmax=10, ngrid=4000`` and a Planck15-like cosmology, so its RELATIVE bin
+#: width ``h/z`` blows up as ``z -> 0``.  Since ``p(dL) propto dL**2`` there,
+#: linear interpolation across those first bins overestimates the density by
+#: ``(dL-a)(b-dL)/dL**2`` -- measured against the exact density: +165% at 1 Mpc,
+#: +32% at 2 Mpc, +2.8% at 5 Mpc, +1.2% at 10 Mpc.  That is squarely inside the
+#: *supported* prior-bound range: LVK cosmo files record ``dmin`` down to 1 Mpc.
+#:
+#: The cure is a geometric segment that holds the relative bin width at
+#: :data:`_USF_NEAR_ZERO_STEP` -- bounding the relative interpolation error of a
+#: quadratic at ``~step**2/4`` -- from :data:`_USF_NEAR_ZERO_ZMIN`
+#: (``dL ~ 4e-7 Mpc``, below the 1e-6 Mpc floor
+#: :func:`uniform_source_frame_prob` clamps its evaluation range to) up to the
+#: redshift where the backbone is already that fine.  Every backbone node is
+#: kept, so the density above the switch point is byte-for-byte what it was.
+_USF_NEAR_ZERO_ZMIN = 1e-10
+_USF_NEAR_ZERO_STEP = 0.01
+
+
+def _usf_z_grid(zmax: float, ngrid: int) -> np.ndarray:
+    """Hybrid redshift grid: geometric near ``z=0``, log-spaced in ``(1+z)``
+    above -- see :data:`_USF_NEAR_ZERO_ZMIN` for why the origin needs it.
+    """
+    backbone = np.expm1(np.linspace(np.log(1.0), np.log(1.0 + zmax), ngrid))
+    if backbone.size < 2:
+        return backbone
+    # h is the backbone's first non-zero node, i.e. its (uniform) step near the
+    # origin.  Below z_switch its relative step h/z exceeds the target; above,
+    # the backbone is already that fine and is left alone.
+    h = float(backbone[1])
+    z_switch = min(h / _USF_NEAR_ZERO_STEP, float(backbone[-1]))
+    if z_switch <= _USF_NEAR_ZERO_ZMIN:
+        return backbone
+    n = 1 + int(np.ceil(np.log(z_switch / _USF_NEAR_ZERO_ZMIN)
+                        / np.log1p(_USF_NEAR_ZERO_STEP)))
+    near = np.geomspace(_USF_NEAR_ZERO_ZMIN, z_switch, n)
+    return np.unique(np.concatenate(([0.0], near, backbone)))
+
+
 def _usf_grid(cosmology, zmax: float, ngrid: int, *,
               time_dilation: bool = True):
-    """(dL, p(dL)) on a log-spaced z grid, up to an arbitrary constant.
+    """(dL, p(dL)) on the hybrid z grid, up to an arbitrary constant.
 
     ``E(z)`` comes from the cosmology object (``efunc``) rather than a
     hardcoded matter+Lambda form, so a cosmology carrying radiation, neutrinos
@@ -250,7 +294,7 @@ def _usf_grid(cosmology, zmax: float, ngrid: int, *,
     *and source-frame time*, the extra ``1/(1+z)``); ``False`` gives
     UniformComovingVolume.
     """
-    z = np.expm1(np.linspace(np.log(1.0), np.log(1.0 + zmax), ngrid))
+    z = _usf_z_grid(zmax, ngrid)
     DC = cosmology.comoving_distance(z).to(u.Mpc).value
     E = np.asarray(cosmology.efunc(z), dtype=float)
     dH = float(cosmology.hubble_distance.to(u.Mpc).value)
@@ -271,7 +315,10 @@ def _usf_prob_astropy(dL, cosmology, dmin, dmax, ngrid: int = 4000, *,
     on [dmin, dmax].
 
     The z grid is extended until it covers ``dmax`` so that no sample is
-    silently interpolated to zero off the end of the grid.
+    silently interpolated to zero off the end of the grid, and refined near
+    ``z=0`` (see :func:`_usf_z_grid`) so that the *shape* is accurate to ~1e-4
+    over the whole supported prior-bound range -- LVK cosmo files record
+    ``dmin`` down to 1 Mpc, where a pure log-(1+z) grid was 165% high.
     """
     dL = np.asarray(dL, dtype=float)
     zmax = 10.0
