@@ -1667,9 +1667,12 @@ def build_store(paths, out_path, params=None, extra_params=None,
     for p in ("cos_tilt_1", "cos_tilt_2", "chi_p"):
         if p not in candidate_params:
             candidate_params.append(p)
-    union_params, columns, avail = _assemble_union(records, candidate_params)
-
-    _write_store(out_path, union_params, columns, offsets, names, avail, meta, cfg)
+    # Written event slice by event slice into preallocated columns: the union is
+    # never concatenated in memory, so the ingest peak is the records alone
+    # rather than the records plus a second copy of the whole catalog (GW-24).
+    union_params = _write_store_from_records(out_path, records,
+                                             candidate_params, offsets, names,
+                                             meta, cfg)
     print(f"\nWrote {out_path}: {len(names)} events, "
           f"{offsets[-1]} total samples, params={union_params}")
 
@@ -1700,8 +1703,33 @@ def build_store(paths, out_path, params=None, extra_params=None,
     return out_path
 
 
+def _union_params_and_avail(records, candidate_params):
+    """The stored column order and the per-event availability mask.
+
+    Split out of :func:`_assemble_union` so the streaming writer
+    (:func:`_write_store_from_records`) decides WHAT to store by exactly the
+    same rule as the concatenating one, without building any column.
+    """
+    seen, ordered = set(), []
+    for p in candidate_params:
+        if p not in seen:
+            seen.add(p)
+            ordered.append(p)
+    union_params = [p for p in ordered
+                    if any(p in rec for (_n, _c, rec) in records)]
+    avail = np.zeros((len(records), len(union_params)), dtype=bool)
+    for j, p in enumerate(union_params):
+        for i, (_name, _n, rec) in enumerate(records):
+            avail[i, j] = p in rec
+    return union_params, avail
+
+
 def _assemble_union(records, candidate_params):
     """Assemble union-schema columns + an availability mask from per-event data.
+
+    Holds the whole catalog a second time (the concatenated columns) on top of
+    ``records``; :func:`_write_store_from_records` is the streaming alternative
+    that ingest itself uses.
 
     Parameters
     ----------
@@ -1723,25 +1751,12 @@ def _assemble_union(records, candidate_params):
         ``avail[i, j]`` is True iff event ``i`` actually provided
         ``union_params[j]`` (False marks a NaN-filled slice).
     """
-    seen, ordered = set(), []
-    for p in candidate_params:
-        if p not in seen:
-            seen.add(p)
-            ordered.append(p)
-    union_params = [p for p in ordered
-                    if any(p in rec for (_n, _c, rec) in records)]
-
-    n_events = len(records)
-    avail = np.zeros((n_events, len(union_params)), dtype=bool)
+    union_params, avail = _union_params_and_avail(records, candidate_params)
     columns = {}
-    for j, p in enumerate(union_params):
-        chunks = []
-        for i, (_name, n, rec) in enumerate(records):
-            if p in rec:
-                chunks.append(np.asarray(rec[p], dtype=np.float64))
-                avail[i, j] = True
-            else:
-                chunks.append(np.full(n, np.nan, dtype=np.float64))
+    for p in union_params:
+        chunks = [np.asarray(rec[p], dtype=np.float64) if p in rec
+                  else np.full(n, np.nan, dtype=np.float64)
+                  for (_name, n, rec) in records]
         columns[p] = (np.concatenate(chunks) if chunks
                       else np.array([], dtype=np.float64))
     return union_params, columns, avail
@@ -1885,16 +1900,8 @@ _SCHEMA_13_FIELDS = ("dL_prior_kind", "dL_prior_sampling_kind",
                      "n_samples_outside_dL_prior_bounds")
 
 
-def _write_store(out_path, stored_params, columns, offsets, names, avail, meta,
-                 cfg):
-    """Write a store.h5 with the union parameter set + availability mask.
-
-    ``columns`` maps each stored parameter to a full-length (already
-    concatenated) 1-D array.  ``avail`` is a (n_events, n_params) bool mask
-    aligned with ``names`` (rows) and ``stored_params`` (columns).
-    """
-    dt_str = h5py.string_dtype(encoding="utf-8")
-    avail = np.asarray(avail, dtype=bool)
+def _store_schema_version(meta):
+    """The schema version a store carrying ``meta`` advertises."""
     # Bump the schema version to 1.2 only when sample-set columns are present,
     # so a store with none still advertises 1.1 and loads unchanged.
     has_sampleset = any(k in meta for k in
@@ -1903,34 +1910,95 @@ def _write_store(out_path, stored_params, columns, offsets, names, avail, meta,
     # when sample-set columns are, else 1.1.
     has_dL_prov = any(k in meta and len(meta[k]) for k in _SCHEMA_13_FIELDS)
     if has_dL_prov:
-        schema_version = SCHEMA_VERSION_DL_PRIOR
-    elif has_sampleset:
-        schema_version = SCHEMA_VERSION_SAMPLESETS
-    else:
-        schema_version = SCHEMA_VERSION
+        return SCHEMA_VERSION_DL_PRIOR
+    if has_sampleset:
+        return SCHEMA_VERSION_SAMPLESETS
+    return SCHEMA_VERSION
+
+
+def _write_store_attrs(f, stored_params, names, meta):
+    """Write the file-level attributes (schema, column names, row count)."""
+    f.attrs["schema_version"] = _store_schema_version(meta)
+    f.attrs.create("param_names",
+                   np.array(stored_params, dtype=h5py.string_dtype()))
+    f.attrs["n_events"] = len(names)
+
+
+def _write_store_index(f, offsets, names, avail, meta, cfg):
+    """Write everything but ``samples/``: the index, the mask and the meta."""
+    dt_str = h5py.string_dtype(encoding="utf-8")
+    idx = f.create_group("index")
+    idx.create_dataset("offsets", data=np.asarray(offsets, dtype=np.int64))
+    idx.create_dataset("event_names", data=np.array(names, dtype=object),
+                       dtype=dt_str)
+    # Per-event x per-parameter availability mask (rows aligned with
+    # index/event_names, columns aligned with attrs/param_names).
+    ag = f.create_group("avail")
+    ag.create_dataset("mask", data=np.asarray(avail, dtype=bool),
+                      compression=cfg.compression)
+    mg = f.create_group("meta")
+    for k in META_FLOAT_FIELDS:
+        mg.create_dataset(k, data=np.asarray(meta[k], dtype=np.float64))
+    for k in META_STR_FIELDS:
+        mg.create_dataset(k, data=np.array(meta[k], dtype=object), dtype=dt_str)
+
+
+def _write_store(out_path, stored_params, columns, offsets, names, avail, meta,
+                 cfg):
+    """Write a store.h5 with the union parameter set + availability mask.
+
+    ``columns`` maps each stored parameter to a full-length (already
+    concatenated) 1-D array.  ``avail`` is a (n_events, n_params) bool mask
+    aligned with ``names`` (rows) and ``stored_params`` (columns).
+    """
     with h5py.File(out_path, "w") as f:
-        f.attrs["schema_version"] = schema_version
-        f.attrs.create("param_names",
-                       np.array(stored_params, dtype=h5py.string_dtype()))
-        f.attrs["n_events"] = len(names)
+        _write_store_attrs(f, stored_params, names, meta)
         g = f.create_group("samples")
         for p in stored_params:
             arr = np.asarray(columns.get(p, np.array([])), dtype=np.float64)
             g.create_dataset(p, data=arr, compression=cfg.compression,
                              shuffle=True)
-        idx = f.create_group("index")
-        idx.create_dataset("offsets", data=np.asarray(offsets, dtype=np.int64))
-        idx.create_dataset("event_names", data=np.array(names, dtype=object),
-                           dtype=dt_str)
-        # Per-event x per-parameter availability mask (rows aligned with
-        # index/event_names, columns aligned with attrs/param_names).
-        ag = f.create_group("avail")
-        ag.create_dataset("mask", data=avail, compression=cfg.compression)
-        mg = f.create_group("meta")
-        for k in META_FLOAT_FIELDS:
-            mg.create_dataset(k, data=np.asarray(meta[k], dtype=np.float64))
-        for k in META_STR_FIELDS:
-            mg.create_dataset(k, data=np.array(meta[k], dtype=object), dtype=dt_str)
+        _write_store_index(f, offsets, names, avail, meta, cfg)
+
+
+def _create_sample_column(g, p, n, cfg):
+    """A preallocated store column: NaN everywhere nothing is written.
+
+    The fill value is what lets a writer skip the slices an event does not
+    provide instead of materialising a NaN block for them -- an unwritten
+    region reads back exactly the NaN the concatenating writer stored.
+    """
+    return g.create_dataset(p, shape=(int(n),), dtype=np.float64,
+                            fillvalue=np.nan, compression=cfg.compression,
+                            shuffle=True)
+
+
+def _write_store_from_records(out_path, records, candidate_params, offsets,
+                              names, meta, cfg):
+    """Write a store straight from per-event arrays, one event slice at a time.
+
+    The concatenating path (:func:`_assemble_union` + :func:`_write_store`)
+    holds the finished union alongside ``records``, i.e. the whole catalog twice
+    -- ~4 GiB for the 282-row production ingest.  Here each event's samples go
+    from the record into its slice of a preallocated column, so the union is
+    never built in memory (GW-24).
+
+    Returns the stored parameter list (the union, in ``candidate_params`` order).
+    """
+    union_params, avail = _union_params_and_avail(records, candidate_params)
+    total = int(offsets[-1]) if len(offsets) else 0
+    with h5py.File(out_path, "w") as f:
+        _write_store_attrs(f, union_params, names, meta)
+        g = f.create_group("samples")
+        for p in union_params:
+            ds = _create_sample_column(g, p, total, cfg)
+            for i, (_name, _n, rec) in enumerate(records):
+                if p not in rec:
+                    continue                      # NaN-filled by construction
+                ds[int(offsets[i]):int(offsets[i + 1])] = np.asarray(
+                    rec[p], dtype=np.float64)
+        _write_store_index(f, offsets, names, avail, meta, cfg)
+    return union_params
 
 
 # --------------------------------------------------------------------------
@@ -1940,8 +2008,19 @@ def _decode(x):
     return x.decode() if isinstance(x, (bytes, bytearray)) else str(x)
 
 
-def _read_store(path):
-    """Read a store.h5 into an in-memory dict (schema-agnostic).
+def _read_store_meta(path):
+    """Read a store's index, mask and meta -- everything EXCEPT the samples.
+
+    This is what merging and appending need to decide WHAT to write: the sample
+    arrays themselves are then copied slice by slice straight between the HDF5
+    files (see :func:`_write_store_streaming`), never materialised in memory.
+    Reading the 282-row / 6.9M-sample production catalog this way costs
+    milliseconds and a few MB, against ~5 s and 2.1 GiB for the full read.
+
+    The returned dict is :func:`_read_store`'s minus ``samples``, plus:
+
+    ``path``    the file the samples still live in;
+    ``slices``  each row's ``(start, stop)`` sample range in that file's columns.
 
     Derives an all-True availability mask for legacy stores that predate the
     ``avail/mask`` dataset -- exact for those stores because the old
@@ -1953,7 +2032,6 @@ def _read_store(path):
         offsets = f["index/offsets"][:].astype(np.int64)
         names = [_decode(n) for n in f["index/event_names"][:]]
         n_events = len(names)
-        samples = {p: f[f"samples/{p}"][:] for p in params}
         if "avail" in f and "mask" in f["avail"]:
             avail = np.asarray(f["avail/mask"][:], dtype=bool)
         else:
@@ -1966,27 +2044,111 @@ def _read_store(path):
             for k in META_STR_FIELDS:
                 if k in f["meta"]:
                     meta[k] = [_decode(v) for v in f[f"meta/{k}"][:]]
-    return dict(params=params, offsets=offsets, names=names, samples=samples,
-                avail=avail, meta=meta, n_events=n_events)
+    slices = [(int(offsets[i]), int(offsets[i + 1])) for i in range(n_events)]
+    return dict(params=params, offsets=offsets, names=names, avail=avail,
+                meta=meta, n_events=n_events, path=str(path), slices=slices)
 
 
-def _subset_store(S, keep):
-    """Return a copy of an in-memory store restricted to event indices ``keep``."""
+def _read_store(path):
+    """Read a store.h5 into an in-memory dict (schema-agnostic).
+
+    Loads every column in full, so the peak memory is the whole catalog (2.1 GiB
+    for the production store).  Prefer :func:`_read_store_meta` whenever the
+    samples are only going to be copied elsewhere.
+    """
+    S = _read_store_meta(path)
+    with h5py.File(path, "r") as f:
+        S["samples"] = {p: f[f"samples/{p}"][:] for p in S["params"]}
+    return S
+
+
+def _subset_meta(S, keep):
+    """Restrict a store's metadata (:func:`_read_store_meta`) to rows ``keep``.
+
+    The sample ranges follow the rows, so the streaming writer still knows where
+    each surviving row's samples live in the source file; nothing is copied here.
+    """
     keep = list(keep)
-    slices = [(int(S["offsets"][i]), int(S["offsets"][i + 1])) for i in keep]
-    samples = {}
-    for p in S["params"]:
-        col = S["samples"][p]
-        samples[p] = (np.concatenate([col[a:b] for a, b in slices]) if slices
-                      else np.array([], dtype=col.dtype))
+    slices = [S["slices"][i] for i in keep]
     offs = [0]
     for a, b in slices:
         offs.append(offs[-1] + (b - a))
     avail = S["avail"][keep, :] if keep else S["avail"][:0, :]
     meta = {k: [v[i] for i in keep] for k, v in S["meta"].items()}
     return dict(params=S["params"], offsets=np.asarray(offs, dtype=np.int64),
-                names=[S["names"][i] for i in keep], samples=samples,
-                avail=avail, meta=meta, n_events=len(keep))
+                names=[S["names"][i] for i in keep], avail=avail, meta=meta,
+                n_events=len(keep), path=S["path"], slices=slices)
+
+
+#: Largest number of float64 samples moved in one read/write step when the merge
+#: streams event slices between stores (1 Mi samples = 8 MiB).  This is what
+#: bounds the merge's memory by construction: one production column is 55 MB and
+#: a whole catalog 2.1 GiB, and the old merge held two of those plus the
+#: concatenation of both.
+_COPY_BLOCK = 1 << 20
+
+
+def _copy_runs(slices, dst_start):
+    """Coalesce ``(start, stop)`` source ranges into ``(start, stop, dst)`` runs.
+
+    Rows that are contiguous in the source AND land contiguously in the output
+    -- the usual case, since a merge keeps whole stores -- become one run, so the
+    copy costs one bounded read per block rather than one per event.
+    """
+    runs = []
+    dst = int(dst_start)
+    for a, b in slices:
+        a, b = int(a), int(b)
+        if b <= a:
+            continue
+        if runs:
+            r0, r1, rd = runs[-1]
+            if r1 == a and rd + (r1 - r0) == dst:      # contiguous both sides
+                runs[-1] = (r0, b, rd)
+                dst += b - a
+                continue
+        runs.append((a, b, dst))
+        dst += b - a
+    return runs
+
+
+def _copy_column(src_ds, dst_ds, runs):
+    """Copy ``runs`` from one column to another in <= ``_COPY_BLOCK`` steps."""
+    for a, b, dst in runs:
+        for s in range(a, b, _COPY_BLOCK):
+            e = min(s + _COPY_BLOCK, b)
+            dst_ds[dst + (s - a):dst + (e - a)] = src_ds[s:e]
+
+
+def _write_store_streaming(out_path, stored_params, sources, offsets, names,
+                           avail, meta, cfg):
+    """Write a store whose sample columns are COPIED from existing stores.
+
+    ``sources`` is a list of ``(store metadata dict, destination start offset)``
+    pairs, in output row order; each dict comes from :func:`_read_store_meta` (or
+    :func:`_subset_meta`) and carries the source path and each kept row's sample
+    range.  Columns are preallocated at their final length with a NaN fill
+    value, so a parameter a source lacks needs no NaN block written at all -- it
+    reads back NaN exactly as the concatenating writer produced it -- and no more
+    than ``_COPY_BLOCK`` samples are in memory at a time.
+    """
+    total = int(offsets[-1]) if len(offsets) else 0
+    with h5py.File(out_path, "w") as f:
+        _write_store_attrs(f, stored_params, names, meta)
+        g = f.create_group("samples")
+        dsets = {p: _create_sample_column(g, p, total, cfg)
+                 for p in stored_params}
+        for S, dst_start in sources:
+            if not S["n_events"]:
+                continue
+            runs = _copy_runs(S["slices"], dst_start)
+            wanted = [p for p in stored_params if p in S["params"]]
+            if not (runs and wanted):
+                continue
+            with h5py.File(S["path"], "r") as sf:
+                for p in wanted:
+                    _copy_column(sf[f"samples/{p}"], dsets[p], runs)
+        _write_store_index(f, offsets, names, avail, meta, cfg)
 
 
 def _row_keys(S):
@@ -2032,6 +2194,12 @@ def merge_stores(store_a, store_b, out_path, cfg: Optional[IngestConfig] = None,
         want mid-pipeline.  ``None`` derives it from the legacy
         ``skip_duplicates`` flag (True -> "skip", False -> "keep").
 
+    Neither store is ever held in memory: only their indices, masks and meta are
+    read, and the samples are then copied event slice by event slice straight
+    from the input files into preallocated output columns (GW-24).  Merging into
+    the 1.7 GB production catalog therefore costs a few MB rather than the ~6 GiB
+    the two full reads plus their concatenation used to.
+
     Returns the output path.
     """
     cfg = cfg or IngestConfig()
@@ -2041,8 +2209,8 @@ def merge_stores(store_a, store_b, out_path, cfg: Optional[IngestConfig] = None,
         raise ValueError(
             f"on_duplicate_key={on_duplicate_key!r} is invalid; use 'skip', "
             f"'refresh' or 'keep'")
-    A = _read_store(store_a)
-    B = _read_store(store_b)
+    A = _read_store_meta(store_a)
+    B = _read_store_meta(store_b)
 
     if on_duplicate_key != "keep":
         a_keys = _row_keys(A)
@@ -2053,27 +2221,18 @@ def merge_stores(store_a, store_b, out_path, cfg: Optional[IngestConfig] = None,
             if on_duplicate_key == "skip":
                 warnings.warn(f"Duplicate events skipped from the second "
                               f"store: {listed}")
-                B = _subset_store(B, [i for i, k in enumerate(b_keys)
-                                      if k not in dupes])
+                B = _subset_meta(B, [i for i, k in enumerate(b_keys)
+                                     if k not in dupes])
             else:
                 warnings.warn(f"Refreshed from the second store (the first "
                               f"store's rows are replaced): {listed}")
-                A = _subset_store(A, [i for i, k in enumerate(a_keys)
-                                      if k not in dupes])
+                A = _subset_meta(A, [i for i, k in enumerate(a_keys)
+                                     if k not in dupes])
 
     # Union parameter order: store A's columns first, then B's new columns.
     union_params = list(A["params"]) + [p for p in B["params"]
                                         if p not in A["params"]]
     a_total = int(A["offsets"][-1]) if A["n_events"] else 0
-    b_total = int(B["offsets"][-1]) if B["n_events"] else 0
-
-    columns = {}
-    for p in union_params:
-        a_col = (A["samples"][p] if p in A["samples"]
-                 else np.full(a_total, np.nan, dtype=np.float64))
-        b_col = (B["samples"][p] if p in B["samples"]
-                 else np.full(b_total, np.nan, dtype=np.float64))
-        columns[p] = np.concatenate([a_col, b_col])
 
     a_idx = {p: j for j, p in enumerate(A["params"])}
     b_idx = {p: j for j, p in enumerate(B["params"])}
@@ -2111,8 +2270,22 @@ def merge_stores(store_a, store_b, out_path, cfg: Optional[IngestConfig] = None,
     for k in PASTRO_KEYS:
         merged_meta[k] = list(resolved_pastro)
 
-    _write_store(out_path, union_params, columns, offsets, names, avail,
-                 merged_meta, cfg)
+    # The copy reads the inputs WHILE writing the output, so an in-place merge
+    # -- out_path IS one of the inputs, which the old in-memory merge allowed
+    # because it had already loaded both -- lands on a sibling temp file and is
+    # renamed over the target once complete.
+    in_place = os.path.exists(out_path) and any(
+        os.path.samefile(out_path, s) for s in (store_a, store_b))
+    write_path = f"{out_path}.gwcat-merge-tmp" if in_place else out_path
+    try:
+        _write_store_streaming(write_path, union_params, [(A, 0), (B, a_total)],
+                               offsets, names, avail, merged_meta, cfg)
+    except BaseException:
+        if in_place and os.path.exists(write_path):
+            os.remove(write_path)
+        raise
+    if in_place:
+        os.replace(write_path, out_path)
     print(f"Merged stores: {A['n_events']} + {B['n_events']} = {n_total} "
           f"events, params={union_params} → {out_path}")
     return out_path
@@ -2164,7 +2337,10 @@ def merge_store(existing_path: str, new_paths, out_path: str = None,
                                        offline=offline)
     out_path = out_path or existing_path
 
-    old = _read_store(existing_path)
+    # Inspection is metadata-only: the existing store's columns are needed to
+    # decide which parameters to ingest for the new events, not its samples,
+    # which merge_stores then copies straight from the file (GW-24).
+    old = _read_store_meta(existing_path)
 
     # Candidate columns for the new events: the generous default set plus any
     # columns the existing store already has (minus the computed p_dL_pe, which
