@@ -116,6 +116,14 @@ class ParameterSpace:
         return SPIN_NONE
 
     @property
+    def mass_block(self) -> ParameterBlock:
+        """The block whose PE factor the builders compose per event (GW-34)."""
+        for b in self.blocks:
+            if b.kind == "mass":
+                return b
+        return MASS_DET_PAIR
+
+    @property
     def ranges(self) -> dict:
         out = {}
         for b in self.blocks:

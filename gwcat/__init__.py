@@ -12,9 +12,13 @@ The (m1det, q, dL)-basis mass Jacobian is applied ONLY in
 GWCatalog.to_darksirens; the store stays mass-prior-agnostic.
 (_to_darksirens_format is a deprecated alias kept for compatibility.)
 """
+# THE version authority for the package: pyproject.toml declares
+# dynamic = ["version"] and reads this literal (setuptools' `attr:` reads it
+# statically, without importing gwcat), so the installed metadata and
+# gwcat.__version__ cannot drift apart. Bump it here and nowhere else.
 __version__ = "0.1.0"
 
-from .catalog import GWCatalog, validate_export
+from .catalog import GWCatalog
 from .ingest import (build_store, merge_store, merge_stores, inspect,
                      IngestConfig, DEFAULT_PARAMS)
 from .selection import SelectionSet, CombinedSelectionSet
@@ -37,6 +41,13 @@ from .event_metadata import (assemble_event_metadata, metadata_diagnostics,
 # as `gwcat.export.export(...)` or `from gwcat.export import export`.
 from .export import (build_pe_product, ExportProduct,
                     register_exporter, get_exporter, list_formats)
+# The public validator is the FORMAT DISPATCHER, not the v1 validator. Binding
+# gwcat.catalog.validate_export here handed every file to the v1 contract, which
+# checks a required dataset only when it happens to exist -- so a gwcat-2.0 file
+# missing p_pe, the masses and the sky came back "ALL PASSED". Only the CLI
+# dispatched. gwcat.catalog.validate_export stays reachable (and frozen) for
+# anyone who deliberately wants the v1 checks on a v1 file.
+from .export.validate import validate_export_any as validate_export
 
 # fetch has optional deps (requests, tqdm); import lazily
 def fetch_and_build(*args, **kwargs):

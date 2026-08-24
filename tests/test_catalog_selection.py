@@ -337,3 +337,237 @@ def test_pastro_summary_shows_the_resolved_value(tmp_path, capsys):
                                       name="pastro_summary.h5"))
     cat.summary()
     assert "0.999" in capsys.readouterr().out
+
+
+# ==========================================================================
+# GW-33: the EFFECTIVE selection survives a chain of views
+# ==========================================================================
+def _spec(cat, **kw):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return cat.select(**kw).selection_spec
+
+
+def test_select_composes_the_filters_of_the_view_it_was_called_on(tmp_path):
+    """The reviewer's reproduction, in miniature.
+
+    ``select()`` has always ANDed its mask with the view it was called on, so
+    the ROWS were right; the provenance it attached described only the LAST
+    call.  Exporting calls ``select()`` once more with its own defaults, and the
+    filtered file then recorded no class filter at all.
+    """
+    cat = GWCatalog(build_mixed_store(tmp_path, MIXED_EVENTS))
+    bbh = cat.select(source_class="bbh")
+    again = bbh.select()                    # what an exporter does
+
+    assert again.n_events == bbh.n_events == 2      # rows were never the bug
+    spec = again.selection_spec
+    assert spec.source_class == ("BBH",)
+    assert spec.source_class_filter == "BBH"
+    assert spec.cut_estimator == "posterior_median_mass"
+    assert spec.is_filtered is True
+
+
+def test_chained_thresholds_compose_to_the_tighter_cut(tmp_path):
+    """Two chained cuts leave the tighter one standing -- which is the one the
+    surviving rows actually reflect."""
+    events = [dict(e, pastro=0.99) for e in MIXED_EVENTS]
+    cat = GWCatalog(build_mixed_store(tmp_path, events, name="tight.h5"))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        sub = (cat.select(far_max=1e-2, pastro_min=0.5)
+                  .select(far_max=1e-3, pastro_min=0.9, snr_min=None))
+    spec = sub.selection_spec
+    assert spec.far_max == 1e-3          # upper bound -> the smaller
+    assert spec.pastro_min == 0.9        # lower bound -> the larger
+    assert spec.far_policy in ("drop_missing", "require", "allow_missing")
+
+
+def test_every_name_filter_normalises_into_one_whitelist(tmp_path):
+    """``allowed_names``, ``names`` and ``event_list`` are one filter --
+    membership in a fixed list -- so they compose into one set and one digest."""
+    cat = GWCatalog(build_mixed_store(tmp_path, MIXED_EVENTS))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        sub = (cat.select(allowed_names=["GW900001_000001", "GW900002_000002"])
+                  .select(event_list=["GW900002_000002", "GW900003_000003"]))
+    spec = sub.selection_spec
+    assert list(sub.event_names) == ["GW900002_000002"]
+    assert spec.allowed_names == ("GW900002_000002",)      # the intersection
+    assert spec.allowed_names_filter == "allowed_names"
+    assert spec.event_list_filter == "custom_sequence"
+    # A direct allowed_names= selection is a whitelist too; recording it as
+    # "none" described a filtered file as unfiltered.
+    assert spec.cut_estimator == "name_whitelist"
+    assert _spec(cat, allowed_names=["GW900001_000001"]).cut_estimator == \
+        "name_whitelist"
+
+
+def test_the_whitelist_digest_ignores_order_and_duplicates(tmp_path):
+    cat = GWCatalog(build_mixed_store(tmp_path, MIXED_EVENTS))
+    a = _spec(cat, allowed_names=["GW900001_000001", "GW900002_000002"])
+    b = _spec(cat, allowed_names=["GW900002_000002", "GW900001_000001",
+                                  "GW900001_000001"])
+    c = _spec(cat, allowed_names=["GW900001_000001"])
+    assert a.allowed_names_digest == b.allowed_names_digest
+    assert a.allowed_names_digest != c.allowed_names_digest
+    assert _spec(cat).allowed_names_digest == ""      # no whitelist at all
+
+
+def test_contradictory_class_filters_raise_rather_than_read_as_unfiltered(
+        tmp_path):
+    """An empty class restriction serialises exactly like "no restriction"."""
+    cat = GWCatalog(build_mixed_store(tmp_path, MIXED_EVENTS))
+    with pytest.raises(ValueError, match="share no class"):
+        cat.select(source_class="bbh").select(source_class="bns")
+
+
+def test_the_spec_digest_moves_with_the_cuts(tmp_path):
+    cat = GWCatalog(build_mixed_store(tmp_path, MIXED_EVENTS))
+    base = _spec(cat).digest()
+    assert _spec(cat, source_class="bbh").digest() != base
+    assert _spec(cat, source_class="bbh").digest() == \
+        _spec(cat, source_class="BBH").digest()          # spelling-independent
+
+
+# ── the v1 exporter records the view, not its own arguments ─────────────────
+def test_to_darksirens_records_the_filter_of_the_view_it_exported(tmp_path):
+    cat = GWCatalog(build_mixed_store(tmp_path, MIXED_EVENTS))
+    out = tmp_path / "from_view.h5"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        bbh = cat.select(source_class="bbh")
+        bbh.to_darksirens(str(out), nsamp=8, seed=0,
+                          cosmology=(67.74, 0.3089))
+    with h5py.File(out, "r") as f:
+        assert int(f.attrs["nobs"]) == 2
+        assert f.attrs["source_class_filter"] == "BBH"
+        assert f.attrs["source_class_cut_estimator"] == "posterior_median_mass"
+        assert bool(f.attrs["selection_filtered"]) is True
+        assert f.attrs["selection_spec_digest"]
+
+
+def test_to_darksirens_warns_about_a_class_cut_inherited_from_the_view(tmp_path):
+    """The GW-12 warning asked the export call's arguments, so a class cut made
+    one line earlier produced a file with no warning and (before GW-33) no
+    record either."""
+    cat = GWCatalog(build_mixed_store(tmp_path, MIXED_EVENTS))
+    out = tmp_path / "inherited_warn.h5"
+    bbh = cat.select(source_class="bbh")
+    with pytest.warns(UserWarning, match="POSTERIOR MEDIAN"):
+        bbh.to_darksirens(str(out), nsamp=8, seed=0,
+                          cosmology=(67.74, 0.3089))
+
+
+def test_to_darksirens_digests_the_events_it_wrote(tmp_path):
+    from gwcat.export.contract import event_list_digest
+
+    cat = GWCatalog(build_mixed_store(tmp_path, MIXED_EVENTS))
+    out = tmp_path / "digest.h5"
+    cat.to_darksirens(str(out), nsamp=8, seed=0, cosmology=(67.74, 0.3089))
+    with h5py.File(out, "r") as f:
+        names = [n.decode() if isinstance(n, bytes) else n
+                 for n in f.attrs["event_names"]]
+        assert f.attrs["event_list_digest"] == event_list_digest(names)
+        # order- and duplicate-independent: it identifies WHICH events
+        assert event_list_digest(names[::-1]) == event_list_digest(names)
+
+
+# ── the cut no injection campaign can reproduce ─────────────────────────────
+def test_pastro_min_is_refused_for_a_paired_export(tmp_path):
+    from gwcat.catalog import UnpairableSelectionCut
+
+    events = [dict(e, pastro=0.99) for e in MIXED_EVENTS]
+    cat = GWCatalog(build_mixed_store(tmp_path, events, name="pa_refuse.h5"))
+    out = tmp_path / "never.h5"
+    with pytest.raises(UnpairableSelectionCut) as ei:
+        cat.to_darksirens(str(out), pastro_min=0.5, nsamp=8, seed=0,
+                          cosmology=(67.74, 0.3089))
+    msg = str(ei.value)
+    assert "p_astro_available=False" in msg      # why there is no equivalent
+    assert "far_max" in msg                      # names the reproducible cut
+    assert "allow_unpaired_pastro_min" in msg    # names the escape hatch
+    assert not out.exists()
+
+    # ...and it is refused just as loudly when the cut came from the view.
+    with pytest.raises(UnpairableSelectionCut):
+        cat.select(pastro_min=0.5).to_darksirens(
+            str(out), nsamp=8, seed=0, cosmology=(67.74, 0.3089))
+
+
+def test_pastro_min_writes_when_explicitly_unpaired_and_says_so(tmp_path):
+    events = [dict(e, pastro=0.99) for e in MIXED_EVENTS]
+    cat = GWCatalog(build_mixed_store(tmp_path, events, name="pa_allow.h5"))
+    out = tmp_path / "unpaired.h5"
+    cat.to_darksirens(str(out), pastro_min=0.5, nsamp=8, seed=0,
+                      cosmology=(67.74, 0.3089),
+                      allow_unpaired_pastro_min=True)
+    with h5py.File(out, "r") as f:
+        assert float(f.attrs["pastro_min"]) == 0.5
+        assert bool(f.attrs["selection_filtered"]) is True
+
+
+# ==========================================================================
+# GW-32 (#8): the sample reader -- per-event, per-row posterior access
+# ==========================================================================
+def test_sample_reader_rows_equal_a_full_read_then_index(tmp_path):
+    """``read(e, p, rows=...)`` IS ``get(p, per_event=True)[p][e][rows]``.
+
+    The export downsamples by drawing row indices and reading only those; the
+    values it writes may not change because of that, so the two access paths
+    are pinned equal here -- for sorted, unsorted, repeated (bootstrap) and
+    empty draws alike.
+    """
+    events = [dict(e, n=n) for e, n in zip(MIXED_EVENTS, (23, 40, 11, 7))]
+    cat = GWCatalog(build_mixed_store(tmp_path, events, name="reader.h5"))
+    params = ["mass_1", "luminosity_distance", "p_dL_pe"]
+    full = cat.get(params, per_event=True)
+
+    rng = np.random.default_rng(3)
+    with cat.sample_reader() as rd:
+        counts = rd.counts()
+        assert counts.tolist() == [len(x) for x in full["mass_1"]]
+        for e, n in enumerate(counts):
+            draws = [
+                np.sort(rng.choice(n, size=5, replace=False)),   # sorted
+                rng.choice(n, size=7, replace=True),             # bootstrap
+                np.array([n - 1, 0, n // 2, 0]),                 # unsorted, dup
+                np.array([], dtype=int),                         # empty
+                None,                                            # whole slice
+            ]
+            for rows in draws:
+                got = rd.read(e, params, rows=rows)
+                for p in params:
+                    want = (full[p][e] if rows is None
+                            else full[p][e][np.asarray(rows, dtype=int)])
+                    np.testing.assert_array_equal(got[p], want)
+
+
+def test_sample_reader_honours_the_required_contract(tmp_path):
+    """Absent parameters behave exactly as they do through :meth:`get`."""
+    from gwcat.schema import MissingParameterError
+
+    cat = GWCatalog(build_mixed_store(tmp_path, MIXED_EVENTS, name="req.h5"))
+    with cat.sample_reader() as rd:
+        with pytest.raises(MissingParameterError, match="not_a_param"):
+            rd.read(0, ["not_a_param"], rows=np.arange(3))
+        got = rd.read(0, ["not_a_param"], rows=np.arange(3),
+                      required=False, fill_value=-1.0)
+        assert got["not_a_param"].tolist() == [-1.0, -1.0, -1.0]
+        whole = rd.read(0, ["not_a_param"], required=False)
+        assert whole["not_a_param"].size == int(rd.counts()[0])
+
+
+def test_sample_reader_matches_numpy_indexing_at_the_edges(tmp_path):
+    """Negative indices count from the end; out of range raises, as numpy does."""
+    cat = GWCatalog(build_mixed_store(tmp_path, MIXED_EVENTS, name="edges.h5"))
+    full = cat.get("mass_1", per_event=True)["mass_1"]
+    with cat.sample_reader() as rd:
+        n = int(rd.counts()[0])
+        rows = np.array([-1, -n, 0, n - 1])
+        np.testing.assert_array_equal(
+            rd.read(0, "mass_1", rows=rows)["mass_1"], full[0][rows])
+        with pytest.raises(IndexError):
+            rd.read(0, "mass_1", rows=np.array([n]))
+        with pytest.raises(IndexError):
+            rd.read(0, "mass_1", rows=np.array([-n - 1]))

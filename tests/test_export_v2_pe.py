@@ -19,6 +19,9 @@ Fixtures are tiny synthetic HDF5 stores built directly with h5py (matching the
 on-disk schema GWCatalog reads, including the per-event availability mask) -- no
 network, no pesummary/ingest.
 """
+import json
+import warnings
+
 import numpy as np
 import h5py
 import pytest
@@ -37,7 +40,7 @@ _P_DL_CONST = 0.7   # constant stored distance prior -> exact p_pe reconstructio
 
 
 def _build_spin_store(tmp_path, events, n_per_event=300, H0=67.74, Om0=0.3089,
-                      seed=11, name="spin_store.h5"):
+                      seed=11, name="spin_store.h5", mass_prior_meta=True):
     """Synthetic store with spin sample columns + per-event spin-prior meta +
     an availability mask.  Returns ``(path, raw)`` where ``raw[name][param]`` is
     the stored per-event sample array (so tests can replicate the resample)."""
@@ -59,7 +62,8 @@ def _build_spin_store(tmp_path, events, n_per_event=300, H0=67.74, Om0=0.3089,
                             "dL_prior_H0", "dL_prior_Om0", "waveform",
                             "approximant", "sample_set_name",
                             "spin_amax_1", "spin_amax_2",
-                            "spin_prior_kind", "spin_prior_source"]}
+                            "spin_prior_kind", "spin_prior_source",
+                            "mass_prior_kind"]}
 
     for ei, ev in enumerate(events):
         n = int(ev.get("n", n_per_event))
@@ -123,6 +127,11 @@ def _build_spin_store(tmp_path, events, n_per_event=300, H0=67.74, Om0=0.3089,
         meta["spin_prior_kind"].append(
             ev.get("kind", "uniform_magnitude_isotropic"))
         meta["spin_prior_source"].append(ev.get("prior_source", "C01:Mixed"))
+        # The parsed mass-prior class (GW-07/GW-34). The real releases put a
+        # UniformInComponents* prior on (chirp_mass, mass_ratio), which IS flat
+        # in the components, so "uniform_detector_frame" is the default here.
+        meta["mass_prior_kind"].append(
+            ev.get("mass_prior_kind", "uniform_detector_frame"))
 
     path = tmp_path / name
     with h5py.File(path, "w") as f:
@@ -134,8 +143,13 @@ def _build_spin_store(tmp_path, events, n_per_event=300, H0=67.74, Om0=0.3089,
                            data=np.array(names, dtype=h5py.string_dtype()))
         f.create_group("avail").create_dataset("mask", data=avail)
         mg = f.create_group("meta")
-        for k in ["source_class", "compact_type", "waveform", "approximant",
-                  "sample_set_name", "spin_prior_kind", "spin_prior_source"]:
+        str_meta = ["source_class", "compact_type", "waveform", "approximant",
+                    "sample_set_name", "spin_prior_kind", "spin_prior_source"]
+        # A store written before the mass-prior ingest carries no such column
+        # at all, which is a different state from "looked and found nothing".
+        if mass_prior_meta:
+            str_meta.append("mass_prior_kind")
+        for k in str_meta:
             mg.create_dataset(k, data=np.array(meta[k],
                                                 dtype=h5py.string_dtype()))
         for k in ["far", "far_available", "pastro", "p_astro",
@@ -544,11 +558,11 @@ def test_rng_neutrality_chieff_fetches_no_extra_store_columns(tmp_path,
 
     chieff parity holds only because that path fetches no EXTRA per-event
     columns and therefore consumes an identical default_rng(seed) stream.
-    Assert the exact column set handed to ``sub.get``, so a future space that
-    quietly starts fetching spin columns for chieff fails here rather than
-    silently shifting every exported sample.
+    Assert the exact column set handed to the per-event reader, so a future
+    space that quietly starts fetching spin columns for chieff fails here rather
+    than silently shifting every exported sample.
     """
-    from gwcat.catalog import GWCatalog
+    from gwcat.catalog import GWCatalog, _SampleReader
     from gwcat.params import get_space
 
     events = [{"name": "GWr_000001", "provide": _FULL_SPIN}]
@@ -556,17 +570,17 @@ def test_rng_neutrality_chieff_fetches_no_extra_store_columns(tmp_path,
     cat = GWCatalog(store)
 
     calls = []
-    orig = GWCatalog.get
+    orig = _SampleReader.read
 
-    def spy(self, params, **kw):
-        calls.append(tuple(params))
-        return orig(self, params, **kw)
+    def spy(self, e, params, **kw):
+        calls.append((params,) if isinstance(params, str) else tuple(params))
+        return orig(self, e, params, **kw)
 
-    monkeypatch.setattr(GWCatalog, "get", spy)
+    monkeypatch.setattr(_SampleReader, "read", spy)
     cat.export(str(tmp_path / "c.h5"), format="gwcat2", spin_basis="chieff",
                nsamp=32, seed=0, cosmology=(67.74, 0.3089))
 
-    # exactly one fetch, and it is the legacy required set -- no spin extras
+    # one fetch per event, and it is the legacy required set -- no spin extras
     assert len(calls) == 1, f"chieff made {len(calls)} store fetches: {calls}"
     assert set(calls[0]) == set(schema.EXPORT_REQUIREMENTS["gwcat2_pe:chieff"])
     assert get_space("chieff").store_params_fetched == ()
@@ -576,8 +590,8 @@ def test_rng_neutrality_chieff_fetches_no_extra_store_columns(tmp_path,
     calls.clear()
     cat.export(str(tmp_path / "k.h5"), format="gwcat2", spin_basis="component",
                nsamp=32, seed=0, cosmology=(67.74, 0.3089))
-    assert len(calls) == 2, f"component made {len(calls)} fetches: {calls}"
-    assert set(calls[1]) & {"a_1", "a_2"}
+    assert len(calls) == 1, f"component made {len(calls)} fetches: {calls}"
+    assert set(calls[0]) & {"a_1", "a_2"}
 
 
 def test_requirements_come_from_the_registry_not_a_ladder(tmp_path):
@@ -621,9 +635,10 @@ def test_nospin_ppe_is_the_mass_jacobian_and_distance_prior_only(tmp_path):
     m1 = raw["GWn_000001"]["mass_1"][idx]
     np.testing.assert_allclose(cols["p_pe"], m1 * _P_DL_CONST, rtol=1e-12)
 
-    # exactly the legacy 10 columns plus the support mask -- no spin coordinates
+    # exactly the legacy 10 columns plus the support mask and the published
+    # density coordinate q (GW-34) -- no spin coordinates
     assert set(cols) == {"ra", "dec", "m1det", "m2det", "chieff", "dL", "p_pe",
-                         "redshift", "m1src", "m2src", "in_support"}
+                         "redshift", "m1src", "m2src", "in_support", "q"}
     assert np.all(np.asarray(cols["in_support"], dtype=bool))
 
 
@@ -667,3 +682,502 @@ def test_nospin_chieff_is_emitted_but_advisory():
     assert "chieff" in sp.advisory_columns
     assert "chieff" not in sp.fit_columns
     assert sp.is_exact is True
+
+
+# ==========================================================================
+# GW-33: the v2 builder records the EFFECTIVE selection, not its own arguments
+# ==========================================================================
+_MIXED_CLASS_EVENTS = [
+    {"name": "GWs_000001", "source_class": "BBH"},
+    {"name": "GWs_000002", "source_class": "BBH"},
+    {"name": "GWs_000003", "source_class": "NSBH"},
+]
+
+
+def test_v2_export_from_a_filtered_view_states_the_filter(tmp_path):
+    """The reviewer's reproduction: exporting ``cat.select(source_class="bbh")``
+    kept every BBH row and recorded an empty ``source_class_filter``, no cut
+    estimator and no event list -- a filtered file advertising itself as
+    unfiltered, which the paired selection function cannot contradict.
+    """
+    store, _ = _build_spin_store(tmp_path, _MIXED_CLASS_EVENTS,
+                                 n_per_event=80, name="mixed_class.h5")
+    out = tmp_path / "from_view.h5"
+    bbh = GWCatalog(store).select(source_class="bbh")
+    with pytest.warns(UserWarning, match="POSTERIOR MEDIAN"):
+        bbh.export(str(out), format="gwcat2", spin_basis="component",
+                   nsamp=32, seed=0, cosmology=(67.74, 0.3089))
+
+    _cols, attrs = _read(out)
+
+    def _s(v):
+        return v.decode() if isinstance(v, bytes) else v
+
+    assert int(attrs["nobs"]) == 2                  # the rows were never wrong
+    assert _s(attrs["source_class_filter"]) == "BBH"
+    assert _s(attrs["source_class_cut_estimator"]) == "posterior_median_mass"
+    assert bool(attrs["selection_filtered"]) is True
+    assert _s(attrs["selection_spec_digest"])
+    spec = json.loads(_s(attrs["selection_spec"]))
+    assert spec["source_class"] == ["BBH"]
+
+
+def test_v2_export_records_the_events_it_wrote(tmp_path):
+    from gwcat.export.contract import event_list_digest
+
+    store, _ = _build_spin_store(tmp_path, _MIXED_CLASS_EVENTS,
+                                 n_per_event=80, name="digest_store.h5")
+    out = tmp_path / "digest.h5"
+    GWCatalog(store).export(str(out), format="gwcat2", spin_basis="component",
+                            nsamp=32, seed=0, cosmology=(67.74, 0.3089))
+    _cols, attrs = _read(out)
+    names = [n.decode() if isinstance(n, bytes) else n
+             for n in attrs["event_names"]]
+    digest = attrs["event_list_digest"]
+    digest = digest.decode() if isinstance(digest, bytes) else digest
+    assert digest == event_list_digest(names)
+    assert digest != event_list_digest(names[:1])
+
+
+def test_v2_export_inherits_the_numeric_cuts_of_the_view(tmp_path):
+    """far_max/snr_min are the numbers the paired selection file is checked
+    against; a cut applied one call earlier used to reach the file as NaN."""
+    events = [dict(e, far=f) for e, f in
+              zip(_MIXED_CLASS_EVENTS, (1e-4, 1e-2, 1e-4))]
+    store, _ = _build_spin_store(tmp_path, events, n_per_event=80,
+                                 name="far_view.h5")
+    out = tmp_path / "far_view_export.h5"
+    sub = GWCatalog(store).select(far_max=1e-3)
+    sub.export(str(out), format="gwcat2", spin_basis="component",
+               nsamp=32, seed=0, cosmology=(67.74, 0.3089))
+    _cols, attrs = _read(out)
+    assert int(attrs["nobs"]) == 2
+    assert float(attrs["far_max"]) == 1e-3
+    assert (attrs["far_policy"].decode()
+            if isinstance(attrs["far_policy"], bytes)
+            else attrs["far_policy"]) == "drop_missing"
+
+
+def test_v2_pastro_min_is_refused_unless_declared_unpaired(tmp_path):
+    from gwcat.catalog import UnpairableSelectionCut
+
+    store, _ = _build_spin_store(tmp_path, _MIXED_CLASS_EVENTS,
+                                 n_per_event=80, name="pastro_store.h5")
+    cat = GWCatalog(store)
+    out = tmp_path / "pa.h5"
+    with pytest.raises(UnpairableSelectionCut, match="p_astro_available=False"):
+        cat.export(str(out), format="gwcat2", spin_basis="component",
+                   nsamp=32, seed=0, cosmology=(67.74, 0.3089),
+                   pastro_min=0.5)
+    assert not out.exists()
+
+    cat.export(str(out), format="gwcat2", spin_basis="component",
+               nsamp=32, seed=0, cosmology=(67.74, 0.3089),
+               pastro_min=0.5, allow_unpaired_pastro_min=True)
+    _cols, attrs = _read(out)
+    assert float(attrs["pastro_min"]) == 0.5
+
+
+# ==========================================================================
+# GW-34: the mass BLOCK drives p_pe, and the file states the prior it got
+# ==========================================================================
+def _decode(v):
+    return [x.decode() if isinstance(x, bytes) else str(x) for x in v]
+
+
+def test_an_assumed_mass_prior_is_not_stamped_as_a_verified_one(tmp_path):
+    """The reviewer's reproduction: the shipped store holds 273 rows parsed as
+    ``uniform_detector_frame`` and 9 whose analytic prior was never found
+    (``assumed_default``), and every one of them was exported with a constant
+    ``mass_prior_basis="uniform_detector_frame"``.
+
+    The m1det Jacobian is only VERIFIED for the parsed class; for the rest it is
+    assumed, and a file that cannot tell a consumer which it got is a file that
+    invites the wrong measure.
+    """
+    events = [{"name": "GWm_000001", "provide": _FULL_SPIN},
+              {"name": "GWm_000002", "provide": _FULL_SPIN,
+               "mass_prior_kind": "assumed_default"}]
+    store, _raw = _build_spin_store(tmp_path, events, n_per_event=120,
+                                    name="massprior_store.h5")
+    out = tmp_path / "massprior.h5"
+    with pytest.warns(UserWarning, match="no VERIFIED uniform detector-frame"):
+        GWCatalog(store).export(str(out), format="gwcat2",
+                                spin_basis="component", nsamp=32, seed=0,
+                                cosmology=(67.74, 0.3089))
+    _cols, attrs = _read(out)
+
+    basis = attrs["mass_prior_basis"]
+    assert (basis.decode() if isinstance(basis, bytes) else basis) == "mixed"
+    assert bool(attrs["mass_prior_verified"]) is False
+    assert _decode(attrs["mass_prior_kind_per_event"]) == [
+        "uniform_detector_frame", "assumed_default"]
+    assert _decode(attrs["mass_prior_unverified_events"]) == ["GWm_000002"]
+    assert int(attrs["n_events_mass_prior_unverified"]) == 1
+
+
+def test_a_fully_parsed_store_still_states_the_verified_basis(tmp_path):
+    """The honest claim must still be available: a file every one of whose rows
+    carries the parsed uniform detector-frame prior says so, with no warning."""
+    events = [{"name": "GWm_000003", "provide": _FULL_SPIN},
+              {"name": "GWm_000004", "provide": _FULL_SPIN}]
+    store, _raw = _build_spin_store(tmp_path, events, n_per_event=120,
+                                    name="massprior_ok_store.h5")
+    out = tmp_path / "massprior_ok.h5"
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        GWCatalog(store).export(str(out), format="gwcat2",
+                                spin_basis="component", nsamp=32, seed=0,
+                                cosmology=(67.74, 0.3089))
+    _cols, attrs = _read(out)
+    basis = attrs["mass_prior_basis"]
+    assert (basis.decode() if isinstance(basis, bytes) else basis) == \
+        "uniform_detector_frame"
+    assert bool(attrs["mass_prior_verified"]) is True
+    assert int(attrs["n_events_mass_prior_unverified"]) == 0
+
+
+def test_a_store_predating_the_mass_prior_ingest_says_unstated(tmp_path):
+    """"Nothing was parsed" and "a prior was parsed and it was flat" are
+    different claims; only the second may be stamped as verified."""
+    events = [{"name": "GWm_000005", "provide": _FULL_SPIN}]
+    store, _raw = _build_spin_store(tmp_path, events, n_per_event=120,
+                                    name="massprior_old_store.h5",
+                                    mass_prior_meta=False)
+    out = tmp_path / "massprior_old.h5"
+    with pytest.warns(UserWarning, match="no VERIFIED uniform detector-frame"):
+        GWCatalog(store).export(str(out), format="gwcat2",
+                                spin_basis="component", nsamp=32, seed=0,
+                                cosmology=(67.74, 0.3089))
+    _cols, attrs = _read(out)
+    basis = attrs["mass_prior_basis"]
+    assert (basis.decode() if isinstance(basis, bytes) else basis) == "unstated"
+    assert bool(attrs["mass_prior_verified"]) is False
+
+
+def test_an_unsupported_mass_prior_is_refused_by_the_blocks_gate(tmp_path):
+    """The gate ``mass.det_pair`` has declared since GW-17, finally evaluated.
+
+    A posterior sampled under a prior that is NOT flat in the detector-frame
+    components has a different Jacobian, and the ratio does not cancel in the
+    per-event normalisation -- so the export refuses instead of applying the
+    wrong measure.  The refusal names every offending event, not just the first.
+    """
+    events = [{"name": "GWm_000006", "provide": _FULL_SPIN},
+              {"name": "GWm_000007", "provide": _FULL_SPIN,
+               "mass_prior_kind": "uniform_chirp_mass_q"},
+              {"name": "GWm_000008", "provide": _FULL_SPIN,
+               "mass_prior_kind": "unrecognized"}]
+    store, _raw = _build_spin_store(tmp_path, events, n_per_event=100,
+                                    name="massprior_bad_store.h5")
+    out = tmp_path / "massprior_bad.h5"
+    with pytest.raises(ValueError, match="Jacobian") as exc:
+        GWCatalog(store).export(str(out), format="gwcat2",
+                                spin_basis="component", nsamp=32, seed=0,
+                                cosmology=(67.74, 0.3089))
+    msg = str(exc.value)
+    assert "GWm_000007" in msg and "GWm_000008" in msg
+    assert "GWm_000006" not in msg
+    assert not out.exists()
+
+    # ...and excluding them is enough to build the rest.
+    GWCatalog(store).export(str(out), format="gwcat2", spin_basis="component",
+                            nsamp=32, seed=0, cosmology=(67.74, 0.3089),
+                            allowed_names=["GWm_000006"],
+                            allowed_names_authoritative=True)
+    _cols, attrs = _read(out)
+    assert int(attrs["nobs"]) == 1
+    assert bool(attrs["mass_prior_verified"]) is True
+
+
+def test_the_refusal_comes_from_the_block_not_a_copy_in_the_builder(tmp_path):
+    """The block's gate is the single rule: widening it in the registry widens
+    the export, which is what "the blocks drive the physics" has to mean."""
+    from gwcat.params.blocks import mass as mass_block_mod
+
+    events = [{"name": "GWm_000009", "provide": _FULL_SPIN,
+               "mass_prior_kind": "uniform_detector_frame_v2"}]
+    store, _raw = _build_spin_store(tmp_path, events, n_per_event=100,
+                                    name="massprior_gate_store.h5")
+    out = tmp_path / "massprior_gate.h5"
+    with pytest.raises(ValueError, match="Jacobian"):
+        GWCatalog(store).export(str(out), format="gwcat2",
+                                spin_basis="component", nsamp=32, seed=0,
+                                cosmology=(67.74, 0.3089))
+
+    old = mass_block_mod.VALID_MASS_PRIOR_KINDS
+    mass_block_mod.VALID_MASS_PRIOR_KINDS = old + ("uniform_detector_frame_v2",)
+    try:
+        GWCatalog(store).export(str(out), format="gwcat2",
+                                spin_basis="component", nsamp=32, seed=0,
+                                cosmology=(67.74, 0.3089))
+    finally:
+        mass_block_mod.VALID_MASS_PRIOR_KINDS = old
+    _cols, attrs = _read(out)
+    assert bool(attrs["mass_prior_verified"]) is True
+
+
+def test_the_export_publishes_q_as_the_density_coordinate(tmp_path):
+    """``p_pe`` carries ``m1det`` -- exactly ``|d(m1det,m2det)/d(m1det,q)|`` --
+    so it is a density in ``(m1det, q)``.  The file used to publish
+    ``(m1det, m2det)`` as its fit columns, which is a different measure.
+    """
+    events = [{"name": "GWq_000001", "provide": _FULL_SPIN}]
+    store, raw = _build_spin_store(tmp_path, events, n_per_event=150,
+                                   name="qcol_store.h5")
+    out = tmp_path / "qcol.h5"
+    GWCatalog(store).export(str(out), format="gwcat2", spin_basis="component",
+                            nsamp=40, seed=1, cosmology=(67.74, 0.3089))
+    cols, attrs = _read(out)
+
+    assert "q" in cols
+    np.testing.assert_allclose(cols["q"], cols["m2det"] / cols["m1det"],
+                               rtol=0, atol=0)
+    # m2det is DERIVED from the published coordinates, and says so.
+    np.testing.assert_allclose(cols["q"] * cols["m1det"], cols["m2det"],
+                               rtol=1e-12)
+    assert np.all((cols["q"] > 0) & (cols["q"] <= 1.0))
+    coord = attrs["mass_density_coordinates"]
+    assert (coord.decode() if isinstance(coord, bytes) else coord) == "m1det,q"
+
+    idx = _replicate_idx(raw["GWq_000001"]["a_1"].size, 40, 1)
+    np.testing.assert_allclose(
+        cols["q"], (raw["GWq_000001"]["mass_2"][idx]
+                    / raw["GWq_000001"]["mass_1"][idx]), rtol=0, atol=0)
+
+
+def test_p_pe_is_bit_identical_to_the_hand_written_jacobian(tmp_path):
+    """Composing the block must not perturb a single float: the chieff export is
+    contractually byte-identical to the frozen v1 exporter, and
+    ``exp(ln_prior_pe)`` differs from ``m1det`` for most samples -- which is why
+    the block declares the factor in linear space as well as in the log."""
+    events = [{"name": "GWq_000002", "provide": _FULL_SPIN}]
+    store, raw = _build_spin_store(tmp_path, events, n_per_event=200,
+                                   name="qbit_store.h5")
+    out = tmp_path / "qbit.h5"
+    GWCatalog(store).export(str(out), format="gwcat2", spin_basis="nospin",
+                            nsamp=64, seed=2, cosmology=(67.74, 0.3089))
+    cols, _attrs = _read(out)
+    idx = _replicate_idx(raw["GWq_000002"]["a_1"].size, 64, 2)
+    m1 = raw["GWq_000002"]["mass_1"][idx]
+    np.testing.assert_array_equal(cols["p_pe"], m1 * _P_DL_CONST)
+
+
+# ==========================================================================
+# GW-31: the chieff basis uses the EVENT's own ceiling, and support() gates it
+# ==========================================================================
+def test_chieff_ppe_uses_each_events_own_prior_ceiling(tmp_path):
+    """The chi_eff prior removed from p_pe must be the prior that sampled it.
+
+    The chieff path used to evaluate one caller-supplied ``amax`` for every
+    event, so an analysis run under ``a ~ U(0, 0.5)`` had a 0.99 prior divided
+    out of it -- and the chi_eff density depends on the ceiling in a
+    chi_eff-DEPENDENT way, so the error survives every normalisation.
+    """
+    from gwcat.spin import chi_eff_prior_logprob
+
+    events = [{"name": "GWa1_000001", "amax1": 0.99, "amax2": 0.99},
+              {"name": "GWa1_000002", "amax1": 0.50, "amax2": 0.50}]
+    store, _ = _build_spin_store(tmp_path, events, name="amax_store.h5")
+    cat = GWCatalog(store)
+    auto = tmp_path / "chieff_auto.h5"
+    cat.export(str(auto), format="gwcat2", spin_basis="chieff", nsamp=48,
+               seed=0, cosmology=(67.74, 0.3089))
+    cols, attrs = _read(auto)
+
+    nsamp = int(attrs["nsamp"])
+    a1 = np.asarray(attrs["chi_eff_amax_1_per_event"], float)
+    a2 = np.asarray(attrs["chi_eff_amax_2_per_event"], float)
+    np.testing.assert_allclose(a1, [0.99, 0.50], rtol=0, atol=0)
+    np.testing.assert_allclose(a2, [0.99, 0.50], rtol=0, atol=0)
+    mode = attrs["chi_eff_amax_mode"]
+    assert (mode.decode() if isinstance(mode, bytes) else mode) == "per_event"
+    srcs = [s.decode() if isinstance(s, bytes) else s
+            for s in attrs["chi_eff_amax_source_per_event"]]
+    assert srcs == ["analytic", "analytic"]
+
+    for i in range(2):
+        sl = slice(i * nsamp, (i + 1) * nsamp)
+        expected = cols["m1det"][sl] * _P_DL_CONST * np.exp(
+            chi_eff_prior_logprob(cols["chieff"][sl], cols["m1src"][sl],
+                                  cols["m2src"][sl], amax=a1[i], amax_2=a2[i]))
+        np.testing.assert_allclose(cols["p_pe"][sl], expected, rtol=1e-12)
+
+    # Forcing one ceiling (the old, and still available, behaviour) leaves the
+    # 0.99 event alone and CHANGES the one whose prior is not 0.99.
+    forced = tmp_path / "chieff_forced.h5"
+    cat.export(str(forced), format="gwcat2", spin_basis="chieff", nsamp=48,
+               seed=0, cosmology=(67.74, 0.3089), amax=0.99)
+    fcols, fattrs = _read(forced)
+    np.testing.assert_array_equal(fcols["p_pe"][:nsamp], cols["p_pe"][:nsamp])
+    assert not np.allclose(fcols["p_pe"][nsamp:], cols["p_pe"][nsamp:],
+                           rtol=1e-6)
+    fmode = fattrs["chi_eff_amax_mode"]
+    assert (fmode.decode() if isinstance(fmode, bytes) else fmode) == "fixed"
+    assert float(fattrs["chi_eff_amax"]) == 0.99
+
+
+def test_chieff_support_is_the_predicate_not_finiteness(tmp_path):
+    """A sample just above the ceiling is EXCLUDED, not given a 2.7e-12 density.
+
+    ``ChiEffPrior.logprob`` returns a finite ~1e-12 there (the grid clamp), so
+    the old ``in_support = isfinite(logp)`` admitted it -- with an inverse weight
+    ~1e12 times too large in the very denominator the export exists to provide.
+    """
+    from gwcat.export.pe_builder import OutOfSupportError
+
+    events = [{"name": "GWa2_000001", "amax1": 0.99, "amax2": 0.99}]
+    store, _ = _build_spin_store(tmp_path, events, n_per_event=64,
+                                 name="oos_store.h5")
+    with h5py.File(store, "r+") as f:
+        ce = f["samples/chi_eff"][:]
+        ce[:] = 0.995                     # above amax = 0.99, below 1
+        f["samples/chi_eff"][...] = ce
+
+    cat = GWCatalog(store)
+    with pytest.raises(OutOfSupportError) as exc:
+        cat.export(str(tmp_path / "oos.h5"), format="gwcat2",
+                   spin_basis="chieff", nsamp=32, seed=0,
+                   cosmology=(67.74, 0.3089))
+    assert "outside the spin prior's support" in str(exc.value)
+
+    # With the gate deliberately opened, the density is EXACTLY zero and the
+    # count is on the file -- not a small number nobody can see.
+    out = tmp_path / "oos_allowed.h5"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        cat.export(str(out), format="gwcat2", spin_basis="chieff", nsamp=32,
+                   seed=0, cosmology=(67.74, 0.3089),
+                   allow_out_of_support=True, allow_zero_p_pe=True)
+    cols, attrs = _read(out)
+    assert np.all(cols["p_pe"] == 0.0)
+    assert np.all(np.asarray(cols["in_support"], dtype=bool) == False)  # noqa: E712
+    assert int(attrs["n_samples_out_of_support"]) == 32
+
+
+# ==========================================================================
+# GW-32 (#8): the draw happens BEFORE the read
+# ==========================================================================
+def test_pe_export_reads_only_the_rows_it_emits(tmp_path, monkeypatch):
+    """The builder must not read a posterior slice it is about to throw away.
+
+    It used to fetch every selected slice with ``get(..., per_event=True)`` and
+    index ``nsamp`` rows out of it afterwards -- 6.88M rows read to emit 1.16M
+    on the shipped store, 1.20 GiB peak.  Pin the order: no whole-selection
+    fetch, and the rows the per-event reader hands back are exactly the rows
+    that reach the file.
+    """
+    from gwcat.catalog import GWCatalog as _GWCatalog, _SampleReader
+
+    events = [{"name": "GWz_00000%d" % i, "provide": _FULL_SPIN, "n": n}
+              for i, n in enumerate((400, 250, 900), start=1)]
+    store, _raw = _build_spin_store(tmp_path, events, name="rowcount.h5")
+    cat = GWCatalog(store)
+    nsamp = 32
+
+    rows_read = []
+    orig_read = _SampleReader.read
+
+    def spy_read(self, e, params, rows=None, **kw):
+        out = orig_read(self, e, params, rows=rows, **kw)
+        rows_read.append(sum(np.size(v) for v in out.values()))
+        return out
+
+    got = []
+    orig_get = _GWCatalog.get
+
+    def spy_get(self, params, **kw):
+        got.append(tuple(params))
+        return orig_get(self, params, **kw)
+
+    monkeypatch.setattr(_SampleReader, "read", spy_read)
+    monkeypatch.setattr(_GWCatalog, "get", spy_get)
+
+    out = tmp_path / "rowcount.h5.out"
+    cat.export(str(out), format="gwcat2", spin_basis="component",
+               nsamp=nsamp, seed=0, cosmology=(67.74, 0.3089))
+
+    with h5py.File(out, "r") as f:
+        emitted = f["m1det"].size
+
+    # The columns the component basis reads: its required set plus the extra
+    # spin columns this store actually carries.
+    from gwcat.params import get_space
+    from gwcat.export.pe_builder import space_ordered_required
+    space = get_space("component")
+    ncols_read = len(set(space_ordered_required(space, "component"))
+                     | {p for p in space.store_params_fetched
+                        if p in cat.params})
+
+    assert emitted == nsamp * len(events)
+    # every read is a drawn-row read, and they sum to the emitted rows x columns
+    assert len(rows_read) == len(events)
+    assert sum(rows_read) == nsamp * len(events) * ncols_read
+    # ... and not one whole-selection posterior fetch happened
+    assert got == [], f"export still fetched whole slices: {got}"
+
+
+def test_pe_export_z_max_reads_dL_once_then_only_the_drawn_rows(tmp_path,
+                                                               monkeypatch):
+    """The z_max cut is the ONE thing that needs values before the draw.
+
+    It gets a single full ``luminosity_distance`` column per event; everything
+    else is still read at the drawn rows only.
+    """
+    from gwcat.catalog import _SampleReader
+
+    events = [{"name": "GWy_000001", "provide": _FULL_SPIN, "n": 500}]
+    store, _raw = _build_spin_store(tmp_path, events, name="zmaxrows.h5")
+    cat = GWCatalog(store)
+
+    calls = []
+    orig_read = _SampleReader.read
+
+    def spy_read(self, e, params, rows=None, **kw):
+        calls.append((params, None if rows is None else len(rows)))
+        return orig_read(self, e, params, rows=rows, **kw)
+
+    monkeypatch.setattr(_SampleReader, "read", spy_read)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        cat.export(str(tmp_path / "zmax.h5"), format="gwcat2",
+                   spin_basis="chieff", nsamp=16, seed=0, z_max=5.0,
+                   cosmology=(67.74, 0.3089))
+
+    assert calls[0] == ("luminosity_distance", None)
+    assert all(n == 16 for _params, n in calls[1:])
+
+
+def test_pe_export_emits_the_rows_the_rng_drew_from_the_full_slice(tmp_path):
+    """Downsampling before the read may not move a single sample value.
+
+    Reproduce the draw independently -- ``default_rng(seed).choice(n, nsamp)``
+    per event over the WHOLE stored slice, exactly as the pre-GW-32 read-then-
+    index builder did -- and require the exported columns to be those rows.
+    """
+    events = [{"name": "GWx_00000%d" % i, "provide": _FULL_SPIN, "n": n}
+              for i, n in enumerate((120, 300), start=1)]
+    store, raw = _build_spin_store(tmp_path, events, name="drawparity.h5")
+    cat = GWCatalog(store)
+    nsamp, seed = 24, 5
+
+    out = tmp_path / "drawparity.out.h5"
+    cat.export(str(out), format="gwcat2", spin_basis="chieff", nsamp=nsamp,
+               seed=seed, cosmology=(67.74, 0.3089))
+
+    rng = np.random.default_rng(seed)
+    want = {"m1det": [], "m2det": [], "dL": [], "ra": [], "dec": [],
+            "chieff": []}
+    src = {"m1det": "mass_1", "m2det": "mass_2", "dL": "luminosity_distance",
+           "ra": "ra", "dec": "dec", "chieff": "chi_eff"}
+    for ev in events:
+        n = int(ev["n"])
+        idx = rng.choice(n, size=nsamp, replace=False)
+        for col, param in src.items():
+            want[col].append(raw[ev["name"]][param][idx])
+
+    with h5py.File(out, "r") as f:
+        for col in want:
+            np.testing.assert_array_equal(
+                f[col][:], np.concatenate(want[col]),
+                err_msg=f"{col} is not the rows the rng drew")

@@ -108,6 +108,60 @@ def test_the_detection_cut_is_in_the_contract():
     assert contract_diff(a, b) == [("detection_threshold", 1.0, 2.0)]
 
 
+def test_every_effective_event_cut_is_in_the_contract():
+    """The class filter used to be the ONLY event cut in the contract, so a PE
+    file cut on p_astro, on a name whitelist, on median masses or on SNR could
+    state a matching ``source_class`` and pass the pairing check (GW-33)."""
+    for field in ("pastro_min", "snr_min", "sky_area_max", "compact_type",
+                  "m1_src_range", "m2_src_range", "allowed_names_digest",
+                  "event_list_digest", "selection_spec_digest"):
+        assert field in CONTRACT_FIELDS, field
+        # Recorded and diffed, not hashed: an injection campaign has no event
+        # list to digest and no p_astro to threshold, so an equality hash over
+        # these could never match on a correct pair.
+        assert field not in PAIRING_FIELDS, field
+    a = build_contract(pastro_min=None)
+    b = build_contract(pastro_min=0.9)
+    assert contract_diff(a, b) == [("pastro_min", None, 0.9)]
+
+
+def test_the_contract_reads_the_effective_selection_off_a_product():
+    """It reads the builders' ``selection_spec`` -- the EFFECTIVE cuts -- rather
+    than re-deriving them from the export call, which is how a filtered file
+    came to describe itself as unfiltered."""
+    from gwcat.catalog import SelectionSpec
+    from gwcat.export.contract import selection_contract_fields
+
+    spec = SelectionSpec().refine(source_class="bbh", pastro_min=0.9,
+                                  m1_src_range=(5.0, 100.0))
+    attrs = dict(spec.to_attrs())
+    attrs["event_list_digest"] = "abc123"
+    fields = selection_contract_fields(attrs)
+    assert fields["pastro_min"] == 0.9
+    assert fields["m1_src_range"] == [5.0, 100.0]
+    assert fields["event_list_digest"] == "abc123"
+    assert fields["selection_spec_digest"] == spec.digest()
+    # A product that states no spec (the selection side, or a pre-GW-33 file)
+    # says "not stated" rather than "no cuts".
+    assert all(v is None for v in selection_contract_fields({}).values())
+    # ...and the contract accepts every one of them by name.
+    build_contract(**selection_contract_fields(attrs))
+
+
+def test_event_list_digest_identifies_which_events_not_their_order():
+    from gwcat.export.contract import event_list_digest
+
+    names = ["GW150914", "GW170817", "GW190521"]
+    assert event_list_digest(names) == event_list_digest(names[::-1])
+    assert event_list_digest(names) == event_list_digest(names + names)
+    assert event_list_digest(names) != event_list_digest(names[:2])
+    assert event_list_digest([b"GW150914"]) == event_list_digest(["GW150914"])
+    # "no list recorded" is not the digest of the empty list
+    assert event_list_digest(None) == ""
+    assert event_list_digest([]) != ""
+    assert len(event_list_digest(names)) == 16
+
+
 def test_amax_is_deliberately_not_in_the_contract():
     """The PE and selection amax legitimately DIFFER -- the PE side removes the
     posterior's own spin prior (~0.99), the selection side swaps the injected
@@ -175,6 +229,41 @@ def test_2_1_carries_the_declared_contract(tmp_path):
 
 
 @needs_store
+def test_2_1_declares_the_coordinates_its_density_is_actually_in(tmp_path):
+    """``p_pe`` carries ``m1det``, which is ``|d(m1det,m2det)/d(m1det,q)|`` --
+    the Jacobian for ``(m1det, q)``.  The contract nevertheless published
+    ``(m1det, m2det)`` as its fit columns, so a generic consumer reading the
+    contract off the file could apply the wrong measure and nothing in the file
+    would contradict it.
+    """
+    a = _export(tmp_path, "gwcat2.1", "component", "coord.h5")
+    fit = [x.decode() if isinstance(x, bytes) else x for x in a["fit_columns"]]
+    adv = [x.decode() if isinstance(x, bytes) else x
+           for x in a["advisory_columns"]]
+    assert "q" in fit and "m2det" not in fit
+    assert "m2det" in adv
+    assert a["mass_density_coordinates"] == "m1det,q"
+    contract = json.loads(a["contract"])
+    assert contract["fit_columns"] == fit
+    assert contract["advisory_columns"] == adv
+
+
+@needs_store
+def test_2_1_states_the_mass_prior_it_was_given_not_a_constant(tmp_path):
+    """The contract's ``mass_prior_kind`` is read off the file's basis, so it is
+    only worth comparing PE-to-PE if the basis is what was ingested.  Every
+    export used to stamp ``"uniform_detector_frame"`` regardless -- including
+    the 9 shipped rows whose analytic prior was never parsed."""
+    a = _export(tmp_path, "gwcat2.1", "component", "massprior21.h5")
+    contract = json.loads(a["contract"])
+    assert contract["mass_prior_kind"] == a["mass_prior_basis"]
+    # this three-event slice IS fully parsed, so the verified claim survives
+    assert a["mass_prior_basis"] == "uniform_detector_frame"
+    assert bool(a["mass_prior_verified"]) is True
+    assert int(a["n_events_mass_prior_unverified"]) == 0
+
+
+@needs_store
 def test_a_projection_file_says_so_on_its_face(tmp_path):
     a = _export(tmp_path, "gwcat2.1", "chieff", "p.h5")
     assert a["spin_basis_kind"] == "projection"
@@ -195,6 +284,33 @@ def test_the_same_space_reproduces_the_same_hash(tmp_path):
     a = _export(tmp_path, "gwcat2.1", "component", "s1.h5")
     b = _export(tmp_path, "gwcat2.1", "component", "s2.h5")
     assert a["contract_hash"] == b["contract_hash"]
+
+
+@needs_store
+def test_2_1_contract_states_the_selection_of_the_view_it_came_from(tmp_path):
+    """The production reproduction (GW-33): exporting ``cat.select("bbh")``
+    retained all 273 BBH rows while the file recorded no class filter, no cut
+    estimator and no event list."""
+    from gwcat.catalog import GWCatalog
+
+    cat = GWCatalog(STORE)
+    bbh = cat.select(source_class="bbh")
+    out = tmp_path / "bbh_view.h5"
+    with pytest.warns(UserWarning, match="POSTERIOR MEDIAN"):
+        bbh.export(str(out), format="gwcat2.1", spin_basis="component",
+                   nsamp=16, seed=0, cosmology=(67.74, 0.3089))
+    with h5py.File(out, "r") as f:
+        attrs = {k: (v.decode() if isinstance(v, bytes) else v)
+                 for k, v in f.attrs.items()}
+    assert int(attrs["nobs"]) == bbh.n_events
+    contract = json.loads(attrs["contract"])
+    assert contract["source_class"] == "BBH"
+    assert contract["event_list_digest"] == attrs["event_list_digest"]
+    assert contract["selection_spec_digest"] == attrs["selection_spec_digest"]
+    # and the class filter reaches the HASH, so this file no longer pairs
+    # silently with an unfiltered selection function.
+    unfiltered = _export(tmp_path, "gwcat2.1", "component", "unfiltered.h5")
+    assert attrs["contract_hash"] != unfiltered["contract_hash"]
 
 
 def test_both_2_1_writers_are_registered():

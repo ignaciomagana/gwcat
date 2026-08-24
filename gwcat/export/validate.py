@@ -16,6 +16,10 @@ It validates ``format_version="gwcat-pe-2.0"`` PE exports (built by
 ``format_version="gwcat-selection-2.0"`` selection export (built by
 :func:`gwcat.export.selection_builder.build_selection_product`), across the three
 spin bases ``chieff`` / ``component`` / ``chieff_chip``.
+
+:func:`validate_export_any` is the ONE public format dispatcher over both
+generations -- it is what ``gwcat.validate_export`` and ``gwcat validate``
+call, so a v2 file can never be handed to the v1 contract (or the reverse).
 """
 from __future__ import annotations
 
@@ -36,6 +40,14 @@ from .selection_builder import SUPPORTED_SPIN_BASES as _SEL_BASES
 #: the 2.1-only pairing-hash comparison is keyed off the attr, not the version.
 _PE_FORMATS = ("gwcat-pe-2.0", "gwcat-pe-2.1")
 _SEL_FORMATS = ("gwcat-selection-2.0", "gwcat-selection-2.1")
+
+#: Format versions the frozen v1 validator (:func:`gwcat.catalog.validate_export`)
+#: owns.  Lives here, next to the v2 strings, so ONE module decides which
+#: generation validates which file: ``gwcat.cli`` used to keep its own copy of
+#: the v2 list (which went stale and silently routed 2.1 files to the v1
+#: validator) while the public ``gwcat.validate_export`` dispatched on nothing
+#: at all and handed every file to the v1 validator.
+_V1_FORMATS = ("gwcat-1.0", "gwcat-selection-1.0")
 
 
 def _validator_generation(_fail, version, kind):
@@ -107,6 +119,23 @@ def _amax_bound(*arrays, default=1.0):
     return max(vals) if vals else float(default)
 
 
+def _amax_provenance(attrs, names):
+    """The per-event / per-campaign ceilings a file records, as a flat array.
+
+    Falls back to the file-level ``chi_eff_amax`` scalar for a file written
+    before the per-proposal ceilings existed, so an older pair is checked rather
+    than reported as missing provenance.  Empty when neither is present.
+    """
+    parts = [np.asarray(attrs[n], dtype=float).ravel()
+             for n in names if n in attrs]
+    if not parts:
+        scalar = attrs.get("chi_eff_amax")
+        if scalar is None:
+            return np.array([], dtype=float)
+        return np.asarray([scalar], dtype=float)
+    return np.concatenate(parts)
+
+
 def validate_export_v2(pe_path, selection_path=None, strict=False):
     """Validate a gwcat-2.0 PE export (and optionally a paired selection export).
 
@@ -154,32 +183,36 @@ def validate_export_v2(pe_path, selection_path=None, strict=False):
         refused: same threshold, different quantity, biased at the boundary
         (GW-12).
 
-    The chieff_chip amax cross-check -- why the two amax are NOT required to match
+    The projection amax cross-check -- why the two amax are NOT required to match
     -----------------------------------------------------------------------------
-    In the ``chieff_chip`` basis the PE side and the selection side each divide
-    out a joint ``(chi_eff, chi_p)`` prior, but they are dividing out *different*
-    densities and therefore legitimately use *different* ``amax`` values:
+    This applies to BOTH projection bases (``chieff`` since GW-31, ``chieff_chip``
+    all along).  The PE side and the selection side each divide out a spin prior,
+    but they are dividing out *different* densities and therefore legitimately
+    use *different* ``amax`` values:
 
-      * The **PE** side reweights ``p_pe`` by the analytic joint prior evaluated
-        at the PE prior's spin ceiling ``chi_eff_chi_p_amax_per_event`` -- the
-        ``amax`` at which the *posterior samples' own* spin prior was defined
-        (typically ~0.99).  Its job is to remove the PE spin prior that was in
-        force when the posterior was sampled.
-      * The **selection** side reweights ``pdraw`` by the joint prior evaluated
-        at each campaign's *detected injected* ceiling
-        ``injected_spin_amax_detected`` -- the ``amax`` of the isotropic spin
-        draw the injection campaign actually used (e.g. 0.998 for an O3 endo3
-        campaign).  Its job is to swap the injected draw density.
+      * The **PE** side reweights ``p_pe`` by the analytic prior evaluated at the
+        PE prior's spin ceiling (``chi_eff_amax_1/2_per_event`` for ``chieff``,
+        ``chi_eff_chi_p_amax_per_event`` for ``chieff_chip``) -- the ``amax`` at
+        which the *posterior samples' own* spin prior was defined (typically
+        ~0.99).  Its job is to remove the PE spin prior that was in force when
+        the posterior was sampled.
+      * The **selection** side reweights ``pdraw`` by the same prior evaluated at
+        each campaign's *detected injected* ceiling
+        (``chi_eff_amax_per_campaign`` / ``injected_spin_amax_detected``) -- the
+        ``amax`` of the isotropic spin draw the injection campaign actually used
+        (0.998 for the O3 endo3 campaign).  Its job is to swap the injected draw
+        density.
 
     Requiring these two ``amax`` to be equal would be WRONG: it would force the
     injection campaign's spin ceiling to match the PE prior's ceiling, which need
-    not hold.  The hierarchical likelihood is consistent by construction as long
-    as *each side uses its own correct amax*.  This check therefore verifies only
-    that each side used a finite, well-defined ceiling (PE: the per-event array
-    is finite; selection: the detected amax is finite), RECORDS both sets of
-    values (a printed NOTE), and emits a ``UserWarning`` if they differ so an
-    analyst who expected equality understands why they should not.  It never
-    fails on inequality.
+    not hold -- and the ``chieff`` branch used to FAIL on exactly that, which is
+    only survivable while both sides are wrong in the same way (GW-31).  The
+    hierarchical likelihood is consistent by construction as long as *each side
+    uses its own correct amax*.  This check therefore verifies only that each
+    side used a finite, well-defined ceiling, RECORDS both sets of values (a
+    printed NOTE), and emits a ``UserWarning`` if they differ so an analyst who
+    expected equality understands why they should not.  It never fails on
+    inequality.
 
     Parameters
     ----------
@@ -263,6 +296,8 @@ def validate_export_v2(pe_path, selection_path=None, strict=False):
     pe_amax = _amax_bound(pe_attrs.get("spin_amax_1_per_event", []),
                           pe_attrs.get("spin_amax_2_per_event", []),
                           pe_attrs.get("chi_eff_chi_p_amax_per_event", []),
+                          pe_attrs.get("chi_eff_amax_1_per_event", []),
+                          pe_attrs.get("chi_eff_amax_2_per_event", []),
                           pe_attrs.get("chi_eff_amax", []))
     _range_checks(_check, pe_cols, pe_amax, prefix="pe")
     _sky_checks(_check, pe_cols, prefix="pe")
@@ -320,6 +355,8 @@ def validate_export_v2(pe_path, selection_path=None, strict=False):
         all_finite = amax_arr.size > 0 and bool(np.all(np.isfinite(amax_arr)))
         if all_iso and all_finite:
             sel_amax = _amax_bound(amax_arr,
+                                   sel_attrs.get("chi_eff_amax_per_campaign",
+                                                 []),
                                    sel_attrs.get("chi_eff_amax", []))
         else:
             sel_amax = 1.0
@@ -344,15 +381,68 @@ def validate_export_v2(pe_path, selection_path=None, strict=False):
 
         # (b) Basis-specific spin-amax handling.
         if pe_basis == "chieff":
-            pe_a = pe_attrs.get("chi_eff_amax")
-            sel_a = sel_attrs.get("chi_eff_amax")
-            if pe_a is not None and sel_a is not None:
-                if abs(float(pe_a) - float(sel_a)) > 1e-6:
-                    _fail("xcheck_chieff_amax",
-                          f"PE chi_eff_amax={pe_a} but selection "
-                          f"chi_eff_amax={sel_a} (|Δ| > 1e-6). Both sides swap "
-                          f"the same 1-D chi_eff prior and must use one amax.")
-                results["xcheck_chieff_amax"] = True
+            # Each side's ceiling is checked against ITS OWN provenance, and the
+            # two are RECORDED rather than required to match -- see the
+            # docstring section on why equality is the wrong contract (GW-31).
+            pe_amax_arr = _amax_provenance(
+                pe_attrs, ("chi_eff_amax_1_per_event",
+                           "chi_eff_amax_2_per_event"))
+            sel_amax_arr = _amax_provenance(
+                sel_attrs, ("chi_eff_amax_per_campaign",))
+            _check("xcheck_chieff_pe_amax_finite",
+                   pe_amax_arr.size > 0 and np.all(np.isfinite(pe_amax_arr)),
+                   "PE chi_eff ceiling (chi_eff_amax_1/2_per_event, or the "
+                   "chi_eff_amax scalar on an older file) is empty or "
+                   "non-finite")
+            _check("xcheck_chieff_sel_amax_finite",
+                   sel_amax_arr.size > 0 and np.all(np.isfinite(sel_amax_arr)),
+                   "selection chi_eff ceiling (chi_eff_amax_per_campaign, or "
+                   "the chi_eff_amax scalar on an older file) is empty or "
+                   "non-finite")
+            # Each side's ceiling against ITS OWN provenance: a campaign whose
+            # ceiling says "detected" must carry the detected value, and a
+            # fabricated ("fallback") ceiling on either side is called out.
+            sel_src = [str(x) for x in np.atleast_1d(
+                sel_attrs.get("chi_eff_amax_source_per_campaign", []))]
+            det = np.asarray(sel_attrs.get("injected_spin_amax_detected", []),
+                             dtype=float).reshape(-1, 2)
+            used = np.asarray(sel_attrs.get("chi_eff_amax_per_campaign", []),
+                              dtype=float).reshape(-1, 2)
+            if sel_src and used.shape[0] == det.shape[0] == len(sel_src):
+                rows = [k for k, s in enumerate(sel_src) if s == "detected"]
+                ok = all(np.allclose(used[k], det[k], rtol=1e-9, atol=1e-12)
+                         for k in rows)
+                _check("xcheck_chieff_sel_amax_matches_detected", ok,
+                       f"a campaign records chi_eff_amax_source='detected' but "
+                       f"its chi_eff_amax_per_campaign {used.tolist()} is not "
+                       f"its injected_spin_amax_detected {det.tolist()}")
+            for side, srcs in (("PE", [str(x) for x in np.atleast_1d(
+                    pe_attrs.get("chi_eff_amax_source_per_event", []))]),
+                    ("selection", sel_src)):
+                n_fab = sum(1 for s in srcs if s == "fallback")
+                if n_fab:
+                    warnings.warn(
+                        f"chieff: {n_fab} {side} ceiling(s) were NOT resolved "
+                        f"from the proposal's own prior (source='fallback'), so "
+                        f"the chi_eff density divided out there rests on a "
+                        f"fabricated amax. It is recorded, not verified.")
+
+            pe_u = sorted({round(float(x), 6) for x in pe_amax_arr.ravel()
+                           if np.isfinite(x)})
+            sel_u = sorted({round(float(x), 6) for x in sel_amax_arr.ravel()
+                            if np.isfinite(x)})
+            print(f"  NOTE: chieff amax -- PE prior amax {pe_u} vs selection "
+                  f"injected amax {sel_u}. These are DIFFERENT quantities (the "
+                  f"PE sampling prior's ceiling vs the injected draw's) and are "
+                  f"NOT required to match.")
+            if set(pe_u) != set(sel_u):
+                warnings.warn(
+                    f"chieff: PE prior amax {pe_u} != selection injected amax "
+                    f"{sel_u}. This is expected and consistent -- each side "
+                    f"divides out its own prior at its own amax (end-O3 injects "
+                    f"a ~ U(0, 0.998) while the GWTC PE priors declare 0.99); "
+                    f"do not 'fix' it by forcing the two to match.")
+            results["xcheck_chieff_amax_recorded"] = True
 
         elif pe_basis == "component":
             _check("xcheck_component_pe_flag",
@@ -505,6 +595,93 @@ def validate_export_v2(pe_path, selection_path=None, strict=False):
     status = "ALL PASSED" if n_pass == n_total else f"{n_total - n_pass} FAILED"
     print(f"  {n_pass}/{n_total} checks: {status}")
     return results
+
+
+# ---------------------------------------------------------------------------
+# The one public format dispatcher (re-exported as ``gwcat.validate_export``)
+# ---------------------------------------------------------------------------
+def read_format_version(path):
+    """Return an export file's ``format_version`` attr (decoded), or ``None``."""
+    with h5py.File(path, "r") as f:
+        v = f.attrs.get("format_version")
+    if isinstance(v, (bytes, bytearray)):
+        v = v.decode()
+    return None if v is None else str(v)
+
+
+def export_generation(version):
+    """Map a ``format_version`` string to ``"v1"`` / ``"v2"`` / ``"unknown"``."""
+    if version in _V1_FORMATS:
+        return "v1"
+    if version in _PE_FORMATS + _SEL_FORMATS:
+        return "v2"
+    return "unknown"
+
+
+def validate_export_any(pe_path, selection_path=None, strict=False):
+    """Validate an export (and optionally its paired selection export),
+    dispatching on each file's declared ``format_version``.
+
+    This is the ONE public entry point, re-exported as
+    :func:`gwcat.validate_export` and used by ``gwcat validate``:
+
+      * ``gwcat-1.0`` / ``gwcat-selection-1.0`` -> the frozen
+        :func:`gwcat.catalog.validate_export`;
+      * ``gwcat-pe-2.x`` / ``gwcat-selection-2.x`` ->
+        :func:`validate_export_v2`;
+      * a mixed v1/v2 pair, or a format this gwcat does not know, is REFUSED
+        with ``ValueError`` rather than checked against the wrong contract.
+
+    Dispatching is the whole point.  ``gwcat.validate_export`` used to be the
+    v1 validator itself, and the v1 validator checks a required dataset only
+    when it happens to exist -- so a gwcat-2.0 file missing ``p_pe``, the
+    masses and the sky came back "ALL PASSED".  Only the CLI dispatched, so the
+    library entry point was the one that could bless an unusable file.
+
+    Parameters
+    ----------
+    pe_path : str or path-like
+        PE export to validate.
+    selection_path : str or path-like, optional
+        Paired selection export.  Must be the same generation as ``pe_path``.
+    strict : bool, default False
+        Raise on the first internal-consistency failure.  Cross-file contract
+        checks always raise on mismatch regardless of this flag.
+
+    Returns
+    -------
+    dict
+        ``{check_name: passed_bool}``, from whichever validator ran.
+    """
+    pe_version = read_format_version(pe_path)
+    pe_gen = export_generation(pe_version)
+    sel_version = sel_gen = None
+    if selection_path is not None:
+        sel_version = read_format_version(selection_path)
+        sel_gen = export_generation(sel_version)
+        if {pe_gen, sel_gen} == {"v1", "v2"}:
+            raise ValueError(
+                f"mixed export generations -- PE is {pe_gen} "
+                f"({pe_version!r}) but selection is {sel_gen} "
+                f"({sel_version!r}). Validate a v1 PE file against a v1 "
+                f"selection file (gwcat-1.0 / gwcat-selection-1.0) or a v2 PE "
+                f"file against a v2 selection file (gwcat-pe-2.0 / "
+                f"gwcat-selection-2.0); the two generations cannot be paired.")
+
+    if "unknown" in {pe_gen, sel_gen} - {None}:
+        # Unknown must stop here.  Falling through to the frozen v1 validator
+        # checks a v1 contract against a file written to some other one and
+        # reports a verdict about a format this gwcat does not know.
+        raise ValueError(
+            f"unrecognised format_version (PE={pe_version!r}, "
+            f"selection={sel_version!r}); this gwcat validates "
+            f"{_V1_FORMATS + _PE_FORMATS + _SEL_FORMATS}. Upgrade gwcat or "
+            f"check the file.")
+
+    if pe_gen == "v2":
+        return validate_export_v2(pe_path, selection_path, strict=strict)
+    from ..catalog import validate_export as _validate_export_v1
+    return _validate_export_v1(pe_path, selection_path, strict=strict)
 
 
 def _xcheck_source_class_estimator(_fail, results, pe_attrs, sel_attrs):

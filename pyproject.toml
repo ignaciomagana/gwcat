@@ -1,13 +1,21 @@
 [build-system]
-requires = ["setuptools>=64", "setuptools-scm>=8"]
+# >=77 is the real floor, not a preference: the SPDX `license` string and
+# `license-files` below are PEP 639, which older setuptools rejects outright.
+# setuptools-scm used to be required here and was never configured -- the
+# version was a hardcoded string -- so it only slowed every build down.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "gwcat"
-version = "0.1.0"
+# ONE version authority: gwcat/__init__.py's __version__ (read statically, no
+# import). It was duplicated here, so `pip show gwcat` and `gwcat.__version__`
+# could disagree -- and both are stamped into exported files as provenance.
+dynamic = ["version"]
 description = "Fast preprocessing of GWTC-2.1/3/4/5 cosmo PE files for dark-siren cosmology"
 readme = "README.md"
 license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.9"
 authors = [
     {name = "gwcat contributors"},
@@ -51,6 +59,9 @@ gwcat-fetch = "gwcat.fetch:_cli"
 [project.urls]
 Documentation = "https://github.com/ignaciomagana/gwcat"
 Repository = "https://github.com/ignaciomagana/gwcat"
+
+[tool.setuptools.dynamic]
+version = {attr = "gwcat.__version__"}
 
 [tool.setuptools.packages.find]
 include = ["gwcat*"]

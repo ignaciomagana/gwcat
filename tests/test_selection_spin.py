@@ -674,5 +674,4 @@ def test_chieff_chip_refuses_an_undetectable_amax(tmp_path):
         spin_meta = {"uniform_isotropic": False, "amax_detected": (None, None)}
 
     with pytest.raises(SpinBasisError, match="undetectable"):
-        _campaign_chieff_chip_lnfactor(_FakeSet(), slice(None), 0.99,
-                                       strict=False)
+        _campaign_chieff_chip_lnfactor(_FakeSet(), slice(None), strict=False)

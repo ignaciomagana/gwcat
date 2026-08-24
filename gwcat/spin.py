@@ -208,11 +208,14 @@ class ChiEffPrior:
         is *positive at ~1e-12* for many q rows, so ``logprob`` there returns
         ~``-25``, not ``-inf`` -- "-inf outside the support" holds only where
         the interpolated density is exactly zero.  This is by design: callers
-        are expected to gate on :meth:`support` first (as the export builders
-        do), which is what makes out-of-support counts reportable rather than
-        discovered as infinities.  darksirens' bit-for-bit port of this class
-        pins the current behavior, so do not "fix" the clamp here without
-        coordinating a paired change there (DS-06).
+        MUST gate on :meth:`support` first, which is what makes out-of-support
+        counts reportable rather than discovered as infinities.  Use
+        :func:`chi_eff_prior_logprob_in_support`, which does exactly that, so
+        the gate cannot be forgotten -- both export builders inferred support
+        from ``isfinite(logprob)`` instead and so accepted samples the prior
+        excludes (GW-31).  darksirens' bit-for-bit port of this class pins the
+        current behavior, so do not "fix" the clamp here without coordinating a
+        paired change there (DS-06).
         """
         p = self.prob(chi_eff, m1, m2)
         with np.errstate(divide="ignore", invalid="ignore"):
@@ -253,15 +256,86 @@ class ChiEffPrior:
 # ------------------------------------------------------------------
 _CACHE = {}
 
+#: The ``amax`` value meaning "resolve the ceiling from the proposal's own
+#: provenance" -- the PE event's sampling-prior ceiling on the PE side, the
+#: campaign's DETECTED injected ceiling on the selection side (GW-31).
+AMAX_AUTO = "auto"
 
-def chi_eff_prior_logprob(chi_eff, m1_source, m2_source, amax=0.99):
+
+def parse_amax_option(amax, *, what="amax"):
+    """Normalise an ``amax`` argument to ``None`` (auto) or a float.
+
+    ``"auto"`` (the default of both v2 builders) means *resolve the ceiling from
+    each proposal's own provenance* and returns ``None``; anything numeric
+    (including a numeric string, so a CLI can pass either) forces that one
+    ceiling on every event / campaign and returns the float.
+    """
+    if amax is None:
+        return None
+    if isinstance(amax, str):
+        if amax.strip().lower() == AMAX_AUTO:
+            return None
+        try:
+            return float(amax)
+        except ValueError:
+            raise ValueError(
+                f"{what}={amax!r}: expected {AMAX_AUTO!r} (resolve each "
+                f"proposal's own ceiling) or a number (force one ceiling).")
+    return float(amax)
+
+
+def get_chi_eff_prior(amax=0.99, amax_2=None):
+    """Cached :class:`ChiEffPrior` for a ``(amax_1, amax_2)`` pair.
+
+    The per-body pair is the cache key (GW-04): a restricted secondary is a real
+    configuration, and it must not collide with the symmetric prior of the same
+    primary ceiling.
+    """
+    key = (float(amax), None if amax_2 is None else float(amax_2))
+    prior = _CACHE.get(key)
+    if prior is None:
+        prior = ChiEffPrior(amax=amax, amax_2=amax_2)
+        _CACHE[key] = prior
+    return prior
+
+
+def chi_eff_prior_logprob(chi_eff, m1_source, m2_source, amax=0.99,
+                          amax_2=None):
     """log p(χ_eff | m1_source, m2_source, amax).
 
-    Builds a ChiEffPrior on first call for each amax and caches it.
+    Builds a ChiEffPrior on first call for each ``(amax, amax_2)`` and caches it.
+    NOTE this is :meth:`ChiEffPrior.logprob`, which does NOT mask the support --
+    see :func:`chi_eff_prior_logprob_in_support` for the gated version every
+    density consumer should use.
     """
-    if amax not in _CACHE:
-        _CACHE[amax] = ChiEffPrior(amax=amax)
-    return _CACHE[amax].logprob(chi_eff, m1_source, m2_source)
+    return get_chi_eff_prior(amax, amax_2).logprob(chi_eff, m1_source,
+                                                   m2_source)
+
+
+def chi_eff_prior_logprob_in_support(chi_eff, m1_source, m2_source, amax=0.99,
+                                     amax_2=None):
+    """``(logprob, in_support)`` with the prior's SUPPORT actually applied.
+
+    :meth:`ChiEffPrior.logprob` deliberately leaves the support unmasked (its
+    docstring says why, and darksirens pins that behaviour bit-for-bit), so the
+    grid clamp returns a small but FINITE density beyond ``amax``: at
+    ``amax=0.99`` a sample at ``chi_eff=0.995`` with ``m1=50, m2=25`` comes back
+    at ``2.73e-12`` even though :meth:`ChiEffPrior.support` is ``False`` there.
+
+    Treating "finite log-density" as "in support" -- which both export builders
+    did -- therefore let excluded samples through carrying a density ~1e12 times
+    too small, i.e. an inverse weight ~1e12 times too LARGE in a denominator.
+    This helper is the gate: ``support()`` first, ``-inf`` (exactly zero
+    density) outside it, and the mask returned so the caller counts what the
+    prior excluded instead of discovering it downstream.
+
+    Returns arrays (never scalars), broadcast to the shape of ``chi_eff``.
+    """
+    prior = get_chi_eff_prior(amax, amax_2)
+    sup = np.asarray(prior.support(chi_eff), dtype=bool)
+    logp = np.asarray(prior.logprob(chi_eff, m1_source, m2_source), dtype=float)
+    logp = np.where(sup, logp, -np.inf)
+    return logp, sup & np.isfinite(logp)
 
 
 # ==================================================================
@@ -700,6 +774,15 @@ class ChiEffChiPPrior:
 _CHIP_CACHE = {}
 
 
+def get_chi_eff_chi_p_prior(amax=0.99):
+    """Cached :class:`ChiEffChiPPrior` for one ``amax``."""
+    prior = _CHIP_CACHE.get(amax)
+    if prior is None:
+        prior = ChiEffChiPPrior(amax=amax)
+        _CHIP_CACHE[amax] = prior
+    return prior
+
+
 def chi_eff_chi_p_prior_logprob(chi_eff, chi_p, m1_source, m2_source,
                                 amax=0.99):
     """log p(χ_eff, χ_p | m1_source, m2_source, amax).
@@ -707,6 +790,23 @@ def chi_eff_chi_p_prior_logprob(chi_eff, chi_p, m1_source, m2_source,
     Builds a :class:`ChiEffChiPPrior` on first call for each amax and caches
     it (like :func:`chi_eff_prior_logprob`).
     """
-    if amax not in _CHIP_CACHE:
-        _CHIP_CACHE[amax] = ChiEffChiPPrior(amax=amax)
-    return _CHIP_CACHE[amax].logprob(chi_eff, chi_p, m1_source, m2_source)
+    return get_chi_eff_chi_p_prior(amax).logprob(chi_eff, chi_p, m1_source,
+                                                 m2_source)
+
+
+def chi_eff_chi_p_prior_logprob_in_support(chi_eff, chi_p, m1_source,
+                                           m2_source, amax=0.99):
+    """``(logprob, in_support)`` for the joint prior, support APPLIED.
+
+    The twin of :func:`chi_eff_prior_logprob_in_support`.  The joint density
+    already vanishes outside the box (both in-plane caps saturate, and the
+    ``s_1z`` interval is empty for ``|chi_eff| > amax``), so the mask changes no
+    number here -- but the builders must not go on inferring support from
+    finiteness, because that inference is what was wrong for the 1-D prior.
+    """
+    prior = get_chi_eff_chi_p_prior(amax)
+    sup = np.asarray(prior.support(chi_eff, chi_p), dtype=bool)
+    logp = np.asarray(prior.logprob(chi_eff, chi_p, m1_source, m2_source),
+                      dtype=float)
+    logp = np.where(sup, logp, -np.inf)
+    return logp, sup & np.isfinite(logp)

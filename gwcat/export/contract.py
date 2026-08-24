@@ -25,6 +25,18 @@ pairing to mean anything.
 * canonical ``source_class`` -- a filtered PE file paired with an unfiltered
   selection file is a silent bias.
 
+The effective event selection (GW-33)
+-------------------------------------
+The class filter was for a long time the ONLY event cut in the contract, so a PE
+file could state a matching ``source_class`` while having been cut on p_astro, on
+a name whitelist, on median source-frame masses or on SNR -- none of which the
+paired injection campaign reproduces, and none of which anything compared.  The
+contract therefore also carries every OTHER effective cut
+(:data:`SELECTION_CONTRACT_FIELDS`), plus two deterministic digests: one over the
+name whitelist that was requested and one over the event list actually written.
+They are recorded and diffed rather than hashed -- an injection campaign has no
+event list to digest, so an equality hash over them could never match.
+
 Why the rest are recorded but NOT hashed
 ----------------------------------------
 An equality hash is the wrong instrument for a field whose two sides are
@@ -54,6 +66,22 @@ from __future__ import annotations
 import hashlib
 import json
 
+#: The effective-event-selection fields (GW-33), read off a product's
+#: ``selection_spec`` provenance by :func:`selection_contract_fields`.  Every
+#: cut a view accumulated, so a filtered PE file cannot present itself as
+#: unfiltered, plus the two digests that identify WHICH events it holds.
+SELECTION_CONTRACT_FIELDS = (
+    "compact_type",
+    "pastro_min",
+    "snr_min",
+    "sky_area_max",
+    "m1_src_range",
+    "m2_src_range",
+    "allowed_names_digest",
+    "event_list_digest",
+    "selection_spec_digest",
+)
+
 #: Fields, in a fixed order, that constitute the full declared contract.
 CONTRACT_FIELDS = (
     "parameter_space",
@@ -70,7 +98,7 @@ CONTRACT_FIELDS = (
     "allow_missing_far",
     "cosmology_H0",
     "cosmology_Om0",
-)
+) + SELECTION_CONTRACT_FIELDS
 
 #: The subset the hash covers -- the declarations that must match EXACTLY across
 #: a PE/selection pair.  See the module docstring for why each of the others is
@@ -108,6 +136,78 @@ def _canonical(value):
     return str(value)
 
 
+def stable_digest(payload: str) -> str:
+    """The package's one short-digest convention, over an already-canonical string.
+
+    Shared by :func:`contract_hash`, :func:`event_list_digest` and
+    :meth:`gwcat.catalog.SelectionSpec.digest` so two digests of the same thing
+    cannot come out different because two call sites picked two hash functions.
+    """
+    return hashlib.blake2b(payload.encode(),
+                           digest_size=HASH_LEN // 2).hexdigest()
+
+
+def event_list_digest(names) -> str:
+    """A deterministic digest over a SET of event names.
+
+    Sorted and de-duplicated first, so the digest identifies *which events* a
+    file holds and not the order they happened to be written in: two exports of
+    the same event list agree, and one extra or missing event does not.  This is
+    what lets a contract state its event selection without carrying (and
+    round-tripping) the whole list.
+
+    ``None`` -- "no list recorded" -- returns ``""``, which is distinct from the
+    digest of the empty list.
+    """
+    if names is None:
+        return ""
+    uniq = sorted({(n.decode() if isinstance(n, (bytes, bytearray)) else str(n))
+                   for n in names})
+    return stable_digest(json.dumps(uniq, separators=(",", ":")))
+
+
+def selection_contract_fields(attrs) -> dict:
+    """The :data:`SELECTION_CONTRACT_FIELDS` of a product, from its attrs.
+
+    Reads the ``selection_spec`` JSON the builders write (the EFFECTIVE cuts,
+    accumulated across every ``select()`` the view went through) rather than
+    re-deriving them from the export call's arguments -- re-deriving is exactly
+    how a filtered file came to advertise itself as unfiltered.  A product that
+    states no spec (the selection/injection side, or a file written before
+    GW-33) yields all-``None``, which the diff reports as "not stated".
+    """
+    out = {k: None for k in SELECTION_CONTRACT_FIELDS}
+
+    def _text(v):
+        if v is None:
+            return None
+        if isinstance(v, (bytes, bytearray)):
+            v = v.decode()
+        s = str(v).strip()
+        return s or None
+
+    raw = _text(attrs.get("selection_spec"))
+    try:
+        spec = json.loads(raw) if raw else None
+    except ValueError:
+        spec = None
+    if not spec:
+        return out
+
+    out.update({
+        "compact_type": list(spec.get("compact_type") or ()) or None,
+        "pastro_min": spec.get("pastro_min"),
+        "snr_min": spec.get("snr_min"),
+        "sky_area_max": spec.get("sky_area_max"),
+        "m1_src_range": spec.get("m1_src_range"),
+        "m2_src_range": spec.get("m2_src_range"),
+        "allowed_names_digest": _text(spec.get("allowed_names_digest")),
+        "event_list_digest": _text(attrs.get("event_list_digest")),
+        "selection_spec_digest": _text(attrs.get("selection_spec_digest")),
+    })
+    return out
+
+
 def build_contract(**fields) -> dict:
     """Assemble a contract dict, filling absent fields with ``None``.
 
@@ -133,8 +233,7 @@ def contract_hash(contract: dict) -> str:
     """
     payload = json.dumps({k: contract.get(k) for k in PAIRING_FIELDS},
                          sort_keys=True, separators=(",", ":"))
-    return hashlib.blake2b(payload.encode(),
-                           digest_size=HASH_LEN // 2).hexdigest()
+    return stable_digest(payload)
 
 
 def contract_diff(pe_contract: dict, sel_contract: dict, fields=None) -> list:

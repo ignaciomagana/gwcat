@@ -168,6 +168,15 @@ class ParameterBlock:
     # ── behaviour (wired in GW-18/GW-19) ────────────────────────────────────
     materialize_pe: Optional[Callable] = None
     ln_prior_pe: Optional[Callable] = None
+    #: The SAME PE prior as a multiplicative factor, for a block that can supply
+    #: it exactly.  ``exp(ln_prior_pe)`` is not the factor a builder would have
+    #: multiplied in -- ``exp(log(m1)) != m1`` for 68% of float64 masses -- and
+    #: the chieff PE export is contractually byte-identical to the frozen v1
+    #: exporter, so composing through the log would break parity by an ulp per
+    #: sample.  A block declaring this is composed in linear space
+    #: (:func:`gwcat.params.compose.block_prior_factor_pe`); one that does not is
+    #: composed as ``exp(ln_prior_pe)``.  Both run the same gates.
+    prior_pe_factor: Optional[Callable] = None
     materialize_inj: Optional[Callable] = None
     ln_draw_inj: Optional[Callable] = None
 

@@ -39,14 +39,23 @@ then, on the concatenated arrays, applies the 1-D chi_eff prior swap
 For a SINGLE campaign, ``N_total == N_k`` so ``frac == 1.0`` exactly
 and ``_pdraw[keep] * 1.0`` is bit-identical to ``_pdraw[keep]``; running the
 single case through this same code path therefore reproduces the single-campaign
-legacy exporter's ``pdraw`` bit-for-bit as well.  The chi_eff swap is applied on
-the concatenated arrays in one call, in the SAME order, so the chieff-basis v2
-``pdraw`` equals the v1 ``pdraw`` array under ``assert_array_equal``.
+legacy exporter's ``pdraw`` bit-for-bit as well.  The chi_eff swap is applied
+per campaign and concatenated in the SAME order, which for one shared ceiling is
+elementwise identical to the single post-concat call -- so with an explicit
+numeric ``amax=`` the chieff-basis v2 ``pdraw`` still equals the v1 ``pdraw``
+array under ``assert_array_equal``.
 
 Spin-basis-specific step (the only place the bases diverge)
 -----------------------------------------------------------
 * **chieff**  ``pdraw *= exp(chi_eff_prior_logprob(chieff, m1src, m2src,
-  amax))`` -- the legacy swap, minus the floor (GW-03).
+  amax_detected_k))`` -- the legacy swap, minus the floor (GW-03), and since
+  GW-31 at each campaign's OWN detected ceiling rather than one caller default.
+  The swap replaces the campaign's real spin-draw density with the analytic
+  chi_eff marginal, so it must be the marginal of the density that campaign
+  actually drew from: end-O3 injects ``a ~ U(0, 0.998)``, and evaluating its
+  marginal at 0.99 leaves a chi_eff-DEPENDENT error in pdraw (measured: x1.008
+  at chi_eff = 0, x0.79 at chi_eff = 0.9) that no per-event normalisation
+  cancels.
 * **component**  ``pdraw *= exp(ln_spin_component)`` with the per-injection,
   frac-independent ``ln_spin_component`` (public accessor); NO clip and NO
   chi_eff factor.  Requires ``component_spin_available`` for every campaign.
@@ -73,7 +82,8 @@ import h5py
 from ..params import BLOCKS, DEFAULT_PARAMETER_SPACE, get_space
 from ..source_class import (format_source_class_filter, CUT_ESTIMATOR_ATTR,
                             selection_cut_estimator)
-from ..spin import chi_eff_prior_logprob, chi_eff_chi_p_prior_logprob
+from ..spin import (AMAX_AUTO, chi_eff_chi_p_prior_logprob_in_support,
+                    chi_eff_prior_logprob_in_support, parse_amax_option)
 from ..selection import (SelectionSet, CombinedSelectionSet,
                          PDRAW_STATE_BY_BASIS, _selection_provenance_dict,
                          _refuse_mixed_cosmology, _cosmo_or_nan,
@@ -150,7 +160,50 @@ def _detect_keep(s, far_threshold, source_class, snr_threshold):
     return detect & sc_mask, det, sc_mask
 
 
-def _campaign_chieff_chip_lnfactor(s, keep, amax, strict):
+def _campaign_chieff_amax(s, forced_amax, amax_fallback):
+    """The ``(amax_1, amax_2)`` the chi_eff swap must use for one campaign.
+
+    ``("detected", a1, a2)`` from the campaign's own injected draw -- the only
+    ceiling the swap may honestly use, since it REPLACES that draw's spin
+    density with the analytic marginal of a ``U(0, amax)`` magnitude prior.
+    ``("caller", ...)`` when a numeric ``amax=`` was passed, and
+    ``("fallback", ...)`` for a campaign carrying no spin draw densities at all
+    (the legacy spin-less files, for which the swap is the only basis available
+    and no ceiling is knowable) -- which warns, because a fabricated ceiling in a
+    density that depends on it is exactly what GW-31 was about.
+    """
+    if forced_amax is not None:
+        return "caller", float(forced_amax), float(forced_amax)
+    detected = (s.spin_meta or {}).get("amax_detected")
+    if (detected is not None
+            and all(a is not None and np.isfinite(a) for a in detected[:2])):
+        return "detected", float(detected[0]), float(detected[1])
+    warnings.warn(
+        f"{s.path}: spin_basis='chieff' needs the ceiling of the injected spin "
+        f"magnitude prior, but this campaign's is undetectable (no per-spin "
+        f"draw densities). Falling back to amax={amax_fallback}, recorded as "
+        f"chi_eff_amax_source_per_campaign='fallback'. The chi_eff marginal "
+        f"depends on that ceiling in a chi_eff-DEPENDENT way, so if the real "
+        f"one differs the error does not cancel; use spin_basis='component' "
+        f"where the campaign carries its exact per-injection spin draw.")
+    return "fallback", float(amax_fallback), float(amax_fallback)
+
+
+def _campaign_chieff_lnfactor(s, keep, amax_1, amax_2):
+    """Per-injection ln chi_eff prior for one campaign, support APPLIED.
+
+    ``support()`` is the predicate, not ``isfinite(logprob)``: beyond ``amax``
+    the grid clamp returns a finite ~1e-12 density (GW-31), and on THIS side a
+    detected injection admitted with a spuriously tiny pdraw carries a ~1e12
+    inverse weight straight into the Monte-Carlo sum for mu.
+    """
+    lnp, sup = chi_eff_prior_logprob_in_support(
+        s._chieff[keep], s._m1src[keep], s._m2src[keep],
+        amax=amax_1, amax_2=amax_2)
+    return np.asarray(lnp, dtype=float), np.asarray(sup, dtype=bool)
+
+
+def _campaign_chieff_chip_lnfactor(s, keep, strict):
     """Per-injection ln (chi_eff, chi_p) prior for one campaign (no floor).
 
     Resolves the campaign's DETECTED amax and validates the single
@@ -189,7 +242,7 @@ def _campaign_chieff_chip_lnfactor(s, keep, amax, strict):
             f"{s.path}: injected spin_amax_1={amax_1} != spin_amax_2={amax_2}; "
             f"the joint (chi_eff, chi_p) prior assumes a single amax and uses "
             f"amax_1={amax_1} (mirroring the PE builder convention).")
-    lnp = chi_eff_chi_p_prior_logprob(
+    lnp, sup = chi_eff_chi_p_prior_logprob_in_support(
         s._chieff[keep], s._chi_p[keep], s._m1src[keep], s._m2src[keep],
         amax=amax_1)
     # No -50 floor (GW-03).  A DETECTED injection whose assumed draw density is
@@ -198,7 +251,8 @@ def _campaign_chieff_chip_lnfactor(s, keep, amax, strict):
     # prior does not cover the campaign.  The caller refuses rather than writing
     # it, because the consumer would silently exclude that injection from the
     # selection integral and bias mu.
-    return np.asarray(lnp, dtype=float), amax_1
+    return (np.asarray(lnp, dtype=float), np.asarray(sup, dtype=bool),
+            amax_1, amax_2)
 
 
 class BlockCampaignMismatch(SpinBasisError):
@@ -302,7 +356,8 @@ def _jsonable(v):
 
 def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                             far_threshold=1.0,
-                            source_class=None, amax=0.99, snr_threshold=None,
+                            source_class=None, amax=AMAX_AUTO,
+                            amax_fallback=0.99, snr_threshold=None,
                             strict=True):
     """Build a selection :class:`ExportProduct` from one or more SelectionSets.
 
@@ -321,10 +376,18 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         Optional source-class subset (see
         :meth:`gwcat.selection.SelectionSet.source_class_mask`).  Subsetting,
         not reweighting: ``ndraw`` is unchanged.
-    amax : float, default 0.99
-        chi_eff-prior spin amax for the ``"chieff"`` basis (matches the legacy
-        swap and the PE builder).  Ignored by ``"component"``; the
-        ``"chieff_chip"`` basis uses each campaign's DETECTED amax instead.
+    amax : float or ``"auto"``, default ``"auto"``
+        chi_eff-prior spin ceiling for the ``"chieff"`` basis.  ``"auto"`` uses
+        each campaign's OWN detected injected ceiling (GW-31) -- the density the
+        swap replaces is that campaign's, so the ceiling must be that campaign's
+        too.  A number forces one ceiling on every campaign (the legacy
+        behaviour, and what reproduces ``to_darksirens`` bit-for-bit).  Ignored
+        by ``"component"``; the ``"chieff_chip"`` basis always uses the detected
+        amax.
+    amax_fallback : float, default 0.99
+        Ceiling assumed for a ``"chieff"``-basis campaign whose injected spin
+        draw carries no detectable ceiling (warned about, and recorded in
+        ``chi_eff_amax_source_per_campaign``).
     snr_threshold : float, optional
         When set, detection becomes ``far-detected OR (snr > snr_threshold)``
         using the cumulative-mixture ``semianalytic_observed_phase_maximized_snr_net``
@@ -344,6 +407,8 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         raise ValueError(
             f"unknown spin_basis={spin_basis!r}; known bases are "
             f"{list(_KNOWN_SPIN_BASES)}.")
+    # `None` = each campaign's own detected ceiling; a float = one forced ceiling.
+    forced_amax = parse_amax_option(amax, what="amax")
 
     if isinstance(sets, CombinedSelectionSet):
         set_list = list(sets._sets)
@@ -386,7 +451,8 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                "m1src": "_m1src", "m2src": "_m2src", "z": "_z"}
     parts = {k: [] for k in base_cols}
     extra_parts = {k: [] for k in ("a1", "a2", "cost1", "cost2", "chip")}
-    lnfactor_parts = []          # component / chieff_chip: per-campaign ln factor
+    lnfactor_parts = []          # per-campaign ln spin factor (every basis)
+    support_parts = []           # per-campaign in-support mask (projections)
     extras_available = True      # a1/a2/cost1/cost2 present for every campaign
     chip_available = True        # chi_p present for every campaign
 
@@ -396,6 +462,9 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     far_columns_union = []
     campaign_info = []
     chieff_chip_amax = []        # per (non-empty) campaign detected amax used
+    # Per (non-empty) campaign chi_eff ceilings actually used, and how each was
+    # resolved ("detected" / "caller" / "fallback").
+    chieff_amax_pairs, chieff_amax_sources = [], []
 
     for k, s in enumerate(set_list):
         keep, det, sc_mask = _detect_keep(s, far_threshold, source_class,
@@ -434,14 +503,26 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         else:
             extra_parts["chip"].append(np.asarray(chi_p)[keep])
 
-        # Per-basis per-injection ln factor (chieff applies its swap post-concat).
+        # Per-basis per-injection ln factor.  The chieff swap is applied HERE,
+        # per campaign, because its ceiling is per campaign (GW-31); with one
+        # shared ceiling this is elementwise identical to the old single
+        # post-concat call, so the v1 parity survives.
         if spin_basis == "component":
             lnfactor_parts.append(np.asarray(s._ln_spin_component)[keep])
+            support_parts.append(np.ones(n_det_k, dtype=bool))
         elif spin_basis == "chieff_chip":
-            lnfac, amax_used = _campaign_chieff_chip_lnfactor(
-                s, keep, amax, strict)
+            lnfac, sup, amax_used, _ = _campaign_chieff_chip_lnfactor(
+                s, keep, strict)
             lnfactor_parts.append(lnfac)
+            support_parts.append(sup)
             chieff_chip_amax.append(amax_used)
+        else:  # chieff
+            src, a1, a2 = _campaign_chieff_amax(s, forced_amax, amax_fallback)
+            lnfac, sup = _campaign_chieff_lnfactor(s, keep, a1, a2)
+            lnfactor_parts.append(lnfac)
+            support_parts.append(sup)
+            chieff_amax_pairs.append((a1, a2))
+            chieff_amax_sources.append(src)
 
         n_det_total += n_det_k
         campaign_info.append(
@@ -464,25 +545,17 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     # ── Spin-basis-specific step: apply the per-injection pdraw factor ──────
     if spin_basis == "chieff":
         # ── Uniform-isotropic gate (GW-06) ─────────────────────────────────
-        # The swap below REPLACES each campaign's real spin-draw density with
-        # the analytic uniform-magnitude/isotropic chi_eff marginal.  That is
-        # only valid if the campaign actually drew its spins that way.  Until
-        # GW-06 the check existed for chieff_chip and not for chieff -- i.e. the
-        # basis that ships was the one with no gate.
+        # The swap REPLACES each campaign's real spin-draw density with the
+        # analytic uniform-magnitude/isotropic chi_eff marginal.  That is only
+        # valid if the campaign actually drew its spins that way.  Until GW-06
+        # the check existed for chieff_chip and not for chieff -- i.e. the basis
+        # that ships was the one with no gate.
         _check_chieff_swap_valid(set_list, strict=strict,
                                  violations=swap_violations)
-        # Legacy swap: one call on the concatenated arrays.  The -50 floor is
-        # gone (GW-03) -- see _campaign_chieff_chip_lnfactor for why a floored
-        # injection is worse here than on the PE side.
-        ln_factor = np.asarray(
-            chi_eff_prior_logprob(data["chieff"], data["m1src"],
-                                  data["m2src"], amax=amax), dtype=float)
-        with np.errstate(over="ignore"):
-            data["pdraw"] = data["pdraw"] * np.exp(ln_factor)
-    else:
-        ln_factor = np.concatenate(lnfactor_parts)
-        with np.errstate(over="ignore"):
-            data["pdraw"] = data["pdraw"] * np.exp(ln_factor)
+    ln_factor = np.concatenate(lnfactor_parts)
+    in_support = np.concatenate(support_parts)
+    with np.errstate(over="ignore"):
+        data["pdraw"] = data["pdraw"] * np.exp(ln_factor)
 
     # ── Out-of-support DETECTED injections are fatal (GW-03) ────────────────
     # A PE sample with zero prior density can be dropped: the posterior simply
@@ -491,7 +564,12 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     # include it.  If the ASSUMED prior gives it zero density the assumption is
     # wrong, and the consumer's `pdraw > 0` guard would quietly exclude it and
     # bias mu low.
-    n_unsupported = int(np.sum(~np.isfinite(ln_factor)))
+    # Out of support is the prior's OWN predicate, not isfinite(ln_factor): the
+    # 1-D chi_eff grid returns a finite ~1e-12 density beyond amax, so the
+    # finiteness test let excluded injections through with a pdraw ~1e12 too
+    # small -- i.e. an inverse weight ~1e12 too large in the sum for mu (GW-31).
+    unsupported = ~(in_support & np.isfinite(ln_factor))
+    n_unsupported = int(np.sum(unsupported))
     if n_unsupported:
         frac = n_unsupported / ln_factor.size
         raise SpinBasisError(
@@ -602,7 +680,18 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         attrs["spin_prior_mode"] = "include"
         attrs["chi_eff_swap_applied"] = True
         attrs["chi_eff_prior_applied_to_pdraw"] = True
-        attrs["chi_eff_amax"] = float(amax)
+        # WHICH ceiling each campaign's swap used, and where it came from.  The
+        # scalar is the envelope (the support bound of the written pdraw); it is
+        # no longer simply the caller's argument, and it is NOT required to
+        # match the PE file's -- the two divide out different priors (GW-31).
+        pairs = np.asarray(chieff_amax_pairs, dtype=float).reshape(-1, 2)
+        attrs["chi_eff_amax_per_campaign"] = pairs
+        attrs["chi_eff_amax_source_per_campaign"] = np.array(
+            chieff_amax_sources, dtype=_str)
+        attrs["chi_eff_amax_mode"] = ("fixed" if forced_amax is not None
+                                      else "per_campaign")
+        attrs["chi_eff_amax"] = (float(pairs.max()) if pairs.size
+                                 else float(amax_fallback))
         # GW-06: empty unless strict=False let a non-uniform-isotropic campaign
         # through, in which case the file says so about itself.
         attrs["spin_basis_assumption_violations"] = json.dumps(swap_violations)
@@ -627,9 +716,13 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         attrs["chi_eff_swap_applied"] = False
         attrs["chi_eff_chi_p_swap_applied"] = True
         attrs["chi_eff_chi_p_prior_applied_to_pdraw"] = True
-        attrs["chi_eff_amax"] = float(amax)
         attrs["chi_eff_chi_p_amax_detected_per_campaign"] = np.array(
             chieff_chip_amax, dtype=float)
+        # The support bound of the joint prior in force, i.e. the largest
+        # detected ceiling -- not the caller's argument, which this basis has
+        # never used for anything.
+        attrs["chi_eff_amax"] = (float(np.max(chieff_chip_amax))
+                                 if chieff_chip_amax else float(amax_fallback))
 
     if snr_threshold is not None:
         attrs["significance_snr_column"] = _SNR_COLUMN
