@@ -22,6 +22,7 @@ import numpy as np
 import h5py
 
 from .cosmology import make_cosmology, z_of_dL
+from .spin import AMAX_AUTO
 from .source_class import (normalize_source_class, resolve_filter_classes,
                            format_source_class_filter, load_event_list,
                            SOURCE_CLASSES, CUT_ESTIMATOR_ATTR,
@@ -219,8 +220,17 @@ class SelectionSpec:
 
     @property
     def source_class_filter(self) -> str:
-        """The composed class request, in the round-trippable attr spelling."""
+        """The composed class request, in the round-trippable attr spelling.
+
+        Falls back to the ``compact_type`` gates when no ``source_class=`` was
+        given (GW-37): both restrict the same posterior-median class column, so
+        a file cut by one must not describe itself as unfiltered because the
+        caller reached for the other spelling.
+        """
         if not self.source_class_requested or not self.source_class:
+            if self.compact_type:
+                return format_source_class_filter(
+                    [normalize_source_class(c) for c in self.compact_type])
             return ""
         return format_source_class_filter(list(self.source_class))
 
@@ -244,15 +254,25 @@ class SelectionSpec:
 
     @property
     def cut_estimator(self) -> str:
-        """WHICH quantity the class restriction was applied to (GW-12).
+        """WHICH quantity the class restriction was applied to (GW-12/GW-37).
 
         Every name filter counts as a whitelist, not only ``event_list=``: an
         ``allowed_names=`` selection is the same "membership in a fixed list"
         the pairing check treats as reproducible, and recording it as ``"none"``
         described a filtered file as unfiltered.
+
+        ``compact_type`` counts as a class cut for exactly the same reason
+        ``source_class`` does (GW-37): the store's ``compact_type`` column is
+        filled at ingest from ``classify_by_mass`` on the posterior MEDIAN
+        source-frame masses, so ``select(compact_type="BBH")`` IS a
+        posterior-median class cut.  Omitting it let that spelling route around
+        every guard GW-12/GW-33 built -- the file recorded
+        ``cut_estimator="none"`` and paired clean against an all-class
+        selection function.
         """
         return pe_cut_estimator(
-            self.source_class if self.source_class_requested else None,
+            (self.source_class if self.source_class_requested
+             else (self.compact_type or None)),
             self.allowed_names if self.name_filters else None)
 
     # ---- serialisation --------------------------------------------------
@@ -707,9 +727,40 @@ class GWCatalog:
         if m2_src_range is not None:
             lo, hi = m2_src_range
             m &= (self.meta["m2_src_med"] >= lo) & (self.meta["m2_src_med"] <= hi)
-        if sky_area_max is not None and "sky_area_90" in self.meta:
+        if sky_area_max is not None:
+            # No presence guard (GW-37).  It used to skip the cut when the store
+            # carried no sky_area_90 while `refine()` recorded the threshold
+            # regardless, so the file advertised a cut it never applied -- and a
+            # paired injection product built to the same criterion compared
+            # EQUAL on that contract field.
+            if "sky_area_90" not in self.meta:
+                raise ValueError(
+                    f"select(sky_area_max={sky_area_max}) needs the "
+                    f"'sky_area_90' meta column and this store has none "
+                    f"(columns: {sorted(self.meta)}). Silently skipping the cut "
+                    f"would record a filter the file does not hold; re-ingest "
+                    f"with sky areas (healpy is required to compute them), or "
+                    f"drop sky_area_max.")
             sa = self.meta["sky_area_90"]
-            m &= np.where(np.isnan(sa), False, sa <= sky_area_max)
+            in_scope = m & np.isin(np.arange(len(self.names)), self._sel)
+            nan_sa = np.isnan(sa)
+            # Same rule the sibling pastro_min cut applies (GW-14): a threshold
+            # crossed with an all-absent column is a configuration error, not a
+            # selection that legitimately keeps nothing.
+            if in_scope.any() and nan_sa[in_scope].all():
+                raise ValueError(
+                    f"select(sky_area_max={sky_area_max}) would exclude all "
+                    f"{int(in_scope.sum())} candidate event(s) because "
+                    f"'sky_area_90' is NaN for every one of them (gwcat writes "
+                    f"NaN when healpy is unavailable at ingest). Re-ingest with "
+                    f"healpy installed, or drop sky_area_max.")
+            n_nan = int(nan_sa[in_scope].sum())
+            if n_nan:
+                warnings.warn(
+                    f"sky_area_max={sky_area_max} drops {n_nan} event(s) with "
+                    f"no sky_area_90: "
+                    f"{sorted(self.names[in_scope & nan_sa].tolist())}.")
+            m &= np.where(nan_sa, False, sa <= sky_area_max)
         _whitelist = allowed_names if allowed_names is not None else names
         if _whitelist is not None:
             _whitelist_arr = np.asarray(_whitelist)
@@ -1023,7 +1074,8 @@ class GWCatalog:
     # ---- darksirens export (Jacobian lives here, and only here) ----------
     def to_darksirens(self, out_path, compact_type=None, nsamp=4096,
                       far_max=None, pastro_min=None, z_max=None,
-                      seed=0, replace="auto", cosmology=None, amax=0.99,
+                      seed=0, replace="auto", cosmology=None, amax=AMAX_AUTO,
+                      amax_fallback=0.99,
                       spin_prior_mode="include",
                       allowed_names=None,
                       allowed_names_authoritative=True,
@@ -1074,6 +1126,20 @@ class GWCatalog:
             Whether the exported p_pe contains the 1-D chi_eff prior factor.
             Default ``"include"`` (Mode A) is byte-identical to prior behavior.
             Any other value raises ``ValueError``.
+        amax : float or ``"auto"``, default ``"auto"``
+            Ceiling of the spin-magnitude prior the 1-D chi_eff prior is
+            evaluated at.  ``"auto"`` (GW-37, matching ``export(...)`` and
+            ``gwcat export pe``) reads EACH event's own ``meta/spin_amax_1`` /
+            ``spin_amax_2``; a number forces one ceiling on every event, which
+            is what the pre-GW-37 default of ``0.99`` did.  One scalar cannot
+            describe a store that mixes spin priors -- a restricted-spin
+            analysis ingests at ``amax=0.05``, where the density ratio against
+            0.99 runs 2.41 at chi_eff = 0 -- and the marginal's dependence on
+            the ceiling is chi_eff-dependent, so the error does not cancel.
+        amax_fallback : float, default 0.99
+            Ceiling used for an event whose store meta carries no spin amax
+            (NaN), warned about and recorded per event in
+            ``chi_eff_amax_source_per_event``.
         cosmology : tuple (H0, Om0) or None
             Cosmology used for the z_max cut, the dL→z inversion, and the
             stored source masses / redshift.
@@ -1265,6 +1331,69 @@ class GWCatalog:
 
         sel_rows = np.asarray(sub._sel)
         reasons_arr = getattr(sub, "_selection_reasons", None)
+
+        # ── The ingested mass-prior class, per selected event (GW-34/GW-37) ──
+        # GW-34 routed the m1det Jacobian through mass.det_pair's gate in
+        # build_pe_product only, so this writer kept multiplying it in blind and
+        # stamping mass_prior_basis="uniform_detector_frame" as a literal -- the
+        # 9 of 282 shipped rows whose prior was never parsed were exported as
+        # verified uniform priors.  Same block, same classifier, same gate here.
+        from .params.blocks.mass import (UNSTATED_MASS_PRIOR,
+                                         classify_mass_prior)
+        from .params.compose import block_prior_factor_pe
+        from .params.context import PEContext
+        from .params import get_space, DEFAULT_PARAMETER_SPACE
+        mass_block = get_space(DEFAULT_PARAMETER_SPACE).mass_block
+        raw_mass_kind = sub.meta.get("mass_prior_kind")
+
+        def _mass_kind(e):
+            """The parsed mass-prior class of selected event ``e``."""
+            if raw_mass_kind is None:
+                return UNSTATED_MASS_PRIOR
+            v = raw_mass_kind[int(sel_rows[e])]
+            v = v.decode() if isinstance(v, (bytes, bytearray)) else str(v)
+            return v or UNSTATED_MASS_PRIOR
+
+        unsupported_mass = [(str(sub.event_names[e]), _mass_kind(e))
+                            for e in range(sub.n_events)
+                            if classify_mass_prior(_mass_kind(e))
+                            == "unsupported"]
+        if unsupported_mass:
+            listed = ", ".join(f"{n}: {k!r}" for n, k in unsupported_mass[:10])
+            raise ValueError(
+                f"{len(unsupported_mass)} selected event(s) were sampled under "
+                f"a mass prior that is NOT uniform in the detector-frame "
+                f"component masses, so the exported m1det Jacobian does not "
+                f"describe them: {listed}"
+                + ("" if len(unsupported_mass) <= 10
+                   else f", ... (+{len(unsupported_mass) - 10} more)")
+                + ". Exclude them or re-ingest; see gwcat.params.blocks.mass.")
+        kept_mass_kind = []
+
+        # ── Per-event chi_eff ceilings (GW-31/GW-37) ─────────────────────────
+        # One scalar amax forced on every event is wrong the moment a store
+        # mixes spin priors (a LowSpin analysis ingests at amax=0.05), and the
+        # store has carried meta/spin_amax_1/2 since GW-04.  "auto" reads them.
+        from .spin import parse_amax_option
+        forced_amax = parse_amax_option(amax, what="amax")
+
+        def _event_amax(e):
+            """``(amax_1, amax_2, source)`` for selected event ``e``."""
+            if forced_amax is not None:
+                return float(forced_amax), float(forced_amax), "caller"
+            out, src = [], "analytic"
+            for name in ("spin_amax_1", "spin_amax_2"):
+                v = sub.meta.get(name)
+                a = (None if v is None
+                     else float(np.asarray(v, dtype=float)[int(sel_rows[e])]))
+                if a is None or not np.isfinite(a):
+                    a, src = float(amax_fallback), "fallback"
+                out.append(a)
+            return out[0], out[1], src
+
+        kept_amax1, kept_amax2, kept_amax_src = [], [], []
+        amax_fallback_events = []
+
         for e in range(sub.n_events):
             n = len(per["luminosity_distance"][e])
             if n == 0:
@@ -1313,8 +1442,19 @@ class GWCatalog:
             dL = per["luminosity_distance"][e][idx_orig]
             p_dL = per["p_dL_pe"][e][idx_orig]
 
-            # Jacobian: uniform detector-frame component-mass prior
-            p_pe = m1 * p_dL
+            # Jacobian: uniform detector-frame component-mass prior.  COMPOSED
+            # through mass.det_pair (GW-34/GW-37) rather than written out here,
+            # so the block's gate on THIS event's ingested prior class is what
+            # decides whether the m1det factor may be applied to it.  The value
+            # is identical (`prior_pe_factor` returns m1det) for every event the
+            # gate admits, so verified rows export bit-for-bit as before.
+            mass_kind_e = _mass_kind(e)
+            ctx_e = PEContext(event_name=str(sub.event_names[e]),
+                              m1det=m1, m2det=m2, dL=dL, cosmology=cosmo_e,
+                              mass_prior_kind=mass_kind_e)
+            p_pe = block_prior_factor_pe(
+                mass_block, {"m1det": m1, "m2det": m2, "q": m2 / m1},
+                ctx_e) * p_dL
 
             # Redshift and source masses under THIS event's PE cosmology
             z = z_of_dL(dL, cosmo_e)
@@ -1330,6 +1470,13 @@ class GWCatalog:
             cols["m1src"].append(m1 / (1 + z))
             cols["m2src"].append(m2 / (1 + z))
             kept.append(sub.event_names[e])
+            kept_mass_kind.append(mass_kind_e)
+            a1_e, a2_e, asrc_e = _event_amax(e)
+            kept_amax1.append(a1_e)
+            kept_amax2.append(a2_e)
+            kept_amax_src.append(asrc_e)
+            if asrc_e == "fallback":
+                amax_fallback_events.append(str(sub.event_names[e]))
             kept_H0.append(float(per_event_H0[e]))
             kept_Om0.append(float(per_event_Om0[e]))
             row = sel_rows[e]
@@ -1356,24 +1503,66 @@ class GWCatalog:
         # only the "include" branch evaluates (GW-03).
         in_support_v1 = np.ones(np.shape(data["p_pe"]), dtype=bool)
         if spin_prior_mode == "include" and data["chieff"].size > 0:
-            from .spin import chi_eff_prior_logprob
-            logp_chi = chi_eff_prior_logprob(data["chieff"], data["m1src"],
-                                             data["m2src"], amax=amax)
+            from .spin import chi_eff_prior_logprob_in_support
+            # Per EVENT, at that event's own ceiling (GW-31/GW-37).  One scalar
+            # for the whole file cannot describe a store that mixes spin priors,
+            # and the marginal depends on the ceiling in a chi_eff-dependent way.
+            logp_parts, sup_parts = [], []
+            for i in range(nobs):
+                sl = slice(i * nsamp, (i + 1) * nsamp)
+                lp, sp = chi_eff_prior_logprob_in_support(
+                    data["chieff"][sl], data["m1src"][sl], data["m2src"][sl],
+                    amax=kept_amax1[i], amax_2=kept_amax2[i])
+                logp_parts.append(np.asarray(lp, dtype=float))
+                sup_parts.append(np.asarray(sp, dtype=bool))
+            logp_chi = np.concatenate(logp_parts)
             # No -50 floor (GW-03): out of support is zero density, not 2e-22
             # in a denominator.  The v1 exporter keeps the zeros (the GW-01
             # positivity check below exempts them) and reports the count.
-            logp_chi = np.asarray(logp_chi, dtype=float)
-            n_unsupported = int(np.sum(~np.isfinite(logp_chi)))
+            # The predicate is the prior's OWN support(), not isfinite(logprob):
+            # past the ceiling the 1-D grid clamp returns a finite ~1e-12
+            # density, so the finiteness test admitted excluded samples with a
+            # p_pe ~1e12 too small -- an inverse weight ~1e12 too LARGE (GW-31).
+            in_support_v1 = np.concatenate(sup_parts) & np.isfinite(logp_chi)
+            n_unsupported = int(np.sum(~in_support_v1))
             if n_unsupported:
                 warnings.warn(
                     f"to_darksirens: {n_unsupported} of {logp_chi.size} samples "
-                    f"fall outside the chi_eff prior's support (amax={amax}); "
-                    f"their p_pe is exactly zero, which the consumer masks "
-                    f"while still counting them in n for the per-event MC "
-                    f"variance.")
+                    f"fall outside the chi_eff prior's support (per-event amax "
+                    f"in [{min(kept_amax1):g}, {max(kept_amax1):g}]); their "
+                    f"p_pe is exactly zero, which the consumer masks while "
+                    f"still counting them in n for the per-event MC variance.")
             with np.errstate(over="ignore"):
-                data["p_pe"] = data["p_pe"] * np.exp(logp_chi)
-            in_support_v1 = np.isfinite(logp_chi)
+                data["p_pe"] = data["p_pe"] * np.where(
+                    in_support_v1, np.exp(logp_chi), 0.0)
+
+        # ── Mass-prior basis, from the rows written (GW-34/GW-37) ───────────
+        mass_kinds = [str(k) for k in kept_mass_kind]
+        uniq_mass_kinds = sorted(set(mass_kinds))
+        mass_prior_basis = (uniq_mass_kinds[0] if len(uniq_mass_kinds) == 1
+                            else ("mixed" if uniq_mass_kinds
+                                  else UNSTATED_MASS_PRIOR))
+        mass_unverified = [str(n) for n, k in zip(kept, mass_kinds)
+                           if classify_mass_prior(k) != "verified"]
+        mass_prior_verified = bool(mass_kinds) and not mass_unverified
+        if mass_unverified:
+            warnings.warn(
+                f"{len(mass_unverified)} of {nobs} exported event(s) carry no "
+                f"VERIFIED uniform detector-frame mass prior (classes "
+                f"{uniq_mass_kinds}), so the m1det Jacobian is assumed for them "
+                f"rather than parsed from the release: "
+                f"{mass_unverified[:10]}"
+                + ("" if len(mass_unverified) <= 10
+                   else f", ... (+{len(mass_unverified) - 10} more)")
+                + f". The file records mass_prior_basis={mass_prior_basis!r} "
+                  f"and mass_prior_verified=False; it is NOT stamped as a "
+                  f"verified uniform prior.")
+        if amax_fallback_events:
+            warnings.warn(
+                f"{len(amax_fallback_events)} exported event(s) have no stored "
+                f"spin amax (meta/spin_amax_1/2 NaN); the chi_eff prior used "
+                f"amax_fallback={amax_fallback} for them, recorded in "
+                f"chi_eff_amax_source_per_event: {amax_fallback_events[:10]}")
 
         # ── Exported-weight support contract (GW-01) ────────────────────────
         from .schema import check_p_pe_positive
@@ -1420,7 +1609,15 @@ class GWCatalog:
             from .validation_summary import gwcat_commit, package_version as _pkg_version
             f.attrs["writer_commit"] = gwcat_commit()
             f.attrs["writer_version"] = _pkg_version()
-            f.attrs["mass_prior_basis"] = "uniform_detector_frame"
+            # From the rows the file actually holds, never as a literal
+            # (GW-34/GW-37): "uniform_detector_frame" is a claim only a file
+            # whose every row carries that parsed class may make.
+            f.attrs["mass_prior_basis"] = mass_prior_basis
+            f.attrs["mass_prior_verified"] = bool(mass_prior_verified)
+            f.attrs["mass_prior_kind_per_event"] = np.array(
+                mass_kinds, dtype=h5py.string_dtype())
+            f.attrs["mass_prior_unverified_events"] = np.array(
+                mass_unverified, dtype=h5py.string_dtype())
             # ── Spin-prior contract provenance (PR 3) ──────────────────────
             chi_eff_included = (spin_prior_mode == "include")
             f.attrs["spin_prior_mode"] = spin_prior_mode
@@ -1443,7 +1640,25 @@ class GWCatalog:
             f.attrs["cosmology_Om0_per_event"] = kept_Om0_arr
             # Legacy flag, kept for backward compat; consistent with the mode.
             f.attrs["chi_eff_in_p_pe"] = bool(chi_eff_included)
-            f.attrs["chi_eff_amax"] = float(amax)
+            # The ceilings the chi_eff prior was ACTUALLY evaluated at, per
+            # event (GW-31/GW-37).  The scalar stays for backward compatibility
+            # when every kept event agreed, and is NaN otherwise rather than
+            # letting one event's ceiling stand for the file's.
+            _a1 = np.asarray(kept_amax1, dtype=float)
+            _a2 = np.asarray(kept_amax2, dtype=float)
+            _uniform_amax = (_a1.size > 0 and np.ptp(_a1) == 0
+                             and np.ptp(_a2) == 0)
+            f.attrs["chi_eff_amax"] = (float(_a1[0]) if _uniform_amax
+                                       else float("nan"))
+            f.attrs["chi_eff_amax_1_per_event"] = _a1
+            f.attrs["chi_eff_amax_2_per_event"] = _a2
+            f.attrs["chi_eff_amax_source_per_event"] = np.array(
+                kept_amax_src, dtype=h5py.string_dtype())
+            f.attrs["chi_eff_amax_mode"] = ("fixed" if forced_amax is not None
+                                            else "per_event")
+            f.attrs["spin_amax_fallback"] = float(amax_fallback)
+            f.attrs["spin_amax_fallback_events"] = np.array(
+                amax_fallback_events, dtype=h5py.string_dtype())
             # Scalar PE cosmology: the override, or the first kept event's
             # cosmology in per-event mode (authoritative record is the
             # per-event array above when cosmology_per_event_varies=True).
@@ -1547,8 +1762,13 @@ class GWCatalog:
                 "cosmology_per_event_varies": bool(cosmology_per_event_varies),
                 "waveform_policy": str(waveform_policy),
                 "approximant": None if approximant is None else str(approximant),
+                # The SAME policy-derived value the HDF5 attr carries (GW-37),
+                # not a re-inference from name uniqueness: the two disagreed
+                # whenever a duplicate row was later dropped by z_max or by
+                # undersampling, and the sidecar exists to spare the reader
+                # from opening the file -- so it must not contradict it.
                 "homogeneous_sample_sets": bool(
-                    len(set(str(k) for k in kept)) == len(kept)),
+                    getattr(sub, "_homogeneous_sample_sets", True)),
             })
             if summary_context:
                 summary.update(summary_context)
@@ -1967,6 +2187,18 @@ def validate_export(gw_path: str, selection_path: str = None, strict: bool = Fal
             if verdict == "warn":
                 warnings.warn(msg)
             results["xcheck_source_class_estimator"] = True
+
+            # (d) The DETECTION cut (GW-37).  The v1 block checked the spin
+            # prior, the cosmology, the class set and the class estimator -- and
+            # never the one number beta is computed at.  Both files already
+            # export it (`far_max`/`snr_min` on the PE side since GW-33,
+            # `far_threshold` on the selection side since v1.0); the check was
+            # simply never written, so a PE file cut at FAR<2/yr paired clean
+            # with injections detected at FAR<1/yr.  Shares the v2
+            # implementation outright so the two cannot drift (GW-25).
+            from .export.validate import _xcheck_detection_cut
+            _xcheck_detection_cut(_fail, results, dict(fg.attrs),
+                                  dict(fs.attrs))
 
     n_pass = sum(results.values())
     n_total = len(results)
