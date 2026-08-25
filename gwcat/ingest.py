@@ -1124,18 +1124,59 @@ def _derive_spin_columns(rec):
     return derived, chi_p_def_maxdiff
 
 
-def _ks_against_prior_samples(dlp, *, kind, cosmo, dmin, dmax, alpha, impl):
-    """KS distance between prior samples ``dlp`` and one candidate density."""
-    grid = np.linspace(max(dmin, dlp.min()), min(dmax, dlp.max()), 200)
+def _ks_against_prior_samples(dlp, *, kind, cosmo, dmin, dmax, alpha, impl,
+                              return_outside=False):
+    """KS distance between prior samples ``dlp`` and one candidate density.
+
+    Both CDFs are conditioned on the SAME window (GW-37).  The model CDF was
+    renormalized over ``[max(dmin, dlp.min()), min(dmax, dlp.max())]`` while the
+    empirical CDF was left unconditional, so the statistic measured missing tail
+    mass instead of shape: 20000 correct PowerLaw(alpha=2) draws on [10, 10000]
+    score KS = 0.0087 against dmax=10000 but 0.4916 against dmax=8000 and 0.8750
+    against dmax=5000 -- a correct parse rejected by a threshold of 0.05.
+
+    A bounds mismatch is still a real defect (the module's own note says
+    exceeding the threshold means "the parse / bounds / cosmology mapping is
+    wrong", naming bounds first), so conditioning does not hide it: the fraction
+    of prior samples falling OUTSIDE the recorded bounds is returned alongside,
+    to be reported as what it is rather than disguised as a failed shape test.
+    """
+    lo = max(dmin, dlp.min())
+    hi = min(dmax, dlp.max())
+    inside = (dlp >= lo) & (dlp <= hi)
+    # How much of the DECLARED prior's mass the samples never reach.  Nonzero in
+    # BOTH directions of a bounds mismatch -- samples beyond the bounds leave
+    # `inside` short, bounds wider than the samples leave model mass uncovered
+    # -- which is what makes it a bounds diagnostic rather than half of one.
+    frac_outside = float("nan")
+    if not inside.any() or not np.isfinite(hi - lo) or hi <= lo:
+        return (float("nan"), 1.0) if return_outside else float("nan")
+
+    full = np.linspace(dmin, dmax, 2000)
+    pdf_full = dL_prior_prob(full, kind=kind, cosmology=cosmo, dmin=dmin,
+                             dmax=dmax, alpha=alpha, impl=impl)
+    cdf_full = np.concatenate(
+        [[0], np.cumsum(0.5 * (pdf_full[1:] + pdf_full[:-1]) * np.diff(full))])
+    if cdf_full[-1] > 0:
+        covered = (np.interp(hi, full, cdf_full)
+                   - np.interp(lo, full, cdf_full)) / cdf_full[-1]
+        # Samples outside the bounds count too: both are range disagreements.
+        frac_outside = float(max(0.0, 1.0 - covered)
+                             + (1.0 - inside.mean()))
+
+    grid = np.linspace(lo, hi, 200)
     pdf = dL_prior_prob(grid, kind=kind, cosmology=cosmo, dmin=dmin,
                         dmax=dmax, alpha=alpha, impl=impl)
     cdf_model = np.concatenate(
         [[0], np.cumsum(0.5 * (pdf[1:] + pdf[:-1]) * np.diff(grid))])
     if cdf_model[-1] <= 0:
-        return float("nan")
+        return (float("nan"), frac_outside) if return_outside else float("nan")
     cdf_model = cdf_model / cdf_model[-1]
-    ecdf = np.searchsorted(np.sort(dlp), grid, side="right") / dlp.size
-    return float(np.max(np.abs(cdf_model - ecdf)))
+    # Conditioned on the same window as the model, so the two are comparable.
+    dlp_in = np.sort(dlp[inside])
+    ecdf = np.searchsorted(dlp_in, grid, side="right") / dlp_in.size
+    ks = float(np.max(np.abs(cdf_model - ecdf)))
+    return (ks, frac_outside) if return_outside else ks
 
 
 def validate_prior_against_samples(priors, analyses_to_try, resolved,
@@ -1174,9 +1215,9 @@ def validate_prior_against_samples(priors, analyses_to_try, resolved,
     dmin, dmax = resolved.dmin, resolved.dmax
 
     sampling_kind = resolved.sampling_kind or resolved.kind
-    ks_sampling = _ks_against_prior_samples(
+    ks_sampling, frac_outside = _ks_against_prior_samples(
         dlp, kind=sampling_kind, cosmo=cosmo, dmin=dmin, dmax=dmax,
-        alpha=resolved.sampling_alpha, impl=impl)
+        alpha=resolved.sampling_alpha, impl=impl, return_outside=True)
     ks_effective = (
         ks_sampling if sampling_kind == resolved.kind
         else _ks_against_prior_samples(
@@ -1184,6 +1225,10 @@ def validate_prior_against_samples(priors, analyses_to_try, resolved,
             alpha=resolved.alpha, impl=impl))
     return {"ks": ks_sampling, "ks_effective": ks_effective,
             "sampling_kind": sampling_kind, "effective_kind": resolved.kind,
+            # Reported separately from the KS (GW-37) so a bounds mismatch is
+            # diagnosed as a bounds mismatch instead of surfacing as a rejected
+            # parse -- the two used to be conflated in one number.
+            "frac_prior_bounds_uncovered": frac_outside,
             "n_prior_samples": int(dlp.size), "analysis": used}
 
 
@@ -1478,6 +1523,24 @@ def build_store(paths, out_path, params=None, extra_params=None,
                         if cfg.prior_ks_fatal:
                             raise PriorMismatchError(msg)
                         warnings.warn(msg)
+                    # A bounds mismatch reported as a bounds mismatch (GW-37).
+                    # The KS is now conditioned on the overlap window on both
+                    # sides, so it no longer absorbs missing tail mass -- which
+                    # means this has to be said separately or it stops being
+                    # said at all.
+                    frac_out = v.get("frac_prior_bounds_uncovered")
+                    if (frac_out is not None and np.isfinite(frac_out)
+                            and frac_out > cfg.dL_outside_warn_frac):
+                        warnings.warn(
+                            f"{name} [{analysis}]: the file's own distance "
+                            f"PRIOR samples and the recorded prior bounds "
+                            f"[{dmin:.4g}, {dmax:.4g}] Mpc from {src} describe "
+                            f"different ranges -- {100 * frac_out:.2f}% of the "
+                            f"declared prior's mass is unaccounted for (samples "
+                            f"outside the bounds, or bounds the samples never "
+                            f"reach). The KS is computed on the overlap and so "
+                            f"does not see this; it usually means the bounds "
+                            f"came from a sibling analysis.")
             # distance prior evaluated per sample, stored mass-prior-agnostic.
             # Dispatched on the EFFECTIVE distribution class (GW-02) and
             # evaluated over the FULL sample range rather than truncated at the
@@ -2274,18 +2337,20 @@ def merge_stores(store_a, store_b, out_path, cfg: Optional[IngestConfig] = None,
     # -- out_path IS one of the inputs, which the old in-memory merge allowed
     # because it had already loaded both -- lands on a sibling temp file and is
     # renamed over the target once complete.
-    in_place = os.path.exists(out_path) and any(
-        os.path.samefile(out_path, s) for s in (store_a, store_b))
-    write_path = f"{out_path}.gwcat-merge-tmp" if in_place else out_path
+    # Staged unconditionally (GW-37), not only when out_path is an input: the
+    # non-in-place branch used to open an arbitrary pre-existing out_path with
+    # h5py.File(..., "w"), so a merge that raised part-way left the file that
+    # was already there destroyed. A previous good store is not ours to lose
+    # because the merge producing its replacement failed.
+    write_path = f"{out_path}.gwcat-merge-tmp"
     try:
         _write_store_streaming(write_path, union_params, [(A, 0), (B, a_total)],
                                offsets, names, avail, merged_meta, cfg)
     except BaseException:
-        if in_place and os.path.exists(write_path):
+        if os.path.exists(write_path):
             os.remove(write_path)
         raise
-    if in_place:
-        os.replace(write_path, out_path)
+    os.replace(write_path, out_path)
     print(f"Merged stores: {A['n_events']} + {B['n_events']} = {n_total} "
           f"events, params={union_params} → {out_path}")
     return out_path
@@ -2352,7 +2417,17 @@ def merge_store(existing_path: str, new_paths, out_path: str = None,
         if p != "p_dL_pe" and p not in candidates:
             candidates.append(p)
 
-    tmpdir = tempfile.mkdtemp()
+    # Stage BESIDE the destination, not in $TMPDIR (GW-37).  The default call is
+    # in-place -- out_path is existing_path -- and /tmp is a different device
+    # from any real store here, so `shutil.move` always fell through
+    # `os.rename`'s EXDEV to the copy fallback, which opens the LIVE store 'wb'
+    # and truncates it before writing a byte.  Any walltime kill, quota or
+    # ENOSPC inside a multi-GB copy destroyed the catalog it was merging into.
+    # A sibling temp dir makes the final step `os.replace`: atomic, same device,
+    # and the original survives every failure -- the pattern `merge_stores`
+    # already uses for its own in-place branch one screen up.
+    dest_dir = os.path.dirname(os.path.abspath(out_path)) or "."
+    tmpdir = tempfile.mkdtemp(dir=dest_dir, prefix=".gwcat-merge-")
     try:
         tmp_new = os.path.join(tmpdir, "new.h5")
         build_store(new_paths, tmp_new, params=candidates, cfg=cfg,
@@ -2362,7 +2437,7 @@ def merge_store(existing_path: str, new_paths, out_path: str = None,
         tmp_merged = os.path.join(tmpdir, "merged.h5")
         merge_stores(existing_path, tmp_new, tmp_merged, cfg=cfg,
                      on_duplicate_key=on_duplicate_key)
-        shutil.move(tmp_merged, out_path)
+        os.replace(tmp_merged, out_path)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 

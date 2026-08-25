@@ -286,6 +286,42 @@ def _checksum_for(file_entry: dict) -> Optional[str]:
     return cs[4:] if cs.startswith("md5:") else (cs or None)
 
 
+def _require_checksums(info: "ReleaseInfo") -> bool:
+    """Whether this release's manifest demands a checksum for every file.
+
+    Declared as ``validation.require_checksums`` and schema-checked at load, but
+    read by nothing until GW-37 -- a declaration nothing consults is a comment.
+    Releases registered without a manifest state nothing and default to False.
+    """
+    manifest = getattr(info, "manifest", None)
+    if manifest is None:
+        return False
+    return bool((manifest.validation or {}).get("require_checksums", False))
+
+
+def _contained_dest(dest_dir, key: str) -> str:
+    """``dest_dir/key``, refusing a remote-supplied name that escapes it.
+
+    ``key`` comes from the Zenodo API, and it was joined onto the data dir with
+    no check (GW-37): a record listing ``../../.ssh/authorized_keys`` -- or an
+    absolute path, which ``/`` discards the left operand for -- wrote wherever
+    it liked. Nothing about the fetch path authenticates the record contents, so
+    the destination has to be constrained here.
+    """
+    from pathlib import Path
+    base = Path(dest_dir).resolve()
+    target = (base / str(key)).resolve()
+    try:
+        target.relative_to(base)
+    except ValueError:
+        raise RuntimeError(
+            f"refusing to download {key!r}: the remote file name resolves to "
+            f"{target}, outside the data directory {base}. A release record "
+            f"that names a path outside its own download directory is not one "
+            f"to trust.")
+    return str(target)
+
+
 def download_file(url: str, dest: str, expected_md5: Optional[str] = None,
                   show_progress: bool = True) -> str:
     """Download a single file with progress bar and checksum verification.
@@ -309,23 +345,46 @@ def download_file(url: str, dest: str, expected_md5: Optional[str] = None,
     resp.raise_for_status()
     total = int(resp.headers.get("Content-Length", 0))
 
-    with open(dest, "wb") as f:
-        bar = tqdm(total=total, unit="B", unit_scale=True,
-                   desc=os.path.basename(dest)[:40], leave=False) \
-              if show_progress and total else None
-        for chunk in resp.iter_content(chunk_size=1 << 20):
-            f.write(chunk)
+    # Staged, then renamed (GW-37).  Writing straight to `dest` meant a dropped
+    # connection, a walltime kill, or the checksum refusal below all left a
+    # truncated file at exactly the path the toolchain consumes -- and the
+    # refusal declared the file corrupt while leaving it there.  The temp name
+    # carries the pid so two concurrent fetches into one data dir cannot write
+    # the same bytes over each other.
+    tmp = f"{dest}.{os.getpid()}.part"
+    try:
+        n_written = 0
+        with open(tmp, "wb") as f:
+            bar = tqdm(total=total, unit="B", unit_scale=True,
+                       desc=os.path.basename(dest)[:40], leave=False) \
+                  if show_progress and total else None
+            for chunk in resp.iter_content(chunk_size=1 << 20):
+                f.write(chunk)
+                n_written += len(chunk)
+                if bar:
+                    bar.update(len(chunk))
             if bar:
-                bar.update(len(chunk))
-        if bar:
-            bar.close()
+                bar.close()
 
-    if expected_md5:
-        actual = _md5(dest)
-        if actual != expected_md5:
+        # A short body is a failed download, not a small file.  Without this a
+        # 10-byte response against Content-Length 1000 was returned as success.
+        if total and n_written != total:
             raise RuntimeError(
-                f"Checksum mismatch for {dest}: expected {expected_md5}, got {actual}"
-            )
+                f"Truncated download for {dest}: the server declared "
+                f"Content-Length={total} but {n_written} byte(s) arrived. "
+                f"Retry the fetch; nothing was written to {dest}.")
+
+        if expected_md5:
+            actual = _md5(tmp)
+            if actual != expected_md5:
+                raise RuntimeError(
+                    f"Checksum mismatch for {dest}: expected {expected_md5}, "
+                    f"got {actual}. The download was discarded.")
+        os.replace(tmp, dest)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
     return dest
 
 
@@ -551,9 +610,20 @@ def fetch_catalog(
         dest_dir.mkdir(parents=True, exist_ok=True)
         for i, f in enumerate(pe_files, 1):
             fname = f["key"]
-            dest = str(dest_dir / fname)
+            dest = _contained_dest(dest_dir, fname)
             url = _download_url_for(f)
             md5 = _checksum_for(f)
+            if md5 is None and _require_checksums(info):
+                # The manifests declare `validation.require_checksums: true`,
+                # the loader schema-checks it, and nothing consulted it (GW-37)
+                # -- so a Zenodo entry that shipped no checksum silently
+                # downgraded to zero verification on a release that demands it.
+                raise RuntimeError(
+                    f"{catalog}: record {rid} lists {fname!r} with no checksum, "
+                    f"but this release's manifest declares "
+                    f"validation.require_checksums: true. An unverified file "
+                    f"cannot be distinguished from a corrupted one; refusing to "
+                    f"download it.")
             cached_ok = os.path.exists(dest) and md5 and _md5(dest) == md5
             if cached_ok:
                 print(f"  [{i}/{len(pe_files)}] {fname} (cached)")

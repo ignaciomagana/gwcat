@@ -477,3 +477,70 @@ def test_detection_xcheck_reads_the_attr_the_writer_actually_stamps():
              "significance_type": "far_or_snr"})
 
 
+# ======================================================================
+# 10. A failed merge or download cannot destroy what was already there
+# ======================================================================
+def test_merge_store_stages_beside_the_destination(tmp_path, monkeypatch):
+    """``shutil.move`` fell through EXDEV to a copy that opened the LIVE store
+    'wb', truncating it before writing a byte -- on the default, in-place,
+    README-documented call, with no backup and no try/except.  /tmp is a
+    different device from any real store here, so that path was not
+    hypothetical: it was the only path the default call ever took.
+    """
+    import gwcat.ingest as ing
+
+    store = _build_store(tmp_path)
+    before = open(store, "rb").read()
+    staged_beside = {}
+
+    def _boom(*a, **kw):
+        # Where the intermediate files live AT THE MOMENT of the merge.
+        staged_beside["dirs"] = [p.name for p in tmp_path.iterdir()
+                                 if p.is_dir()
+                                 and p.name.startswith(".gwcat-merge-")]
+        raise RuntimeError("merge blew up")
+
+    monkeypatch.setattr(ing, "merge_stores", _boom)
+    with pytest.raises(RuntimeError, match="merge blew up"):
+        ing.merge_store(store, [], event_table={})
+
+    assert open(store, "rb").read() == before, \
+        "a failed merge destroyed the store it was merging into"
+    assert staged_beside.get("dirs"), \
+        "staging still goes to $TMPDIR, a different device, so the final " \
+        "step is a truncating copy rather than an atomic os.replace"
+    assert not [p for p in tmp_path.iterdir()
+                if p.is_dir() and p.name.startswith(".gwcat-merge-")], \
+        "the staging directory leaked"
+
+
+def test_download_file_leaves_nothing_behind_on_a_checksum_mismatch(
+        tmp_path, monkeypatch):
+    """The refusal declared the file corrupt and left it at the consumed path."""
+    import gwcat.fetch as fetch
+
+    class _Resp:
+        headers = {"Content-Length": "4"}
+
+        def raise_for_status(self):
+            pass
+
+        def iter_content(self, chunk_size=0):
+            yield b"junk"
+
+    monkeypatch.setattr(fetch, "requests",
+                        type("R", (), {"get": staticmethod(
+                            lambda *a, **kw: _Resp())})(),
+                        raising=False)
+    dest = tmp_path / "data.h5"
+    import sys
+    sys.modules.setdefault("tqdm", type(sys)("tqdm"))
+    sys.modules["tqdm"].tqdm = lambda *a, **kw: None
+    sys.modules.setdefault("requests", type(sys)("requests"))
+    sys.modules["requests"].get = lambda *a, **kw: _Resp()
+
+    with pytest.raises(RuntimeError, match="Checksum mismatch"):
+        fetch.download_file("https://example.invalid/x", str(dest),
+                            expected_md5="0" * 32, show_progress=False)
+    assert not dest.exists(), "a file declared corrupt was left on disk"
+    assert not list(tmp_path.glob("*.part")), "the staging file leaked"
