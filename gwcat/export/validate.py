@@ -291,6 +291,16 @@ def validate_export_v2(pe_path, selection_path=None, strict=False):
                f"p_pe means the store's p_dL_pe was truncated at the recorded "
                f"distance-prior bounds -- re-ingest so the distance prior is "
                f"evaluated over the full sample range.")
+    else:
+        # The `else` the frozen v1 validator and the v2 SELECTION block both
+        # have, and only this one lacked (GW-37).  With nobs=0 every length
+        # check above passes trivially (expected = 0*nsamp = 0) and every array
+        # check is skipped, so an export whose cuts dropped every event
+        # validated ALL PASSED and `gwcat validate` exited 0 -- defeating a
+        # scripted exit-code gate at exactly the moment it was needed.
+        _check("pe_p_pe_nonempty", False,
+               f"p_pe is empty (nobs={nobs}). Every event was dropped by the "
+               f"export's cuts; the file has no posterior samples at all.")
 
     # Physical ranges.
     pe_amax = _amax_bound(pe_attrs.get("spin_amax_1_per_event", []),
@@ -301,6 +311,7 @@ def validate_export_v2(pe_path, selection_path=None, strict=False):
                           pe_attrs.get("chi_eff_amax", []))
     _range_checks(_check, pe_cols, pe_amax, prefix="pe")
     _sky_checks(_check, pe_cols, prefix="pe")
+    _fit_columns_present(_check, pe_attrs, pe_present, prefix="pe")
 
     # ── Selection file (internal) + cross-checks ────────────────────────────
     if selection_path is not None:
@@ -323,6 +334,34 @@ def validate_export_v2(pe_path, selection_path=None, strict=False):
         _check("sel_ndraw_gt_ndet", ndraw > n_det,
                f"ndraw={ndraw} <= n_detected={n_det}")
 
+        # Required datasets, and every column tied to n_detected (GW-37).  This
+        # block had NEITHER -- the PE half above has both, and so does the
+        # frozen v1 validator this one replaced, whose own docstring names "the
+        # v1 validator checks a required dataset only when it happens to exist"
+        # as the defect being fixed.  Without them a selection file with every
+        # dataset deleted validated ALL PASSED (the 13 guarded checks vanish
+        # rather than fail), and a RAGGED file -- pdraw at length 60 against
+        # columns truncated to 3 -- passed too, which is the dangerous one: it
+        # never raises, so a consumer reading columns independently pairs
+        # injection i's draw density with injection j's masses and distance.
+        sel_required = list(_SEL_LEGACY)
+        if sel_basis == "component":
+            sel_required += _SPIN_COLUMNS
+        elif sel_basis == "chieff_chip":
+            sel_required += ["chip"]
+        for ds in sel_required:
+            _check(f"sel_has_{ds}", ds in sel_present,
+                   f"dataset {ds!r} missing; the {sel_attrs.get('format_version')} "
+                   f"schema with spin_basis={sel_basis!r} mandates "
+                   f"{sel_required}")
+        for ds in sel_required:
+            if ds in sel_cols and ds != "pdraw":
+                _check(f"sel_{ds}_length", sel_cols[ds].shape[0] == n_det,
+                       f"{sel_cols[ds].shape[0]} != n_detected = {n_det}; the "
+                       f"columns are ragged, so a consumer reading them "
+                       f"independently pairs one injection's draw density with "
+                       f"another's parameters.")
+
         if "pdraw" in sel_cols:
             pd = sel_cols["pdraw"]
             _check("sel_pdraw_length", pd.shape[0] == n_det,
@@ -333,6 +372,13 @@ def validate_export_v2(pe_path, selection_path=None, strict=False):
                        f"min={pd.min():.3e}")
             else:
                 _check("sel_pdraw_nonempty", False, "pdraw is empty")
+
+        # Every name a 2.1 file declares in its OWN fit_columns must exist as a
+        # dataset (GW-37).  A generic check beats extending two more hardcoded
+        # lists: the selection file declared `q` and shipped no `q`, and nothing
+        # compared the declaration against the file, so 70/70 checks passed on a
+        # product whose contract described coordinates it did not contain.
+        _fit_columns_present(_check, sel_attrs, sel_present, prefix="sel")
 
         # Per-campaign injected-spin provenance attrs must be present.
         for a in ("injected_spin_format", "injected_spin_amax_detected",
@@ -766,12 +812,19 @@ def _xcheck_detection_cut(_fail, results, pe_attrs, sel_attrs):
     pe_far = _num(pe_attrs.get("far_max"))
     sel_far = _num(sel_attrs.get("far_threshold"))
     pe_snr = _num(pe_attrs.get("snr_min"))
-    sel_snr = _num(sel_attrs.get("snr_threshold"))
+    # `significance_snr_threshold` is the name the selection builder ACTUALLY
+    # writes (GW-37).  This read used a name nothing in the package ever
+    # stamps, so the SNR arm was structurally NaN: a selection file whose
+    # injection mask is `far-detected OR snr > t` -- strictly looser than the
+    # event cut -- compared equal on both legs and paired clean, biasing mu high
+    # and the inferred rate low.  The legacy spelling stays as a fallback.
+    sel_snr = _num(sel_attrs.get("significance_snr_threshold",
+                                 sel_attrs.get("snr_threshold")))
 
     mism, unstated = [], []
     for label, pe_v, sel_v, pe_name, sel_name in (
             ("FAR", pe_far, sel_far, "far_max", "far_threshold"),
-            ("SNR", pe_snr, sel_snr, "snr_min", "snr_threshold")):
+            ("SNR", pe_snr, sel_snr, "snr_min", "significance_snr_threshold")):
         if _same(pe_v, sel_v):
             continue
         where = (f"PE {pe_name}={pe_v} vs selection {sel_name}={sel_v}")
@@ -794,6 +847,29 @@ def _xcheck_detection_cut(_fail, results, pe_attrs, sel_attrs):
               f"name-whitelisted event list can satisfy the injection cut "
               f"exactly -- but the files cannot show it. Verify the "
               f"equivalence directly before quoting a rate.")
+
+    # The redshift truncation must match too (GW-37).  The PE export drops
+    # posterior samples above z_max; unless the injections are subset the same
+    # way, mu keeps its full-z content and the two sides integrate over
+    # different redshift ranges.  NaN on both sides ("no truncation") agrees.
+    pe_zmax = _num(pe_attrs.get("z_max"))
+    sel_zmax = _num(sel_attrs.get("z_max"))
+    if not _same(pe_zmax, sel_zmax):
+        msg = (f"PE z_max={pe_zmax} vs selection z_max={sel_zmax}. The PE "
+               f"export truncated its posteriors at that redshift; the "
+               f"selection product must subset its injections the same way "
+               f"(build_selection_product(z_max=...)) or mu integrates over a "
+               f"redshift range the events do not cover.")
+        if np.isnan(pe_zmax) or np.isnan(sel_zmax):
+            # One side predates the record (no z_max attr at all): unknown is
+            # not evidence of a mismatch, the same convention the cut legs use.
+            if "z_max" in pe_attrs and "z_max" in sel_attrs:
+                _fail("xcheck_detection_cut", msg)
+            else:
+                warnings.warn("redshift truncation stated on one side only -- "
+                              + msg)
+        else:
+            _fail("xcheck_detection_cut", msg)
 
     if (not np.isnan(pe_far)
             and bool(pe_attrs.get("allow_missing_far", False))):
@@ -863,6 +939,29 @@ def _xcheck_campaign_cosmology(_check, results, sel_attrs):
     results.setdefault(
         "xcheck_campaign_cosmology",
         all(results.get(k, True) for k in subs))
+
+
+def _fit_columns_present(_check, attrs, present, prefix):
+    """Every coordinate a file DECLARES must exist as a dataset in it (GW-37).
+
+    ``fit_columns`` is the contract's statement of which coordinates the
+    exported density is a density in, and a generic consumer iterates it
+    directly.  Nothing compared it against the file, so a 2.1 selection product
+    could declare ``q`` -- the mass density coordinate GW-34 made canonical --
+    and ship no such dataset while passing every check.  A declaration nothing
+    verifies is documentation, not a contract.
+    """
+    declared = attrs.get("fit_columns")
+    if declared is None:
+        return  # a 2.0 file states no fit_columns; nothing to check.
+    names = [v.decode() if isinstance(v, (bytes, bytearray)) else str(v)
+             for v in np.atleast_1d(declared)]
+    missing = [n for n in names if n not in present]
+    _check(f"{prefix}_fit_columns_present", not missing,
+           f"declares fit_columns={names} but the file has no dataset(s) "
+           f"{missing}; a consumer iterating fit_columns raises KeyError, and "
+           f"one that falls back to the present columns builds the density in "
+           f"the wrong coordinates.")
 
 
 def _sky_checks(_check, cols, prefix, sky_available=None):

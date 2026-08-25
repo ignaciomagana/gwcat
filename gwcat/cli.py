@@ -271,6 +271,12 @@ def build_parser() -> argparse.ArgumentParser:
                              "injected amax, a number forces one ceiling. "
                              "Ignored by 'component'; 'chieff_chip' always "
                              "uses the detected amax.")
+    p_xsel.add_argument("--z-max", type=float, default=None, metavar="Z",
+                        help="Subset injections to z <= Z, matching the PE "
+                             "export's --z-max. Subsetting only (ndraw is "
+                             "unchanged). Omit it against a truncated PE "
+                             "export and mu covers a redshift range the "
+                             "events do not; the validator refuses the pair.")
     p_xsel.add_argument("--snr-threshold", type=float, default=None,
                         metavar="SNR",
                         help="Optional OR-branch: detection = far-detected OR "
@@ -521,6 +527,7 @@ def _cmd_export_selection(args) -> int:
         source_class=_parse_source_class(args.source_class),
         amax=args.amax,
         snr_threshold=args.snr_threshold,
+        z_max=args.z_max,
     )
     return 0
 

@@ -138,14 +138,24 @@ def _read_snr_column(path):
     return None
 
 
-def _detect_keep(s, far_threshold, source_class, snr_threshold):
+def _detect_keep(s, far_threshold, source_class, snr_threshold, z_max=None):
     """``(keep, det, sc_mask)`` for one campaign, mirroring the legacy masks.
 
     ``keep = detect & sc_mask`` where ``detect`` is the FAR cut, OR-ed with the
-    SNR cut (``snr > snr_threshold``) when ``snr_threshold`` is not ``None``.
+    SNR cut (``snr > snr_threshold``) when ``snr_threshold`` is not ``None``,
+    and intersected with ``z <= z_max`` when a redshift truncation is in force.
+
+    ``z_max`` is the injection-side counterpart of the PE export's per-sample
+    redshift truncation (GW-37).  It had none: the PE side dropped posterior
+    samples above the cut while mu kept its full-z content, so the two sides
+    integrated over different redshift ranges.  Like the source-class filter
+    this is SUBSETTING, not reweighting -- ``ndraw`` is untouched, so the
+    Essick fractions N_k/N_total are unchanged.
     """
     det = s.detected_mask(far_threshold)
     sc_mask = s.source_class_mask(source_class)
+    if z_max is not None:
+        sc_mask = sc_mask & (np.asarray(s._z, dtype=float) <= float(z_max))
     if snr_threshold is not None:
         snr = _read_snr_column(s.path)
         if snr is None:
@@ -358,7 +368,7 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                             far_threshold=1.0,
                             source_class=None, amax=AMAX_AUTO,
                             amax_fallback=0.99, snr_threshold=None,
-                            strict=True):
+                            z_max=None, strict=True):
     """Build a selection :class:`ExportProduct` from one or more SelectionSets.
 
     Parameters
@@ -388,6 +398,13 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         Ceiling assumed for a ``"chieff"``-basis campaign whose injected spin
         draw carries no detectable ceiling (warned about, and recorded in
         ``chi_eff_amax_source_per_campaign``).
+    z_max : float, optional
+        Redshift truncation matching the PE export's per-sample ``z_max``
+        (GW-37).  Injections above it are SUBSET out (``ndraw`` untouched, so
+        the Essick fractions are unchanged), which is what makes mu integrate
+        over the same redshift range the truncated posteriors cover.  Leaving
+        it ``None`` against a truncated PE export means the two sides cover
+        different z ranges; the validator cross-checks the pair.
     snr_threshold : float, optional
         When set, detection becomes ``far-detected OR (snr > snr_threshold)``
         using the cumulative-mixture ``semianalytic_observed_phase_maximized_snr_net``
@@ -468,7 +485,7 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
 
     for k, s in enumerate(set_list):
         keep, det, sc_mask = _detect_keep(s, far_threshold, source_class,
-                                          snr_threshold)
+                                          snr_threshold, z_max=z_max)
         n_before_total += int(det.size)
         n_after_total += int(sc_mask.sum())
         for c in s._far_columns:
@@ -594,6 +611,15 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     # ── Output columns: legacy 10 + (a1,a2,cost1,cost2,chip when available) ──
     columns = {
         "m1det": data["m1det"], "m2det": data["m2det"], "dL": data["dL"],
+        # GW-34 made `q` the published mass density COORDINATE registry-wide and
+        # the PE builder emits it, but this builder never did -- so a 2.1
+        # selection file declared `q` in its own fit_columns and shipped no such
+        # dataset (GW-37).  A contract-driven consumer raised KeyError on it; one
+        # that fell back to the present columns built the injection-side density
+        # over (m1det, m2det) against a PE side in (m1det, q), reintroducing the
+        # per-injection m1det mismatch GW-34 removed.  pdraw already IS a density
+        # in (m1det, q, dL) -- only the self-description was wrong.
+        "q": data["m2det"] / data["m1det"],
         "chieff": data["chieff"], "ra": data["ra"], "dec": data["dec"],
         "m1src": data["m1src"], "m2src": data["m2src"],
         "redshift": data["z"], "pdraw": data["pdraw"],
@@ -728,6 +754,12 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         attrs["significance_snr_column"] = _SNR_COLUMN
         attrs["significance_snr_threshold"] = float(snr_threshold)
         attrs["significance_type"] = "far_or_snr"
+
+    # The redshift truncation this product was built under (GW-37).  NaN when
+    # unused, in the same spelling the PE side stamps, so the validator can
+    # compare them and a reader can see that mu covers the same z range the
+    # truncated posteriors do.
+    attrs["z_max"] = float("nan") if z_max is None else float(z_max)
 
     # ── Validation-summary feed (writer fills output_path + summary_context) ─
     from ..validation_summary import (value_counts, package_version)

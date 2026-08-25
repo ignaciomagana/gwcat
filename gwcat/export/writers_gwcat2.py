@@ -38,7 +38,7 @@ _PE_DATASETS = ["ra", "dec", "m1det", "m2det", "chieff", "dL", "p_pe",
 
 #: The legacy selection datasets, in the order the v1 exporter writes them,
 #: followed by the additive component-spin columns.
-_SELECTION_DATASETS = ["m1det", "m2det", "dL", "chieff", "ra", "dec",
+_SELECTION_DATASETS = ["m1det", "m2det", "q", "dL", "chieff", "ra", "dec",
                        "m1src", "m2src", "redshift", "pdraw",
                        "a1", "a2", "cost1", "cost2", "chip"]
 
@@ -297,7 +297,37 @@ def _contract_attrs(product, kind):
     # differ by construction.
     thr = a.get("far_max") if kind == "pe" else a.get("far_threshold")
     thr = None if thr is None or not np.isfinite(float(thr)) else float(thr)
-    stat = None if thr is None else "far"
+    # From the product's OWN attrs, not from the presence of a FAR threshold
+    # (GW-37).  When --snr-threshold is set the selection builder widens the
+    # injection mask to `far-detected OR snr > t` and records
+    # significance_type="far_or_snr", which these two lines ignored: the file
+    # then declared itself FAR-only and hash-matched a genuinely FAR-only PE
+    # file, while its injection mask was strictly looser than the event cut --
+    # mu biased high, the inferred rate biased low, and nothing to see in either
+    # file.  Two lines below this module's own comment saying exactly that.
+    snr_min = a.get("snr_min") if kind == "pe" else a.get(
+        "significance_snr_threshold")
+    snr_min = (None if snr_min is None or not np.isfinite(float(snr_min))
+               else float(snr_min))
+    stat = a.get("significance_type")
+    stat = (str(stat) if stat is not None
+            else (None if thr is None
+                  else ("far_or_snr" if snr_min is not None else "far")))
+    if stat is None and snr_min is not None:
+        stat = "snr"
+
+    _sel_fields = dict(selection_contract_fields(a))
+    # z_max is an EXPORT argument, not a select() cut, so it lives in the attrs
+    # rather than in the selection_spec JSON the helper reads (GW-37).
+    _zmax = a.get("z_max")
+    _sel_fields["z_max"] = (None if _zmax is None
+                            or not np.isfinite(float(_zmax)) else float(_zmax))
+    if kind == "selection" and snr_min is not None:
+        # `selection_contract_fields` reads snr_min out of the PE-side
+        # selection_spec, which an injection product does not have, so a mask
+        # widened by --snr-threshold left the field None and the SNR leg could
+        # not be compared at all.  State the threshold this file actually used.
+        _sel_fields["snr_min"] = snr_min
 
     contract = build_contract(
         parameter_space=space.name,
@@ -320,7 +350,7 @@ def _contract_attrs(product, kind):
         # (GW-33).  The class filter used to be the only cut in the contract, so
         # a file cut on p_astro / a name whitelist / median masses could state a
         # matching source_class and pass.
-        **selection_contract_fields(a),
+        **_sel_fields,
     )
     return {
         "parameter_space": space.name,
