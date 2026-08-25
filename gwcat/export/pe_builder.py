@@ -483,6 +483,11 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                             "chieff", "p_pe", "redshift", "m1src", "m2src"]}
     kept = []
     kept_mass_kind = []
+    #: Posterior samples each kept event lost to z_max (GW-37).  The truncation
+    #: used to appear in no attr, no summary key and no contract field, so a
+    #: truncated export and an untruncated one compared EQUAL on
+    #: selection_spec_digest, event_list_digest and contract_hash alike.
+    n_cut_by_z_max = []
     kept_H0, kept_Om0 = [], []
     kept_ss_name, kept_ss_approx, kept_ss_reason = [], [], []
     # Resampling provenance (GW-13), aligned with ``kept``.
@@ -561,10 +566,12 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             # a cut was asked for.  ``mass_1``/``mass_2`` used to be read in full
             # and subset here too; both subsets were dead -- the kept rows are
             # re-indexed from the store below -- so they are no longer read at all.
+            n_cut_e = 0
             if z_max is not None:
                 dL_e = reader.read(e, "luminosity_distance")["luminosity_distance"]
                 z_e = z_of_dL(dL_e, cosmo_e)
                 keep = z_e <= z_max
+                n_cut_e = int(np.sum(~keep))
                 if not keep.any():
                     continue
                 idx_map = np.nonzero(keep)[0]
@@ -627,6 +634,7 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             cols["m2src"].append(m2 / (1 + z))
             kept.append(sub.event_names[e])
             kept_mass_kind.append(mass_kind_e)
+            n_cut_by_z_max.append(n_cut_e)
             kept_H0.append(float(per_event_H0[e]))
             kept_Om0.append(float(per_event_Om0[e]))
             row = sel_rows[e]
@@ -796,6 +804,21 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                     cost2_list.append(cost2_e)
 
     nobs = len(kept)
+    if nobs == 0:
+        # The guard build_selection_product has had all along (GW-37).  A
+        # zero-event product is not a small product: with nobs=0 every length
+        # check is `0 == 0*nsamp`, every array check is skipped, and the file
+        # validated ALL PASSED while `gwcat export pe` exited 0 -- so a scripted
+        # export-then-validate gate reported success on an empty catalog.  The
+        # realistic trigger is mundane: a GWOSC outage leaves every event with
+        # far=NaN and the default missing-FAR policy drops all of them.
+        raise ValueError(
+            f"the export's cuts left 0 of {sub.n_events} selected event(s), so "
+            f"there is no PE product to build. Effective selection: "
+            f"{sub.selection_spec.to_json()}. Check far_max/pastro_min/z_max "
+            f"and whether the store's FARs were populated at ingest (a store "
+            f"ingested during a GWOSC outage carries far=NaN for every event, "
+            f"which the default missing-FAR policy then drops).")
     data = {k: np.concatenate(v) if v else np.array([])
             for k, v in cols.items()}
 
@@ -1072,6 +1095,15 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
               f"mass_prior_verified=False; it is NOT stamped as a verified "
               f"uniform prior.")
 
+    if z_max is not None and any(n > 0 for n in n_cut_by_z_max):
+        warnings.warn(
+            f"z_max={z_max} dropped {sum(n_cut_by_z_max)} posterior sample(s) "
+            f"across {sum(1 for n in n_cut_by_z_max if n)} of {nobs} event(s). "
+            f"The selection product must be built with the SAME z_max "
+            f"(build_selection_product(z_max=...), CLI --z-max) or mu "
+            f"integrates over a redshift range the exported posteriors do not "
+            f"cover; validate_export refuses a pair whose z_max disagrees.")
+
     # ── Provenance attrs (everything the legacy exporter records EXCEPT ──────
     # format_version, which is the writer's; plus the new spin_basis). The two
     # legacy-compat spin attrs (spin_prior_mode / chi_eff_prior_applied_to_p_pe
@@ -1082,6 +1114,16 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         "nsamp": int(nsamp),
         "nobs": int(nobs),
         "mock_data": False,
+        # ── The per-sample redshift truncation (GW-37) ──────────────────────
+        # NaN when unused, because HDF5 has no null and "no truncation" must be
+        # distinguishable from "this file predates the record".  It appeared in
+        # no attr at all, so a file truncated at z<0.12 was indistinguishable
+        # from the full posterior it came from -- same selection_spec_digest,
+        # same event_list_digest, same contract_hash.  The injection side takes
+        # the same argument now (build_selection_product(z_max=...)), and the
+        # validator cross-checks the two.
+        "z_max": float("nan") if z_max is None else float(z_max),
+        "n_samples_cut_by_z_max": np.asarray(n_cut_by_z_max, dtype=np.int64),
         # spin basis (new in v2)
         "spin_basis": spin_basis,
         # provenance
@@ -1161,6 +1203,9 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         "event_names_exported": [str(k) for k in kept],
         "nsamp_per_event": int(nsamp),
         "spin_basis": spin_basis,
+        # The redshift truncation, in the sidecar too (GW-37).
+        "z_max": None if z_max is None else float(z_max),
+        "n_samples_cut_by_z_max": int(sum(n_cut_by_z_max)),
         # The EFFECTIVE selection (GW-33), the same record the attrs carry.
         "selection_spec": spec.to_dict(),
         "selection_spec_digest": spec.digest(),

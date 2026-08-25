@@ -8,6 +8,8 @@ The batch's unifying theme is that a defect fixed on the v2 export path was
 left standing on the v1 path (GW-25's "recurring failure mode"), or that a
 declaration was written and never read.  The tests are grouped that way.
 """
+import json
+
 import h5py
 import numpy as np
 import pytest
@@ -257,5 +259,221 @@ def test_chieff_support_is_the_priors_own_predicate_not_isfinite():
                                                  amax=0.99)
     assert not sup[0]
     assert logp[0] == -np.inf
+
+
+# ======================================================================
+# 5. A zero-event export is refused, and an empty p_pe fails validation
+# ======================================================================
+def test_zero_event_pe_export_is_refused(tmp_path):
+    """It used to build, write, validate ALL PASSED and exit 0.
+
+    With nobs=0 every length check is `0 == 0*nsamp` and every array check is
+    skipped, so the one tool whose job is to catch this reported success.
+    """
+    events = [dict(e, far=float("nan")) for e in MIXED_EVENTS]
+    cat = GWCatalog(_build_store(tmp_path, events=events, name="allnan.h5"))
+    with pytest.raises(ValueError, match="left 0 of"):
+        cat.export(str(tmp_path / "empty.h5"), format="gwcat2",
+                   spin_basis="chieff", nsamp=16, seed=0, cosmology=_COSMO,
+                   far_max=1.0)
+
+
+def test_v2_validator_fails_on_an_empty_p_pe(tmp_path):
+    """The `else` the v1 validator and the v2 selection block both had."""
+    from gwcat.export.validate import validate_export_v2
+
+    cat = GWCatalog(_build_store(tmp_path))
+    pe = tmp_path / "pe.h5"
+    cat.export(str(pe), format="gwcat2", spin_basis="chieff", nsamp=16,
+               seed=0, cosmology=_COSMO, far_max=1.0, allow_missing_far=True)
+    with h5py.File(pe, "r+") as f:
+        del f["p_pe"]
+        f.create_dataset("p_pe", data=np.array([], dtype=float))
+        f.attrs["nobs"] = 0
+    results = validate_export_v2(str(pe))
+    assert results["pe_p_pe_nonempty"] is False, (
+        "an empty p_pe was not reported at all -- the check vanished rather "
+        "than failing, which is what let a zero-event export pass ALL PASSED")
+
+
+# ======================================================================
+# 7. The v2 selection validator checks presence and length
+# ======================================================================
+def _v2_pair(tmp_path):
+    events = [e for e in MIXED_EVENTS if np.isfinite(e["far"])]
+    cat = GWCatalog(_build_store(tmp_path, events=events, name="v2store.h5"))
+    pe = tmp_path / "pe.h5"
+    cat.export(str(pe), format="gwcat2", spin_basis="chieff", nsamp=16,
+               seed=0, cosmology=_COSMO, far_max=1.0)
+    inj = write_o4_full(tmp_path / "inj.hdf", n=120, amax=(0.9, 0.9), seed=9)
+    sel = tmp_path / "sel.h5"
+    SelectionSet(inj).export(str(sel), format="gwcat2", spin_basis="chieff",
+                             far_threshold=1.0)
+    return pe, sel
+
+
+def test_v2_selection_validator_fails_on_a_missing_dataset(tmp_path):
+    """A selection file with every dataset deleted used to pass 56/56.
+
+    The 13 guarded checks VANISHED rather than failing, so `failed` was {} and
+    the CLI exited 0 -- a regression against the v1 validator this replaced,
+    whose own docstring names that defect as the thing being fixed.
+    """
+    from gwcat.export.validate import validate_export_v2
+
+    _, sel = _v2_pair(tmp_path)
+    with h5py.File(sel, "r+") as f:
+        del f["pdraw"]
+        del f["ra"]
+    results = validate_export_v2(str(tmp_path / "pe.h5"), str(sel))
+    assert results["sel_has_pdraw"] is False
+    assert results["sel_has_ra"] is False
+
+
+def test_v2_selection_validator_fails_on_ragged_columns(tmp_path):
+    """The dangerous variant: it never raises, so nothing downstream notices.
+
+    A consumer reading columns independently then pairs injection i's draw
+    density with injection j's masses and distance.
+    """
+    from gwcat.export.validate import validate_export_v2
+
+    pe, sel = _v2_pair(tmp_path)
+    with h5py.File(sel, "r+") as f:
+        m1 = np.asarray(f["m1det"])[:3]
+        del f["m1det"]
+        f.create_dataset("m1det", data=m1)
+    results = validate_export_v2(str(pe), str(sel))
+    assert results["sel_m1det_length"] is False
+
+
+def test_declared_fit_columns_must_exist_as_datasets(tmp_path):
+    """A 2.1 selection file declared ``q`` and shipped no ``q`` dataset.
+
+    The values were right -- pdraw genuinely is a density in (m1det, q, dL) --
+    which is exactly why no numeric check tripped.  A generic check beats
+    extending two more hardcoded lists.
+    """
+    from gwcat.export.validate import validate_export_v2
+
+    events = [e for e in MIXED_EVENTS if np.isfinite(e["far"])]
+    cat = GWCatalog(_build_store(tmp_path, events=events, name="s21.h5"))
+    pe = tmp_path / "pe21.h5"
+    cat.export(str(pe), format="gwcat2.1", spin_basis="chieff", nsamp=16,
+               seed=0, cosmology=_COSMO, far_max=1.0)
+    inj = write_o4_full(tmp_path / "inj.hdf", n=120, amax=(0.9, 0.9), seed=4)
+    sel = tmp_path / "sel21.h5"
+    SelectionSet(inj).export(str(sel), format="gwcat2.1", spin_basis="chieff",
+                             far_threshold=1.0)
+
+    # The dataset is emitted now ...
+    with h5py.File(sel, "r") as f:
+        assert "q" in f
+        np.testing.assert_allclose(np.asarray(f["q"]),
+                                   np.asarray(f["m2det"])
+                                   / np.asarray(f["m1det"]))
+        declared = [v.decode() if isinstance(v, bytes) else str(v)
+                    for v in f.attrs["fit_columns"]]
+        assert "q" in declared
+
+    # ... and removing it is now detected rather than passing 70/70.
+    with h5py.File(sel, "r+") as f:
+        del f["q"]
+    results = validate_export_v2(str(pe), str(sel))
+    assert results["sel_fit_columns_present"] is False
+
+
+# ======================================================================
+# 8. z_max has an injection-side counterpart and is recorded
+# ======================================================================
+def test_z_max_is_recorded_and_must_match_on_both_sides(tmp_path):
+    """The truncation appeared in no attr, no summary key, no contract field.
+
+    So a truncated export and the full one it came from compared EQUAL on
+    selection_spec_digest, event_list_digest and contract_hash alike, while
+    mu kept its full-z content.
+    """
+    from gwcat.export.validate import validate_export_v2
+
+    cat = GWCatalog(_build_store(tmp_path))
+    pe = tmp_path / "pe_zmax.h5"
+    with pytest.warns(UserWarning, match="posterior sample"):
+        cat.export(str(pe), format="gwcat2", spin_basis="chieff", nsamp=16,
+                   seed=0, cosmology=_COSMO, far_max=1.0,
+                   allow_missing_far=True, z_max=0.10)
+    with h5py.File(pe, "r") as f:
+        assert float(f.attrs["z_max"]) == 0.10
+        assert np.asarray(f.attrs["n_samples_cut_by_z_max"]).sum() > 0
+
+    inj = write_o4_full(tmp_path / "inj.hdf", n=200, amax=(0.9, 0.9), seed=8)
+    # An untruncated selection file against a truncated PE file is refused.
+    sel_full = tmp_path / "sel_full.h5"
+    SelectionSet(inj).export(str(sel_full), format="gwcat2",
+                             spin_basis="chieff", far_threshold=1.0)
+    with pytest.raises(ValueError, match="z_max"):
+        validate_export_v2(str(pe), str(sel_full))
+
+    # Subset the injections the same way and the pair is coherent.
+    sel_cut = tmp_path / "sel_cut.h5"
+    SelectionSet(inj).export(str(sel_cut), format="gwcat2",
+                             spin_basis="chieff", far_threshold=1.0,
+                             z_max=0.10)
+    with h5py.File(sel_cut, "r") as f:
+        assert float(f.attrs["z_max"]) == 0.10
+        assert np.all(np.asarray(f["redshift"]) <= 0.10)
+        assert f.attrs["ndraw"] == h5py.File(sel_full, "r").attrs["ndraw"], \
+            "z_max is subsetting, not reweighting: ndraw must be untouched"
+
+
+# ======================================================================
+# 9. far_or_snr files say so, and the SNR leg is actually compared
+# ======================================================================
+def test_far_or_snr_is_named_in_the_contract(tmp_path):
+    """``stat = None if thr is None else "far"`` ignored the SNR leg entirely.
+
+    A selection product whose injection mask is `far-detected OR snr > t` is
+    strictly looser than a FAR-only event cut, so it biases mu high and the
+    inferred rate low -- and it hash-matched a FAR-only PE file.
+    """
+    from test_export_v2_selection import _write_o4_with_snr
+
+    n = 40
+    far = np.full(n, 5.0)
+    far[:20] = 0.1                 # 20 detected by FAR
+    snr = np.zeros(n)
+    snr[25:30] = 15.0              # 5 far-undetected injections pass SNR > 10
+    inj = _write_o4_with_snr(tmp_path / "o4snr.hdf", n, far, snr)
+    sel = tmp_path / "sel_snr.h5"
+    SelectionSet(inj).export(str(sel), format="gwcat2.1",
+                             spin_basis="chieff", far_threshold=1.0,
+                             snr_threshold=10.0)
+
+    with h5py.File(sel, "r") as f:
+        assert f.attrs["significance_type"] == "far_or_snr"
+        contract = json.loads(str(f.attrs["contract"]))
+    assert contract["detection_statistic"] == "far_or_snr", \
+        "the file declared itself FAR-only while detecting on far OR snr"
+    assert contract["snr_min"] == 10.0
+
+
+def test_detection_xcheck_reads_the_attr_the_writer_actually_stamps():
+    """``_xcheck_detection_cut`` read `snr_threshold`, which nothing writes.
+
+    So the SNR arm was structurally NaN and `_same(nan, nan)` returned True --
+    the check never even reached its own "stated on one side only" warning.
+    """
+    from gwcat.export.validate import _xcheck_detection_cut
+
+    results = {}
+
+    def _fail(name, msg):
+        raise ValueError(msg)
+
+    with pytest.raises(ValueError, match="SNR"):
+        _xcheck_detection_cut(
+            _fail, results,
+            {"far_max": 1.0, "snr_min": 8.0},
+            {"far_threshold": 1.0, "significance_snr_threshold": 10.0,
+             "significance_type": "far_or_snr"})
 
 

@@ -72,6 +72,11 @@ import json
 #: unfiltered, plus the two digests that identify WHICH events it holds.
 SELECTION_CONTRACT_FIELDS = (
     "compact_type",
+    # The PE export's per-sample redshift truncation, and the injection subset
+    # that matches it (GW-37).  It was in no contract field at all, so a
+    # truncated PE product and the full one it came from hashed and diffed
+    # identically while covering different redshift ranges.
+    "z_max",
     "pastro_min",
     "snr_min",
     "sky_area_max",
