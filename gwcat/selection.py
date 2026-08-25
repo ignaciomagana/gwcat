@@ -56,7 +56,7 @@ from .source_class import (classify_by_mass, normalize_source_class,
                            DEFAULT_NSBH_MASS_THRESHOLD,
                            CUT_ESTIMATOR_ATTR, selection_cut_estimator)
 from . import selection_spin as _sspin
-from .spin import chi_p_from_components
+from .spin import AMAX_AUTO, chi_p_from_components
 
 # Human-readable description of what the exported ``pdraw`` represents after all
 # of the code's manipulations (see the module docstring / to_darksirens).  Both
@@ -581,6 +581,85 @@ def _refuse_mixed_cosmology(set_list):
         "ddL/dz and cannot honour an override. Drop the override so every "
         "campaign uses its own generation cosmology, which is what makes each "
         "campaign's Jacobian correct.")
+
+
+def _v1_chieff_swap(set_list, keeps, amax, *, strict=True):
+    """Ceilings, uniform-isotropic gate and support mask for the v1 chi_eff swap.
+
+    GW-37.  The two v1 ``to_darksirens`` exporters carried their own copy of the
+    swap, and that copy is what kept the three defects GW-03/GW-31 removed from
+    the v2 builder only: the swap applied to a campaign never checked for
+    uniform magnitudes and isotropic tilts, the support tested as
+    ``isfinite(logprob)`` (which the 1-D grid clamp makes True ~1e-12 past the
+    ceiling), and one caller-supplied ``amax`` forced on every campaign when the
+    density being REPLACED is that campaign's own.  Rather than patch a second
+    copy, both exporters now call the v2 helpers outright -- one implementation,
+    so the two generations cannot drift again.
+
+    Returns ``(ln_factor, in_support, amax_pairs, amax_sources, mode)`` with the
+    factor concatenated in campaign order over each campaign's ``keep`` mask.
+    """
+    # Function-local: gwcat.export.selection_builder imports this module.
+    from .export.selection_builder import (
+        _campaign_chieff_amax, _campaign_chieff_lnfactor,
+        _check_chieff_swap_valid)
+    from .spin import parse_amax_option
+
+    forced_amax = parse_amax_option(amax, what="amax")
+    _check_chieff_swap_valid(set_list, strict=strict, violations=[])
+
+    ln_parts, sup_parts, pairs, sources = [], [], [], []
+    for s, keep in zip(set_list, keeps):
+        src, a1, a2 = _campaign_chieff_amax(s, forced_amax, ASSUMED_REMOVAL_AMAX)
+        lnp, sup = _campaign_chieff_lnfactor(s, keep, a1, a2)
+        ln_parts.append(lnp)
+        sup_parts.append(sup)
+        pairs.append((a1, a2))
+        sources.append(src)
+    mode = "fixed" if forced_amax is not None else "per_campaign"
+    return (np.concatenate(ln_parts), np.concatenate(sup_parts),
+            pairs, sources, mode)
+
+
+def _v1_refuse_unsupported(ln_factor, in_support, amax_pairs, what):
+    """Refuse detected injections the assumed chi_eff prior excludes (GW-03).
+
+    The predicate is the prior's OWN ``support()``, carried in ``in_support``,
+    not ``isfinite(ln_factor)``: past the ceiling the grid returns a finite
+    ~1e-12 density, so the finiteness test admitted excluded injections with a
+    ``pdraw`` ~1e12 too small -- an inverse weight ~1e12 too LARGE in the
+    Monte-Carlo sum for mu.
+    """
+    unsupported = ~(np.asarray(in_support, dtype=bool)
+                    & np.isfinite(ln_factor))
+    n_unsupported = int(np.sum(unsupported))
+    if not n_unsupported:
+        return
+    ceilings = ", ".join(f"({a1:g},{a2:g})" for a1, a2 in amax_pairs)
+    raise ValueError(
+        f"{what}: {n_unsupported} of {ln_factor.size} detected injections "
+        f"fall outside the assumed chi_eff prior's support (per-campaign "
+        f"amax {ceilings}), so their pdraw would be exactly zero. They were "
+        f"drawn and detected, so dropping them biases the selection integral "
+        f"mu low. Fix the amax or export in the component basis, which is "
+        f"exact for any campaign.")
+
+
+def _write_chieff_amax_attrs(f, amax_pairs, amax_sources, mode):
+    """Stamp the ceilings the swap ACTUALLY used, per campaign (GW-31/GW-37).
+
+    ``chi_eff_amax`` stays scalar for backward compatibility when every
+    campaign resolved to the same ceiling, and is NaN otherwise so a reader
+    cannot mistake one campaign's ceiling for the file's.
+    """
+    a1s = [a1 for a1, _ in amax_pairs]
+    a2s = [a2 for _, a2 in amax_pairs]
+    uniform = len(set(a1s)) == 1 and len(set(a2s)) == 1
+    f.attrs["chi_eff_amax"] = float(a1s[0]) if uniform else float("nan")
+    f.attrs["chi_eff_amax_1_per_campaign"] = np.asarray(a1s, dtype=float)
+    f.attrs["chi_eff_amax_2_per_campaign"] = np.asarray(a2s, dtype=float)
+    f.attrs["chi_eff_amax_source_per_campaign"] = [str(s) for s in amax_sources]
+    f.attrs["chi_eff_amax_mode"] = str(mode)
 
 
 def _ddL_dz(z, dL_mpc, H0, Om0):
@@ -1601,9 +1680,10 @@ class SelectionSet:
     # Export
     # ------------------------------------------------------------------
     def to_darksirens(self, out_path: str, far_threshold: float = 1.0,
-                      amax: float = 0.99, source_class=None,
+                      amax=AMAX_AUTO, source_class=None,
                       write_summary: bool = False,
-                      summary_context: Optional[dict] = None):
+                      summary_context: Optional[dict] = None,
+                      strict: bool = True):
         """Write a pre-processed selection file for darksirens.
 
         Applies the 1-D chi_eff spin-prior swap: the injection spin-draw
@@ -1619,8 +1699,15 @@ class SelectionSet:
         out_path : str
         far_threshold : float
             FAR detection threshold in yr⁻¹.
-        amax : float
-            Maximum spin magnitude for the isotropic prior (default 0.99).
+        amax : float or ``"auto"``, default ``"auto"``
+            Ceiling of the uniform spin-magnitude prior whose chi_eff marginal
+            the swap multiplies in.  ``"auto"`` (GW-37, matching
+            :func:`gwcat.export.build_selection_product`) uses this campaign's
+            OWN detected injected ceiling -- the density being replaced is that
+            campaign's, so the ceiling must be too.  A number forces one
+            ceiling, which is what the pre-GW-37 default of ``0.99`` did to
+            every campaign including endo3 (injected at 0.998); the resulting
+            error is chi_eff-dependent and does NOT divide out of mu.
         source_class : str, iterable, or None
             Optional source-class filter (``bbh``/``nsbh``/``bns``/``massgap``/
             ``cbc`` or a canonical class).  Injections are classified by their
@@ -1637,9 +1724,11 @@ class SelectionSet:
             (``--no-summary`` to disable).
         summary_context : dict, optional
             Extra fields merged into the written summary.
+        strict : bool, default True
+            Raise when the campaign's injected spins are measurably not
+            uniform-magnitude/isotropic, which makes the swap the wrong density
+            by a chi_eff-dependent O(1) factor (GW-37).  ``False`` warns.
         """
-        from .spin import chi_eff_prior_logprob
-
         self._load()
         det = self.detected_mask(far_threshold)
         sc_mask = self.source_class_mask(source_class)
@@ -1653,25 +1742,19 @@ class SelectionSet:
                 + ("" if source_class is None
                    else f" in source class {source_class!r}"))
 
-        # Apply the 1-D chi_eff prior swap
+        # Apply the 1-D chi_eff prior swap.  Ceilings, the uniform-isotropic
+        # gate and the support mask all come from the v2 helpers (GW-37) so the
+        # two export generations cannot disagree about the same physics.
         chieff_det = self._chieff[keep]
         m1src_det = self._m1src[keep]
         m2src_det = self._m2src[keep]
-        logp_chi = np.asarray(
-            chi_eff_prior_logprob(chieff_det, m1src_det, m2src_det, amax=amax),
-            dtype=float)
+        logp_chi, in_support, amax_pairs, amax_sources, amax_mode = (
+            _v1_chieff_swap([self], [keep], amax, strict=strict))
         # No -50 floor (GW-03): a detected injection with zero assumed draw
         # density is a contradiction, not a small number -- see
-        # gwcat/export/selection_builder.py.  The v1 twin refuses identically.
-        n_unsupported = int(np.sum(~np.isfinite(logp_chi)))
-        if n_unsupported:
-            raise ValueError(
-                f"to_selection_file: {n_unsupported} of {logp_chi.size} "
-                f"detected injections fall outside the assumed chi_eff prior's "
-                f"support (amax={amax}), so their pdraw would be exactly zero. "
-                f"They were drawn and detected, so dropping them biases the "
-                f"selection integral mu low. Fix the amax or export in the "
-                f"component basis, which is exact for any campaign.")
+        # gwcat/export/selection_builder.py.  The v2 twin refuses identically.
+        _v1_refuse_unsupported(logp_chi, in_support, amax_pairs,
+                               "to_selection_file")
         with np.errstate(over="ignore"):
             pdraw_det = self._pdraw[keep] * np.exp(logp_chi)
         # The array that is about to be written (GW-28).  _load already vetted
@@ -1679,7 +1762,7 @@ class SelectionSet:
         # the product rather than assume the multiply was harmless.
         _require_positive_finite(
             pdraw_det, "pdraw (after the chi_eff swap)", self.path,
-            note=f"amax={amax}, far_threshold={far_threshold}.")
+            note=f"amax={amax_pairs[0]}, far_threshold={far_threshold}.")
 
         with h5py.File(out_path, "w") as f:
             f.attrs["format_version"] = "gwcat-selection-1.0"
@@ -1714,7 +1797,7 @@ class SelectionSet:
             f.attrs["sky_position_available"] = bool(
                 getattr(self, "_sky_position_available", True))
             f.attrs["chi_eff_swap_applied"] = True
-            f.attrs["chi_eff_amax"] = float(amax)
+            _write_chieff_amax_attrs(f, amax_pairs, amax_sources, amax_mode)
             # ── Spin-prior contract provenance (PR 3) ──────────────────────
             # Selection export always applies the chi_eff swap (Mode A); the
             # naming mirrors the PE export so downstream can cross-check the two.
@@ -1922,9 +2005,10 @@ class CombinedSelectionSet:
     # Export
     # ------------------------------------------------------------------
     def to_darksirens(self, out_path: str, far_threshold: float = 1.0,
-                      amax: float = 0.99, source_class=None,
+                      amax=AMAX_AUTO, source_class=None,
                       write_summary: bool = False,
-                      summary_context: Optional[dict] = None):
+                      summary_context: Optional[dict] = None,
+                      strict: bool = True):
         """Write a combined selection file for darksirens.
 
         Parameters
@@ -1932,8 +2016,11 @@ class CombinedSelectionSet:
         out_path : str
         far_threshold : float
             FAR detection threshold in yr⁻¹, applied per campaign.
-        amax : float
-            Maximum spin magnitude for the chi_eff prior (default 0.99).
+        amax : float or ``"auto"``, default ``"auto"``
+            Ceiling of the uniform spin-magnitude prior behind the chi_eff
+            swap.  ``"auto"`` (GW-37) resolves it PER CAMPAIGN from each
+            campaign's own injected draw; a number forces one ceiling on all of
+            them, which is what the pre-GW-37 default did.
         source_class : str, iterable, or None
             Optional source-class filter applied per campaign by injected
             source-frame mass (see :meth:`SelectionSet.source_class_mask`).
@@ -1946,9 +2033,10 @@ class CombinedSelectionSet:
             ``.md`` next to ``out_path``.  See :mod:`gwcat.validation_summary`.
         summary_context : dict, optional
             Extra fields merged into the written summary.
+        strict : bool, default True
+            Raise when a campaign's injected spins are measurably not
+            uniform-magnitude/isotropic (GW-37).  ``False`` warns.
         """
-        from .spin import chi_eff_prior_logprob
-
         # Load all campaigns
         for s in self._sets:
             s._load()
@@ -1973,6 +2061,10 @@ class CombinedSelectionSet:
         n_after_total = 0
         far_columns_union = []
         campaign_info = []
+        # The campaigns that actually CONTRIBUTED rows, in concatenation order
+        # (empty ones are skipped below).  The chi_eff swap resolves its ceiling
+        # per campaign, so it needs the same list in the same order (GW-37).
+        contrib_sets, contrib_keeps = [], []
 
         for k, s in enumerate(self._sets):
             det = s.detected_mask(far_threshold)
@@ -2007,6 +2099,8 @@ class CombinedSelectionSet:
             cols["m2src"].append(s._m2src[keep])
             cols["z"].append(s._z[keep])
             cols["pdraw"].append(pdraw_k)
+            contrib_sets.append(s)
+            contrib_keeps.append(keep)
             n_det_total += n_det_k
             campaign_info.append(
                 f"{s.path}: N={ndraw_per[k]}, T={s._T_yr:.2f}yr, "
@@ -2022,20 +2116,13 @@ class CombinedSelectionSet:
         # Concatenate
         data = {k: np.concatenate(v) for k, v in cols.items()}
 
-        # Apply 1-D chi_eff prior swap
-        logp_chi = np.asarray(chi_eff_prior_logprob(
-            data["chieff"], data["m1src"], data["m2src"], amax=amax),
-            dtype=float)
+        # Apply 1-D chi_eff prior swap, per-campaign ceilings and support gate
+        # shared with the v2 builder (GW-37).
+        logp_chi, in_support, amax_pairs, amax_sources, amax_mode = (
+            _v1_chieff_swap(contrib_sets, contrib_keeps, amax, strict=strict))
         # No -50 floor (GW-03); see the sibling exporter above.
-        n_unsupported = int(np.sum(~np.isfinite(logp_chi)))
-        if n_unsupported:
-            raise ValueError(
-                f"to_combined_selection_file: {n_unsupported} of "
-                f"{logp_chi.size} detected injections fall outside the assumed "
-                f"chi_eff prior's support (amax={amax}), so their pdraw would "
-                f"be exactly zero. They were drawn and detected, so dropping "
-                f"them biases the selection integral mu low. Fix the amax or "
-                f"export in the component basis.")
+        _v1_refuse_unsupported(logp_chi, in_support, amax_pairs,
+                               "to_combined_selection_file")
         with np.errstate(over="ignore"):
             data["pdraw"] *= np.exp(logp_chi)
         # The array that is about to be written (GW-28); the Essick N_k/N_total
@@ -2044,7 +2131,7 @@ class CombinedSelectionSet:
             data["pdraw"], "pdraw (after the chi_eff swap and the Essick "
             "N_k/N_total rescaling)",
             " + ".join(s.path for s in self._sets),
-            note=f"amax={amax}, far_threshold={far_threshold}.")
+            note=f"amax={amax_pairs}, far_threshold={far_threshold}.")
 
         # An override that reached only SOME campaigns corrupts the combined
         # pdraw exactly as it does on the v2 path (GW-09); this exporter has
@@ -2108,7 +2195,7 @@ class CombinedSelectionSet:
                     f"silently drop the NaN campaigns' injections; cut on "
                     f"campaign, not on finiteness, if that is not intended.")
             f.attrs["chi_eff_swap_applied"] = True
-            f.attrs["chi_eff_amax"] = float(amax)
+            _write_chieff_amax_attrs(f, amax_pairs, amax_sources, amax_mode)
             # ── Spin-prior contract provenance (PR 3) ──────────────────────
             f.attrs["spin_prior_mode"] = "include"
             f.attrs["chi_eff_prior_applied_to_pdraw"] = True

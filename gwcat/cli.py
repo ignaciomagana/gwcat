@@ -185,7 +185,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_export.add_argument("--nsamp", type=int, default=4096)
     p_export.add_argument("--seed", type=int, default=0)
     p_export.add_argument("--z-max", type=float, default=None)
-    p_export.add_argument("--amax", type=float, default=0.99)
+    # "auto" like the v2 `export pe` sibling (GW-37): one hardcoded ceiling
+    # cannot describe a store that mixes spin priors, and the chi_eff marginal
+    # depends on the ceiling in a chi_eff-DEPENDENT way that does not cancel.
+    p_export.add_argument("--amax", default="auto", metavar="AMAX",
+                          help="Spin-prior ceiling: 'auto' (default) reads each "
+                               "event's own spin_amax_1/2 from the store, a "
+                               "number forces one ceiling on every event.")
+    p_export.add_argument("--amax-fallback", type=float, default=0.99,
+                          help="Fallback spin amax for events whose store meta "
+                               "lacks spin_amax_1/2 (NaN); default 0.99.")
     p_export.add_argument("--no-summary", action="store_true",
                           help="Skip writing validation_summary.json/.md "
                                "next to --out.")
@@ -295,7 +304,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_sel.add_argument("--out", required=True, metavar="OUT.h5")
     p_sel.add_argument("--far-threshold", type=float, default=1.0,
                        metavar="FAR_YR")
-    p_sel.add_argument("--amax", type=float, default=0.99)
+    # "auto" like the v2 `export selection` sibling (GW-37): the swap replaces
+    # a campaign's OWN injected spin density, so the ceiling must be that
+    # campaign's -- endo3 injects 0.998, not 0.99.
+    p_sel.add_argument("--amax", default="auto", metavar="AMAX",
+                       help="chi_eff-prior spin ceiling: 'auto' (default) uses "
+                            "each campaign's own DETECTED injected amax, a "
+                            "number forces one ceiling on every campaign.")
     p_sel.add_argument("--source-class", default=None,
                        help="bbh / nsbh / bns / massgap / cbc, or a canonical "
                             "class name.")
@@ -409,6 +424,7 @@ def _cmd_export_darksirens(args) -> int:
         seed=args.seed,
         z_max=args.z_max,
         amax=args.amax,
+        amax_fallback=args.amax_fallback,
         write_summary=not args.no_summary,
     )
     return 0

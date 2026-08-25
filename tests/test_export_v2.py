@@ -227,15 +227,16 @@ def test_attr_contract_matches_legacy(tmp_path):
         assert bool(fb.attrs["chi_eff_prior_applied_to_p_pe"]) is True
         assert bool(fb.attrs["chi_eff_in_p_pe"]) is True
 
-        # mass_prior_basis is the ONE legacy attr the v2 file deliberately
-        # states differently (GW-34).  The frozen v1 writer stamps the constant
-        # "uniform_detector_frame" on every file regardless of what was
-        # ingested; v2 reports the class the store actually carries -- here
+        # mass_prior_basis is reported from the rows the file actually holds on
+        # BOTH sides now (GW-34 for v2, GW-37 for v1).  v1 used to stamp the
+        # constant "uniform_detector_frame" on every file regardless of what was
+        # ingested; both writers now report the class the store carries -- here
         # nothing, because this synthetic store predates the mass-prior ingest.
         # A file may only claim the verified basis when every row it holds
         # carries it.
-        assert fa.attrs["mass_prior_basis"] == "uniform_detector_frame"
+        assert fa.attrs["mass_prior_basis"] == "unstated"
         assert fb.attrs["mass_prior_basis"] == "unstated"
+        assert bool(fa.attrs["mass_prior_verified"]) is False
         assert bool(fb.attrs["mass_prior_verified"]) is False
 
         # Every other legacy attr except format_version must match.  NaN is a
@@ -243,7 +244,7 @@ def test_attr_contract_matches_legacy(tmp_path):
         # as NaN because HDF5 has no null -- so the two sides agreeing on NaN is
         # agreement, which bare `==` would call a difference.
         for key in fa.attrs:
-            if key in ("format_version", "mass_prior_basis"):
+            if key in ("format_version",):
                 continue
             assert key in fb.attrs, f"v2 file missing legacy attr {key!r}"
             va, vb = fa.attrs[key], fb.attrs[key]
