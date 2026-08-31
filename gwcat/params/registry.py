@@ -18,7 +18,8 @@ from typing import Dict, Tuple
 from .block import ParameterBlock
 from .blocks import (DISTANCE_DL, MASS_DET_PAIR, SKY_RADEC, SPIN_ALIGNED_Z,
                      SPIN_CARTESIAN, SPIN_CHIEFF, SPIN_CHIEFF_CHIP,
-                     SPIN_COMPONENT_6D, SPIN_COMPONENT_POLAR, SPIN_NONE)
+                     SPIN_CHIEFF_REFERENCE, SPIN_COMPONENT_6D,
+                     SPIN_COMPONENT_POLAR, SPIN_NONE)
 
 #: Always present, in this order.
 _CORE: Tuple[ParameterBlock, ...] = (MASS_DET_PAIR, DISTANCE_DL, SKY_RADEC)
@@ -26,8 +27,9 @@ _CORE: Tuple[ParameterBlock, ...] = (MASS_DET_PAIR, DISTANCE_DL, SKY_RADEC)
 #: Every registered block, by name.
 BLOCKS: Dict[str, ParameterBlock] = {
     b.name: b for b in (MASS_DET_PAIR, DISTANCE_DL, SKY_RADEC, SPIN_NONE,
-                        SPIN_CHIEFF, SPIN_CHIEFF_CHIP, SPIN_COMPONENT_POLAR,
-                        SPIN_COMPONENT_6D, SPIN_CARTESIAN, SPIN_ALIGNED_Z)
+                        SPIN_CHIEFF, SPIN_CHIEFF_CHIP, SPIN_CHIEFF_REFERENCE,
+                        SPIN_COMPONENT_POLAR, SPIN_COMPONENT_6D,
+                        SPIN_CARTESIAN, SPIN_ALIGNED_Z)
 }
 
 
@@ -170,6 +172,14 @@ SPACES: Dict[str, ParameterSpace] = {
         "chieff", _CORE + (SPIN_CHIEFF,),
         notes="Legacy default. A PROJECTION: invalid for a campaign that is "
               "not uniform-magnitude/isotropic (GW-06)."),
+    "chieff_reference": ParameterSpace(
+        "chieff_reference", _CORE + (SPIN_CHIEFF_REFERENCE,),
+        notes="chi_eff against a DECLARED reference spin prior, reached by "
+              "REWEIGHTING the campaign's exact component draw instead of "
+              "substituting for it. Buildable on any campaign -- including the "
+              "ones 'chieff' must refuse -- and its a_ref must equal the PE "
+              "side's ceiling. Selection side only; its PE half is a 'chieff' "
+              "export at amax = a_ref."),
     "chieff_chip": ParameterSpace(
         "chieff_chip", _CORE + (SPIN_CHIEFF_CHIP,),
         notes="Opt-in, not a shipped product. Cannot be built against O4 at "

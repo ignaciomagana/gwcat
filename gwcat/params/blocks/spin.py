@@ -8,6 +8,16 @@ basis is exact for the non-uniform-isotropic O4 campaigns and the projections
 are not -- and it is now a property of the block rather than a rule remembered
 at each call site.
 
+A projection comes in two kinds, and only one of them makes a claim about the
+campaign.  ``spin.chieff`` / ``spin.chieff_chip`` **substitute**: they discard the
+campaign's spin draw and write the analytic marginal in its place, which is the
+right density only if the campaign really drew spins that way (hence
+``_PROJECTION_PARENT``).  ``spin.chieff_reference`` **reweights**: it keeps the
+campaign's exact component draw and divides by a declared reference spin prior,
+so it requires nothing of the campaign's spin distribution -- only that the
+campaign's magnitudes COVER the reference ceiling, which is a support check, not
+a distributional one.
+
 Measured consequence of ``prior_is_per_event_constant`` (GW-24, 259 events):
 the flat-box component prior gives ESS/nsamp median 0.861 with zero events below
 0.1, against 0.589 and 30 events below 0.1 for chieff.
@@ -74,6 +84,58 @@ SPIN_CHIEFF_CHIP = ParameterBlock(
     notes=("chi_p reaches the assumed ceiling on real data where chi_eff does "
            "not, which is why the -50 floor concentrated its damage here. "
            "Opt-in, not a shipped product (GW-23). ~1 min per 1e6 points."),
+)
+
+
+def _ln_chieff_reference_pe(cols, ctx):
+    """The SAME analytic marginal as ``spin.chieff`` -- see the block notes.
+
+    The reference basis differs from ``spin.chieff`` only on the INJECTION side
+    (reweight vs substitution); the PE side of both is the isotropic
+    uniform-magnitude chi_eff prior, so a ``chieff`` PE export at
+    ``amax = a_ref`` is exactly the PE half of this basis.
+    """
+    return _ln_chieff_pe(cols, ctx)
+
+
+SPIN_CHIEFF_REFERENCE = ParameterBlock(
+    name="spin.chieff_reference",
+    kind="spin",
+    columns=("chieff",),
+    advisory_columns=("a1", "a2", "cost1", "cost2", "chip"),
+    map_kind="projection",
+    # The exported density is NOT the campaign's own: it is the campaign's own
+    # density REWEIGHTED, exactly, to a declared reference spin prior.  So the
+    # space is not "exact" in the sense `is_exact` means (no assumed density
+    # anywhere) -- there is an assumed density, it is just the DECLARED one
+    # rather than a claim about the campaign.
+    exact_draw_density=False,
+    # Deliberately EMPTY, and this is the whole point of the block.  A
+    # substituting projection (spin.chieff) needs the parent draw to BE
+    # uniform-isotropic, because it throws that draw away.  A reweighting
+    # projection keeps the parent draw in the numerator and divides by the
+    # reference in the denominator, so it assumes nothing about the parent --
+    # it only needs the parent to COVER the reference support, which is a
+    # coverage check on the injected magnitudes (enforced in the builder), not
+    # a distributional requirement expressible here.
+    requires_campaign=CampaignRequirement(),
+    store_required=("a_1", "a_2", "chi_eff"),
+    store_alternatives=(("cos_tilt_1", "tilt_1"), ("cos_tilt_2", "tilt_2")),
+    store_params_fetched=("a_1", "a_2", "cos_tilt_1", "cos_tilt_2",
+                          "tilt_1", "tilt_2", "chi_p"),
+    ln_prior_pe=_ln_chieff_reference_pe,
+    ranges={"chieff": Range(-1.0, 1.0), "a1": Range(0.0, 1.0),
+            "a2": Range(0.0, 1.0), "cost1": Range(-1.0, 1.0),
+            "cost2": Range(-1.0, 1.0), "chip": Range(0.0, 1.0)},
+    notes=("chi_eff against a DECLARED reference spin prior (isotropic, "
+           "uniform magnitude, ceiling a_ref), reached by reweighting the "
+           "campaign's exact component draw rather than substituting for it: "
+           "pdraw_ref = pdraw_component * p_iso(chieff|q,a_ref) / p_ref(a,cost) "
+           "with p_ref = 1/(4 a_ref^2). Valid for ANY campaign, including the "
+           "non-uniform-isotropic O4 sets that spin.chieff must refuse. Its PE "
+           "half is a spin.chieff export at amax = a_ref, and unlike the "
+           "spin.chieff pairing the two ceilings MUST match -- the reference "
+           "is the same object on both sides."),
 )
 
 

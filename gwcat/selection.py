@@ -90,11 +90,23 @@ PDRAW_STATE_CHIEFF_CHIP = (
     "and injection weights. Detector-frame masses in Msun, dL in Mpc."
 )
 
+PDRAW_STATE_CHIEFF_REFERENCE = (
+    "draw_density_in_(m1det,q,dL,chieff)_basis_with_1D_chi_eff_prior_included; "
+    "built from the campaign's EXACT per-injection component spin draw and "
+    "REWEIGHTED to a declared isotropic uniform-magnitude reference spin prior "
+    "(ceiling spin_reference_amax) -- the campaign's own spin density is "
+    "divided out, not discarded, so this is valid for a campaign of any spin "
+    "distribution; rows outside the reference support carry weight exactly zero "
+    "via spin_reference_excluded_pdraw; normalised by T_obs and injection "
+    "weights. Detector-frame masses in Msun, dL in Mpc."
+)
+
 # pdraw_state keyed by spin basis (used by gwcat.export.selection_builder).
 PDRAW_STATE_BY_BASIS = {
     "chieff": PDRAW_STATE_CHIEFF,
     "component": PDRAW_STATE_COMPONENT,
     "chieff_chip": PDRAW_STATE_CHIEFF_CHIP,
+    "chieff_reference": PDRAW_STATE_CHIEFF_REFERENCE,
 }
 
 # Note recorded whenever a source-class filter subsets the injections: this is

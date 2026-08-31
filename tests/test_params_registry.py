@@ -482,6 +482,73 @@ def test_chieff_chip_projection_recovers_the_component_prior(q):
         f"over {int(keep.sum())} bins")
 
 
+def _draw_nonuniform_component(a_ref, q, n, seed, a_pow=2.0, tilt_slope=0.8):
+    """Sample a campaign that is NEITHER uniform in magnitude NOR isotropic.
+
+    ``p(a) = (a_pow+1) a^a_pow`` on ``[0, 1]`` and
+    ``p(cos t) = (1 + tilt_slope * cos t)/2`` on ``[-1, 1]`` -- the shape of
+    campaign ``spin.chieff`` must refuse.  Returns ``(chi_eff, p_draw)`` with
+    ``p_draw`` the exact 4-D component draw density at each draw.
+    """
+    rng = np.random.default_rng(seed)
+
+    def _mag():
+        a = rng.uniform(0.0, 1.0, n) ** (1.0 / (a_pow + 1.0))
+        return a, (a_pow + 1.0) * a ** a_pow
+
+    def _tilt():
+        # Inverse-CDF for p(c) = (1 + m c)/2 on [-1, 1].
+        u = rng.uniform(0.0, 1.0, n)
+        m = tilt_slope
+        c = (-1.0 + np.sqrt(1.0 + 2.0 * m * (2.0 * u - 1.0) + m ** 2)) / m
+        return c, (1.0 + m * c) / 2.0
+
+    a1, pa1 = _mag()
+    a2, pa2 = _mag()
+    c1, pc1 = _tilt()
+    c2, pc2 = _tilt()
+    chi_eff = (a1 * c1 + q * a2 * c2) / (1.0 + q)
+    return chi_eff, pa1 * pa2 * pc1 * pc2, a1, a2
+
+
+@pytest.mark.parametrize("q", [1.0, 0.4])
+def test_chieff_reference_reweighting_recovers_the_reference_prior(q):
+    """The recovery check for ``spin.chieff_reference``, and it is a different
+    claim from the one above.
+
+    ``spin.chieff`` claims to BE the pushforward of a uniform-isotropic component
+    prior.  ``spin.chieff_reference`` claims something stronger and campaign-free:
+    that dividing ANY campaign's component draw by its own density and
+    multiplying by the reference one recovers the reference chi_eff marginal.
+    So this test draws a campaign that is neither uniform in magnitude nor
+    isotropic in tilt -- exactly what ``spin.chieff`` must refuse -- and checks
+    that the reweighted chi_eff distribution is ``ChiEffPrior(a_ref)``.
+    """
+    from gwcat.spin import ChiEffPrior
+
+    a_ref = 0.9
+    chi_eff, p_draw, a1, a2 = _draw_nonuniform_component(
+        a_ref, q, 4_000_000, seed=17)
+
+    # The reference: isotropic tilts, magnitudes uniform on [0, a_ref], so
+    # p_ref = 1/(4 a_ref^2) inside its support and exactly 0 outside it -- the
+    # weight the builder writes as a sentinel pdraw.
+    in_ref = (a1 <= a_ref) & (a2 <= a_ref)
+    w = np.where(in_ref, 1.0 / (4.0 * a_ref ** 2), 0.0) / p_draw
+
+    prior = ChiEffPrior(amax=a_ref)
+    edges = np.linspace(-a_ref, a_ref, 41)
+    hist, _ = np.histogram(chi_eff, bins=edges, weights=w)
+    hist = hist / (w.sum() * np.diff(edges))
+    mid = 0.5 * (edges[1:] + edges[:-1])
+    pred = prior.prob(mid, 1.0, q)
+
+    keep = pred > 0.05 * pred.max()
+    rel = np.abs(hist[keep] / pred[keep] - 1.0)
+    assert np.median(rel) < 0.02, (
+        f"q={q}: median relative deviation {np.median(rel):.4f}")
+
+
 def test_every_projection_block_has_a_recovery_check():
     """A registry-level guard: adding a projection block without a recovery test
     should be visible.  The two above cover the two that exist; aligned_z is
@@ -490,7 +557,8 @@ def test_every_projection_block_has_a_recovery_check():
     from gwcat.params import BLOCKS
 
     projections = {n for n, b in BLOCKS.items() if b.map_kind == "projection"}
-    covered = {"spin.chieff", "spin.chieff_chip"}
+    covered = {"spin.chieff", "spin.chieff_chip",
+               "spin.chieff_reference"}
     known_untested = {"spin.aligned_z"}   # needs the _single_spin_pdf 1/2 fix
     assert projections == covered | known_untested, (
         f"projection blocks without a recovery test: "
