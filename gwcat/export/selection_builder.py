@@ -65,6 +65,68 @@ Spin-basis-specific step (the only place the bases diverge)
   detectable amax per campaign (else :class:`SpinBasisError`).  If a campaign's
   ``amax_1 != amax_2`` the joint prior (which assumes a single amax) uses
   ``amax_1`` and warns -- mirroring the PE builder's convention.
+* **chieff_reference**  the component factor FIRST (so the intermediate is the
+  component-basis pdraw bit-for-bit), then one explicit change of spin
+  reference::
+
+      pdraw = pdraw_component * p_iso(chieff | m1src, m2src, a_ref) * 4 a_ref^2
+
+  i.e. ``pdraw_component * p_iso(chieff|q,a_ref) / p_ref(a,cosθ)`` with the
+  reference spin prior ``p_ref = 1/(4 a_ref^2)`` (isotropic tilts, magnitudes
+  uniform on ``[0, a_ref]``).  ``a_ref`` is REQUIRED and explicit
+  (``spin_reference_amax=``): it is not a property of the campaign but a
+  declaration about the reference the consumer's PE side divides out, and a
+  default would be a fabricated one.  See the section below for why this is not
+  the ``chieff`` swap.
+
+Why ``chieff_reference`` is not the ``chieff`` swap
+---------------------------------------------------
+Both write a density in ``(m1det, q, dL, chi_eff)``, and that is the whole of
+the resemblance.
+
+* ``chieff`` **substitutes**: it throws the campaign's spin draw away and writes
+  the analytic marginal in its place.  That is the right density only if the
+  campaign drew its spins that way, which is why ``_check_chieff_swap_valid``
+  refuses it on a measured non-uniform-isotropic campaign (GW-06).  **That guard
+  stays exactly as it is**; the new basis is not a way around it.
+* ``chieff_reference`` **reweights**: the campaign's exact per-injection
+  component density stays in the numerator and the reference is divided in, so
+  nothing is assumed about how the campaign drew its spins and the basis is
+  buildable on the campaigns ``chieff`` must refuse.
+
+The estimator this makes exact.  With ``s`` the spin degrees of freedom beyond
+``chi_eff``, the selection integral a ``chi_eff``-only population model needs is
+
+    alpha = int p_pop(theta_4) E_ref[P_det | chi_eff, theta_4] d theta_4,
+
+the non-``chi_eff`` spin content averaged over the SAME reference prior the PE
+side assumes.  Monte-Carlo'd over the campaign's actual draws its weight is
+
+    w = p_pop(theta_4) J * [ p_ref(a,cosθ) / p_iso(chi_eff|q,a_ref) ]
+                         / [ p_base(m1det,q,dL) * p_draw(a,cosθ) ]
+      = p_pop(theta_4) J / pdraw,
+
+because ``p_ref / p_iso`` is precisely the reference conditional density of the
+spin components given ``chi_eff`` and ``pdraw_component = p_base * p_draw``.
+
+Out of the reference support -- and why it is NOT the GW-03 contradiction.
+``p_ref`` is exactly zero where ``a_1 > a_ref`` or ``a_2 > a_ref``, so those
+injections carry weight exactly zero: not a small density in a denominator, but
+a region the DECLARED reference assigns no probability to at all.  Under the
+substituting bases an out-of-support detected injection is fatal, because there
+the zero is the assumed prior contradicting a draw that really happened.  Here
+the draw and the detection are untouched -- it is the reference that stops -- so
+the honest treatment is a zero weight, written as a large sentinel ``pdraw``
+(``out_of_reference_pdraw``, default 1e300) whose inverse weight is ~1e-300,
+counted in ``spin_reference_excluded_rows``, and never confused with the fatal
+case, which still raises.
+
+The converse hole is real and is checked: if a campaign's magnitudes stop BELOW
+``a_ref`` the reference support is not covered, the reweighting has nothing to
+put in the missing region, and alpha comes out biased low.  With a detectable
+(uniform-magnitude) ceiling that is provable and raises under ``strict``; on a
+campaign with no detectable ceiling it falls back to the largest magnitude
+actually drawn and warns, because "not observed" is weaker than "not drawn".
 
 Columns (all bases): the legacy 10 (``m1det, m2det, dL, chieff, ra, dec, m1src,
 m2src, redshift, pdraw``) plus ``a1, a2, cost1, cost2, chip`` whenever every
@@ -94,8 +156,23 @@ from .product import ExportProduct
 #: tuple is declarable but not yet buildable; the CLI and the validator read
 #: this tuple (as ``SUPPORTED_SPIN_BASES``) so they cannot advertise or reject
 #: a different set than the builder enforces.
-_KNOWN_SPIN_BASES = ("chieff", "component", "chieff_chip")
+_KNOWN_SPIN_BASES = ("chieff", "component", "chieff_chip",
+                     "chieff_reference")
 SUPPORTED_SPIN_BASES = _KNOWN_SPIN_BASES
+
+#: Bases whose ``pdraw`` is the campaign's own density reweighted to a DECLARED
+#: reference spin prior rather than the campaign's own density (or a
+#: substitution for it).  Each requires an explicit ``spin_reference_amax``.
+_REFERENCE_BASES = ("chieff_reference",)
+
+#: ``pdraw`` written for a row the declared reference assigns zero density to.
+#: Large rather than infinite so the file stays finite-and-positive (the loader
+#: contract every consumer enforces) while the row's importance weight
+#: ``p_pop * J / pdraw`` is ~1e-300 -- 290-odd orders of magnitude below any real
+#: weight, and exactly zero the moment it is multiplied by a population density.
+#: Same value as the sentinel the marked-transition analysis had been patching in
+#: downstream, so a product built here matches one built there row for row.
+OUT_OF_REFERENCE_PDRAW = 1e300
 
 #: The cumulative-mixture SNR column used by the optional OR-branch.
 _SNR_COLUMN = "semianalytic_observed_phase_maximized_snr_net"
@@ -265,6 +342,140 @@ def _campaign_chieff_chip_lnfactor(s, keep, strict):
             amax_1, amax_2)
 
 
+def _parse_reference_amax(spin_basis, spin_reference_amax):
+    """The declared reference ceiling for a reference basis, validated.
+
+    Required, never defaulted.  ``a_ref`` is not a property of the campaign that
+    could be resolved from the file (that is what ``amax="auto"`` does for the
+    substituting swap); it is a statement about the reference prior the
+    CONSUMER's PE side divides out, and the only place that is known is the call
+    site.  A default here would be a fabricated ceiling inside a density that
+    depends on it -- GW-31, one basis over.
+    """
+    if spin_basis not in _REFERENCE_BASES:
+        if spin_reference_amax is not None:
+            raise ValueError(
+                f"spin_reference_amax={spin_reference_amax!r} was passed with "
+                f"spin_basis={spin_basis!r}, which has no reference prior. It "
+                f"applies only to {list(_REFERENCE_BASES)}; the substituting "
+                f"chi_eff swap takes its ceiling from `amax=` instead.")
+        return None
+    if spin_reference_amax is None:
+        raise ValueError(
+            f"spin_basis={spin_basis!r} needs an explicit "
+            f"spin_reference_amax=: the reference spin prior this export "
+            f"reweights TO is a declaration about the PE side it will be "
+            f"paired with (typically the GWTC sampling-prior ceiling 0.99), "
+            f"not a property of the injection campaign, so there is no honest "
+            f"default to resolve it from.")
+    a_ref = float(spin_reference_amax)
+    if not np.isfinite(a_ref) or not (0.0 < a_ref <= 1.0):
+        raise ValueError(
+            f"spin_reference_amax={spin_reference_amax!r}: the reference spin "
+            f"magnitude ceiling must be finite and in (0, 1].")
+    return a_ref
+
+
+def _check_reference_coverage(set_list, a_ref, *, strict):
+    """Refuse/warn when a campaign's magnitudes do not COVER the reference.
+
+    The reweighting divides the reference density by the campaign's own, so it
+    can only redistribute weight where the campaign actually drew.  If a
+    campaign's magnitude prior stops at ``amax_k < a_ref`` then the region
+    ``a in (amax_k, a_ref]`` -- which carries reference probability
+    ``1 - (amax_k/a_ref)^2`` per body -- has no draws to carry it, and every
+    detected system in it is missing from the sum.  ``alpha`` is then biased
+    LOW, the same direction and for the same reason as a dropped detected
+    injection (GW-03).
+
+    Two evidences, deliberately not conflated.  A campaign with a DETECTED
+    (uniform-magnitude) ceiling proves the hole, so it raises under ``strict``.
+    A campaign without one leaves only the largest magnitude actually drawn,
+    which is a sample maximum and not a support bound -- that warns.
+
+    Returns ``(covered_flags, evidence_per_campaign)``.
+    """
+    covered, evidence, proven_bad, unproven_bad = [], [], [], []
+    for s in set_list:
+        meta = s.spin_meta or {}
+        detected = meta.get("amax_detected")
+        has_det = (detected is not None
+                   and all(a is not None and np.isfinite(a)
+                           for a in detected[:2]))
+        if has_det:
+            bound = float(min(detected[0], detected[1]))
+            source = "detected"
+        else:
+            mags = [np.asarray(a, dtype=float) for a in (s._a1, s._a2)
+                    if a is not None]
+            bound = float(min(m.max() for m in mags)) if mags else float("nan")
+            source = "drawn_max"
+        ok = bool(np.isfinite(bound) and bound >= a_ref)
+        covered.append(ok)
+        evidence.append({"path": str(s.path), "bound": bound,
+                         "bound_source": source, "covers_a_ref": ok})
+        if not ok:
+            (proven_bad if source == "detected" else unproven_bad).append(
+                evidence[-1])
+
+    def _detail(rows):
+        return "; ".join(f"{r['path']} (magnitudes reach {r['bound']:.6g}, "
+                         f"from {r['bound_source']})" for r in rows)
+
+    if proven_bad:
+        msg = (
+            f"spin_reference_amax={a_ref} exceeds the injected spin magnitude "
+            f"ceiling of {len(proven_bad)} campaign(s): {_detail(proven_bad)}. "
+            f"The reference prior puts probability where those campaigns drew "
+            f"no injections at all, so the reweighted selection integral is "
+            f"missing that region entirely and alpha is biased LOW -- which "
+            f"raises the likelihood in the direction that looks like a better "
+            f"fit. Lower spin_reference_amax to the campaign ceiling (and use "
+            f"the SAME value on the PE side), or use spin_basis='component', "
+            f"which needs no reference at all. Pass strict=False to export "
+            f"anyway; the file records spin_reference_coverage_per_campaign.")
+        if strict:
+            raise BlockCampaignMismatch(msg)
+        warnings.warn(msg)
+    if unproven_bad:
+        warnings.warn(
+            f"spin_reference_amax={a_ref} is above the largest spin magnitude "
+            f"DRAWN by {len(unproven_bad)} campaign(s): "
+            f"{_detail(unproven_bad)}. These campaigns carry no detectable "
+            f"magnitude ceiling, so this is a sample maximum, not a support "
+            f"bound -- it is evidence of a coverage hole, not proof of one. "
+            f"Recorded in spin_reference_coverage_per_campaign.")
+    return covered, evidence
+
+
+def _campaign_reference_lnfactor(s, keep, a_ref):
+    """``(ln p_iso(chieff|q,a_ref), in_reference_support)`` for one campaign.
+
+    The reference conditional's numerator only; the constant ``1/p_ref =
+    4 a_ref^2`` is applied once, after concatenation, so the arithmetic is one
+    multiplication on the finished component pdraw rather than a per-campaign
+    log sum (which would move the result by an ulp against the component export
+    it is built from).
+
+    In-support means BOTH bodies inside the reference magnitude ceiling AND
+    ``chi_eff`` inside the reference prior's own support predicate -- the
+    predicate, not ``isfinite``, for the GW-31 reason: past ``amax`` the grid
+    clamp returns a finite ~1e-12 density.
+    """
+    if s._a1 is None or s._a2 is None:
+        raise SpinBasisError(
+            f"{s.path}: spin_basis='chieff_reference' needs the injected spin "
+            f"magnitudes a1/a2 to evaluate the reference support "
+            f"(a_i <= a_ref), and this file carries none "
+            f"(spin_format={s.spin_meta.get('spin_format')!r}).")
+    lnp, chi_sup = chi_eff_prior_logprob_in_support(
+        s._chieff[keep], s._m1src[keep], s._m2src[keep], amax=a_ref)
+    in_ref = (np.asarray(chi_sup, dtype=bool)
+              & (np.asarray(s._a1, dtype=float)[keep] <= a_ref)
+              & (np.asarray(s._a2, dtype=float)[keep] <= a_ref))
+    return np.asarray(lnp, dtype=float), np.asarray(in_ref, dtype=bool)
+
+
 class BlockCampaignMismatch(SpinBasisError):
     """A campaign's injected draw contradicts the requested basis's assumption.
 
@@ -367,8 +578,9 @@ def _jsonable(v):
 def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                             far_threshold=1.0,
                             source_class=None, amax=AMAX_AUTO,
-                            amax_fallback=0.99, snr_threshold=None,
-                            z_max=None, strict=True):
+                            amax_fallback=0.99, spin_reference_amax=None,
+                            out_of_reference_pdraw=OUT_OF_REFERENCE_PDRAW,
+                            snr_threshold=None, z_max=None, strict=True):
     """Build a selection :class:`ExportProduct` from one or more SelectionSets.
 
     Parameters
@@ -376,10 +588,13 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     sets : SelectionSet, CombinedSelectionSet, or list of SelectionSet
         One campaign or several; handled uniformly (see the module docstring's
         parity contract).
-    spin_basis : {"component", "chieff", "chieff_chip"}
+    spin_basis : {"component", "chieff", "chieff_chip", "chieff_reference"}
         Per-injection spin factor / extra columns (see the module docstring).
         Defaults to ``"component"`` -- the exact component-basis draw density,
-        which is well-defined for every file.
+        which is well-defined for every file.  ``"chieff_reference"`` writes the
+        ``(m1det, q, dL, chi_eff)`` density against a DECLARED reference spin
+        prior by reweighting that exact component density; it needs
+        ``spin_reference_amax`` and is valid for any campaign.
     far_threshold : float, default 1.0
         FAR detection threshold in yr^-1, applied per campaign.
     source_class : str, iterable, or None
@@ -398,6 +613,20 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         Ceiling assumed for a ``"chieff"``-basis campaign whose injected spin
         draw carries no detectable ceiling (warned about, and recorded in
         ``chi_eff_amax_source_per_campaign``).
+    spin_reference_amax : float
+        REQUIRED by (and only accepted by) ``spin_basis="chieff_reference"``:
+        the magnitude ceiling ``a_ref`` of the isotropic uniform-magnitude
+        reference spin prior the exported ``pdraw`` is expressed against.  It
+        must be the ceiling the paired PE export divides out (0.99 for the GWTC
+        sampling priors) -- unlike the substituting swap's ``amax``, where the
+        two sides legitimately differ, here they are the SAME object and the
+        validator refuses a pair whose ceilings disagree.  No default: see
+        :func:`_parse_reference_amax`.
+    out_of_reference_pdraw : float, default 1e300
+        ``pdraw`` written for a row the reference assigns zero density to
+        (``a_i > a_ref``), so its importance weight underflows to exactly zero
+        while the file keeps a finite positive ``pdraw`` everywhere.  Reference
+        bases only.
     z_max : float, optional
         Redshift truncation matching the PE export's per-sample ``z_max``
         (GW-37).  Injections above it are SUBSET out (``ndraw`` untouched, so
@@ -426,6 +655,9 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             f"{list(_KNOWN_SPIN_BASES)}.")
     # `None` = each campaign's own detected ceiling; a float = one forced ceiling.
     forced_amax = parse_amax_option(amax, what="amax")
+    # `None` for every non-reference basis; a validated float for a reference
+    # basis, which never defaults it.
+    a_ref = _parse_reference_amax(spin_basis, spin_reference_amax)
 
     if isinstance(sets, CombinedSelectionSet):
         set_list = list(sets._sets)
@@ -447,15 +679,22 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             f"Cosmology mismatch across campaigns: H0={H0s}, Om0={Om0s}. "
             f"Results may be inconsistent.")
 
-    # component basis: every campaign must carry the exact component spin draw.
-    if spin_basis == "component":
+    # The component draw density is the STARTING POINT of both the component
+    # basis and every reference basis (which reweights it), so both require it.
+    if spin_basis == "component" or spin_basis in _REFERENCE_BASES:
         for s in set_list:
             if not s.component_spin_available:
                 raise SpinBasisError(
                     f"{s.path}: component-basis spin draw density unavailable "
                     f"(spin_format={s.spin_meta.get('spin_format')!r}); this "
                     f"file lacks the per-spin draw information needed for "
-                    f"spin_basis='component'. Use spin_basis='chieff'.")
+                    f"spin_basis={spin_basis!r}. Use spin_basis='chieff'.")
+
+    #: Per-campaign reference-support coverage (reference bases only).
+    reference_coverage, reference_coverage_evidence = [], []
+    if a_ref is not None:
+        reference_coverage, reference_coverage_evidence = (
+            _check_reference_coverage(set_list, a_ref, strict=strict))
 
     ndraw_per = [int(s._ndraw) for s in set_list]
     ndraw_total = sum(ndraw_per)
@@ -470,6 +709,8 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     extra_parts = {k: [] for k in ("a1", "a2", "cost1", "cost2", "chip")}
     lnfactor_parts = []          # per-campaign ln spin factor (every basis)
     support_parts = []           # per-campaign in-support mask (projections)
+    ref_lnp_parts = []           # per-campaign ln p_iso(chieff|q,a_ref)
+    ref_support_parts = []       # per-campaign in-REFERENCE-support mask
     extras_available = True      # a1/a2/cost1/cost2 present for every campaign
     chip_available = True        # chi_p present for every campaign
 
@@ -527,6 +768,17 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         if spin_basis == "component":
             lnfactor_parts.append(np.asarray(s._ln_spin_component)[keep])
             support_parts.append(np.ones(n_det_k, dtype=bool))
+        elif spin_basis == "chieff_reference":
+            # The component factor, byte-for-byte what the component basis
+            # applies -- the reference change is one multiplication on the
+            # FINISHED component pdraw, below.  `support_parts` stays all-True:
+            # the campaign's own density is positive on every drawn injection,
+            # and the reference's zeros are a separate, non-fatal mask.
+            lnfactor_parts.append(np.asarray(s._ln_spin_component)[keep])
+            support_parts.append(np.ones(n_det_k, dtype=bool))
+            lnp_ref, in_ref = _campaign_reference_lnfactor(s, keep, a_ref)
+            ref_lnp_parts.append(lnp_ref)
+            ref_support_parts.append(in_ref)
         elif spin_basis == "chieff_chip":
             lnfac, sup, amax_used, _ = _campaign_chieff_chip_lnfactor(
                 s, keep, strict)
@@ -607,6 +859,39 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             f"campaign: fix the amax (GW-04) or use spin_basis='component', "
             f"which is exact for any campaign because the assumed prior "
             f"cancels identically.")
+
+    # ── Reference bases: the one explicit change of spin reference ──────────
+    # `data["pdraw"]` is now the component-basis pdraw, bit-for-bit what
+    # spin_basis="component" would have written.  The reference spin prior is
+    # CONSTANT inside its support (isotropic tilts, magnitudes uniform on
+    # [0, a_ref] => p_ref = 1/(4 a_ref^2)), so the whole change of reference is
+    # the single factor p_iso(chi_eff | q, a_ref) / p_ref applied to it -- one
+    # multiplication, in this association, so a reference export and the
+    # component export it is built from differ by exactly that factor and by
+    # nothing else the floating-point arithmetic re-orders.
+    n_out_of_reference = 0
+    ln_ref_norm = float("nan")
+    if a_ref is not None:
+        ln_ref_norm = np.log(4.0 * a_ref ** 2)
+        ln_p_ref_chi = np.concatenate(ref_lnp_parts)
+        in_reference = np.concatenate(ref_support_parts)
+        with np.errstate(over="ignore", invalid="ignore"):
+            data["pdraw"] = data["pdraw"] * np.exp(ln_p_ref_chi + ln_ref_norm)
+        bad = ~np.isfinite(data["pdraw"]) | (data["pdraw"] <= 0.0)
+        n_bad = int(np.sum(bad & in_reference))
+        if n_bad:
+            raise SpinBasisError(
+                f"spin_basis={spin_basis!r}: {n_bad} of {bad.size} detected "
+                f"injections are INSIDE the reference support "
+                f"(a_ref={a_ref}) yet came out with a non-finite or "
+                f"non-positive pdraw. That is an arithmetic failure of the "
+                f"reweighting, not a support statement, and it must not be "
+                f"written as a zero-weight row -- those rows are physically "
+                f"in the integral.")
+        excluded = ~in_reference | bad
+        data["pdraw"] = np.where(excluded, float(out_of_reference_pdraw),
+                                 data["pdraw"])
+        n_out_of_reference = int(np.sum(excluded))
 
     # ── Output columns: legacy 10 + (a1,a2,cost1,cost2,chip when available) ──
     columns = {
@@ -698,7 +983,12 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         "spin_removal_amax_assumed_per_campaign": np.array(
             [float(getattr(s, "_removal_amax", None) or np.nan)
              for s in set_list], dtype=float),
-        "spin_removal_amax_cancels": bool(spin_basis == "component"),
+        # Also True for a reference basis: its starting point IS the
+        # component density, and the reference factor does not involve the
+        # removal ceiling, so the (assumed/injected)^2 constant cancels there
+        # for exactly the same reason.
+        "spin_removal_amax_cancels": bool(
+            spin_basis == "component" or spin_basis in _REFERENCE_BASES),
     })
 
     # Basis-specific spin-prior contract attrs (mirror the v1 / PE naming).
@@ -725,6 +1015,47 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             [v for v in swap_violations if v.get("verified")])
         attrs["spin_basis_assumption_unverified"] = bool(
             [v for v in swap_violations if not v.get("verified")])
+    elif spin_basis == "chieff_reference":
+        attrs["spin_prior_mode"] = "include"
+        # Both True, and both mean what they have always meant: the 1-D chi_eff
+        # prior IS a factor of the exported pdraw (unlike chieff_chip, where a
+        # JOINT prior is and these are False).  WHICH chi_eff density, and how
+        # it got there, is what the spin_reference_* attrs below say -- the
+        # campaign's own spin draw was divided out by the reference rather than
+        # discarded, which is the difference between this basis and the swap.
+        attrs["chi_eff_swap_applied"] = True
+        attrs["chi_eff_prior_applied_to_pdraw"] = True
+        attrs["chi_eff_prior_source"] = "reweighted_from_component_draw"
+        attrs["component_spin_draw_retained"] = False
+        attrs["spin_basis_source"] = "component"
+        attrs["spin_reference"] = (
+            f"isotropic uniform-magnitude a_max={a_ref}")
+        attrs["spin_reference_amax"] = float(a_ref)
+        # The support bound of the written pdraw, in the same spelling every
+        # other basis uses for it.
+        attrs["chi_eff_amax"] = float(a_ref)
+        attrs["chi_eff_amax_mode"] = "reference"
+        attrs["spin_reference_formula"] = (
+            "pdraw = pdraw_component * exp(chi_eff_prior_logprob_in_support("
+            "chieff, m1src, m2src, amax=a_ref)) * 4 * a_ref**2; equivalently "
+            "pdraw_component * p_iso(chieff|q,a_ref) / p_ref(a1,cost1,a2,cost2) "
+            "with the reference spin prior p_ref = 1/(4 a_ref^2). Rows with "
+            "a1 > a_ref or a2 > a_ref (zero reference density) carry weight "
+            "exactly zero and are written with spin_reference_excluded_pdraw.")
+        attrs["spin_reference_excluded_rows"] = int(n_out_of_reference)
+        attrs["spin_reference_excluded_pdraw"] = float(out_of_reference_pdraw)
+        attrs["spin_reference_ln_norm"] = float(ln_ref_norm)
+        # Whether each campaign's injected magnitudes COVER [0, a_ref], and on
+        # what evidence -- a detected (uniform-magnitude) ceiling proves it, a
+        # sample maximum only suggests it.
+        attrs["spin_reference_coverage_per_campaign"] = np.array(
+            reference_coverage, dtype=bool)
+        attrs["spin_reference_coverage_bound_per_campaign"] = np.array(
+            [e["bound"] for e in reference_coverage_evidence], dtype=float)
+        attrs["spin_reference_coverage_source_per_campaign"] = np.array(
+            [e["bound_source"] for e in reference_coverage_evidence],
+            dtype=_str)
+        attrs["spin_reference_coverage_ok"] = bool(all(reference_coverage))
     elif spin_basis == "component":
         attrs["spin_prior_mode"] = "component"
         # Stated False, not omitted: darksirens' loader REQUIRES this attr, so
@@ -805,6 +1136,11 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                                  for s in set_list],
         "component_columns_emitted": bool(extras_available),
     }
+    if a_ref is not None:
+        summary["spin_reference_amax"] = float(a_ref)
+        summary["spin_reference_excluded_rows"] = int(n_out_of_reference)
+        summary["spin_reference_coverage_per_campaign"] = [
+            bool(x) for x in reference_coverage]
 
     for info in campaign_info:
         print(f"  {info}")

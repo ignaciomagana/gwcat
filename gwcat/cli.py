@@ -271,6 +271,17 @@ def build_parser() -> argparse.ArgumentParser:
                              "injected amax, a number forces one ceiling. "
                              "Ignored by 'component'; 'chieff_chip' always "
                              "uses the detected amax.")
+    p_xsel.add_argument("--spin-reference-amax", type=float, default=None,
+                        metavar="A_REF",
+                        help="REQUIRED by (and only accepted by) "
+                             "--parameter-space chieff_reference: the ceiling "
+                             "of the isotropic uniform-magnitude reference "
+                             "spin prior the exported pdraw is expressed "
+                             "against. It must equal the ceiling the paired PE "
+                             "export divides out (0.99 for the GWTC sampling "
+                             "priors); there is no default because it is a "
+                             "declaration about that pairing, not a property "
+                             "of the campaign.")
     p_xsel.add_argument("--z-max", type=float, default=None, metavar="Z",
                         help="Subset injections to z <= Z, matching the PE "
                              "export's --z-max. Subsetting only (ndraw is "
@@ -526,6 +537,7 @@ def _cmd_export_selection(args) -> int:
         far_threshold=args.far_threshold,
         source_class=_parse_source_class(args.source_class),
         amax=args.amax,
+        spin_reference_amax=args.spin_reference_amax,
         snr_threshold=args.snr_threshold,
         z_max=args.z_max,
     )

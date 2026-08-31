@@ -400,6 +400,20 @@ def _v2_selection_additions(attrs: Dict[str, Any]) -> Dict[str, Any]:
             out["injected_spin_checks"] = _json.loads(_decode(checks))
         except Exception:
             out["injected_spin_checks"] = _decode(checks)
+    # Reference-basis provenance: WHICH reference the pdraw is expressed
+    # against, and what it cost -- a summary that omitted a_ref would describe
+    # a density without naming the prior it is a density with respect to.
+    if "spin_reference_amax" in attrs:
+        out["spin_reference_amax"] = float(attrs["spin_reference_amax"])
+        for key, cast in (("spin_reference_excluded_rows", int),
+                          ("spin_reference_excluded_pdraw", float),
+                          ("spin_reference_coverage_ok", bool)):
+            if key in attrs:
+                out[key] = cast(attrs[key])
+        cov = attrs.get("spin_reference_coverage_per_campaign")
+        if cov is not None:
+            out["spin_reference_coverage_per_campaign"] = [
+                bool(x) for x in np.asarray(cov).ravel()]
     if "pdraw_state" in attrs:
         out["pdraw_state"] = _decode(attrs["pdraw_state"])
     return out
