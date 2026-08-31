@@ -910,3 +910,64 @@ def test_v1_validator_refuses_a_v2_file_outright(tmp_path):
     pe = _pe_component(tmp_path, name="v2_for_v1.h5")
     results = v1_validator(str(pe))
     assert results["pe_format_version"] is False
+
+
+# ======================================================================
+# 8. The one unequal pair that validates: chieff PE + chieff_reference selection
+# ======================================================================
+def _pe_chieff_at(tmp_path, amax, name="pe_ref.h5"):
+    events = [{"name": "GWv0_000001", "amax1": amax, "amax2": amax},
+              {"name": "GWv0_000002", "amax1": amax, "amax2": amax}]
+    store, _ = _build_spin_store(tmp_path, events, name=f"store_{name}")
+    out = tmp_path / name
+    GWCatalog(store).export(str(out), format="gwcat2", spin_basis="chieff",
+                            nsamp=48, seed=0, allow_projection_basis=True,
+                            cosmology=_COSMO)
+    return out
+
+
+def _sel_reference(tmp_path, a_ref, name="sel_ref.h5"):
+    inj = write_o4_full(tmp_path / f"inj_{name}.hdf", n=60, amax=(0.998, 0.998),
+                        seed=6)
+    out = tmp_path / name
+    SelectionSet(inj).export(str(out), spin_basis="chieff_reference",
+                             spin_reference_amax=a_ref)
+    return out
+
+
+def test_chieff_pe_pairs_with_a_chieff_reference_selection(tmp_path):
+    """They are the two halves of ONE density: the selection pdraw was
+    reweighted TO the prior the PE p_pe divides OUT. So the bases need not be
+    equal -- but the ceilings must be."""
+    pe = _pe_chieff_at(tmp_path, 0.99)
+    sel = _sel_reference(tmp_path, 0.99)
+    results = validate_export_v2(str(pe), str(sel))
+    assert results["xcheck_spin_basis"] is True
+    assert results["xcheck_reference_amax_matches"] is True
+    assert results["xcheck_reference_pdraw_state"] is True
+    assert all(results.values()), \
+        f"unexpected failures: {[k for k, v in results.items() if not v]}"
+
+
+def test_reference_pair_with_disagreeing_ceilings_fails(tmp_path):
+    """The mirror image of the chieff/chieff rule (GW-31), and the reason the
+    exception is safe: there the two amax are different quantities and must NOT
+    be forced equal; here they are the same object and a difference leaves an
+    uncancelled chi_eff-dependent factor in every weight."""
+    pe = _pe_chieff_at(tmp_path, 0.90)
+    sel = _sel_reference(tmp_path, 0.99)
+    with pytest.raises(ValueError) as ei:
+        validate_export_v2(str(pe), str(sel))
+    msg = str(ei.value)
+    assert "xcheck_reference_amax_matches" in msg
+    assert "0.99" in msg and "0.9" in msg
+
+
+def test_component_pe_still_refuses_a_chieff_reference_selection(tmp_path):
+    """The exception is one named pair, not a general loosening."""
+    pe = _pe_component(tmp_path, basis="component")
+    sel = _sel_reference(tmp_path, 0.99)
+    with pytest.raises(ValueError) as ei:
+        validate_export_v2(str(pe), str(sel))
+    assert "chieff_reference" in str(ei.value)
+    assert "spin_basis" in str(ei.value)

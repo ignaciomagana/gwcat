@@ -85,6 +85,13 @@ _SEL_LEGACY = ["m1det", "m2det", "dL", "chieff", "ra", "dec",
 #: Optional per-injection spin columns a selection export may add.
 _SPIN_COLUMNS = ["a1", "a2", "cost1", "cost2", "chip"]
 
+#: (PE basis, selection basis) pairs that validate WITHOUT being equal.  Only
+#: one: the reference basis writes the injection-side density against the very
+#: prior a chieff PE export removes, so the two are the two halves of one
+#: density -- see :func:`_xcheck_reference_pair`, which then requires the single
+#: thing that makes them one (the same ceiling).
+_REFERENCE_PAIRS = {("chieff", "chieff_reference")}
+
 #: Small multiplicative slack for magnitude upper bounds (float round-off).
 _SLACK = 1.001
 _TOL = 1e-9
@@ -168,7 +175,12 @@ def validate_export_v2(pe_path, selection_path=None, strict=False):
     Cross-file contract checks (ALWAYS raise on mismatch)
     -----------------------------------------------------
       * PE ``spin_basis`` must equal selection ``spin_basis`` (the error names
-        both).
+        both) -- with the single exception of a ``chieff`` PE file paired with a
+        ``chieff_reference`` selection file, which are the two halves of one
+        density and are then held to the STRICTER rule that their ceilings match
+        exactly (:func:`_xcheck_reference_pair`).  Note that the 2.1 pairing
+        hash covers ``parameter_space`` verbatim and so does not yet recognise
+        that pair; export a reference pair at 2.0.
       * Basis-specific spin-amax handling (see below).
       * ``component`` basis: PE ``component_spin_prior_applied_to_p_pe`` must be
         ``True`` and the selection ``pdraw_state`` must equal the component
@@ -347,6 +359,12 @@ def validate_export_v2(pe_path, selection_path=None, strict=False):
         sel_required = list(_SEL_LEGACY)
         if sel_basis == "component":
             sel_required += _SPIN_COLUMNS
+        elif sel_basis == "chieff_reference":
+            # a1/a2 are the coordinates of the reference SUPPORT: they are what
+            # tells a reader which rows carry the zero-weight sentinel and why.
+            # A reference file without them states that some rows are outside
+            # the reference and offers no way to see which.
+            sel_required += ["a1", "a2"]
         elif sel_basis == "chieff_chip":
             sel_required += ["chip"]
         for ds in sel_required:
@@ -417,16 +435,30 @@ def validate_export_v2(pe_path, selection_path=None, strict=False):
 
         # ── Cross-file contract checks (ALWAYS raise on mismatch) ────────────
         # (a) spin_basis must match -- name BOTH sides.
-        if pe_basis != sel_basis:
+        #
+        # One pair is legitimate without being equal, and it is a pair about the
+        # SAME density rather than a loosening: a chieff_reference selection file
+        # is expressed against a declared isotropic uniform-magnitude reference
+        # prior, and a chieff PE file at that same ceiling divides out exactly
+        # that prior.  The two halves therefore fit -- provided the ceilings
+        # match, which (b) below then REQUIRES rather than merely records.  That
+        # requirement is the mirror image of the chieff/chieff rule, where the
+        # two amax legitimately differ because each side removes its own prior.
+        reference_pair = (pe_basis, sel_basis) in _REFERENCE_PAIRS
+        if pe_basis != sel_basis and not reference_pair:
             _fail("xcheck_spin_basis",
                   f"PE spin_basis={pe_basis!r} but selection "
                   f"spin_basis={sel_basis!r}. The PE export and its selection "
                   f"function must share one spin basis; otherwise the priors "
-                  f"divided out on each side are inconsistent.")
+                  f"divided out on each side are inconsistent. The only "
+                  f"unequal pair that validates is "
+                  f"{sorted(_REFERENCE_PAIRS)}.")
         results["xcheck_spin_basis"] = True
 
         # (b) Basis-specific spin-amax handling.
-        if pe_basis == "chieff":
+        if reference_pair:
+            _xcheck_reference_pair(_check, _fail, results, pe_attrs, sel_attrs)
+        elif pe_basis == "chieff":
             # Each side's ceiling is checked against ITS OWN provenance, and the
             # two are RECORDED rather than required to match -- see the
             # docstring section on why equality is the wrong contract (GW-31).
@@ -939,6 +971,73 @@ def _xcheck_campaign_cosmology(_check, results, sel_attrs):
     results.setdefault(
         "xcheck_campaign_cosmology",
         all(results.get(k, True) for k in subs))
+
+
+def _xcheck_reference_pair(_check, _fail, results, pe_attrs, sel_attrs):
+    """A chieff PE file and a chieff_reference selection file: ONE ceiling.
+
+    This is the cross-check that is stricter here than for chieff/chieff, and
+    the reason is the whole difference between the two bases.  The substituting
+    swap divides out a DIFFERENT prior on each side -- the posterior's sampling
+    prior on one, the injected draw on the other -- so its two ``amax`` values
+    are two different quantities and forcing them equal would be wrong (GW-31).
+    The reference basis divides out the SAME prior on both sides: the reference
+    is one declared object, and if the two files name different ceilings for it
+    the spin density does not cancel between numerator and denominator, leaving
+    a chi_eff-dependent error in every population posterior the pair produces.
+    So here equality is the contract, and a mismatch fails.
+    """
+    a_ref = sel_attrs.get("spin_reference_amax")
+    if a_ref is None:
+        _fail("xcheck_reference_amax_recorded",
+              "selection spin_basis='chieff_reference' but the file records no "
+              "spin_reference_amax; the density it writes is a density with "
+              "respect to a reference prior it does not name.")
+    a_ref = float(a_ref)
+    _check("xcheck_reference_amax_finite", np.isfinite(a_ref) and a_ref > 0,
+           f"selection spin_reference_amax={a_ref!r} is not a positive finite "
+           f"ceiling")
+
+    pe_amax = _amax_provenance(pe_attrs, ("chi_eff_amax_1_per_event",
+                                          "chi_eff_amax_2_per_event"))
+    _check("xcheck_reference_pe_amax_finite",
+           pe_amax.size > 0 and np.all(np.isfinite(pe_amax)),
+           "PE chi_eff ceiling (chi_eff_amax_1/2_per_event, or the "
+           "chi_eff_amax scalar on an older file) is empty or non-finite")
+    if pe_amax.size and np.all(np.isfinite(pe_amax)):
+        if not np.allclose(pe_amax, a_ref, rtol=1e-9, atol=1e-12):
+            pe_u = sorted({round(float(x), 9) for x in pe_amax.ravel()})
+            _fail("xcheck_reference_amax_matches",
+                  f"PE chi_eff prior amax {pe_u} != selection "
+                  f"spin_reference_amax {a_ref}. In this basis the two are the "
+                  f"SAME object -- the selection pdraw was reweighted TO the "
+                  f"prior the PE p_pe divides OUT -- so they must be equal, "
+                  f"and a mismatch leaves an uncancelled chi_eff-dependent "
+                  f"factor in every event's weight. Re-export the selection "
+                  f"file with spin_reference_amax equal to the PE ceiling (or "
+                  f"the PE file at that amax).")
+        results["xcheck_reference_amax_matches"] = True
+
+    from ..selection import PDRAW_STATE_CHIEFF_REFERENCE
+    if sel_attrs.get("pdraw_state") != PDRAW_STATE_CHIEFF_REFERENCE:
+        _fail("xcheck_reference_pdraw_state",
+              f"selection pdraw_state={sel_attrs.get('pdraw_state')!r} does "
+              f"not match the chieff_reference constant. The file was not "
+              f"written by the reference-basis builder.")
+    results["xcheck_reference_pdraw_state"] = True
+
+    # Coverage is a physics fact about the campaigns, recorded at build time;
+    # the validator reads it rather than re-deriving it, and says so out loud
+    # because a coverage hole biases alpha LOW.
+    cov = sel_attrs.get("spin_reference_coverage_ok")
+    if cov is not None and not bool(cov):
+        warnings.warn(
+            f"chieff_reference: the selection file records "
+            f"spin_reference_coverage_ok=False -- at least one campaign's "
+            f"injected spin magnitudes do not reach a_ref={a_ref}, so the "
+            f"reference support has a region with no draws in it and the "
+            f"selection integral is biased low. See "
+            f"spin_reference_coverage_per_campaign.")
 
 
 def _fit_columns_present(_check, attrs, present, prefix):
