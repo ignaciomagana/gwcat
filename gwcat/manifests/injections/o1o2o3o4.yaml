@@ -25,6 +25,33 @@ metadata:
   source_class_reference: not_applicable
   far_available_online: false
   preferred_waveform_source: manifest
+  # GW-39.  One file, several runs: semianalytic O1/O2 rows (detected by the
+  # simulated observed SNR; every FAR is +inf, no sky position) next to real
+  # O3/O4 rows (detected by search FAR), per-row mixture weights and one joint
+  # draw density.  gwcat recognises it as campaign_kind=cumulative_mixture and
+  # applies the release's rule per run; a FAR-only cut, the chieff substitution
+  # basis, and combining it with endo3/rpo4ab are refused.
+  campaign_kind: cumulative_mixture
+  default_detection_rule:
+    policy: lvk-cumulative
+    O1: "semianalytic_observed_phase_maximized_snr_net > 10"
+    O2: "semianalytic_observed_phase_maximized_snr_net > 10"
+    O3a: "min(o3_*_far) < 1 /yr"
+    O3b: "min(o3_*_far) < 1 /yr"
+    O4a: "min(o4a_*_far) < 1 /yr"
+    O4b: "min(o4b_*_far) < 1 /yr"
+    command: "gwcat export selection <file> --parameter-space chieff_reference --spin-reference-amax 0.99 --detection-policy lvk-cumulative --snr-threshold 10 --far-threshold 1 --sky-marginal"
+  # Zenodo 19500052 checksums (the record's own md5), for pinning.
+  files:
+    mixture-semi_o1_o2-real_o3_o4a_o4b-cartesian_spins_20260410130052UTC-clipped.hdf:
+      md5: 867909ab2eac141905905abf63700da1
+      size: 1142135496
+    mixture-semi_o1_o2-real_o3_o4a_o4b-polar_spins_20260410130052UTC-clipped.hdf:
+      md5: 1498cc813a770e6b5da86c8fbf2b3126
+      size: 1142135648
+    gwtc-5_o1234ab_sensitivity-estimates.md:
+      md5: 5ffdec765b6b3b4935f88d88ac11a3cc
+      size: 11486
 
 validation:
   require_checksums: true
