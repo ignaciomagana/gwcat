@@ -357,6 +357,15 @@ def validate_export_v2(pe_path, selection_path=None, strict=False):
         # never raises, so a consumer reading columns independently pairs
         # injection i's draw density with injection j's masses and distance.
         sel_required = list(_SEL_LEGACY)
+        # GW-39: a sky-marginalised product omits ra/dec by construction, and
+        # must then really omit them (a file that says marginalised and ships
+        # a sky would be ambiguous about which it is).
+        _sky_marg = bool(sel_attrs.get("sky_marginalized", False))
+        if _sky_marg:
+            sel_required = [c for c in sel_required if c not in ("ra", "dec")]
+            _check("sel_sky_marginalized_has_no_radec",
+                   "ra" not in sel_present and "dec" not in sel_present,
+                   "sky_marginalized=True but the file carries ra/dec")
         if sel_basis == "component":
             sel_required += _SPIN_COLUMNS
         elif sel_basis == "chieff_reference":
@@ -402,6 +411,22 @@ def validate_export_v2(pe_path, selection_path=None, strict=False):
         for a in ("injected_spin_format", "injected_spin_amax_detected",
                   "injected_spin_uniform_isotropic"):
             _check(f"sel_has_{a}", a in sel_attrs, f"attr {a!r} missing")
+
+        # GW-39: a cumulative-mixture product must say how each run was
+        # detected and how its exposure is defined, and its per-run written
+        # counts must add up to the file.
+        if bool(sel_attrs.get("cumulative_mixture", False)):
+            for a in ("run_labels", "n_detected_per_run",
+                      "detection_rule_per_run", "T_definition_per_run",
+                      "N_per_run", "T_per_run_s"):
+                _check(f"sel_mixture_has_{a}", a in sel_attrs,
+                       f"cumulative_mixture=True but attr {a!r} is missing")
+            if "n_detected_per_run" in sel_attrs:
+                _nper = np.asarray(sel_attrs["n_detected_per_run"]).ravel()
+                _check("sel_mixture_n_detected_per_run_sum",
+                       int(np.sum(_nper)) == n_det,
+                       f"sum(n_detected_per_run)={int(np.sum(_nper))} != "
+                       f"n_detected={n_det}")
 
         # Magnitude bound for the range checks.  A campaign's detected amax
         # only bounds its injections when that campaign's draw really is

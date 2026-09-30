@@ -132,6 +132,31 @@ Columns (all bases): the legacy 10 (``m1det, m2det, dL, chieff, ra, dec, m1src,
 m2src, redshift, pdraw``) plus ``a1, a2, cost1, cost2, chip`` whenever every
 contributing campaign carries them (they are free -- read from the additive
 component-spin accessors -- so the chieff basis includes them too).
+``sky_marginal=True`` drops ``ra``/``dec`` and records ``sky_marginalized``.
+
+Cumulative multi-run mixtures (GW-39)
+-------------------------------------
+The GWTC-5.0 O1-O4b file is ONE campaign whose rows come from six runs.  Three
+ways of exporting it look plausible and are wrong, and each is refused here
+rather than written:
+
+* a FAR-only cut (:class:`MixtureDetectionError`): the O1/O2 rows are
+  semianalytic and carry no FAR, so none is detected while their draws and
+  exposure stay in ``ndraw``/``T_obs`` -- the release's rule is SNR on O1/O2
+  rows and search FAR on O3/O4 rows, applied per run
+  (:meth:`gwcat.selection.SelectionSet.detected_mask`);
+* the ``chieff``/``chieff_chip`` substitution bases: the file ships one joint
+  spin density, the uniform/isotropic assumption cannot be verified on it, and
+  its spins are measured non-isotropic -- ``chieff_reference`` reweights
+  instead and is exact;
+* combining it with a campaign that overlaps it in time
+  (:class:`OverlappingCampaignError`), which double-counts exposure.
+
+The export records the per-run provenance (``run_labels``,
+``detection_rule_per_run``, ``n_detected_per_run``, the two window tables, the
+per-run mixture weights, the derived ``N_per_run``/``T_per_run_s`` with
+``T_definition_per_run``, ``z_draw_max_per_run``) and runs the reference
+coverage check per run as well as per campaign.
 """
 from __future__ import annotations
 
@@ -149,7 +174,13 @@ from ..spin import (AMAX_AUTO, chi_eff_chi_p_prior_logprob_in_support,
 from ..selection import (SelectionSet, CombinedSelectionSet,
                          PDRAW_STATE_BY_BASIS, _selection_provenance_dict,
                          _refuse_mixed_cosmology, _cosmo_or_nan,
-                         _cosmology_is_mixed)
+                         _cosmology_is_mixed, SNR_COLUMN,
+                         CAMPAIGN_CUMULATIVE_MIXTURE, MixtureDetectionError,
+                         MixtureInvariantError, _mixture_far_only_message)
+from ..observing_runs import (RUN_LABELS, SEMIANALYTIC_RUNS,
+                              INJECTION_SUPPORT_GPS, EXPOSURE_WINDOWS_GPS,
+                              MIXTURE_COMPONENTS, MIXTURE_RELEASE_ANCHORS,
+                              derive_mixture_bookkeeping)
 from .product import ExportProduct
 
 #: Spin bases the selection builder implements.  A registry space outside this
@@ -175,7 +206,29 @@ _REFERENCE_BASES = ("chieff_reference",)
 OUT_OF_REFERENCE_PDRAW = 1e300
 
 #: The cumulative-mixture SNR column used by the optional OR-branch.
-_SNR_COLUMN = "semianalytic_observed_phase_maximized_snr_net"
+_SNR_COLUMN = SNR_COLUMN
+
+#: ``detection_policy`` values the builder (and ``export selection
+#: --detection-policy``) accept.  ``far``: the FAR cut, OR-ed with the SNR
+#: column when ``snr_threshold`` is given.  ``lvk-cumulative``: the release's
+#: per-run rule on a cumulative mixture (SNR on O1/O2 rows, the run's own
+#: search FARs on O3/O4 rows); it requires ``snr_threshold`` and a mixture.
+DETECTION_POLICIES = ("far", "lvk-cumulative")
+
+#: Spin formats that carry ONE joint (masses, redshift, spins) draw density.
+#: The chi_eff/chi_eff_chip swaps need the campaign's spins to be uniform in
+#: magnitude and isotropic, and a joint density admits no such check.
+_JOINT_SPIN_FORMATS = ("joint_cartesian", "joint_polar")
+
+
+class OverlappingCampaignError(ValueError):
+    """Two campaigns in one selection product cover the same GPS time.
+
+    A cumulative mixture already contains every run's exposure in its
+    ``total_generated``/``total_analysis_time`` and per-row weights; adding a
+    campaign that overlaps it in time (endo3 for O3, rpo4ab for O4) counts that
+    exposure twice and double-counts its detections in the Essick sum.
+    """
 
 #: Extra per-injection spin columns (emitted when available for every campaign).
 #: Read off the component block rather than re-typed (GW-19): the registry is the
@@ -197,30 +250,19 @@ class SpinBasisError(RuntimeError):
     """
 
 
-def _read_snr_column(path):
-    """Read the semianalytic SNR column from an injection file, or ``None``.
+def _detect_keep(s, far_threshold, source_class, snr_threshold, z_max=None,
+                 acknowledge_semianalytic_excluded=False):
+    """``(keep, detect, sc_mask)`` for one campaign, mirroring the legacy masks.
 
-    Looks in the ``events`` group/dataset (O4) or the ``injections`` group (O3).
-    Returns a float array, or ``None`` when the column is absent.
-    """
-    with h5py.File(path, "r") as f:
-        for group in ("events", "injections"):
-            if group not in f:
-                continue
-            table = f[group]
-            names = (table.dtype.names if isinstance(table, h5py.Dataset)
-                     and table.dtype.names is not None else set(table.keys()))
-            if _SNR_COLUMN in names:
-                return np.asarray(table[_SNR_COLUMN], dtype=float)
-    return None
-
-
-def _detect_keep(s, far_threshold, source_class, snr_threshold, z_max=None):
-    """``(keep, det, sc_mask)`` for one campaign, mirroring the legacy masks.
-
-    ``keep = detect & sc_mask`` where ``detect`` is the FAR cut, OR-ed with the
-    SNR cut (``snr > snr_threshold``) when ``snr_threshold`` is not ``None``,
-    and intersected with ``z <= z_max`` when a redshift truncation is in force.
+    ``keep = detect & sc_mask``.  For a single campaign ``detect`` is the FAR
+    cut, OR-ed with the SNR cut (``snr > snr_threshold``) when
+    ``snr_threshold`` is not ``None``.  For a cumulative mixture (GW-39) it is
+    the RUN-AWARE rule of :meth:`gwcat.selection.SelectionSet.detected_mask`
+    -- SNR on the O1/O2 rows only, the run's own search FARs on the O3/O4 rows
+    only -- and a FAR-only request on a mixture with semianalytic rows raises
+    :class:`MixtureDetectionError` unless
+    ``acknowledge_semianalytic_excluded=True``.  ``sc_mask`` is intersected
+    with ``z <= z_max`` when a redshift truncation is in force.
 
     ``z_max`` is the injection-side counterpart of the PE export's per-sample
     redshift truncation (GW-37).  It had none: the PE side dropped posterior
@@ -229,22 +271,171 @@ def _detect_keep(s, far_threshold, source_class, snr_threshold, z_max=None):
     this is SUBSETTING, not reweighting -- ``ndraw`` is untouched, so the
     Essick fractions N_k/N_total are unchanged.
     """
-    det = s.detected_mask(far_threshold)
+    if (s.campaign_kind == CAMPAIGN_CUMULATIVE_MIXTURE
+            and snr_threshold is None
+            and not acknowledge_semianalytic_excluded):
+        n_semi = int(np.isin(np.asarray(s.run), SEMIANALYTIC_RUNS).sum())
+        if n_semi:
+            raise MixtureDetectionError(
+                _mixture_far_only_message(s.path, n_semi))
+    detect = s.detected_mask(
+        far_threshold, snr_threshold=snr_threshold,
+        acknowledge_semianalytic_excluded=acknowledge_semianalytic_excluded)
     sc_mask = s.source_class_mask(source_class)
     if z_max is not None:
         sc_mask = sc_mask & (np.asarray(s._z, dtype=float) <= float(z_max))
-    if snr_threshold is not None:
-        snr = _read_snr_column(s.path)
-        if snr is None:
-            raise ValueError(
-                f"snr_threshold={snr_threshold} was requested but injection "
-                f"file {s.path} has no {_SNR_COLUMN!r} column; only cumulative "
-                f"mixture files carry it. Drop snr_threshold (=None) to use the "
-                f"FAR cut alone.")
-        detect = det | (np.asarray(snr, dtype=float) > snr_threshold)
-    else:
-        detect = det
-    return detect & sc_mask, det, sc_mask
+    return detect & sc_mask, detect, sc_mask
+
+
+def _refuse_overlapping_campaigns(set_list):
+    """Refuse a cumulative mixture combined with a campaign that overlaps it.
+
+    A mixture's normalisation (``total_generated``, ``total_analysis_time``) and
+    its per-row weights already hold every run it spans; a second campaign over
+    any of that time -- endo3 for O3, rpo4ab for O4 -- would count the shared
+    exposure twice.  The overlap is judged on GPS ranges (the rows' own times,
+    else the campaign's ``gps_start``/``gps_end`` attrs); a campaign whose
+    range is unknown is refused too, because an overlap cannot be ruled out.
+    """
+    if len(set_list) < 2:
+        return
+    mixtures = [s for s in set_list
+                if s.campaign_kind == CAMPAIGN_CUMULATIVE_MIXTURE]
+    for m in mixtures:
+        lo, hi = m.gps_range
+        for o in set_list:
+            if o is m:
+                continue
+            rng = o.gps_range
+            if rng is None:
+                raise OverlappingCampaignError(
+                    f"{m.path} is a cumulative multi-run mixture spanning GPS "
+                    f"[{lo:.0f}, {hi:.0f}], and it is combined with {o.path}, "
+                    f"whose GPS range is unknown (no row times, no "
+                    f"gps_start/gps_end attrs), so an overlap cannot be ruled "
+                    f"out. A mixture already contains every run's exposure; "
+                    f"export it alone.")
+            if rng[0] <= hi and lo <= rng[1]:
+                raise OverlappingCampaignError(
+                    f"{m.path} is a cumulative multi-run mixture spanning GPS "
+                    f"[{lo:.0f}, {hi:.0f}], and it is combined with {o.path} "
+                    f"(GPS [{rng[0]:.0f}, {rng[1]:.0f}]), which overlaps it. "
+                    f"The mixture's total_generated, total_analysis_time and "
+                    f"per-row weights already carry that time's exposure, so "
+                    f"combining the two double-counts it (and its detected "
+                    f"injections) in the selection integral. Export the "
+                    f"mixture alone; to use another campaign for one run, "
+                    f"build that run from its own campaign instead.")
+
+
+def _mixture_run_attrs(s, keep, detect, far_threshold, snr_threshold,
+                       mixture_anchors):
+    """The per-run provenance attrs of one cumulative-mixture campaign (GW-39).
+
+    Everything is read from the file itself (row times, weights, attrs) except
+    the O3/O4 component (T, N) anchors used to solve the O1/O2 bookkeeping,
+    which come from ``mixture_anchors`` or, by default, the bundled
+    :data:`gwcat.observing_runs.MIXTURE_RELEASE_ANCHORS` entry of this release.
+    """
+    _str = h5py.string_dtype()
+    run = np.asarray(s.run)
+    runs = [r for r in RUN_LABELS if np.any(run == r)]
+    z = np.asarray(s._z, dtype=float)
+    w = np.asarray(s._weights, dtype=float)
+    rules = s.detection_rule_per_run(far_threshold, snr_threshold)
+    attrs = {
+        "cumulative_mixture": True,
+        "run_labels": np.array(runs, dtype=_str),
+        "n_rows_per_run": np.array([int(np.sum(run == r)) for r in runs],
+                                   dtype=np.int64),
+        # Rows WRITTEN per run: detection AND any source-class / z_max subset,
+        # so they sum to n_detected.  The detection-rule count alone is next.
+        "n_detected_per_run": np.array(
+            [int(np.sum(keep & (run == r))) for r in runs], dtype=np.int64),
+        "n_passing_detection_rule_per_run": np.array(
+            [int(np.sum(detect & (run == r))) for r in runs], dtype=np.int64),
+        "injection_support_gps_per_run": np.array(
+            [INJECTION_SUPPORT_GPS[r] for r in runs], dtype=float),
+        "exposure_windows_gps_per_run": np.array(
+            [EXPOSURE_WINDOWS_GPS[r] for r in runs], dtype=float),
+        "row_time_range_gps_per_run": np.array(
+            [(float(np.min(s._time[run == r])), float(np.max(s._time[run == r])))
+             for r in runs], dtype=float),
+        "detection_rule_per_run": np.array([rules[r] for r in runs],
+                                           dtype=_str),
+        "mixture_weights_per_run": json.dumps(
+            {r: [float(x) for x in np.unique(w[run == r])] for r in runs}),
+        "z_draw_max_per_run": np.array(
+            [float(np.max(z[run == r])) for r in runs], dtype=float),
+        "o3_draw_density_source": "mixture_joint_lnpdraw",
+    }
+
+    comps = [c for c, _, _ in MIXTURE_COMPONENTS]
+    attrs["mixture_components"] = np.array(comps, dtype=_str)
+    attrs["mixture_component_runs"] = json.dumps(
+        {c: list(r) for c, r, _ in MIXTURE_COMPONENTS})
+    attrs["T_definition_per_run"] = np.array(
+        [d for _, _, d in MIXTURE_COMPONENTS], dtype=_str)
+    key = (int(s._ndraw), int(round(s._total_analysis_time_s)))
+    anchors = (mixture_anchors if mixture_anchors is not None
+               else MIXTURE_RELEASE_ANCHORS.get(key))
+    has_semi = bool(np.isin(run, SEMIANALYTIC_RUNS).any())
+    if anchors is None or not has_semi:
+        if has_semi:
+            warnings.warn(
+                f"{s.path}: no O3/O4 component anchors are known for this "
+                f"cumulative mixture (total_generated, total_analysis_time) = "
+                f"{key}, so its per-run N_k and T_k cannot be derived from the "
+                f"weights; N_per_run and T_per_run_s are written as NaN. pdraw "
+                f"is unaffected (it uses the weights directly).")
+        attrs["N_per_run"] = np.full(len(comps), np.nan)
+        attrs["T_per_run_s"] = np.full(len(comps), np.nan)
+        attrs["N_per_run_integrality_residual"] = np.full(2, np.nan)
+        attrs["mixture_bookkeeping_status"] = (
+            "unavailable_no_anchor" if has_semi
+            else "not_derived_no_semianalytic_rows")
+        attrs["mixture_bookkeeping_anchor_sources"] = json.dumps({})
+        return attrs
+    try:
+        book = derive_mixture_bookkeeping(
+            run, w, s._ndraw, s._total_analysis_time_s, anchors)
+    except ValueError as exc:
+        raise MixtureInvariantError(f"{s.path}: {exc}") from exc
+    attrs["N_per_run"] = np.array(book["N"], dtype=float)
+    attrs["T_per_run_s"] = np.array(book["T_s"], dtype=float)
+    attrs["N_per_run_integrality_residual"] = np.array(
+        book["N_integrality_residual"], dtype=float)
+    attrs["mixture_bookkeeping_status"] = "derived_from_weights_and_anchors"
+    attrs["mixture_bookkeeping_anchor_sources"] = json.dumps(
+        book["anchor_sources"])
+    return attrs
+
+
+def _reference_coverage_per_run(s, a_ref):
+    """``(runs, covered, bound)`` -- the a_ref coverage check, run by run.
+
+    The per-campaign check takes the largest magnitude drawn over the WHOLE
+    file, so one run reaching a_ref hides another that stops short of it.  A
+    mixture's runs were drawn separately (O3 by endo3, to 0.998), so the check
+    is repeated on each run's own rows: the per-run bound is the smaller of the
+    two bodies' largest drawn magnitudes.
+    """
+    run = np.asarray(s.run)
+    runs = [r for r in RUN_LABELS if np.any(run == r)]
+    a1 = np.asarray(s._a1, dtype=float)
+    a2 = np.asarray(s._a2, dtype=float)
+    bound = [float(min(a1[run == r].max(), a2[run == r].max())) for r in runs]
+    covered = [bool(b >= a_ref) for b in bound]
+    bad = [f"{r} (magnitudes reach {b:.6g})"
+           for r, b, ok in zip(runs, bound, covered) if not ok]
+    if bad:
+        warnings.warn(
+            f"spin_reference_amax={a_ref} is above the largest spin magnitude "
+            f"DRAWN in run(s) {', '.join(bad)} of {s.path}. These runs carry "
+            f"no detectable magnitude ceiling, so this is a sample maximum, "
+            f"not a support bound -- evidence of a coverage hole in those runs, "
+            f"not proof. Recorded in spin_reference_coverage_per_run.")
+    return runs, covered, bound
 
 
 def _campaign_chieff_amax(s, forced_amax, amax_fallback):
@@ -503,7 +694,7 @@ def _check_chieff_swap_valid(set_list, *, strict, violations):
     how the shipped ``selection_o3o4ab_allsky.h5`` came to apply it to an O4ab
     campaign measured at ``isotropy_dev = 0.6419``.
     """
-    bad, unverifiable = [], []
+    bad, unverifiable, joint_unverifiable = [], [], []
     for s in set_list:
         meta = s.spin_meta or {}
         if meta.get("uniform_isotropic"):
@@ -526,7 +717,42 @@ def _check_chieff_swap_valid(set_list, *, strict, violations):
         ran = any(checks.get(k) is not None for k in
                   ("magnitude_uniform", "max_spin_uniform", "isotropy_dev"))
         record["verified"] = bool(ran)
+        if not ran and record["spin_format"] in _JOINT_SPIN_FORMATS:
+            # GW-39.  A JOINT (masses, redshift, spins) draw density is not the
+            # spin-less legacy case above: the campaign DID draw spins from a
+            # distribution of its own, one that a joint density does not let
+            # the uniform/isotropic checks inspect.  The GWTC-5.0 cumulative
+            # mixture is the live case, and its spins are measured
+            # non-isotropic (O1/O2 mean cos tilt 0.245, O4 0.240), which is
+            # the 91f1b924 defect class -- so "unverifiable" is refused here,
+            # not waved through.
+            record["reason"] = ("joint spin draw density: uniform-magnitude/"
+                                "isotropic assumption cannot be verified")
+            joint_unverifiable.append(record)
+            continue
         (bad if ran else unverifiable).append(record)
+
+    if joint_unverifiable:
+        msg = (
+            f"spin_basis='chieff' replaces each campaign's real spin-draw "
+            f"density with the analytic uniform-magnitude/isotropic chi_eff "
+            f"marginal, but {len(joint_unverifiable)} campaign(s) ship one "
+            f"JOINT (masses, redshift, spins) draw density, so whether they "
+            f"drew spins that way cannot be verified: "
+            + "; ".join(f"{b['path']} (spin_format={b['spin_format']!r})"
+                        for b in joint_unverifiable)
+            + ". If they did not, the exported pdraw is the wrong density by "
+            f"an O(1), chi_eff-dependent factor that does not cancel (the "
+            f"isotropic-substitution defect). Use "
+            f"spin_basis='chieff_reference' (with spin_reference_amax=), which "
+            f"keeps the campaign's exact per-injection spin density and "
+            f"reweights it, or spin_basis='component'. Pass strict=False to "
+            f"export anyway; the file then records "
+            f"spin_basis_assumption_violations.")
+        if strict:
+            raise BlockCampaignMismatch(msg)
+        warnings.warn(msg)
+        violations.extend(joint_unverifiable)
 
     if unverifiable:
         warnings.warn(
@@ -580,7 +806,10 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                             source_class=None, amax=AMAX_AUTO,
                             amax_fallback=0.99, spin_reference_amax=None,
                             out_of_reference_pdraw=OUT_OF_REFERENCE_PDRAW,
-                            snr_threshold=None, z_max=None, strict=True):
+                            snr_threshold=None, z_max=None, strict=True,
+                            detection_policy="far",
+                            acknowledge_semianalytic_excluded=False,
+                            sky_marginal=False, mixture_anchors=None):
     """Build a selection :class:`ExportProduct` from one or more SelectionSets.
 
     Parameters
@@ -643,6 +872,26 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         not verified single-uniform-isotropic.  ``False`` warns and proceeds
         when a detected amax is nonetheless available (an undetectable amax
         always raises).
+    detection_policy : {"far", "lvk-cumulative"}, default "far"
+        Recorded in the attrs.  ``"lvk-cumulative"`` (GW-39) requires a
+        cumulative-mixture campaign and ``snr_threshold``, and states that the
+        release's per-run rule is intended: semianalytic SNR on the O1/O2 rows,
+        each run's own search FARs on the O3/O4 rows.  On a mixture the
+        run-aware rule is applied whenever ``snr_threshold`` is given.
+    acknowledge_semianalytic_excluded : bool, default False
+        A FAR-only cut on a cumulative mixture with semianalytic O1/O2 rows
+        raises :class:`MixtureDetectionError` (it detects none of them while
+        their draws and exposure stay in the normalisation).  ``True`` allows
+        it, for a deliberately O3+O4-only analysis.
+    sky_marginal : bool, default False
+        Omit the ``ra``/``dec`` columns and record ``sky_marginalized=True``:
+        pdraw carries no sky density and the population is isotropic, so the
+        sky is marginalised rather than NaN-filled.  Required in effect for
+        the cumulative mixtures, which ship no sky position at all.
+    mixture_anchors : dict, optional
+        The O3/O4 component ``{"O3": {"T_s", "N", "source"}, "O4": {...}}``
+        used to derive a mixture's per-run N_k/T_k; defaults to the bundled
+        :data:`gwcat.observing_runs.MIXTURE_RELEASE_ANCHORS` entry.
 
     Returns
     -------
@@ -653,6 +902,10 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         raise ValueError(
             f"unknown spin_basis={spin_basis!r}; known bases are "
             f"{list(_KNOWN_SPIN_BASES)}.")
+    if detection_policy not in DETECTION_POLICIES:
+        raise ValueError(
+            f"unknown detection_policy={detection_policy!r}; known policies "
+            f"are {list(DETECTION_POLICIES)}.")
     # `None` = each campaign's own detected ceiling; a float = one forced ceiling.
     forced_amax = parse_amax_option(amax, what="amax")
     # `None` for every non-reference basis; a validated float for a reference
@@ -670,6 +923,23 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
 
     for s in set_list:
         s._load()
+
+    # A cumulative mixture already holds every run's exposure (GW-39).
+    _refuse_overlapping_campaigns(set_list)
+    is_mixture = [s.campaign_kind == CAMPAIGN_CUMULATIVE_MIXTURE
+                  for s in set_list]
+    if detection_policy == "lvk-cumulative":
+        if snr_threshold is None:
+            raise ValueError(
+                "detection_policy='lvk-cumulative' needs snr_threshold (the "
+                "semianalytic O1/O2 SNR threshold; 10 in the LVK analyses): "
+                "without it no O1/O2 row can be detected while their exposure "
+                "stays in the normalisation.")
+        if not any(is_mixture):
+            raise ValueError(
+                "detection_policy='lvk-cumulative' applies the per-run rule of "
+                "a cumulative multi-run mixture, and none of the campaigns is "
+                "one: " + ", ".join(str(s.path) for s in set_list))
 
     # Cosmology consistency check (mirror CombinedSelectionSet.to_darksirens).
     H0s = [s.H0 for s in set_list]
@@ -692,9 +962,14 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
 
     #: Per-campaign reference-support coverage (reference bases only).
     reference_coverage, reference_coverage_evidence = [], []
+    #: The same check run by run on each mixture campaign (GW-39).
+    reference_coverage_runs = None
     if a_ref is not None:
         reference_coverage, reference_coverage_evidence = (
             _check_reference_coverage(set_list, a_ref, strict=strict))
+        for s, mix in zip(set_list, is_mixture):
+            if mix:
+                reference_coverage_runs = _reference_coverage_per_run(s, a_ref)
 
     ndraw_per = [int(s._ndraw) for s in set_list]
     ndraw_total = sum(ndraw_per)
@@ -724,9 +999,14 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     # resolved ("detected" / "caller" / "fallback").
     chieff_amax_pairs, chieff_amax_sources = [], []
 
+    mixture_attrs = None
     for k, s in enumerate(set_list):
-        keep, det, sc_mask = _detect_keep(s, far_threshold, source_class,
-                                          snr_threshold, z_max=z_max)
+        keep, det, sc_mask = _detect_keep(
+            s, far_threshold, source_class, snr_threshold, z_max=z_max,
+            acknowledge_semianalytic_excluded=acknowledge_semianalytic_excluded)
+        if is_mixture[k]:
+            mixture_attrs = _mixture_run_attrs(
+                s, keep, det, far_threshold, snr_threshold, mixture_anchors)
         n_before_total += int(det.size)
         n_after_total += int(sc_mask.sum())
         for c in s._far_columns:
@@ -914,6 +1194,11 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             columns[name] = np.concatenate(extra_parts[name])
     if chip_available:
         columns["chip"] = np.concatenate(extra_parts["chip"])
+    if sky_marginal:
+        # GW-39: the sky is marginalised, not missing -- no sky density is in
+        # pdraw and the population models are isotropic -- so the columns are
+        # omitted rather than written as NaN a consumer would have to exempt.
+        del columns["ra"], columns["dec"]
 
     # ── Provenance attrs ────────────────────────────────────────────────────
     _str = h5py.string_dtype()
@@ -1080,6 +1365,25 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         # never used for anything.
         attrs["chi_eff_amax"] = (float(np.max(chieff_chip_amax))
                                  if chieff_chip_amax else float(amax_fallback))
+
+    # ── GW-39: campaign kind, detection policy, sky, per-run bookkeeping ────
+    attrs["cumulative_mixture"] = bool(any(is_mixture))
+    attrs["campaign_kind_per_campaign"] = np.array(
+        [str(s.campaign_kind) for s in set_list], dtype=_str)
+    attrs["detection_policy"] = str(detection_policy)
+    attrs["acknowledge_semianalytic_excluded"] = bool(
+        acknowledge_semianalytic_excluded)
+    attrs["sky_marginalized"] = bool(sky_marginal)
+    if mixture_attrs is not None:
+        attrs.update(mixture_attrs)
+    if reference_coverage_runs is not None:
+        runs_c, cov_c, bound_c = reference_coverage_runs
+        attrs["spin_reference_coverage_runs"] = np.array(runs_c, dtype=_str)
+        attrs["spin_reference_coverage_per_run"] = np.array(cov_c, dtype=bool)
+        attrs["spin_reference_coverage_bound_per_run"] = np.array(
+            bound_c, dtype=float)
+        attrs["spin_reference_coverage_ok"] = bool(
+            attrs.get("spin_reference_coverage_ok", True) and all(cov_c))
 
     if snr_threshold is not None:
         attrs["significance_snr_column"] = _SNR_COLUMN

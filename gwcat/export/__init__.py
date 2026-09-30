@@ -21,7 +21,9 @@ from __future__ import annotations
 from .product import ExportProduct
 from .registry import register_exporter, get_exporter, list_formats
 from .pe_builder import build_pe_product
-from .selection_builder import build_selection_product, SpinBasisError
+from .selection_builder import (build_selection_product, SpinBasisError,
+                                OverlappingCampaignError,
+                                MixtureDetectionError, MixtureInvariantError)
 from .validate import validate_export_v2
 
 # Import writer modules for their registration side effects (module-level
@@ -33,6 +35,9 @@ __all__ = [
     "build_pe_product",
     "build_selection_product",
     "SpinBasisError",
+    "OverlappingCampaignError",
+    "MixtureDetectionError",
+    "MixtureInvariantError",
     "ExportProduct",
     "validate_export_v2",
     "register_exporter",
