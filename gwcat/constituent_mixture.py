@@ -212,7 +212,7 @@ def mixture_prior_densities(m1, q, dL, components: Sequence[dict]):
 
 
 def truncated_dL_density(kind, cosmology, dmin, dmax, alpha=None,
-                         impl="auto"):
+                         impl="exact"):
     """A constituent's distance prior normalised on ITS bounds, 0 outside.
 
     Unlike the single-prior ingest path (GW-01), which widens the evaluation

@@ -1665,6 +1665,15 @@ class GWCatalog:
             chi_eff_included = (spin_prior_mode == "include")
             f.attrs["spin_prior_mode"] = spin_prior_mode
             f.attrs["chi_eff_prior_applied_to_p_pe"] = bool(chi_eff_included)
+            if chi_eff_included:
+                # WHICH chi_eff density (GW-40i): exact unless scoped to the
+                # legacy grid (--legacy-grid-priors).
+                from .spin import (CHI_EFF_PRIOR_METHODS,
+                                   current_chi_eff_prior_impl)
+                _chi_impl = current_chi_eff_prior_impl()
+                f.attrs["chi_eff_prior_impl"] = _chi_impl
+                f.attrs["chi_eff_prior_method"] = CHI_EFF_PRIOR_METHODS[
+                    _chi_impl]
             f.attrs["mass_jacobian_applied"] = True
             # The distance prior p_dL_pe is a FACTOR of p_pe, not removed.
             f.attrs["distance_prior_removed"] = False

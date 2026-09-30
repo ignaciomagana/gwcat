@@ -198,6 +198,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_export.add_argument("--no-summary", action="store_true",
                           help="Skip writing validation_summary.json/.md "
                                "next to --out.")
+    p_export.add_argument("--legacy-grid-priors", action="store_true",
+                          help="Multiply p_pe by the pre-GW-40i chi_eff prior "
+                               "(bilinear interpolation of a 200x2000 table, "
+                               "up to 4e-3 off) instead of the exact closed "
+                               "form. For reproducing products built before "
+                               "GW-40i only (the v1 regression); recorded as "
+                               "chi_eff_prior_impl='grid'.")
 
     # -- export (versioned registry: gwcat2 PE format) -------------------
     p_export2 = sub.add_parser(
@@ -273,6 +280,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_pe.add_argument("--no-summary", action="store_true",
                       help="Skip writing validation_summary.json/.md "
                            "next to --out.")
+    p_pe.add_argument("--legacy-grid-priors", action="store_true",
+                      help="Multiply p_pe by the pre-GW-40i chi_eff prior "
+                           "(bilinear interpolation of a 200x2000 table, up "
+                           "to 4e-3 off) instead of the exact closed form. "
+                           "For reproducing products built before GW-40i only "
+                           "(the v1 regression); recorded as "
+                           "chi_eff_prior_impl='grid'. The distance prior is "
+                           "fixed at ingest (`ingest --legacy-grid-priors`).")
 
     p_xsel = xsub.add_parser(
         "selection",
@@ -353,6 +368,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_xsel.add_argument("--no-summary", action="store_true",
                         help="Skip writing validation_summary.json/.md "
                              "next to --out.")
+    p_xsel.add_argument("--legacy-grid-priors", action="store_true",
+                        help="Multiply pdraw (chieff / chieff_reference / "
+                             "chieff_chip bases) by the pre-GW-40i chi_eff "
+                             "prior (bilinear interpolation of a 200x2000 "
+                             "table, up to 4e-3 off) instead of the exact "
+                             "closed form. For reproducing products built "
+                             "before GW-40i only; recorded as "
+                             "chi_eff_prior_impl='grid'.")
 
     xsub.add_parser(
         "list-formats",
@@ -391,6 +414,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_sel.add_argument("--no-summary", action="store_true",
                        help="Skip writing validation_summary.json/.md next "
                             "to --out.")
+    p_sel.add_argument("--legacy-grid-priors", action="store_true",
+                       help="Multiply pdraw by the pre-GW-40i interpolated "
+                            "chi_eff prior instead of the exact closed form "
+                            "(reproducing pre-GW-40i products only).")
 
     # -- validate ---------------------------------------------------------
     p_val = sub.add_parser(
@@ -481,7 +508,23 @@ def _parse_source_class(spec: Optional[str]):
     return [s.strip() for s in spec.split(",") if s.strip()]
 
 
+def _prior_impl_scope(args):
+    """The chi_eff-prior implementation this command builds with (GW-40i).
+
+    Exact unless ``--legacy-grid-priors`` asked for the pre-GW-40i table; every
+    p_pe / pdraw built inside the scope uses it and records it.
+    """
+    from .spin import chi_eff_prior_impl
+    return chi_eff_prior_impl(
+        "grid" if getattr(args, "legacy_grid_priors", False) else "exact")
+
+
 def _cmd_export_darksirens(args) -> int:
+    with _prior_impl_scope(args):
+        return _cmd_export_darksirens_impl(args)
+
+
+def _cmd_export_darksirens_impl(args) -> int:
     from .catalog import GWCatalog
 
     cosmology = _parse_cosmology(args.cosmology)
@@ -508,10 +551,11 @@ def _cmd_export_darksirens(args) -> int:
 
 
 def _cmd_export(args) -> int:
-    if args.export_command == "pe":
-        return _cmd_export_pe(args)
-    if args.export_command == "selection":
-        return _cmd_export_selection(args)
+    if args.export_command in ("pe", "selection"):
+        with _prior_impl_scope(args):
+            if args.export_command == "pe":
+                return _cmd_export_pe(args)
+            return _cmd_export_selection(args)
     if args.export_command == "list-formats":
         return _cmd_export_list_formats(args)
     if args.export_command == "list-spaces":
@@ -635,6 +679,11 @@ def _cmd_export_list_formats(args) -> int:
 
 
 def _cmd_selection(args) -> int:
+    with _prior_impl_scope(args):
+        return _cmd_selection_impl(args)
+
+
+def _cmd_selection_impl(args) -> int:
     from .selection import SelectionSet, CombinedSelectionSet
 
     kwargs = {}

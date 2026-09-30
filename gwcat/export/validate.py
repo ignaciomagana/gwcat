@@ -723,6 +723,9 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
         # (e2) Per-campaign selection cosmology (GW-09).
         _xcheck_campaign_cosmology(_check, results, sel_attrs)
 
+        # (e3) The same chi_eff prior implementation on both sides (GW-40i).
+        _xcheck_chi_eff_prior_impl(_fail, results, pe_attrs, sel_attrs)
+
         # (f) 2.1 pairing hash.  Only when BOTH sides carry one -- and never as
         # a substitute for the checks above, which name the offending field.
         pe_hash = pe_attrs.get("contract_hash")
@@ -998,6 +1001,43 @@ def _xcheck_detection_cut(_fail, results, pe_attrs, sel_attrs):
                   f"event list is not the FAR-cut list the injections model. "
                   f"Supply the missing FARs or drop those events.")
     results["xcheck_detection_cut"] = True
+
+
+def _xcheck_chi_eff_prior_impl(_fail, results, pe_attrs, sel_attrs):
+    """PE ``p_pe`` and selection ``pdraw`` must carry the SAME chi_eff density.
+
+    The chi_eff factor of a chieff-type pair is the same analytic prior on both
+    sides; GW-40i made it exact and kept the interpolated table only as a
+    legacy option.  A pair built with different implementations does not
+    divide out one density: the exact and grid values differ by up to 4e-3
+    relative, chi_eff-dependently, so the mismatch does not cancel.
+
+    Both sides recording ``chi_eff_prior_impl`` and disagreeing -> FAIL.  One
+    side recording it and the other not (a file from before the record) ->
+    WARN: unknown is not evidence of a mismatch, but the older file almost
+    certainly used the grid.
+    """
+    pe_impl = pe_attrs.get("chi_eff_prior_impl")
+    sel_impl = sel_attrs.get("chi_eff_prior_impl")
+    if isinstance(pe_impl, bytes):
+        pe_impl = pe_impl.decode()
+    if isinstance(sel_impl, bytes):
+        sel_impl = sel_impl.decode()
+    if pe_impl is not None and sel_impl is not None:
+        if str(pe_impl) != str(sel_impl):
+            _fail("xcheck_chi_eff_prior_impl",
+                  f"PE chi_eff_prior_impl={pe_impl!r} but selection "
+                  f"chi_eff_prior_impl={sel_impl!r}: p_pe and pdraw carry "
+                  f"different chi_eff densities (the legacy grid is up to "
+                  f"4e-3 off the exact prior, chi_eff-dependently, so the "
+                  f"difference does not cancel). Rebuild both with the same "
+                  f"implementation (--legacy-grid-priors on both or neither).")
+    elif (pe_impl is None) != (sel_impl is None):
+        warnings.warn(
+            f"chi_eff_prior_impl recorded on one side only (PE={pe_impl!r}, "
+            f"selection={sel_impl!r}); the unrecorded file predates GW-40i and "
+            f"almost certainly used the legacy interpolated grid.")
+    results["xcheck_chi_eff_prior_impl"] = True
 
 
 def _xcheck_campaign_cosmology(_check, results, sel_attrs):

@@ -460,10 +460,14 @@ def test_astropy_and_bilby_agree_in_shape_and_impl_is_recorded():
     # Same shape (ratios agree) even where the absolute normalisation differs.
     ratio = p_b / p_a
     assert np.max(np.abs(ratio / ratio[0] - 1.0)) < 5e-3
-    # 'auto' picks bilby when it is importable.
+    # The legacy 'auto' picks bilby when it is importable ...
     _, info_auto = uniform_source_frame_prob(dL, cosmo, dmin, dmax,
-                                             return_info=True)
+                                             impl="auto", return_info=True)
     assert info_auto["impl"] == "bilby"
+    # ... and the default is the exact density since GW-40i.
+    _, info_def = uniform_source_frame_prob(dL, cosmo, dmin, dmax,
+                                            return_info=True)
+    assert info_def["impl"] == "exact"
 
 
 def test_bilby_prob_would_zero_out_of_bounds_samples():

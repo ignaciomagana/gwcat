@@ -256,7 +256,9 @@ def test_module_cache_reuse():
     a = chi_eff_chi_p_prior_logprob(0.1, 0.2, 30.0, 25.0, amax=0.99)
     b = chi_eff_chi_p_prior_logprob(0.1, 0.2, 30.0, 25.0, amax=0.99)
     assert a == pytest.approx(b)
-    assert 0.99 in _spin._CHIP_CACHE
+    # Keyed by (chi_eff marginal impl, amax) since GW-40i; exact by default.
+    assert ("exact", 0.99) in _spin._CHIP_CACHE
+    assert _spin._CHIP_CACHE[("exact", 0.99)].impl == "exact"
 
 
 def test_out_of_support_chi_p_is_minus_inf_not_a_floor():
@@ -427,17 +429,30 @@ def test_logprob_in_support_applies_the_support_mask():
 
 def test_logprob_in_support_carries_the_per_body_ceilings():
     """A restricted secondary must not be widened to the primary's ceiling."""
-    from gwcat.spin import ChiEffPrior, chi_eff_prior_logprob_in_support
+    from gwcat.spin import (ChiEffPrior, ChiEffPriorExact,
+                            chi_eff_prior_logprob_in_support)
 
     chi = np.array([0.1, 0.3])
+    # Legacy grid: bit-identical to the table class it wraps.
     lp, sup = chi_eff_prior_logprob_in_support(chi, 40.0, 10.0,
-                                               amax=0.99, amax_2=0.05)
+                                               amax=0.99, amax_2=0.05,
+                                               impl="grid")
     ref = ChiEffPrior(amax=0.99, amax_2=0.05)
     np.testing.assert_allclose(lp, ref.logprob(chi, 40.0, 10.0), rtol=0,
                                atol=0)
     assert bool(sup.all())
     # ... and that is NOT the symmetric-ceiling density.
     sym = ChiEffPrior(amax=0.99).logprob(chi, 40.0, 10.0)
+    assert not np.allclose(lp, sym, rtol=1e-6)
+
+    # The default (exact) carries the per-body ceilings the same way.
+    lp, sup = chi_eff_prior_logprob_in_support(chi, 40.0, 10.0,
+                                               amax=0.99, amax_2=0.05)
+    ref = ChiEffPriorExact(amax=0.99, amax_2=0.05)
+    np.testing.assert_allclose(lp, ref.logprob(chi, 40.0, 10.0), rtol=0,
+                               atol=0)
+    assert bool(sup.all())
+    sym = ChiEffPriorExact(amax=0.99).logprob(chi, 40.0, 10.0)
     assert not np.allclose(lp, sym, rtol=1e-6)
 
 

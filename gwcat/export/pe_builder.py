@@ -641,6 +641,11 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     sel_cfg_amax = (_meta_str_sel("spin_amax_config_per_constituent")
                     or [""] * sub.n_events)
     kept_cfg_amax = []
+    # Which implementation evaluated each event's p_dL_pe AT INGEST (GW-40i:
+    # "exact" by default; "bilby"/"astropy"/"analytic" in older stores or under
+    # --legacy-grid-priors).  A meta read, like the provenance above.
+    sel_dL_impl = _meta_str_sel("dL_prior_impl") or [""] * sub.n_events
+    kept_dL_impl = []
     kept_prior_kind = {p: [] for p in ("mass", "spin", "dL")}
     kept_prior_label = {p: [] for p in ("mass", "spin", "dL")}
     #: Raw samples removed by the GW-40c spin-support cut, per kept event --
@@ -820,6 +825,7 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                 kept_prior_kind[_p].append(sel_prior_kind[_p][e])
                 kept_prior_label[_p].append(sel_prior_label[_p][e])
             kept_cfg_amax.append(sel_cfg_amax[e])
+            kept_dL_impl.append(sel_dL_impl[e])
             kept_H0.append(float(per_event_H0[e]))
             kept_Om0.append(float(per_event_Om0[e]))
             row = sel_rows[e]
@@ -1391,7 +1397,15 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         "spin_prior_non_own_analytic_events": np.array(
             [str(n) for n, k in zip(kept, kept_prior_kind["spin"])
              if k != "own_analytic"], dtype=_str),
+        # ── How the two analytic prior factors were evaluated (GW-40i) ──────
+        "dL_prior_impl_per_event": np.array(
+            [str(x) for x in kept_dL_impl], dtype=_str),
     }
+    if chi_eff_included:
+        from ..spin import CHI_EFF_PRIOR_METHODS, current_chi_eff_prior_impl
+        _chi_impl = current_chi_eff_prior_impl()
+        attrs["chi_eff_prior_impl"] = _chi_impl
+        attrs["chi_eff_prior_method"] = CHI_EFF_PRIOR_METHODS[_chi_impl]
     attrs.update(_population_resolver_attrs(cat, kept))
     attrs.update(_sample_set_map_attrs(
         getattr(sub, "_sample_set_map_report", None), kept))
