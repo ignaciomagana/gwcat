@@ -49,6 +49,8 @@ from .source_class import (normalize_source_class, classify_by_mass,
                           DEFAULT_NSBH_MASS_THRESHOLD)
 from .spin import chi_p_from_components
 from .event_metadata import PASTRO_KEYS, resolve_pastro, resolve_pastro_column
+from .release_cosmology import (load_release_cosmology_table,
+                                ReleaseReweightCosmologyError)
 
 # --------------------------------------------------------------------------
 # Parameter sets
@@ -123,6 +125,15 @@ META_STR_FIELDS = [
     # token ("Planck15_LAL" vs "Planck15" -- matched exactly, never by substring).
     "dL_prior_kind", "dL_prior_sampling_kind", "dL_prior_cosmology_name",
     "dL_prior_release_flavour", "dL_prior_basis",
+    # WHERE the (H0, Om0) the distance prior is evaluated at came from (GW-40a):
+    # "analytic_declared" (the prior repr names it), "catalog_default" (nothing
+    # declared, the per-CATALOG IngestConfig default), or -- for a reweighted
+    # `_cosmo` release -- the release-reweight table row's own `source`
+    # ("documented" / "inferred_from_z(dL)"), with that table's sha256 beside
+    # it.  The pesummary version that wrote the file (its `version/pesummary`)
+    # is recorded too: it is what the table's citations are checked against.
+    "dL_prior_cosmology_source", "dL_prior_cosmology_table_sha256",
+    "release_pesummary_version",
     # where f_ref came from, e.g. "meta_data[C01:IMRPhenomXPHM]:sibling" (GW-07).
     # Spins, tilts and chi_p are all defined AT f_ref, so a borrowed value has to
     # say whose it is.  mass_prior_source likewise records which analysis's
@@ -177,6 +188,33 @@ SPIN_STR_FIELDS = ["spin_prior_kind", "spin_prior_source", "derived_params"]
 META_FLOAT_FIELDS += SPIN_FLOAT_FIELDS
 META_STR_FIELDS += SPIN_STR_FIELDS
 
+# ── Per-prior source provenance (GW-40b) ─────────────────────────────────────
+# For each of the mass, spin and distance priors: WHICH label's declaration the
+# resolved prior came from (``prior_source_label_*``, "" when none) and WHAT
+# KIND of source that is (``prior_source_kind_*``), one of
+# :data:`PRIOR_SOURCE_KINDS`.  The legacy ``*_prior_kind`` columns say what the
+# prior IS; these say where gwcat got it -- a combined ``Mixed`` set has no
+# priors group of its own, so its "analytic" prior is a sibling's, and until
+# now nothing on the row said so.
+PRIOR_SOURCE_KINDS = ("own_analytic", "sibling_inherited",
+                      "config_file_declared", "assumed_default",
+                      "release_reweighted", "constituent_mixture")
+PRIOR_SOURCE_STR_FIELDS = [f"prior_source_{w}_{p}"
+                           for p in ("mass", "spin", "dL")
+                           for w in ("label", "kind")]
+META_STR_FIELDS += PRIOR_SOURCE_STR_FIELDS
+# Constituent-mixture provenance (GW-40f): which constituents a combined set's
+# mixture prior was built from, and their VERIFIED row counts ("" elsewhere).
+META_STR_FIELDS += ["constituent_mixture_labels", "constituent_mixture_counts"]
+# The spin ceilings each constituent of a combined (``Mixed``) set DECLARES in
+# its LALInference ``config_file/engine/a_spin{1,2}-max`` (approximation A5 of
+# the v2 build plan): JSON ``{constituent_label: [a1_max, a2_max] or null}``
+# over the same-prefix siblings, "" for a non-Mixed row.  A Mixed set's spin
+# prior is inherited from ONE sibling's analytic group; this records what the
+# OTHER constituents (e.g. C01:SEOBNRv4PHM, which has no analytic group)
+# declared, so a per-half ceiling difference is visible on the row.
+META_STR_FIELDS += ["spin_amax_config_per_constituent"]
+
 # Default waveform priority when no Mixed set exists (O4b/GWTC-5 events).
 O4_WAVEFORM_PRIORITY = [
     "C00:IMRPhenomXPHM-SpinTaylor", "C00:SEOBNRv5PHM",
@@ -192,8 +230,24 @@ class IngestConfig:
     nsbh_mass_threshold: float = DEFAULT_NSBH_MASS_THRESHOLD
     o4_waveform_priority: list = field(default_factory=lambda: list(O4_WAVEFORM_PRIORITY))
     o3_waveform_priority: list = field(default_factory=lambda: list(O3_WAVEFORM_PRIORITY))
-    o3_default_cosmo: tuple = (PLANCK15.H0.value, PLANCK15.Om0)   # used when no analytic
+    #: Cosmology for an O1-O3 row whose distance prior declares none and which
+    #: is NOT a reweighted `_cosmo` release (those use the release-reweight
+    #: table below).  Chosen by CATALOG since GW-40a, not by label prefix.
+    o3_default_cosmo: tuple = (PLANCK15.H0.value, PLANCK15.Om0)
     o4_fallback_cosmo: tuple = (O4_FALLBACK.H0.value, O4_FALLBACK.Om0)
+    #: The release-reweight cosmology table (GW-40a): path to a YAML table, or
+    #: None for the bundled production table
+    #: (``gwcat/data/release_reweight_cosmology.yaml``, operator decision OD-2).
+    #: Every `_cosmo` (release_reweighted) row takes its (H0, Om0) from the row
+    #: for its CATALOG; a catalog the table lacks is refused, never defaulted.
+    release_reweight_cosmology_table: Optional[str] = None
+    #: Build a ``C00:Mixed`` row's prior as the equal-weight mixture of its
+    #: constituents' own normalised analytic priors (GW-40f), with the mixing
+    #: fractions verified row by row, instead of borrowing one sibling's.
+    #: Needed only for label policies that USE C00:Mixed (BUILD_PLAN OD-1
+    #: options b/c).  Off by default so existing stores and the v1 exporter
+    #: are unchanged; a row whose mixture cannot be verified is refused.
+    constituent_mixture_prior: bool = False
     validate_prior: bool = True
     compression: str = "gzip"
     #: Which UniformSourceFrame implementation evaluates p_dL_pe (GW-01).
@@ -241,6 +295,54 @@ def detect_catalog(path: str) -> str:
 
 def _prefix_for(analyses) -> str:
     return "C01" if any(a.startswith("C01") for a in analyses) else "C00"
+
+
+#: Catalog -> observing-run era, for choosing IngestConfig defaults (GW-40a).
+#: The defaults used to be keyed by the label PREFIX (``C01`` = O3), which is
+#: wrong for GWTC-5's GW240925_005809: an O4 event released with ``C01`` labels
+#: was ranked with the O3 waveform list and would have been given the O3
+#: default cosmology.
+CATALOG_ERA = {
+    "GWTC-1": "O1-O3", "GWTC-2": "O1-O3", "GWTC-2.1": "O1-O3",
+    "GWTC-3": "O1-O3",
+    "GWTC-4": "O4", "GWTC-4.1": "O4", "GWTC-5": "O4",
+}
+
+
+def _catalog_era(catalog, prefix: str = "") -> str:
+    """``"O1-O3"`` or ``"O4"`` for ``catalog``; the prefix only as a last resort.
+
+    An unrecognised catalog (a file name gwcat cannot place) keeps the historical
+    prefix rule, so nothing that used to ingest changes behaviour.
+    """
+    era = CATALOG_ERA.get(str(catalog) if catalog is not None else "")
+    if era is not None:
+        return era
+    return "O1-O3" if str(prefix).startswith("C01") else "O4"
+
+
+def _default_cosmo_for(catalog, analysis: str, cfg: "IngestConfig"):
+    """The per-catalog fallback cosmology for a prior that declares none."""
+    era = _catalog_era(catalog, _label_parts(analysis)[0])
+    return cfg.o3_default_cosmo if era == "O1-O3" else cfg.o4_fallback_cosmo
+
+
+def _priority_for(catalog, prefix: str, cfg: "IngestConfig"):
+    """The waveform-priority list for a file, chosen by CATALOG (GW-40a).
+
+    The era's list is re-expressed with the FILE's own prefix, so an O4 file
+    released with ``C01`` labels ranks ``C01:IMRPhenomXPHM-SpinTaylor`` where a
+    ``C00`` file ranks ``C00:IMRPhenomXPHM-SpinTaylor``.
+    """
+    era = _catalog_era(catalog, prefix)
+    base = cfg.o3_waveform_priority if era == "O1-O3" else cfg.o4_waveform_priority
+    out = []
+    for want in base:
+        _p, b, v = _label_parts(want)
+        lab = f"{prefix}:{b}" + (f":{v}" if v else "")
+        if lab not in out:
+            out.append(lab)
+    return out
 
 
 def event_name_from_path(path: str) -> str:
@@ -343,7 +445,7 @@ def _priority_matches(analyses, priority):
     return out
 
 
-def select_analysis(analyses, prefix: str, cfg: IngestConfig):
+def select_analysis(analyses, prefix: str, cfg: IngestConfig, catalog=None):
     """Pick the single preferred analysis label for one PE file.
 
     This is the historical one-sample-set-per-event heuristic (kept as the
@@ -353,22 +455,29 @@ def select_analysis(analyses, prefix: str, cfg: IngestConfig):
     carrying the file's prefix.  :func:`select_analyses` builds on it to support
     ingesting several sample sets per event.
     """
-    ordered = rank_analyses(analyses, prefix, cfg)
+    ordered = rank_analyses(analyses, prefix, cfg, catalog=catalog)
     if not ordered:
         raise RuntimeError(f"No usable analysis among {analyses}")
     return ordered[0]
 
 
-def rank_analyses(analyses, prefix: str, cfg: IngestConfig):
+def rank_analyses(analyses, prefix: str, cfg: IngestConfig, catalog=None):
     """Order the prefix's analyses by ingest preference (most preferred first).
 
     ``{prefix}:Mixed`` (if present) ranks first, then the configured
     waveform-priority list in order, then any remaining prefixed analyses in
     their original order.  The index into this list becomes each sample set's
     ``priority_rank``; the first element is what :func:`select_analysis` returns.
+
+    ``catalog`` (GW-40a) chooses the waveform-priority list by observing-run
+    era; without it the historical prefix rule applies.
     """
     prefixed = [a for a in analyses if _label_parts(a)[0] == prefix]
-    priority = cfg.o3_waveform_priority if prefix == "C01" else cfg.o4_waveform_priority
+    if catalog is None:
+        priority = (cfg.o3_waveform_priority if prefix == "C01"
+                    else cfg.o4_waveform_priority)
+    else:
+        priority = _priority_for(catalog, prefix, cfg)
     ordered = []
     # Every Mixed set first, best spin variant first (GW-07).
     for a in find_mixed_analyses(prefixed, prefix):
@@ -385,7 +494,7 @@ def rank_analyses(analyses, prefix: str, cfg: IngestConfig):
 
 
 def select_analyses(analyses, prefix: str, cfg: IngestConfig,
-                    sample_sets="preferred"):
+                    sample_sets="preferred", catalog=None):
     """Return the list of analysis labels to ingest for one PE file.
 
     Parameters
@@ -402,9 +511,9 @@ def select_analyses(analyses, prefix: str, cfg: IngestConfig,
     """
     if isinstance(sample_sets, str):
         if sample_sets == "preferred":
-            return [select_analysis(analyses, prefix, cfg)]
+            return [select_analysis(analyses, prefix, cfg, catalog=catalog)]
         if sample_sets == "all":
-            ordered = rank_analyses(analyses, prefix, cfg)
+            ordered = rank_analyses(analyses, prefix, cfg, catalog=catalog)
             if not ordered:
                 raise RuntimeError(f"No usable analysis among {analyses}")
             return ordered
@@ -695,6 +804,16 @@ class ResolvedDLPrior:
     cosmology_name: str = ""
     flavour: str = "native"
     basis: str = ""
+    #: Where (H0, Om0) came from (GW-40a): "analytic_declared",
+    #: "catalog_default", or a release-reweight table row's `source`.
+    cosmology_source: str = ""
+    #: sha256 of the release-reweight table used ("" when none was consulted).
+    cosmology_table_sha256: str = ""
+    #: Per-prior provenance (GW-40b): the label whose analytic group supplied
+    #: the prior ("" when none did) and its kind -- "own_analytic",
+    #: "sibling_inherited", "assumed_default" or "release_reweighted".
+    prior_source_label: str = ""
+    prior_source_kind: str = ""
 
     @property
     def cosmology(self):
@@ -702,19 +821,27 @@ class ResolvedDLPrior:
 
 
 def resolve_dL_prior(catalog, analysis, analyses, priors, dL_samples,
-                     cfg: IngestConfig, flavour: str = "native"):
+                     cfg: IngestConfig, flavour: str = "native",
+                     release_table=None):
     """Resolve the effective distance prior for one ingested analysis.
 
-    Strategy for the bounds/cosmology is unchanged: read analytic from the chosen
+    Strategy for the bounds is unchanged: read analytic from the chosen
     analysis; if absent (e.g. the GWTC-2.1/3 ``Mixed`` sets, whose analytic AND
     prior-sample groups are both empty), search sibling analyses; if still absent
-    use the catalog default cosmology with bounds from the dL sample range.
+    use the bounds of the dL sample range.
 
-    What GW-02 adds is the distribution CLASS, which was never parsed, and an
-    exact cosmology-token mapping.  The effective class is the declared one
-    EXCEPT for a reweighted ``_cosmo`` release, where it is UniformSourceFrame by
-    release convention -- recorded as ``basis="release_reweighted"`` so the
-    assumption is visible in the store rather than implicit in a filename.
+    GW-02 added the distribution CLASS and an exact cosmology-token mapping.  The
+    effective class is the declared one EXCEPT for a reweighted ``_cosmo``
+    release, where it is UniformSourceFrame by release convention -- recorded as
+    ``basis="release_reweighted"``.
+
+    GW-40a: the COSMOLOGY of a ``release_reweighted`` row comes from the explicit
+    per-catalog release-reweight table (``release_table``, or the one
+    ``cfg.release_reweight_cosmology_table`` names, or the bundled production
+    table), NEVER from the file's ``meta_data`` and never from a label-prefix
+    default; a catalog the table lacks raises
+    :class:`~gwcat.release_cosmology.ReleaseReweightCosmologyError`.  Any other
+    row whose prior declares no cosmology takes the per-CATALOG default.
 
     Returns a :class:`ResolvedDLPrior`.
     """
@@ -732,39 +859,76 @@ def resolve_dL_prior(catalog, analysis, analyses, priors, dL_samples,
 
     parsed = _try(analysis)
     src = f"analytic[{analysis}]"
+    src_label = analysis if parsed is not None else ""
     if parsed is None:
         for an in analyses:  # sibling search (handles O4 Mixed w/o priors)
             parsed = _try(an)
             if parsed is not None:
                 src = f"analytic[{an}]"
+                src_label = an
                 break
 
     dmin = float(np.min(dL_samples))
     dmax = float(np.max(dL_samples))
-    default_cosmo = (cfg.o3_default_cosmo if analysis.startswith("C01")
-                     else cfg.o4_fallback_cosmo)
+    default_cosmo = _default_cosmo_for(catalog, analysis, cfg)
+
+    reweighted = flavour == "cosmo"
+    table_row, table_sha = None, ""
+    if reweighted:
+        table = release_table or load_release_cosmology_table(
+            cfg.release_reweight_cosmology_table)
+        table_row = table.lookup(catalog)
+        table_sha = table.sha256
 
     if parsed is None:
         # No analytic anywhere (9 of the GWTC-2.1 rows).  A cosmo-flavour
         # release is still reweighted, so UniformSourceFrame remains the
         # effective prior; there is simply no declaration to compare it to.
+        if reweighted:
+            return ResolvedDLPrior(
+                kind="UniformSourceFrame", H0=table_row.H0, Om0=table_row.Om0,
+                dmin=dmin, dmax=dmax,
+                source="default(no_analytic)",
+                sampling_kind="", cosmology_name=table_row.name,
+                flavour=flavour, basis="release_reweighted",
+                cosmology_source=table_row.source,
+                cosmology_table_sha256=table_sha,
+                prior_source_label="", prior_source_kind="release_reweighted")
         H0, Om0 = default_cosmo
         return ResolvedDLPrior(
             kind="UniformSourceFrame", H0=H0, Om0=Om0, dmin=dmin, dmax=dmax,
             source="default(no_analytic)", sampling_kind="",
-            flavour=flavour,
-            basis=("release_reweighted" if flavour == "cosmo"
-                   else "assumed_default"))
+            flavour=flavour, basis="assumed_default",
+            cosmology_source="catalog_default",
+            prior_source_label="", prior_source_kind="assumed_default")
 
     if parsed.dmin is not None:
         dmin = parsed.dmin
     if parsed.dmax is not None:
         dmax = parsed.dmax
 
+    sampling_kind = parsed.kind or ""
+    if reweighted:
+        # Reweighted release: the declared class is the sampling prior only,
+        # and the cosmology is the table's -- whatever the stale repr says.
+        H0, Om0 = table_row.H0, table_row.Om0
+        src += f"+release_table[{catalog}]"
+        return ResolvedDLPrior(
+            kind="UniformSourceFrame", H0=H0, Om0=Om0, dmin=dmin, dmax=dmax,
+            source=src, alpha=None, sampling_kind=sampling_kind,
+            sampling_alpha=parsed.alpha, cosmology_name=table_row.name,
+            flavour=flavour, basis="release_reweighted",
+            cosmology_source=table_row.source,
+            cosmology_table_sha256=table_sha,
+            prior_source_label=src_label,
+            prior_source_kind="release_reweighted")
+
     H0, Om0 = parsed.H0, parsed.Om0
+    cosmology_source = "analytic_declared"
     if H0 is None:
         H0, Om0 = default_cosmo
         src += "+default_cosmo"
+        cosmology_source = "catalog_default"
         if parsed.cosmology_recognized is False:
             warnings.warn(
                 f"{analysis}: analytic distance prior names an unrecognised "
@@ -774,30 +938,32 @@ def resolve_dL_prior(catalog, analysis, analyses, priors, dL_samples,
                 f"check against the file's own prior samples is the only thing "
                 f"standing between this guess and a wrong p_dL_pe.")
 
-    sampling_kind = parsed.kind or ""
-    if flavour == "cosmo":
-        # Reweighted release: the declared class is the sampling prior only.
-        kind, alpha, basis = "UniformSourceFrame", None, "release_reweighted"
-    else:
-        kind = sampling_kind or "UniformSourceFrame"
-        alpha = parsed.alpha
-        basis = "analytic_declared" if sampling_kind else "assumed_default"
-        if kind not in DL_PRIOR_KINDS:
-            raise DistancePriorKindError(
-                f"{analysis}: analytic distance prior declares class "
-                f"{kind!r}, which gwcat cannot evaluate (known: "
-                f"{list(DL_PRIOR_KINDS)}). Refusing to substitute "
-                f"UniformSourceFrame -- that substitution is the GW-02 defect.")
-        if kind in DL_PRIOR_NEEDS_ALPHA and alpha is None:
-            raise ValueError(
-                f"{analysis}: analytic distance prior declares {kind} but no "
-                f"alpha could be parsed from {parsed.raw[:120]!r}.")
+    kind = sampling_kind or "UniformSourceFrame"
+    alpha = parsed.alpha
+    basis = "analytic_declared" if sampling_kind else "assumed_default"
+    if kind not in DL_PRIOR_KINDS:
+        raise DistancePriorKindError(
+            f"{analysis}: analytic distance prior declares class "
+            f"{kind!r}, which gwcat cannot evaluate (known: "
+            f"{list(DL_PRIOR_KINDS)}). Refusing to substitute "
+            f"UniformSourceFrame -- that substitution is the GW-02 defect.")
+    if kind in DL_PRIOR_NEEDS_ALPHA and alpha is None:
+        raise ValueError(
+            f"{analysis}: analytic distance prior declares {kind} but no "
+            f"alpha could be parsed from {parsed.raw[:120]!r}.")
 
+    if not sampling_kind:
+        psk = "assumed_default"
+    elif src_label == analysis:
+        psk = "own_analytic"
+    else:
+        psk = "sibling_inherited"
     return ResolvedDLPrior(
         kind=kind, H0=H0, Om0=Om0, dmin=dmin, dmax=dmax, source=src,
         alpha=alpha, sampling_kind=sampling_kind,
         sampling_alpha=parsed.alpha, cosmology_name=parsed.cosmology_name,
-        flavour=flavour, basis=basis)
+        flavour=flavour, basis=basis, cosmology_source=cosmology_source,
+        prior_source_label=src_label, prior_source_kind=psk)
 
 
 # --------------------------------------------------------------------------
@@ -869,9 +1035,19 @@ class ResolvedMassPrior:
     q_min: Optional[float] = None
     q_max: Optional[float] = None
     source: str = ""
+    #: GW-40b: whose analytic group it came from, and the provenance kind
+    #: ("own_analytic" / "sibling_inherited" / "assumed_default").
+    source_label: str = ""
+    source_kind: str = ""
+    #: Parsed ``Constraint`` bounds on the detector-frame component masses
+    #: (GW-40f; None when the group records none).
+    m1_min: Optional[float] = None
+    m1_max: Optional[float] = None
+    m2_min: Optional[float] = None
+    m2_max: Optional[float] = None
 
 
-def resolve_mass_prior(analysis, analyses, priors):
+def resolve_mass_prior(analysis, analyses, priors, *, siblings=True):
     """Parse the analytic mass prior for one ingested analysis.
 
     Searches the chosen analysis then its siblings, exactly as the distance and
@@ -880,6 +1056,9 @@ def resolve_mass_prior(analysis, analyses, priors):
     -- a *constraint*, not a prior -- with the actual prior on
     ``(chirp_mass, mass_ratio)``, so the class of that pair is what decides
     whether the mass Jacobian is right.
+
+    ``siblings=False`` (GW-40f) restricts the search to ``analysis`` itself, for
+    a constituent whose OWN prior is required.
     """
     analytic = priors.get("analytic", {}) if isinstance(priors, dict) else {}
 
@@ -888,10 +1067,15 @@ def resolve_mass_prior(analysis, analyses, priors):
         if not node:
             return None
         got = {k: node[k] for k in ("chirp_mass", "mass_ratio") if k in node}
-        return got if len(got) == 2 else None
+        if len(got) != 2:
+            return None
+        for k in ("mass_1", "mass_2"):
+            if k in node:
+                got[k] = node[k]
+        return got
 
     found, src_an = _find(analysis), analysis
-    if found is None:
+    if found is None and siblings:
         for an in analyses:
             found = _find(an)
             if found is not None:
@@ -899,28 +1083,177 @@ def resolve_mass_prior(analysis, analyses, priors):
                 break
     if found is None:
         return ResolvedMassPrior(kind="assumed_default",
-                                 source="default(no_analytic_prior)")
+                                 source="default(no_analytic_prior)",
+                                 source_label="",
+                                 source_kind="assumed_default")
+    src_kind = "own_analytic" if src_an == analysis else "sibling_inherited"
+
+    def _constraint(key):
+        got = _parse_analytic_spin(found[key]) if key in found else None
+        if got is None or got[0] != "Constraint":
+            return None, None
+        return (None if got[1] is None else float(got[1]),
+                None if got[2] is None else float(got[2]))
 
     mc = _parse_analytic_spin(found["chirp_mass"])
     q = _parse_analytic_spin(found["mass_ratio"])
     kinds = (mc[0] if mc else None, q[0] if q else None)
     if kinds == _UNIFORM_IN_COMPONENTS:
+        m1lo, m1hi = _constraint("mass_1")
+        m2lo, m2hi = _constraint("mass_2")
         return ResolvedMassPrior(
             kind="uniform_detector_frame",
             chirp_min=None if mc[1] is None else float(mc[1]),
             chirp_max=None if mc[2] is None else float(mc[2]),
             q_min=None if q[1] is None else float(q[1]),
             q_max=None if q[2] is None else float(q[2]),
-            source=f"analytic[{src_an}]")
-    raw = "; ".join(f"{k}={str(found[k])[:80]!r}" for k in sorted(found))
+            source=f"analytic[{src_an}]",
+            source_label=src_an, source_kind=src_kind,
+            m1_min=m1lo, m1_max=m1hi, m2_min=m2lo, m2_max=m2hi)
+    raw = "; ".join(f"{k}={str(found[k])[:80]!r}" for k in sorted(found)
+                    if k in ("chirp_mass", "mass_ratio"))
     return ResolvedMassPrior(
         kind="unrecognized",
-        source=f"analytic[{src_an}]:unrecognized({raw})")
+        source=f"analytic[{src_an}]:unrecognized({raw})",
+        source_label=src_an, source_kind=src_kind)
+
+
+@dataclass(frozen=True)
+class ResolvedSpinPrior:
+    """The spin-magnitude prior plus where it came from (GW-40b).
+
+    ``kind``/``source`` are the legacy PR-2 fields (what the prior IS).
+    ``source_label``/``source_kind`` say WHOSE declaration it is: the ingested
+    label's own analytic group ("own_analytic"), a sibling's
+    ("sibling_inherited"), a LALInference ``config_file/engine/a_spin{1,2}-max``
+    pair ("config_file_declared"), or nothing ("assumed_default").
+    """
+    amax_1: float
+    amax_2: float
+    kind: str
+    source: str
+    source_label: str = ""
+    source_kind: str = ""
+
+
+#: The LALInference ``[engine]`` keys that declare the spin-magnitude ceilings.
+_CONFIG_SPIN_KEYS = ("a_spin1-max", "a_spin2-max")
+
+
+def _config_float(val):
+    """A finite float from a config value (str / bytes / 1-element array)."""
+    if isinstance(val, (bytes, bytearray)):
+        val = val.decode()
+    if isinstance(val, (list, tuple, np.ndarray)):
+        arr = np.asarray(val).ravel()
+        if arr.size != 1:
+            return None
+        val = arr[0]
+        if isinstance(val, (bytes, bytearray)):
+            val = val.decode()
+    try:
+        v = float(str(val).strip().strip("'\""))
+    except (TypeError, ValueError):
+        return None
+    return v if np.isfinite(v) else None
+
+
+def _spin_amax_from_config(data, analysis, analyses=()):
+    """Spin ceilings DECLARED by a LALInference config (GW-40b).
+
+    The six GWTC-2.1 LALInference events (GW170608_020116, GW190707_093326,
+    GW190720_000836, GW190725_174728, GW190728_064510, GW190924_021846) carry no
+    analytic priors group anywhere, so their spin prior used to be recorded as
+    ``assumed_default``.  Their constituent runs' ``config_file/engine`` DOES
+    declare ``a_spin1-max = a_spin2-max = 0.99``.
+
+    Search order: ``analysis``'s own config, else every sibling that declares
+    the keys.  Returns ``(amax_1, amax_2, labels, consistent)`` or ``None``;
+    ``consistent`` is False when siblings declare different ceilings (then the
+    caller must NOT upgrade the provenance -- a Mixed set built from runs with
+    different ceilings is not a single declared prior).
+    """
+    cfg_all = getattr(data, "config", None)
+    if not isinstance(cfg_all, dict):
+        return None
+
+    def _one(an):
+        try:
+            cfgd = cfg_all.get(an)
+        except Exception:
+            return None
+        if not isinstance(cfgd, dict):
+            return None
+        eng = cfgd.get("engine")
+        if not isinstance(eng, dict):
+            return None
+        vals = [_config_float(eng.get(k)) for k in _CONFIG_SPIN_KEYS]
+        if any(v is None for v in vals):
+            return None
+        return float(vals[0]), float(vals[1])
+
+    own = _one(analysis)
+    if own is not None:
+        return own[0], own[1], [analysis], True
+    hits = [(an, _one(an)) for an in analyses if an != analysis]
+    hits = [(an, v) for an, v in hits if v is not None]
+    if not hits:
+        return None
+    vals = {v for _an, v in hits}
+    a1, a2 = hits[0][1]
+    return a1, a2, [an for an, _v in hits], len(vals) == 1
+
+
+def constituent_spin_amax_config(data, analysis, analyses):
+    """JSON ``{sibling: [a1_max, a2_max] | null}`` for a ``Mixed`` label.
+
+    Every same-prefix, non-Mixed sibling of ``analysis`` is listed, with the
+    ceilings its ``config_file/engine/a_spin{1,2}-max`` declares, or ``null``
+    when its config declares none.  ``""`` for a label that is not a combined
+    ``Mixed`` set, or when ``data`` carries no config at all.
+    """
+    import json as _json
+    prefix, base, _variant = _label_parts(analysis)
+    if base != "Mixed":
+        return ""
+    cfg_all = getattr(data, "config", None)
+    if not isinstance(cfg_all, dict):
+        return ""
+    out = {}
+    for an in analyses:
+        p2, b2, _v2 = _label_parts(an)
+        if an == analysis or p2 != prefix or b2 == "Mixed":
+            continue
+        got = _spin_amax_from_config(data, an, ())
+        out[str(an)] = (None if got is None
+                        else [float(got[0]), float(got[1])])
+    return _json.dumps(out, sort_keys=True)
 
 
 def resolve_spin_prior(analysis, analyses, priors, a1_samples, a2_samples,
                        fallback_amax=0.99, allow_variant_mismatch=False):
     """Return ``(amax_1, amax_2, kind, source)`` for the spin-magnitude prior.
+
+    The legacy 4-tuple view of :func:`resolve_spin_prior_full`; see there.
+    """
+    r = resolve_spin_prior_full(
+        analysis, analyses, priors, a1_samples, a2_samples,
+        fallback_amax=fallback_amax,
+        allow_variant_mismatch=allow_variant_mismatch)
+    return r.amax_1, r.amax_2, r.kind, r.source
+
+
+def resolve_spin_prior_full(analysis, analyses, priors, a1_samples,
+                            a2_samples, fallback_amax=0.99,
+                            allow_variant_mismatch=False, data=None):
+    """Resolve the spin-magnitude prior AND its provenance (GW-40b).
+
+    ``data`` (the pesummary read object) enables the LALInference config path:
+    when no analytic spin prior exists for the label or any sibling, a
+    ``config_file/engine/a_spin{1,2}-max`` declaration upgrades the provenance
+    from ``assumed_default`` to ``config_file_declared`` and supplies the
+    ceilings.  The legacy ``kind`` stays ``"assumed_default"`` there: the config
+    declares the bounds, not the distribution class.
 
     Mirrors :func:`resolve_dL_prior`: read the analytic spin priors of the
     chosen ``analysis``; if that analysis carries no priors group (e.g. an O4
@@ -953,6 +1286,7 @@ def resolve_spin_prior(analysis, analyses, priors, a1_samples, a2_samples,
 
     found = _find(analysis)
     src_an = analysis
+    src_label = analysis if found is not None else ""
     if found is None:
         # Sibling search (an O4 Mixed set carries no priors group of its own).
         #
@@ -975,6 +1309,7 @@ def resolve_spin_prior(analysis, analyses, priors, a1_samples, a2_samples,
         for an in same:
             found = _find(an)
             src_an = an
+            src_label = an
             break
 
         if found is None and other:
@@ -997,6 +1332,7 @@ def resolve_spin_prior(analysis, analyses, priors, a1_samples, a2_samples,
                     raise SpinPriorMismatchError(msg)
                 warnings.warn(msg)
                 found, src_an = _find(other[0]), f"{other[0]}:variant_mismatch"
+                src_label = other[0]
             else:
                 # The ingested label declares NO spin restriction (a plain
                 # `C01:Mixed`), while every candidate sibling does.  Which one
@@ -1022,6 +1358,7 @@ def resolve_spin_prior(analysis, analyses, priors, a1_samples, a2_samples,
                     f"variant_assumed in spin_prior_source.")
                 found = _find(best)
                 src_an = f"{best}:variant_assumed({tok})"
+                src_label = best
 
     def _is_uniform_zero(p):
         return (p is not None and p[0] == "Uniform"
@@ -1031,10 +1368,30 @@ def resolve_spin_prior(analysis, analyses, priors, a1_samples, a2_samples,
     def _is_sine_or_absent(p):
         return p is None or p[0] == "Sine"
 
+    src_kind = ("" if found is None else
+                "own_analytic" if src_label == analysis else "sibling_inherited")
     if found is None:
         amax_1 = amax_2 = float(fallback_amax)
         kind = "assumed_default"
         source = "default(no_analytic_prior)"
+        src_label, src_kind = "", "assumed_default"
+        declared = (_spin_amax_from_config(data, analysis, analyses)
+                    if data is not None else None)
+        if declared is not None:
+            c1, c2, clabels, consistent = declared
+            where = ",".join(clabels)
+            if consistent:
+                amax_1, amax_2 = c1, c2
+                source = (f"config_file[{where}]/engine/"
+                          f"a_spin1-max={c1:g},a_spin2-max={c2:g}")
+                src_label, src_kind = where, "config_file_declared"
+            else:
+                warnings.warn(
+                    f"{analysis}: the constituent configs {clabels} declare "
+                    f"DIFFERENT spin ceilings (engine/a_spin1-max, "
+                    f"a_spin2-max); not treating them as one declared prior. "
+                    f"Spin provenance stays assumed_default.")
+                source += f" | config_file_inconsistent({where})"
     else:
         p_a1 = _parse_analytic_spin(found["a_1"]) if "a_1" in found else None
         p_a2 = _parse_analytic_spin(found["a_2"]) if "a_2" in found else None
@@ -1068,7 +1425,9 @@ def resolve_spin_prior(analysis, analyses, priors, a1_samples, a2_samples,
                       f"({'; '.join(viol)}); prior bounds may be wrong")
         source += " | sample_exceeds_amax(" + "; ".join(viol) + ")"
 
-    return amax_1, amax_2, kind, source
+    return ResolvedSpinPrior(amax_1=amax_1, amax_2=amax_2, kind=kind,
+                             source=source, source_label=src_label,
+                             source_kind=src_kind)
 
 
 #: The single chi_p implementation (GW-08).  ``ingest`` previously carried a
@@ -1240,8 +1599,8 @@ def inspect(path: str, cfg: Optional[IngestConfig] = None):
     catalog = detect_catalog(path)
     data, samples_dict, analyses, priors = _read_event_pesummary(path)
     prefix = _prefix_for(analyses)
-    analysis = select_analysis(analyses, prefix, cfg)
-    ranked = rank_analyses(analyses, prefix, cfg)
+    analysis = select_analysis(analyses, prefix, cfg, catalog=catalog)
+    ranked = rank_analyses(analyses, prefix, cfg, catalog=catalog)
     s = samples_dict[analysis]
     dL = np.asarray(s["luminosity_distance"], float)
     flavour = detect_release_flavour(path)
@@ -1256,9 +1615,12 @@ def inspect(path: str, cfg: Optional[IngestConfig] = None):
     f_ref, f_ref_source = _read_f_ref(data, analysis, analyses)
     a1_samp = np.asarray(s["a_1"], float) if "a_1" in s else None
     a2_samp = np.asarray(s["a_2"], float) if "a_2" in s else None
-    spin_amax_1, spin_amax_2, spin_kind, spin_src = resolve_spin_prior(
+    sp = resolve_spin_prior_full(
         analysis, analyses, priors, a1_samp, a2_samp,
-        allow_variant_mismatch=cfg.spin_prior_allow_variant_mismatch)
+        allow_variant_mismatch=cfg.spin_prior_allow_variant_mismatch,
+        data=data)
+    spin_amax_1, spin_amax_2, spin_kind, spin_src = (sp.amax_1, sp.amax_2,
+                                                     sp.kind, sp.source)
     mass_prior = resolve_mass_prior(analysis, analyses, priors)
     avail = [p for p in DEFAULT_PARAMS if p in s]
     missing = [p for p in WAVEFORM_PARAMS if p not in s]
@@ -1280,6 +1642,8 @@ def inspect(path: str, cfg: Optional[IngestConfig] = None):
                      "sampling_kind": res.sampling_kind,
                      "sampling_alpha": res.sampling_alpha,
                      "cosmology_name": res.cosmology_name,
+                     "cosmology_source": res.cosmology_source,
+                     "cosmology_table_sha256": res.cosmology_table_sha256,
                      "release_flavour": res.flavour, "basis": res.basis,
                      # GW-01: which implementation evaluates p_dL_pe, and how
                      # many samples the recorded bounds fail to cover.
@@ -1288,7 +1652,16 @@ def inspect(path: str, cfg: Optional[IngestConfig] = None):
                      "frac_outside_bounds": dL_info["frac_outside_bounds"]},
         # Spin-magnitude prior resolution (PR 2).
         "spin_prior": {"amax_1": spin_amax_1, "amax_2": spin_amax_2,
-                       "kind": spin_kind, "source": spin_src},
+                       "kind": spin_kind, "source": spin_src,
+                       "source_label": sp.source_label,
+                       "source_kind": sp.source_kind},
+        # Per-prior source provenance (GW-40b).
+        "prior_source": {
+            "mass": {"label": mass_prior.source_label,
+                     "kind": mass_prior.source_kind},
+            "spin": {"label": sp.source_label, "kind": sp.source_kind},
+            "dL": {"label": res.prior_source_label,
+                   "kind": res.prior_source_kind}},
         # Parsed mass prior (GW-07): "uniform_detector_frame" is the only value
         # that justifies the export's |dm2det/dq| = m1det Jacobian.
         "mass_prior": {"kind": mass_prior.kind, "source": mass_prior.source,
@@ -1399,6 +1772,120 @@ def _resolve_event_table(event_table, cache_dir=None, offline=None):
         return {}
 
 
+def _constituent_mixture_prior(catalog, analysis, analyses, samples_dict,
+                               priors, cfg, flavour):
+    """The equal-weight constituent-mixture prior of a ``C00:Mixed`` row.
+
+    See :mod:`gwcat.constituent_mixture`.  Every contributing constituent must
+    carry its OWN analytic mass (uniform in components), distance and spin
+    priors; the spin priors and the distance-prior cosmology must agree across
+    constituents; every Mixed row must equal one constituent row and each
+    constituent must supply exactly ``n_Mixed / K`` rows.  Anything else is
+    refused (:class:`~gwcat.constituent_mixture.ConstituentMixtureError`).
+    """
+    from .constituent_mixture import (ConstituentMixtureError,
+                                      match_constituent_rows,
+                                      mixture_prior_densities,
+                                      truncated_dL_density, uic_normalisation)
+    pfx, _base, variant = _label_parts(analysis)
+    want = _spin_variant_token(variant)
+    cands = {a: samples_dict[a] for a in analyses
+             if a != analysis and _label_parts(a)[0] == pfx
+             and _label_parts(a)[1] != "Mixed"
+             and _spin_variant_token(_label_parts(a)[2]) == want}
+    labels, counts = match_constituent_rows(samples_dict[analysis], cands)
+
+    comps, amaxes, cosmos, dl_kinds, bad = [], set(), set(), set(), []
+    for lab in labels:
+        smp = samples_dict[lab]
+        mp = resolve_mass_prior(lab, [lab], priors, siblings=False)
+        rd = resolve_dL_prior(catalog, lab, [lab], priors,
+                              np.asarray(smp["luminosity_distance"], float),
+                              cfg, flavour=flavour)
+        sp = resolve_spin_prior_full(
+            lab, [lab], priors,
+            np.asarray(smp["a_1"], float) if "a_1" in smp else None,
+            np.asarray(smp["a_2"], float) if "a_2" in smp else None)
+        if mp.kind != "uniform_detector_frame" or mp.source_kind != "own_analytic":
+            bad.append(f"{lab}: mass prior {mp.kind}/{mp.source_kind}")
+            continue
+        if rd.prior_source_kind != "own_analytic":
+            bad.append(f"{lab}: distance prior {rd.prior_source_kind}")
+            continue
+        if (sp.kind != "uniform_magnitude_isotropic"
+                or sp.source_kind != "own_analytic"):
+            bad.append(f"{lab}: spin prior {sp.kind}/{sp.source_kind}")
+            continue
+        amaxes.add((sp.amax_1, sp.amax_2))
+        cosmos.add((rd.H0, rd.Om0, rd.cosmology_name))
+        dl_kinds.add(rd.kind)
+        bounds = dict(mc_min=mp.chirp_min, mc_max=mp.chirp_max,
+                      q_min=mp.q_min, q_max=mp.q_max, m1_min=mp.m1_min,
+                      m1_max=mp.m1_max, m2_min=mp.m2_min, m2_max=mp.m2_max)
+        comps.append(dict(
+            bounds, label=lab, Z=uic_normalisation(**bounds),
+            dmin=rd.dmin, dmax=rd.dmax, dl_kind=rd.kind,
+            p_dL=truncated_dL_density(rd.kind, rd.cosmology, rd.dmin, rd.dmax,
+                                      rd.alpha, impl=cfg.dL_prior_impl)))
+    if bad:
+        raise ConstituentMixtureError(
+            f"{analysis}: cannot build the constituent-mixture prior -- every "
+            f"constituent must carry its own analytic priors: {bad}.")
+    if len(amaxes) != 1:
+        raise ConstituentMixtureError(
+            f"{analysis}: constituents declare different spin priors "
+            f"{sorted(amaxes)}; the chi_eff prior would not factor out of the "
+            f"mixture. Refusing rather than approximating.")
+    if len(cosmos) != 1:
+        raise ConstituentMixtureError(
+            f"{analysis}: constituents' distance priors use different "
+            f"cosmologies {sorted(cosmos)}; one exported z(dL) cannot describe "
+            f"them.")
+    mixed = samples_dict[analysis]
+    m1 = np.asarray(mixed["mass_1"], float)
+    q = np.asarray(mixed["mass_2"], float) / m1
+    dL = np.asarray(mixed["luminosity_distance"], float)
+    joint, marg = mixture_prior_densities(m1, q, dL, comps)
+    n_zero = int(np.sum(~(joint > 0)))
+    if n_zero:
+        raise ConstituentMixtureError(
+            f"{analysis}: {n_zero} Mixed sample(s) lie outside EVERY "
+            f"constituent's prior support; the mixture assigns them zero "
+            f"density.")
+    (a1, a2), = amaxes
+    (H0, Om0, cname), = cosmos
+    return dict(labels=labels, counts=counts, p_mass_dL=joint, p_dL=marg,
+                amax_1=a1, amax_2=a2, H0=H0, Om0=Om0, cosmology_name=cname,
+                dl_kind=(dl_kinds.pop() if len(dl_kinds) == 1 else "mixture"),
+                dmin=min(c["dmin"] for c in comps),
+                dmax=max(c["dmax"] for c in comps),
+                chirp_min=min(c["mc_min"] for c in comps),
+                chirp_max=max(c["mc_max"] for c in comps),
+                q_min=min(c["q_min"] for c in comps),
+                q_max=max(c["q_max"] for c in comps),
+                Z={c["label"]: c["Z"] for c in comps})
+
+
+def _release_pesummary_version(path) -> str:
+    """The pesummary version that wrote a PE release file ("" if unreadable).
+
+    Read from the file's own ``version/pesummary`` dataset with h5py (a few
+    bytes; the samples are not touched).  It is provenance for the
+    release-reweight table's citations, never an input to any density.
+    """
+    try:
+        with h5py.File(path, "r") as f:
+            if "version" in f and "pesummary" in f["version"]:
+                v = np.asarray(f["version/pesummary"][()]).ravel()
+                if v.size:
+                    x = v[0]
+                    return (x.decode() if isinstance(x, (bytes, bytearray))
+                            else str(x))
+    except (OSError, KeyError, TypeError, ValueError):
+        pass
+    return ""
+
+
 def build_store(paths, out_path, params=None, extra_params=None,
                 cfg: Optional[IngestConfig] = None, event_table=None,
                 sample_sets="preferred", file_provenance: Optional[dict] = None,
@@ -1456,6 +1943,10 @@ def build_store(paths, out_path, params=None, extra_params=None,
     event_table = _resolve_event_table(event_table, cache_dir=cache_dir,
                                        offline=offline)
     file_provenance = file_provenance or {}
+    # The release-reweight cosmology table (GW-40a) is loaded on first use by
+    # resolve_dL_prior (cached per path+sha256), so a build with no `_cosmo`
+    # file never reads it and every row records the sha256 of the bytes used.
+    release_table = None
 
     records = []   # per row: (name, n_samples, {param: array}) -- union schema
     offsets = [0]
@@ -1467,15 +1958,18 @@ def build_store(paths, out_path, params=None, extra_params=None,
         data, samples_dict, analyses, priors = _read_event_pesummary(path)
         prefix = _prefix_for(analyses)
         # Sample-set contract (PR 6): one or more analyses per file, each a row.
-        preferred_label = select_analysis(analyses, prefix, cfg)
-        ranked = rank_analyses(analyses, prefix, cfg)
-        labels = select_analyses(analyses, prefix, cfg, sample_sets)
+        # Defaults keyed by CATALOG, not label prefix (GW-40a).
+        preferred_label = select_analysis(analyses, prefix, cfg,
+                                          catalog=catalog)
+        ranked = rank_analyses(analyses, prefix, cfg, catalog=catalog)
+        labels = select_analyses(analyses, prefix, cfg, sample_sets,
+                                 catalog=catalog)
         # Which labels the waveform-priority list actually matched, so
         # selection_reason can distinguish a priority hit from the last resort.
         priority_labels = _priority_matches(
             [a for a in analyses if _label_parts(a)[0] == prefix],
-            cfg.o3_waveform_priority if prefix == "C01"
-            else cfg.o4_waveform_priority)
+            _priority_for(catalog, prefix, cfg))
+        pesummary_version = _release_pesummary_version(path)
         et = event_table.get(name, {})
         prov = file_provenance.get(os.path.basename(path), {})
         # Whether this release's posteriors are still on the prior its
@@ -1494,7 +1988,8 @@ def build_store(paths, out_path, params=None, extra_params=None,
 
             dL = np.asarray(s["luminosity_distance"], float)
             res = resolve_dL_prior(catalog, analysis, analyses, priors, dL, cfg,
-                                   flavour=flavour)
+                                   flavour=flavour,
+                                   release_table=release_table)
             H0, Om0, dmin, dmax, src = (res.H0, res.Om0, res.dmin, res.dmax,
                                         res.source)
             ks_val = None
@@ -1577,9 +2072,22 @@ def build_store(paths, out_path, params=None, extra_params=None,
             # Spin-magnitude prior resolution (PR 2), mirroring resolve_dL_prior.
             a1_samp = np.asarray(s["a_1"], float) if "a_1" in s else None
             a2_samp = np.asarray(s["a_2"], float) if "a_2" in s else None
-            spin_amax_1, spin_amax_2, spin_kind, spin_src = resolve_spin_prior(
+            sp = resolve_spin_prior_full(
                 analysis, analyses, priors, a1_samp, a2_samp,
-                allow_variant_mismatch=cfg.spin_prior_allow_variant_mismatch)
+                allow_variant_mismatch=cfg.spin_prior_allow_variant_mismatch,
+                data=data)
+            spin_amax_1, spin_amax_2, spin_kind, spin_src = (
+                sp.amax_1, sp.amax_2, sp.kind, sp.source)
+            # ── Constituent-mixture prior for C00:Mixed (GW-40f, opt-in) ─────
+            cmix = None
+            if (cfg.constituent_mixture_prior
+                    and _label_parts(analysis)[0] == "C00"
+                    and _label_parts(analysis)[1] == "Mixed"):
+                cmix = _constituent_mixture_prior(
+                    catalog, analysis, analyses, samples_dict, priors, cfg,
+                    flavour)
+                rec["p_dL_pe"] = cmix["p_dL"]
+                rec["p_mass_dL_pe"] = cmix["p_mass_dL"]
             records.append((name, n, rec))
 
             # metadata
@@ -1645,6 +2153,15 @@ def build_store(paths, out_path, params=None, extra_params=None,
                     f"|dm2det/dq| = m1det Jacobian that assumes it is.")
             meta["mass_prior_kind"].append(mp.kind)
             meta["mass_prior_source"].append(mp.source)
+            # ── Per-prior source provenance (GW-40b) ────────────────────────
+            meta["prior_source_label_mass"].append(mp.source_label)
+            meta["prior_source_kind_mass"].append(mp.source_kind)
+            meta["prior_source_label_spin"].append(sp.source_label)
+            meta["prior_source_kind_spin"].append(sp.source_kind)
+            meta["spin_amax_config_per_constituent"].append(
+                constituent_spin_amax_config(data, analysis, analyses))
+            meta["prior_source_label_dL"].append(res.prior_source_label)
+            meta["prior_source_kind_dL"].append(res.prior_source_kind)
             meta["mass_prior_chirp_min"].append(
                 np.nan if mp.chirp_min is None else mp.chirp_min)
             meta["mass_prior_chirp_max"].append(
@@ -1685,6 +2202,10 @@ def build_store(paths, out_path, params=None, extra_params=None,
             meta["dL_prior_cosmology_name"].append(res.cosmology_name)
             meta["dL_prior_release_flavour"].append(res.flavour)
             meta["dL_prior_basis"].append(res.basis)
+            meta["dL_prior_cosmology_source"].append(res.cosmology_source)
+            meta["dL_prior_cosmology_table_sha256"].append(
+                res.cosmology_table_sha256)
+            meta["release_pesummary_version"].append(pesummary_version)
             meta["dL_prior_alpha"].append(
                 np.nan if res.alpha is None else float(res.alpha))
             meta["dL_prior_sampling_alpha"].append(
@@ -1717,6 +2238,46 @@ def build_store(paths, out_path, params=None, extra_params=None,
                                   priority_labels=priority_labels)
             for k, val in ss.items():
                 meta[k].append(val)
+            if cmix is None:
+                meta["constituent_mixture_labels"].append("")
+                meta["constituent_mixture_counts"].append("")
+            else:
+                joined = "+".join(cmix["labels"])
+                over = {
+                    "constituent_mixture_labels": joined,
+                    "constituent_mixture_counts": ",".join(
+                        str(cmix["counts"][lab]) for lab in cmix["labels"]),
+                    "mass_prior_kind": "constituent_mixture",
+                    "mass_prior_source": f"constituent_mixture[{joined}]",
+                    "mass_prior_chirp_min": cmix["chirp_min"],
+                    "mass_prior_chirp_max": cmix["chirp_max"],
+                    "mass_prior_q_min": cmix["q_min"],
+                    "mass_prior_q_max": cmix["q_max"],
+                    "dL_prior_kind": cmix["dl_kind"],
+                    "dL_prior_basis": "constituent_mixture",
+                    "dL_prior_source": f"constituent_mixture[{joined}]",
+                    "dL_prior_min": cmix["dmin"],
+                    "dL_prior_max": cmix["dmax"],
+                    "dL_prior_H0": float(cmix["H0"]),
+                    "dL_prior_Om0": float(cmix["Om0"]),
+                    "dL_prior_cosmology_name": cmix["cosmology_name"],
+                    "spin_amax_1": float(cmix["amax_1"]),
+                    "spin_amax_2": float(cmix["amax_2"]),
+                    "spin_prior_kind": "uniform_magnitude_isotropic",
+                    "spin_prior_source": f"constituent_mixture[{joined}]",
+                }
+                for p in ("mass", "spin", "dL"):
+                    over[f"prior_source_label_{p}"] = joined
+                    over[f"prior_source_kind_{p}"] = "constituent_mixture"
+                meta["constituent_mixture_labels"].append(
+                    over.pop("constituent_mixture_labels"))
+                meta["constituent_mixture_counts"].append(
+                    over.pop("constituent_mixture_counts"))
+                # Every other field was already appended for this row from the
+                # sibling-borrowed resolution; the mixture REPLACES it.
+                for k, val in over.items():
+                    meta[k][-1] = val
+                src = f"constituent_mixture[{joined}]"
             print(f"[{catalog}] {name}: {n} samp, sample_set={analysis}, "
                   f"prior={src}")
 
@@ -1726,7 +2287,7 @@ def build_store(paths, out_path, params=None, extra_params=None,
     # stored and correctly marked available even when a caller passed a custom
     # ``params`` that omitted them (a column absent from every rec is dropped by
     # _assemble_union, so this is harmless when nothing was derived).
-    candidate_params = list(params) + ["p_dL_pe"]
+    candidate_params = list(params) + ["p_dL_pe", "p_mass_dL_pe"]
     for p in ("cos_tilt_1", "cos_tilt_2", "chi_p"):
         if p not in candidate_params:
             candidate_params.append(p)
@@ -1955,12 +2516,24 @@ SCHEMA_VERSION_SAMPLESETS = "1.2"
 #: which is why GW-16 re-ingests rather than back-filling.
 SCHEMA_VERSION_DL_PRIOR = "1.3"
 
+#: 1.4 adds the release-reweight cosmology provenance (GW-40a:
+#: dL_prior_cosmology_source / _table_sha256, release_pesummary_version) and
+#: the per-prior source provenance (GW-40b: prior_source_{label,kind}_{mass,
+#: spin,dL}).  Every one is read-optional, so 1.1-1.3 stores still load; they
+#: simply carry no record of where each prior came from.
+SCHEMA_VERSION_PRIOR_PROVENANCE = "1.4"
+
 #: The meta columns whose presence marks a 1.3 store.
 _SCHEMA_13_FIELDS = ("dL_prior_kind", "dL_prior_sampling_kind",
                      "dL_prior_cosmology_name", "dL_prior_release_flavour",
                      "dL_prior_basis", "dL_prior_impl", "dL_prior_alpha",
                      "dL_prior_sampling_alpha", "dL_prior_ks",
                      "n_samples_outside_dL_prior_bounds")
+
+
+#: The meta columns whose (non-empty) presence marks a 1.4 store.
+_SCHEMA_14_FIELDS = ("dL_prior_cosmology_source", "prior_source_kind_spin",
+                     "prior_source_kind_mass", "prior_source_kind_dL")
 
 
 def _store_schema_version(meta):
@@ -1972,6 +2545,10 @@ def _store_schema_version(meta):
     # 1.3 when the distance-prior provenance is present (GW-01/GW-02), else 1.2
     # when sample-set columns are, else 1.1.
     has_dL_prov = any(k in meta and len(meta[k]) for k in _SCHEMA_13_FIELDS)
+    has_prior_prov = any(k in meta and len(meta[k]) and any(meta[k])
+                         for k in _SCHEMA_14_FIELDS)
+    if has_prior_prov:
+        return SCHEMA_VERSION_PRIOR_PROVENANCE
     if has_dL_prov:
         return SCHEMA_VERSION_DL_PRIOR
     if has_sampleset:
@@ -2505,6 +3082,21 @@ def _cli(
     ap.add_argument("--no-summary", action="store_true",
                     help="Skip writing validation_summary.json/.md next to "
                          "--out.")
+    ap.add_argument("--release-reweight-cosmology-table", default=None,
+                    metavar="YAML",
+                    help="Release-reweight cosmology table for the GWTC-2.1/3 "
+                         "_cosmo releases (GW-40a). Default: the bundled "
+                         "gwcat/data/release_reweight_cosmology.yaml (LAL "
+                         "Planck15 67.90/0.3065, cited). The pre-GW-40 "
+                         "astropy behaviour is bundled as "
+                         "release_reweight_cosmology_legacy_astropy.yaml, for "
+                         "regressions only.")
+    ap.add_argument("--constituent-mixture-prior", action="store_true",
+                    help="Build each C00:Mixed row's prior as the equal-weight "
+                         "mixture of its constituents' own normalised priors, "
+                         "with the mixing fractions verified row by row "
+                         "(GW-40f; needed only for label policies that use "
+                         "C00:Mixed). Default: off.")
     a = ap.parse_args(argv)
     if a.inspect:
         inspect(a.inspect)
@@ -2528,8 +3120,11 @@ def _cli(
     offline = True if a.offline else None
     write_summary = default_write_summary and not a.no_summary
 
+    cfg = IngestConfig(
+        release_reweight_cosmology_table=a.release_reweight_cosmology_table,
+        constituent_mixture_prior=a.constituent_mixture_prior)
     build_store(paths, a.out, event_table=event_table, sample_sets=sample_sets,
-                cache_dir=a.cache_dir, offline=offline,
+                cache_dir=a.cache_dir, offline=offline, cfg=cfg,
                 file_provenance=file_provenance, write_summary=write_summary)
 
 

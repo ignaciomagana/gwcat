@@ -40,7 +40,8 @@ _P_DL_CONST = 0.7   # constant stored distance prior -> exact p_pe reconstructio
 
 
 def _build_spin_store(tmp_path, events, n_per_event=300, H0=67.74, Om0=0.3089,
-                      seed=11, name="spin_store.h5", mass_prior_meta=True):
+                      seed=11, name="spin_store.h5", mass_prior_meta=True,
+                      prior_source_meta=True):
     """Synthetic store with spin sample columns + per-event spin-prior meta +
     an availability mask.  Returns ``(path, raw)`` where ``raw[name][param]`` is
     the stored per-event sample array (so tests can replicate the resample)."""
@@ -63,7 +64,9 @@ def _build_spin_store(tmp_path, events, n_per_event=300, H0=67.74, Om0=0.3089,
                             "approximant", "sample_set_name",
                             "spin_amax_1", "spin_amax_2",
                             "spin_prior_kind", "spin_prior_source",
-                            "mass_prior_kind"]}
+                            "mass_prior_kind",
+                            "prior_source_kind_spin",
+                            "prior_source_label_spin"]}
 
     for ei, ev in enumerate(events):
         n = int(ev.get("n", n_per_event))
@@ -132,6 +135,12 @@ def _build_spin_store(tmp_path, events, n_per_event=300, H0=67.74, Om0=0.3089,
         # in the components, so "uniform_detector_frame" is the default here.
         meta["mass_prior_kind"].append(
             ev.get("mass_prior_kind", "uniform_detector_frame"))
+        # GW-40b per-prior provenance: the default models a label carrying its
+        # own analytic spin prior.
+        meta["prior_source_kind_spin"].append(
+            ev.get("prior_source_kind_spin", "own_analytic"))
+        meta["prior_source_label_spin"].append(
+            ev.get("prior_source_label_spin", f"C01:{wf}"))
 
     path = tmp_path / name
     with h5py.File(path, "w") as f:
@@ -145,6 +154,8 @@ def _build_spin_store(tmp_path, events, n_per_event=300, H0=67.74, Om0=0.3089,
         mg = f.create_group("meta")
         str_meta = ["source_class", "compact_type", "waveform", "approximant",
                     "sample_set_name", "spin_prior_kind", "spin_prior_source"]
+        if prior_source_meta:
+            str_meta += ["prior_source_kind_spin", "prior_source_label_spin"]
         # A store written before the mass-prior ingest carries no such column
         # at all, which is a different state from "looked and found nothing".
         if mass_prior_meta:
@@ -994,7 +1005,12 @@ def test_chieff_ppe_uses_each_events_own_prior_ceiling(tmp_path):
     assert (mode.decode() if isinstance(mode, bytes) else mode) == "per_event"
     srcs = [s.decode() if isinstance(s, bytes) else s
             for s in attrs["chi_eff_amax_source_per_event"]]
-    assert srcs == ["analytic", "analytic"]
+    # GW-40c: the ceiling's source is now the spin prior's source KIND; the
+    # historical resolution ("analytic" = read from the store) is kept beside it.
+    assert srcs == ["own_analytic", "own_analytic"]
+    res = [s.decode() if isinstance(s, bytes) else s
+           for s in attrs["chi_eff_amax_resolution_per_event"]]
+    assert res == ["analytic", "analytic"]
 
     for i in range(2):
         sl = slice(i * nsamp, (i + 1) * nsamp)

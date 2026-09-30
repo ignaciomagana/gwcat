@@ -223,6 +223,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_pe.add_argument("--approximant", default=None,
                       help="Required with "
                            "--waveform-policy=strict-approximant.")
+    p_pe.add_argument("--sample-set-map", default=None, metavar="FILE",
+                      help="Required with --waveform-policy=event-map "
+                           "(GW-40e): a JSON {event: label} map (optionally "
+                           "with 'substitutes': {event: reason | {label, "
+                           "reason}}), or a popsummary file whose "
+                           "events/event_sample_IDs give the map. An unmapped "
+                           "event, or a mapped label the store lacks without "
+                           "a declared substitute, fails.")
+    p_pe.add_argument("--nrsur-q-rule", type=float, default=None,
+                      metavar="FRAC",
+                      help="event-map only: refuse an NRSur7dq4 label whose "
+                           "C00:IMRPhenomXPHM-SpinTaylor posterior has more "
+                           "than FRAC of its mass at q < 1/6, and verify every "
+                           "declared 'nrsur_q_rule' substitute.")
+    p_pe.add_argument("--nrsur-q-rule-substitute", action="store_true",
+                      help="With --nrsur-q-rule: substitute XPHM-SpinTaylor "
+                           "for a violating NRSur label (recorded, reason "
+                           "'nrsur_q_rule') instead of refusing.")
     p_pe.add_argument("--cosmology", default=None, metavar="H0,Om0",
                       help="Override cosmology applied to every exported "
                            "event. Omit (default) to use each event's own "
@@ -245,6 +263,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_pe.add_argument("--amax-fallback", type=float, default=0.99,
                       help="Fallback spin amax for events whose store meta "
                            "lacks spin_amax_1/2 (NaN); default 0.99.")
+    p_pe.add_argument("--drop-spin-above-ceiling", action="store_true",
+                      help="Before resampling, drop every raw sample with "
+                           "a_1 > amax_1 or a_2 > amax_2 at the event's "
+                           "resolved ceiling (GW-40c), so the PE spin support "
+                           "equals a chieff_reference selection's. Counts are "
+                           "written as n_dropped_spin_above_ceiling_per_event. "
+                           "Default: off (the historical draw).")
     p_pe.add_argument("--no-summary", action="store_true",
                       help="Skip writing validation_summary.json/.md "
                            "next to --out.")
@@ -378,6 +403,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_val.add_argument("--strict", action="store_true",
                        help="Raise on the first internal-consistency failure "
                             "(cross-file contract checks always raise).")
+    p_val.add_argument("--spin-prior-allow-list", default=None, metavar="FILE",
+                       help="Events a chieff/chieff_reference pair may carry "
+                            "whose spin prior is not their label's own "
+                            "analytic one (GW-40d): a .json list or "
+                            "{event: prior_source_kind} map, or a text file "
+                            "of 'NAME [KIND]' lines. Without it every such "
+                            "event is refused.")
 
     return parser
 
@@ -542,6 +574,10 @@ def _cmd_export_pe(args) -> int:
         z_max=args.z_max,
         amax=args.amax,
         amax_fallback=args.amax_fallback,
+        drop_spin_above_ceiling=args.drop_spin_above_ceiling,
+        sample_set_map=args.sample_set_map,
+        nrsur_q_rule=args.nrsur_q_rule,
+        nrsur_q_rule_substitute=args.nrsur_q_rule_substitute,
     )
     return 0
 
@@ -629,8 +665,9 @@ def _cmd_validate(args) -> int:
     from .export.validate import validate_export_any
 
     try:
-        results = validate_export_any(args.pe_path, args.selection_path,
-                                      strict=args.strict)
+        results = validate_export_any(
+            args.pe_path, args.selection_path, strict=args.strict,
+            spin_prior_allow_list=args.spin_prior_allow_list)
     except (ValueError, AssertionError) as e:
         print(f"validate: FAILED: {e}", file=sys.stderr)
         return 1

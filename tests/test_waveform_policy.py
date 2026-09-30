@@ -102,8 +102,9 @@ def _one_event_three_sets(name="GW850101_010101"):
 # 0. resolver unit sanity + declared policy set
 # ==========================================================================
 def test_policy_names_declared():
+    # "event-map" added by GW-40e (tests/test_waveform_event_map.py).
     assert WAVEFORM_POLICIES == ("preferred", "mixed-first",
-                                 "strict-approximant", "all")
+                                 "strict-approximant", "all", "event-map")
 
 
 def test_resolve_policy_rejects_unknown():
@@ -181,7 +182,10 @@ def test_build_store_all_ingests_every_analysis(tmp_path, monkeypatch):
     monkeypatch.setattr(ing, "_read_event_pesummary",
                         _fake_reader_factory(analyses))
 
-    path = tmp_path / "GWTC-5_GW850101_010101_cosmo.h5"
+    # A native (no flavour token) name, as the real O4 combined releases are:
+    # there is no GWTC-5 `_cosmo` release, and since GW-40a a `_cosmo` file of a
+    # catalog the release-reweight table does not list is refused.
+    path = tmp_path / "GWTC-5_GW850101_010101.hdf5"
     path.write_bytes(b"")  # existence only; the reader is faked
     out = tmp_path / "store_all.h5"
     build_store([str(path)], str(out), sample_sets="all", event_table={},
@@ -198,7 +202,9 @@ def test_build_store_all_ingests_every_analysis(tmp_path, monkeypatch):
         # 1.3 since GW-01/GW-02: the store now carries the distance-prior
         # provenance (dL_prior_kind / _impl / out-of-bounds counts) that a
         # correct p_dL_pe depends on.  Sample-set columns alone would be 1.2.
-        assert f.attrs["schema_version"] == "1.3"
+        # 1.4 since GW-40a/b: plus the release-reweight cosmology and
+        # per-prior source provenance.
+        assert f.attrs["schema_version"] == "1.4"
 
     # default preferred ingest keeps exactly one row (the Mixed set).
     out1 = tmp_path / "store_pref.h5"

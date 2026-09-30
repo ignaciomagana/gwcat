@@ -101,7 +101,11 @@ def test_unknown_cosmology_token_is_recorded_not_guessed():
 
 
 def test_named_cosmologies_are_distinct_objects():
-    assert set(NAMED_COSMOLOGIES) == {"Planck15", "Planck15_LAL"}
+    # GW-40a adds the EXACT lower-case alias of the LAL object; still no
+    # case-folding (see test_ingest_release_cosmology_table).
+    assert set(NAMED_COSMOLOGIES) == {"Planck15", "Planck15_LAL",
+                                      "Planck15_lal"}
+    assert NAMED_COSMOLOGIES["Planck15_lal"] is LAL_PLANCK15
     assert NAMED_COSMOLOGIES["Planck15_LAL"] is LAL_PLANCK15
     assert NAMED_COSMOLOGIES["Planck15"] is PLANCK15
 

@@ -188,6 +188,23 @@ class ChiPDefinitionError(ValueError):
     components, so a joint (chi_eff, chi_p) prior would not describe it."""
 
 
+#: The mass-prior class of a constituent-mixture row (GW-40f).
+CONSTITUENT_MIXTURE = "constituent_mixture"
+
+
+def _mass_state(kind) -> str:
+    """:func:`classify_mass_prior`, plus the constituent mixture (GW-40f).
+
+    A ``constituent_mixture`` row's density is not the ``m1det`` Jacobian the
+    mass block gates, so the block would call it unsupported; it is instead a
+    parsed, row-verified prior carried as ``p_mass_dL_pe`` -- verified, but
+    applied here rather than through the block.
+    """
+    if str(kind) == CONSTITUENT_MIXTURE:
+        return "verified"
+    return classify_mass_prior(kind)
+
+
 def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                      nsamp=4096, seed=0,
                      far_max=None, pastro_min=None, z_max=None,
@@ -203,7 +220,10 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                      chi_p_def_tol=1e-6,
                      max_out_of_support_frac=0.0,
                      allow_out_of_support=False,
-                     allow_projection_basis=False):
+                     allow_projection_basis=False,
+                     drop_spin_above_ceiling=False,
+                     sample_set_map=None, nrsur_q_rule=None,
+                     nrsur_q_rule_substitute=False):
     """Build a PE :class:`ExportProduct` from a :class:`~gwcat.catalog.GWCatalog`.
 
     For ``spin_basis="chieff"`` this reproduces the legacy
@@ -249,6 +269,33 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     ``mass_prior_verified=False`` instead of being stamped as verified.  The
     file publishes ``q = m2det/m1det`` -- the coordinate the Jacobian belongs to
     -- with ``m2det`` kept as a derived, advisory column.
+
+    The spin-support cut (GW-40c)
+    -----------------------------
+    ``drop_spin_above_ceiling=True`` removes, BEFORE resampling, every raw
+    sample with ``a_1 > amax_1`` or ``a_2 > amax_2`` at the event's resolved
+    ceiling (the one the spin prior below is evaluated at).  The GWTC priors
+    declare 0.99 while 1,810 of 1.16M samples (71 of 282 events) exceed it; a
+    projection basis keeps the declared ceiling, so without the cut PE and a
+    ``chieff_reference`` selection (zero density above a_ref) have different
+    supports.  For a uniform-magnitude prior the cut is exact rejection to
+    ``U(0, amax)``.  The cut runs AFTER the ``z_max`` cut, so the per-event
+    counts written as ``n_dropped_spin_above_ceiling_per_event`` are samples
+    with ``z <= z_max``; ``n_above_spin_ceiling_raw_per_event`` counts the whole
+    raw label (before ``z_max``) -- the integer an independent raw-file count
+    reproduces -- and ``spin_ceiling_cut_order`` records which applies.  The
+    draw then sees only the kept samples, so ``replace="auto"`` resamples with replacement exactly when
+    fewer than ``nsamp`` remain.  Off by default: the default draw is unchanged.
+
+    Per-prior provenance (GW-40c)
+    -----------------------------
+    ``prior_source_{kind,label}_{mass,spin,dL}_per_event`` carry the store's
+    GW-40b provenance onto the file; ``chi_eff_amax_source_per_event`` is the
+    spin prior's source KIND when the ceiling came from the store (the
+    pre-GW-40 resolution -- analytic / fallback / caller -- is kept as
+    ``chi_eff_amax_resolution_per_event``); ``spin_prior_assumed_events`` lists
+    the events whose spin prior is ``assumed_default``.  An older store without
+    those columns yields ``"unrecorded"`` (and the legacy "analytic" source).
 
     Effective-selection provenance (GW-33)
     --------------------------------------
@@ -300,6 +347,12 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     forced_amax = parse_amax_option(amax, what="amax")
     # Every basis that divides out a SPIN prior needs a ceiling; nospin does not.
     need_amax = need_extras or spin_basis == "chieff"
+    if drop_spin_above_ceiling and not need_amax:
+        raise ValueError(
+            f"drop_spin_above_ceiling=True needs a spin prior ceiling to cut "
+            f"at, but spin_basis={spin_basis!r} divides out no spin prior. The "
+            f"cut exists to make the PE spin support equal the selection's "
+            f"reference support; drop the flag for this basis.")
 
     # chieff basis ALWAYS uses "include" semantics: the 1-D chi_eff prior is
     # multiplied into p_pe here (Mode A), matching the legacy default.  The
@@ -332,7 +385,10 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                      allow_missing_far=allow_missing_far,
                      require_far=require_far,
                      waveform_policy=waveform_policy,
-                     approximant=approximant)
+                     approximant=approximant,
+                     sample_set_map=sample_set_map,
+                     nrsur_q_rule=nrsur_q_rule,
+                     nrsur_q_rule_substitute=nrsur_q_rule_substitute)
 
     # The EFFECTIVE selection (GW-33): this call's filters composed with those
     # `cat` already carried.  `select()` intersects rows with the view it is
@@ -390,10 +446,19 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     # refuses a NaN-filled required column outright.)
     extra_avail = {p: sub.param_available(p) for p in extra_params}
 
+    # A constituent-mixture row (GW-40f) carries its joint mass x distance
+    # prior as a sample column; only those events read it.
+    has_cmix_col = "p_mass_dL_pe" in sub._param_index
+    cmix_avail = (sub.param_available("p_mass_dL_pe") if has_cmix_col
+                  else np.zeros(sub.n_events, dtype=bool))
+
     def _read_plan(e):
         """The columns event ``e`` will actually be asked for."""
-        return need + [p for p in extra_params
+        plan = need + [p for p in extra_params
                        if p not in need and extra_avail[p][e]]
+        if _mass_kind(e) == CONSTITUENT_MIXTURE:
+            plan = plan + ["p_mass_dL_pe"]
+        return plan
 
     # ── Resolve cosmology: per-event (default) or a single override ─────────
     sel_idx = np.asarray(sub._sel)
@@ -465,7 +530,14 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     # time.  The rule is the block's own classifier, so the two cannot diverge.
     unsupported_mass = [(str(sub.event_names[e]), _mass_kind(e))
                         for e in range(sub.n_events)
-                        if classify_mass_prior(_mass_kind(e)) == "unsupported"]
+                        if _mass_state(_mass_kind(e)) == "unsupported"]
+    no_cmix = [str(sub.event_names[e]) for e in range(sub.n_events)
+               if _mass_kind(e) == CONSTITUENT_MIXTURE and not cmix_avail[e]]
+    if no_cmix:
+        raise ValueError(
+            f"{len(no_cmix)} event(s) declare a constituent_mixture mass prior "
+            f"but the store carries no p_mass_dL_pe samples for them: "
+            f"{no_cmix[:10]}. Re-ingest with constituent_mixture_prior=True.")
     if unsupported_mass:
         listed = ", ".join(f"{n}: {k!r}" for n, k in unsupported_mass[:10])
         more = ("" if len(unsupported_mass) <= 10
@@ -515,6 +587,80 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         amax_src1_list, amax_src2_list, amax_infl_list = [], [], []
         samples_bound_events = []
         fallback_events, unrecognized_events, mismatch_events = [], [], []
+
+        def _declared_ceiling(e):
+            """``(amax_1, amax_2, used_fallback)`` BEFORE any samples_bound
+            widening: a forced numeric ``amax`` for every event, else this
+            event's stored ceilings, else ``amax_fallback``.  One function for
+            both the GW-40c spin cut (before the draw) and the prior (after), so
+            the cut and the density can never use different ceilings."""
+            if forced_amax is not None:
+                return float(forced_amax), float(forced_amax), False
+            a1 = (float(sel_amax1[e]) if sel_amax1 is not None
+                  else float("nan"))
+            a2 = (float(sel_amax2[e]) if sel_amax2 is not None
+                  else float("nan"))
+            fb = False
+            if not np.isfinite(a1):
+                a1, fb = float(amax_fallback), True
+            if not np.isfinite(a2):
+                a2, fb = float(amax_fallback), True
+            return a1, a2, fb
+
+    # ── Per-prior source provenance, per selected event (GW-40c) ─────────────
+    # A META read (no sample access), so the rng stream is untouched.  A store
+    # written before GW-40b has no prior_source_* columns: those events read
+    # "unrecorded" (or "assumed_default" where the legacy class column says so)
+    # rather than being silently promoted to a verified source.
+    def _meta_str_sel(name):
+        v = sub.meta.get(name)
+        if v is None:
+            return None
+        return [x.decode() if isinstance(x, (bytes, bytearray)) else str(x)
+                for x in np.asarray(v)[sel_idx]]
+
+    _legacy_kind_col = {"mass": "mass_prior_kind", "spin": "spin_prior_kind"}
+    sel_prior_kind, sel_prior_label = {}, {}
+    for _p in ("mass", "spin", "dL"):
+        kinds = _meta_str_sel(f"prior_source_kind_{_p}")
+        labels = _meta_str_sel(f"prior_source_label_{_p}")
+        if kinds is None or not any(kinds):
+            legacy = (_meta_str_sel(_legacy_kind_col[_p])
+                      if _p in _legacy_kind_col else
+                      _meta_str_sel("dL_prior_basis"))
+            kinds = ["assumed_default" if k == "assumed_default"
+                     else "release_reweighted" if k == "release_reweighted"
+                     else "unrecorded"
+                     for k in (legacy or [""] * sub.n_events)]
+            labels = [""] * sub.n_events
+        sel_prior_kind[_p] = [k or "unrecorded" for k in kinds]
+        sel_prior_label[_p] = labels or [""] * sub.n_events
+    spin_kind_recorded = _meta_str_sel("prior_source_kind_spin") is not None
+    # A5: the spin ceilings each constituent of a Mixed set declares in its
+    # config (JSON per row; "" for non-Mixed rows and pre-GW-40 stores).
+    sel_cfg_amax = (_meta_str_sel("spin_amax_config_per_constituent")
+                    or [""] * sub.n_events)
+    kept_cfg_amax = []
+    kept_prior_kind = {p: [] for p in ("mass", "spin", "dL")}
+    kept_prior_label = {p: [] for p in ("mass", "spin", "dL")}
+    #: Raw samples removed by the GW-40c spin-support cut, per kept event --
+    #: counted AFTER the z_max cut (the samples the cut actually removed from
+    #: the pool the draw sees) ...
+    n_dropped_spin = []
+    #: ... and the same count over the event's WHOLE raw label, before any
+    #: z_max cut: the number an independent count of the raw file reproduces.
+    n_above_spin_ceiling_raw = []
+    if drop_spin_above_ceiling:
+        avail_a1_cut = sub.param_available("a_1")
+        avail_a2_cut = sub.param_available("a_2")
+        no_spin = [str(sub.event_names[e]) for e in range(sub.n_events)
+                   if not (avail_a1_cut[e] and avail_a2_cut[e])]
+        if no_spin:
+            raise ValueError(
+                f"drop_spin_above_ceiling=True needs the a_1/a_2 sample columns "
+                f"to cut on, but {len(no_spin)} selected event(s) lack them: "
+                f"{no_spin[:10]}. Re-ingest with spin magnitudes, or exclude "
+                f"those events.")
 
     if need_extras:
         avail_a1 = sub.param_available("a_1")
@@ -578,6 +724,32 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             else:
                 idx_map = np.arange(n)
 
+            # ── The spin-support cut (GW-40c), BEFORE the draw ──────────────
+            # Reads the event's full a_1/a_2 (a sample read, but not an rng
+            # call, so with the flag off nothing here runs and the draw is the
+            # historical one bit for bit).
+            # Order: the z_max cut (above) runs first, so
+            # n_dropped_spin_above_ceiling counts only samples with z <= z_max;
+            # n_above_spin_ceiling_raw counts the whole raw label.
+            n_drop_e = 0
+            n_raw_e = 0
+            if drop_spin_above_ceiling:
+                c1, c2, _fb = _declared_ceiling(e)
+                ab = reader.read(e, ["a_1", "a_2"])
+                a1_raw = np.asarray(ab["a_1"], dtype=float)
+                a2_raw = np.asarray(ab["a_2"], dtype=float)
+                above_raw = (np.abs(a1_raw) > c1) | (np.abs(a2_raw) > c2)
+                n_raw_e = int(np.sum(above_raw))
+                ok = ~above_raw[idx_map]
+                n_drop_e = int(np.sum(~ok))
+                if not ok.any():
+                    raise ValueError(
+                        f"drop_spin_above_ceiling: every sample of event "
+                        f"{sub.event_names[e]} has a spin magnitude above its "
+                        f"ceiling ({c1:g}, {c2:g}); the event has no support "
+                        f"under its own spin prior.")
+                idx_map = idx_map[ok]
+
             n_kept = len(idx_map)
             rep = (n_kept < nsamp) if replace == "auto" else bool(replace)
             if n_kept < nsamp and not rep:
@@ -612,11 +784,18 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             # the same function distance.dl calls; see gwcat.params.compose.)
             mass_kind_e = _mass_kind(e)
             q = m2 / m1
-            ctx_e = PEContext(event_name=str(sub.event_names[e]),
-                              m1det=m1, m2det=m2, dL=dL, cosmology=cosmo_e,
-                              mass_prior_kind=mass_kind_e)
-            p_pe = block_prior_factor_pe(
-                mass_block, {"m1det": m1, "m2det": m2, "q": q}, ctx_e) * p_dL
+            if mass_kind_e == CONSTITUENT_MIXTURE:
+                # GW-40f: the equal-weight mixture of the constituents' own
+                # normalised (m1det, q) x dL priors, built and verified at
+                # ingest -- NOT m1det * p_dL, which is one constituent's shape.
+                p_pe = np.asarray(drawn["p_mass_dL_pe"], dtype=float)
+            else:
+                ctx_e = PEContext(event_name=str(sub.event_names[e]),
+                                  m1det=m1, m2det=m2, dL=dL, cosmology=cosmo_e,
+                                  mass_prior_kind=mass_kind_e)
+                p_pe = block_prior_factor_pe(
+                    mass_block, {"m1det": m1, "m2det": m2, "q": q},
+                    ctx_e) * p_dL
 
             # Redshift and source masses under THIS event's PE cosmology
             z = z_of_dL(dL, cosmo_e)
@@ -635,6 +814,12 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             kept.append(sub.event_names[e])
             kept_mass_kind.append(mass_kind_e)
             n_cut_by_z_max.append(n_cut_e)
+            n_dropped_spin.append(n_drop_e)
+            n_above_spin_ceiling_raw.append(n_raw_e)
+            for _p in ("mass", "spin", "dL"):
+                kept_prior_kind[_p].append(sel_prior_kind[_p][e])
+                kept_prior_label[_p].append(sel_prior_label[_p][e])
+            kept_cfg_amax.append(sel_cfg_amax[e])
             kept_H0.append(float(per_event_H0[e]))
             kept_Om0.append(float(per_event_Om0[e]))
             row = sel_rows[e]
@@ -652,22 +837,9 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                 # store for every event -- the caller has said which ceiling to use.
                 # Otherwise it comes from THIS event's prior provenance, and only a
                 # missing/NaN one falls back (recorded, and warned about below).
-                used_fallback = False
-                if forced_amax is not None:
-                    a1max = a2max = float(forced_amax)
-                else:
-                    a1max = (float(sel_amax1[e]) if sel_amax1 is not None
-                             else float("nan"))
-                    a2max = (float(sel_amax2[e]) if sel_amax2 is not None
-                             else float("nan"))
-                    if not np.isfinite(a1max):
-                        a1max = float(amax_fallback)
-                        used_fallback = True
-                    if not np.isfinite(a2max):
-                        a2max = float(amax_fallback)
-                        used_fallback = True
-                    if used_fallback:
-                        fallback_events.append(str(name))
+                a1max, a2max, used_fallback = _declared_ceiling(e)
+                if used_fallback:
+                    fallback_events.append(str(name))
 
                 # np.isclose, not exact float equality (GW-04): a single injected
                 # ceiling round-trips as 0.9980000000000001 vs 0.9979999999999999
@@ -969,8 +1141,19 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                 # declares none, "caller" = a numeric amax= overrode both).
                 "chi_eff_amax_1_per_event": amax1_arr,
                 "chi_eff_amax_2_per_event": amax2_arr,
-                "chi_eff_amax_source_per_event": np.array(amax_src1_list,
-                                                          dtype=_str),
+                # GW-40c: the SOURCE KIND of the ceiling -- where the spin
+                # prior it came from was declared (own_analytic /
+                # sibling_inherited / config_file_declared / assumed_default)
+                # -- whenever it came from the store; "caller"/"fallback" when
+                # it did not.  A pre-GW-40b store (no provenance columns)
+                # keeps the historical "analytic".  The historical resolution
+                # itself is kept as chi_eff_amax_resolution_per_event.
+                "chi_eff_amax_source_per_event": np.array(
+                    [(k if (r == "analytic" and spin_kind_recorded) else r)
+                     for r, k in zip(amax_src1_list,
+                                     kept_prior_kind["spin"])], dtype=_str),
+                "chi_eff_amax_resolution_per_event": np.array(
+                    amax_src1_list, dtype=_str),
                 "chi_eff_amax_mode": ("fixed" if forced_amax is not None
                                       else "per_event"),
                 "spin_amax_fallback": float(amax_fallback),
@@ -1080,7 +1263,7 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                         else ("mixed" if uniq_mass_kinds
                               else UNSTATED_MASS_PRIOR))
     mass_unverified = [str(n) for n, k in zip(kept, mass_kinds)
-                       if classify_mass_prior(k) != "verified"]
+                       if _mass_state(k) != "verified"]
     mass_prior_verified = bool(mass_kinds) and not mass_unverified
     if mass_unverified:
         warnings.warn(
@@ -1178,7 +1361,40 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         "prior_reweight_ess_per_event": ess_per_event,
         "max_out_of_support_frac": float(max_out_of_support_frac),
         "out_of_support_allowed": bool(allow_out_of_support),
+        # ── The spin-support cut (GW-40c) ────────────────────────────────────
+        "spin_ceiling_cut_applied": bool(drop_spin_above_ceiling),
+        # Removed from the pool the draw sees: samples with z <= z_max (every
+        # sample when no z_max) whose a_1 or a_2 exceeds the ceiling.
+        "n_dropped_spin_above_ceiling_per_event": np.asarray(
+            n_dropped_spin if drop_spin_above_ceiling else [0] * nobs,
+            dtype=np.int64),
+        # The same count over the WHOLE raw label, before the z_max cut -- the
+        # integer an independent raw-file count reproduces.  Equal to the
+        # above when z_max is None.
+        "n_above_spin_ceiling_raw_per_event": np.asarray(
+            n_above_spin_ceiling_raw if drop_spin_above_ceiling
+            else [0] * nobs, dtype=np.int64),
+        "spin_ceiling_cut_order": ("after_z_max_cut" if z_max is not None
+                                   else "no_z_max_cut"),
+        # ── Per-prior source provenance (GW-40c) ─────────────────────────────
+        **{f"prior_source_kind_{p}_per_event": np.array(
+            kept_prior_kind[p], dtype=_str) for p in ("mass", "spin", "dL")},
+        **{f"prior_source_label_{p}_per_event": np.array(
+            kept_prior_label[p], dtype=_str) for p in ("mass", "spin", "dL")},
+        # A5: per event, JSON {constituent: [a1_max, a2_max] | null} of the
+        # ceilings a Mixed set's constituents declare in their configs.
+        "spin_amax_config_per_constituent_per_event": np.array(
+            kept_cfg_amax, dtype=_str),
+        "spin_prior_assumed_events": np.array(
+            [str(n) for n, k in zip(kept, kept_prior_kind["spin"])
+             if k == "assumed_default"], dtype=_str),
+        "spin_prior_non_own_analytic_events": np.array(
+            [str(n) for n, k in zip(kept, kept_prior_kind["spin"])
+             if k != "own_analytic"], dtype=_str),
     }
+    attrs.update(_population_resolver_attrs(cat, kept))
+    attrs.update(_sample_set_map_attrs(
+        getattr(sub, "_sample_set_map_report", None), kept))
     # ── The EFFECTIVE event selection (GW-33) ───────────────────────────────
     # The composed source_class_filter and cut estimator (GW-12: WHICH masses
     # the class threshold was applied to), every numeric cut as a number the
@@ -1240,10 +1456,130 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         "prior_reweight_ess_median": (float(np.median(ess_per_event))
                                       if ess_per_event.size else None),
         "chi_p_definition": str(chi_p_definition),
+        "spin_ceiling_cut_applied": bool(drop_spin_above_ceiling),
+        "n_dropped_spin_above_ceiling": int(sum(n_dropped_spin)),
+        "n_above_spin_ceiling_raw": int(sum(n_above_spin_ceiling_raw)),
+        "prior_source_kind_counts": {
+            p: {k: int(kept_prior_kind[p].count(k))
+                for k in sorted(set(kept_prior_kind[p]))}
+            for p in ("mass", "spin", "dL")},
+        "population_resolver": attrs.get("population_resolver", ""),
     })
 
     return ExportProduct(kind="pe", columns=columns, attrs=attrs,
                          spin_basis=spin_basis, summary=summary)
+
+
+#: The one resolver whose output is the bundled GWTC-5 BBH population.
+POPULATION_RESOLVER = ("gwcat.population_samples."
+                       "resolve_gwtc5_bbh_population_names")
+
+
+def _names_sha256(names):
+    """sha256 of the sorted unique names, one per line with a trailing
+    newline -- the recipe the v1 ``allowed_names_digest`` reference
+    (``fe6e33da...``) was computed with."""
+    import hashlib
+    uniq = sorted({(n.decode() if isinstance(n, (bytes, bytearray))
+                    else str(n)) for n in names})
+    return hashlib.sha256(("\n".join(uniq) + "\n").encode()).hexdigest()
+
+
+def _population_resolver_attrs(cat, kept):
+    """Whether the exported event set IS the bundled-population resolver's
+    output, with the resolver's inputs (GW-40c).
+
+    The resolver is re-run here on the store's names (a pure, local function of
+    the bundled lists -- no GWOSC); when its output equals the exported event
+    set, the file records the resolver's qualified name, the sha256 of every
+    bundled list it read and the resolved names' digest.  Otherwise (a subset,
+    a different population, a synthetic store) ``population_resolver`` is ""
+    and ``population_resolver_match`` False -- recorded, never guessed.
+
+    What this does NOT prove: it shows the exported set EQUALS the resolver's
+    output on the store's names, not that the caller obtained the set by
+    calling the resolver (an equal set from any other source records the same
+    attrs).  A call-trace claim (BUILD_PLAN G3g) must come from the build
+    wrapper's own audit log, not from these attrs.
+    """
+    import hashlib
+    import json as _json
+    from .contract import event_list_digest as _digest
+    from ..bbh_allowed_names import _event_list_path
+
+    files = ("bbh_o1o2.txt", "bbh_o3a.txt", "bbh_o3b.txt", "bbh_o4a.txt",
+             "bbh_o4b.txt", "non_bbh_exclusions.txt", "provenance.yaml")
+    shas = {}
+    for fn in files:
+        try:
+            with open(_event_list_path(fn), "rb") as f:
+                shas[fn] = hashlib.sha256(f.read()).hexdigest()
+        except OSError:
+            shas[fn] = ""
+    match, resolved, aliases, err = False, [], {}, ""
+    try:
+        from ..population_samples import resolve_gwtc5_bbh_population_names
+        resolved, aliases = resolve_gwtc5_bbh_population_names(
+            [str(n) for n in cat.names])
+        match = sorted(resolved) == sorted(str(k) for k in kept)
+    except ValueError as exc:
+        err = str(exc)[:200]
+    inputs = {
+        "bundled_list_sha256": shas,
+        # Two digests of the SAME resolved set, under two recipes, each
+        # labelled so a gate compares like with like:
+        "allowed_names_digest": _digest(resolved) if resolved else "",
+        "allowed_names_digest_recipe": (
+            "gwcat.export.contract.event_list_digest: blake2b-64 of the JSON "
+            "list of sorted unique names"),
+        "allowed_names_sha256": (_names_sha256(resolved) if resolved else ""),
+        "allowed_names_sha256_recipe": (
+            "sha256 of the sorted unique names joined by '\\n' with a "
+            "trailing '\\n' (the v1 / BUILD_PLAN G3a recipe)"),
+        "n_resolved": len(resolved),
+        "n_aliases": len(aliases),
+        "aliases": {str(k): str(v) for k, v in sorted(aliases.items())},
+        "error": err,
+    }
+    return {
+        "population_resolver": POPULATION_RESOLVER if match else "",
+        "population_resolver_match": bool(match),
+        "population_resolver_inputs": _json.dumps(inputs, sort_keys=True),
+    }
+
+
+def _sample_set_map_attrs(report, kept):
+    """The event-map provenance on the file (GW-40e); empty for other policies.
+
+    Restricted to the EXPORTED events, in export order, so the substitute and
+    q-fraction lists describe exactly what the file holds.
+    """
+    import h5py
+    _str = h5py.string_dtype()
+    kept = [str(k) for k in kept]
+    report = report or {}
+    subs = report.get("substitutes", {}) or {}
+    qf = report.get("nrsur_q_frac", {}) or {}
+    sub_ev = [k for k in kept if k in subs]
+    q_ev = [k for k in kept if k in qf]
+    thr = report.get("nrsur_q_rule")
+    return {
+        "sample_set_map_source": str(report.get("map_source", "")),
+        "sample_set_map_sha256": str(report.get("map_sha256", "")),
+        "sample_set_substitute_events": np.array(sub_ev, dtype=_str),
+        "sample_set_substitute_labels": np.array(
+            [subs[k]["label"] for k in sub_ev], dtype=_str),
+        "sample_set_substitute_original_labels": np.array(
+            [subs[k].get("original_label", "") for k in sub_ev], dtype=_str),
+        "sample_set_substitute_reasons": np.array(
+            [subs[k]["reason"] for k in sub_ev], dtype=_str),
+        "nrsur_q_rule": float("nan") if thr is None else float(thr),
+        "nrsur_q_rule_substitute": bool(report.get("nrsur_q_rule_substitute",
+                                                   False)),
+        "nrsur_q_frac_events": np.array(q_ev, dtype=_str),
+        "nrsur_q_frac_below_floor": np.asarray([qf[k] for k in q_ev],
+                                               dtype=float),
+    }
 
 
 def _ss_meta(sub, row, field):

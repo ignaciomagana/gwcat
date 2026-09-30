@@ -64,9 +64,20 @@ O4_FALLBACK = LAL_PLANCK15
 
 #: Cosmology tokens that appear verbatim in LVK analytic prior reprs, resolved by
 #: EXACT match (after stripping quotes/whitespace) -- never by substring.
+#:
+#: ``'Planck15_lal'`` (GW-40a) is the lower-case spelling some pesummary
+#: ``meta_data`` blocks and prior reprs use for the same LAL object.  It is an
+#: EXACT alias -- there is still no case-folding, so ``'planck15_lal'`` or
+#: ``'PLANCK15_LAL'`` remain unrecognised and fail loudly -- and it is consulted
+#: only for a cosmology an analytic prior string explicitly DECLARES.  gwcat
+#: never reads ``meta_data/cosmology`` to decide a reweighted release's prior
+#: (that field is absent on every GWTC-2.1/3 ``C01:Mixed`` set and contradicts
+#: the stored z(dL) for several GWTC-4.1/5 labels); see
+#: :mod:`gwcat.release_cosmology` for where that cosmology comes from instead.
 NAMED_COSMOLOGIES = {
     "Planck15": PLANCK15,
     "Planck15_LAL": LAL_PLANCK15,
+    "Planck15_lal": LAL_PLANCK15,
 }
 
 

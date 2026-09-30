@@ -234,7 +234,7 @@ def test_build_store_write_summary(tmp_path, monkeypatch):
 
     monkeypatch.setattr(ing, "_read_event_pesummary", _fake_reader)
 
-    path = tmp_path / "GWTC-5_GW920101_010101_cosmo.h5"
+    path = tmp_path / "GWTC-5_GW920101_010101.hdf5"
     path.write_bytes(b"")  # existence only; the reader is faked
     out = tmp_path / "store.h5"
     ing.build_store([str(path)], str(out), event_table={},
@@ -263,7 +263,7 @@ def test_build_store_default_no_summary_files(tmp_path, monkeypatch):
 
     monkeypatch.setattr(ing, "_read_event_pesummary", _fake_reader)
 
-    path = tmp_path / "GWTC-5_GW920102_020202_cosmo.h5"
+    path = tmp_path / "GWTC-5_GW920102_020202.hdf5"
     path.write_bytes(b"")
     out = tmp_path / "store_nosum.h5"
     ing.build_store([str(path)], str(out), event_table={},
