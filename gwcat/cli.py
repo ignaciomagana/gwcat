@@ -669,6 +669,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # zero-density injection -- whose message already says what to fix.  The
     # user asked on the command line, so answer there, not with a traceback
     # (validate already did; the export commands surfaced raw tracebacks).
+    # A SpinBasisError (a RuntimeError; BlockCampaignMismatch is one) is a
+    # diagnosed refusal too -- e.g. the chieff basis on a joint-density file.
+    from .export.selection_builder import SpinBasisError
     try:
         if args.command == "export-darksirens":
             return _cmd_export_darksirens(args)
@@ -678,7 +681,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return _cmd_selection(args)
         if args.command == "validate":
             return _cmd_validate(args)
-    except ValueError as e:
+    except (ValueError, SpinBasisError) as e:
         print(f"{PROG} {args.command}: error: {e}", file=sys.stderr)
         return 1
 

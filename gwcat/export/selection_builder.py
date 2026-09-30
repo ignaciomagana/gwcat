@@ -154,8 +154,10 @@ rather than written:
 
 The export records the per-run provenance (``run_labels``,
 ``detection_rule_per_run``, ``n_detected_per_run``, the two window tables, the
-per-run mixture weights, the derived ``N_per_run``/``T_per_run_s`` with
-``T_definition_per_run``, ``z_draw_max_per_run``) and runs the reference
+per-run mixture weights, ``T_definition_per_run``, ``z_draw_max_per_run``;
+and per exposure component O1/O2/O3/O4 the derived ``N_per_component`` /
+``T_per_component_s`` with ``T_definition_per_component``, mapped by
+``component_of_run``) and runs the reference
 coverage check per run as well as per campaign.
 """
 from __future__ import annotations
@@ -176,7 +178,8 @@ from ..selection import (SelectionSet, CombinedSelectionSet,
                          _refuse_mixed_cosmology, _cosmo_or_nan,
                          _cosmology_is_mixed, SNR_COLUMN,
                          CAMPAIGN_CUMULATIVE_MIXTURE, MixtureDetectionError,
-                         MixtureInvariantError, _mixture_far_only_message)
+                         MixtureInvariantError, _mixture_far_only_message,
+                         _semianalytic_far_only_message)
 from ..observing_runs import (RUN_LABELS, SEMIANALYTIC_RUNS,
                               INJECTION_SUPPORT_GPS, EXPOSURE_WINDOWS_GPS,
                               MIXTURE_COMPONENTS, MIXTURE_RELEASE_ANCHORS,
@@ -271,13 +274,20 @@ def _detect_keep(s, far_threshold, source_class, snr_threshold, z_max=None,
     this is SUBSETTING, not reweighting -- ``ndraw`` is untouched, so the
     Essick fractions N_k/N_total are unchanged.
     """
-    if (s.campaign_kind == CAMPAIGN_CUMULATIVE_MIXTURE
-            and snr_threshold is None
-            and not acknowledge_semianalytic_excluded):
-        n_semi = int(np.isin(np.asarray(s.run), SEMIANALYTIC_RUNS).sum())
-        if n_semi:
-            raise MixtureDetectionError(
-                _mixture_far_only_message(s.path, n_semi))
+    if snr_threshold is None and not acknowledge_semianalytic_excluded:
+        if s.campaign_kind == CAMPAIGN_CUMULATIVE_MIXTURE:
+            n_semi = int(np.isin(np.asarray(s.run), SEMIANALYTIC_RUNS).sum())
+            if n_semi:
+                raise MixtureDetectionError(
+                    _mixture_far_only_message(s.path, n_semi))
+        else:
+            # Any format: rows with a semianalytic SNR and no finite FAR are
+            # detectable only by SNR (review fix; e.g. the GWTC-3 O1+O2+O3
+            # real+semianalytic injections files).
+            n_semi = int(s.semianalytic_row_mask().sum())
+            if n_semi:
+                raise MixtureDetectionError(
+                    _semianalytic_far_only_message(s.path, n_semi))
     detect = s.detected_mask(
         far_threshold, snr_threshold=snr_threshold,
         acknowledge_semianalytic_excluded=acknowledge_semianalytic_excluded)
@@ -349,9 +359,12 @@ def _mixture_run_attrs(s, keep, detect, far_threshold, snr_threshold,
         "n_rows_per_run": np.array([int(np.sum(run == r)) for r in runs],
                                    dtype=np.int64),
         # Rows WRITTEN per run: detection AND any source-class / z_max subset,
-        # so they sum to n_detected.  The detection-rule count alone is next.
+        # so they sum to n_detected_mixture -- the rows this MIXTURE campaign
+        # wrote, which is the product's n_detected only when the mixture is
+        # the product's sole campaign.  The detection-rule count alone is next.
         "n_detected_per_run": np.array(
             [int(np.sum(keep & (run == r))) for r in runs], dtype=np.int64),
+        "n_detected_mixture": int(np.sum(keep)),
         "n_passing_detection_rule_per_run": np.array(
             [int(np.sum(detect & (run == r))) for r in runs], dtype=np.int64),
         "injection_support_gps_per_run": np.array(
@@ -370,12 +383,25 @@ def _mixture_run_attrs(s, keep, detect, far_threshold, snr_threshold,
         "o3_draw_density_source": "mixture_joint_lnpdraw",
     }
 
+    # Two granularities, never mixed under one name (review fix): every
+    # ``*_per_run`` attr is aligned with ``run_labels`` (one entry per run
+    # present), every ``*_per_component`` attr with ``mixture_components``
+    # (O1, O2, O3, O4 -- the exposure components; O3a/O3b and O4a/O4b share
+    # one (N, T) each, so there is no per-run N or T to write).
+    # ``component_of_run`` maps the first onto the second.
     comps = [c for c, _, _ in MIXTURE_COMPONENTS]
+    comp_of = {r: c for c, rr, _ in MIXTURE_COMPONENTS for r in rr}
+    tdef_of = {c: d for c, _, d in MIXTURE_COMPONENTS}
     attrs["mixture_components"] = np.array(comps, dtype=_str)
     attrs["mixture_component_runs"] = json.dumps(
         {c: list(r) for c, r, _ in MIXTURE_COMPONENTS})
+    attrs["component_of_run"] = np.array([comp_of[r] for r in runs],
+                                         dtype=_str)
     attrs["T_definition_per_run"] = np.array(
+        [tdef_of[comp_of[r]] for r in runs], dtype=_str)
+    attrs["T_definition_per_component"] = np.array(
         [d for _, _, d in MIXTURE_COMPONENTS], dtype=_str)
+    attrs["semianalytic_components"] = np.array(["O1", "O2"], dtype=_str)
     key = (int(s._ndraw), int(round(s._total_analysis_time_s)))
     anchors = (mixture_anchors if mixture_anchors is not None
                else MIXTURE_RELEASE_ANCHORS.get(key))
@@ -386,11 +412,13 @@ def _mixture_run_attrs(s, keep, detect, far_threshold, snr_threshold,
                 f"{s.path}: no O3/O4 component anchors are known for this "
                 f"cumulative mixture (total_generated, total_analysis_time) = "
                 f"{key}, so its per-run N_k and T_k cannot be derived from the "
-                f"weights; N_per_run and T_per_run_s are written as NaN. pdraw "
+                f"weights; N_per_component and T_per_component_s are written "
+                f"as NaN. pdraw "
                 f"is unaffected (it uses the weights directly).")
-        attrs["N_per_run"] = np.full(len(comps), np.nan)
-        attrs["T_per_run_s"] = np.full(len(comps), np.nan)
-        attrs["N_per_run_integrality_residual"] = np.full(2, np.nan)
+        attrs["N_per_component"] = np.full(len(comps), np.nan)
+        attrs["T_per_component_s"] = np.full(len(comps), np.nan)
+        attrs["N_integrality_residual_per_semianalytic_component"] = np.full(
+            2, np.nan)
         attrs["mixture_bookkeeping_status"] = (
             "unavailable_no_anchor" if has_semi
             else "not_derived_no_semianalytic_rows")
@@ -401,9 +429,9 @@ def _mixture_run_attrs(s, keep, detect, far_threshold, snr_threshold,
             run, w, s._ndraw, s._total_analysis_time_s, anchors)
     except ValueError as exc:
         raise MixtureInvariantError(f"{s.path}: {exc}") from exc
-    attrs["N_per_run"] = np.array(book["N"], dtype=float)
-    attrs["T_per_run_s"] = np.array(book["T_s"], dtype=float)
-    attrs["N_per_run_integrality_residual"] = np.array(
+    attrs["N_per_component"] = np.array(book["N"], dtype=float)
+    attrs["T_per_component_s"] = np.array(book["T_s"], dtype=float)
+    attrs["N_integrality_residual_per_semianalytic_component"] = np.array(
         book["N_integrality_residual"], dtype=float)
     attrs["mixture_bookkeeping_status"] = "derived_from_weights_and_anchors"
     attrs["mixture_bookkeeping_anchor_sources"] = json.dumps(
@@ -925,9 +953,25 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         s._load()
 
     # A cumulative mixture already holds every run's exposure (GW-39).
-    _refuse_overlapping_campaigns(set_list)
     is_mixture = [s.campaign_kind == CAMPAIGN_CUMULATIVE_MIXTURE
                   for s in set_list]
+    if sum(is_mixture) > 1:
+        # The per-run attrs describe ONE mixture; two would overwrite each
+        # other (and two cumulative mixtures overlap in time anyway).
+        raise OverlappingCampaignError(
+            "more than one cumulative multi-run mixture in one selection "
+            "product: " + ", ".join(str(s.path) for s, m in
+                                     zip(set_list, is_mixture) if m)
+            + ". Each already carries every run's exposure; export one.")
+    _refuse_overlapping_campaigns(set_list)
+    if acknowledge_semianalytic_excluded and snr_threshold is not None:
+        raise ValueError(
+            "acknowledge_semianalytic_excluded=True (--acknowledge-semianalytic-"
+            "excluded) together with snr_threshold="
+            f"{snr_threshold!r}: the acknowledgement says the semianalytic "
+            "rows are EXCLUDED (a FAR-only cut), while an SNR threshold "
+            "detects them. Pass one or the other; the file would otherwise "
+            "record an exclusion that did not happen.")
     if detection_policy == "lvk-cumulative":
         if snr_threshold is None:
             raise ValueError(
@@ -1370,7 +1414,19 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     attrs["cumulative_mixture"] = bool(any(is_mixture))
     attrs["campaign_kind_per_campaign"] = np.array(
         [str(s.campaign_kind) for s in set_list], dtype=_str)
-    attrs["detection_policy"] = str(detection_policy)
+    # The rule actually APPLIED, not only the one requested (review fix):
+    # on a mixture any snr_threshold engages the per-run LVK rule, whatever
+    # policy name was passed.
+    if any(is_mixture) and snr_threshold is not None:
+        applied_policy = "lvk-cumulative"
+    elif acknowledge_semianalytic_excluded:
+        applied_policy = "far(semianalytic_rows_excluded)"
+    elif snr_threshold is not None:
+        applied_policy = "far_or_snr"
+    else:
+        applied_policy = "far"
+    attrs["detection_policy"] = applied_policy
+    attrs["detection_policy_requested"] = str(detection_policy)
     attrs["acknowledge_semianalytic_excluded"] = bool(
         acknowledge_semianalytic_excluded)
     attrs["sky_marginalized"] = bool(sky_marginal)

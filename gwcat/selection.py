@@ -181,6 +181,22 @@ def _mixture_far_only_message(path, n_semi):
         f"leaves exactly the O3+O4 selection.")
 
 
+def _semianalytic_far_only_message(path, n_semi):
+    """The FAR-only refusal for a SINGLE campaign that has semianalytic rows."""
+    return (
+        f"{path}: this injection file has {n_semi} semianalytic row(s) -- a "
+        f"nonzero {SNR_COLUMN!r} and no finite search FAR -- and a FAR-only "
+        f"detection cut was requested. A FAR cut detects NONE of those rows, "
+        f"while the file's total_generated and analysis time still count "
+        f"their draws and their exposure, so their contribution to the "
+        f"selection integral would be silently zero: the detection "
+        f"probability is biased LOW and the inferred rate HIGH. Apply the "
+        f"file's SNR rule with --snr-threshold (snr_threshold= in the Python "
+        f"API), or pass --acknowledge-semianalytic-excluded "
+        f"(acknowledge_semianalytic_excluded=True) ONLY for an analysis whose "
+        f"PE file has no event from the semianalytically simulated runs.")
+
+
 def _h5_field_names(table):
     """Return available column names for an HDF group or compound dataset."""
     if isinstance(table, h5py.Dataset) and table.dtype.names is not None:
@@ -1782,6 +1798,26 @@ class SelectionSet:
         self._load()
         return self._gps_range
 
+    def semianalytic_row_mask(self) -> np.ndarray:
+        """Rows only an SNR cut can detect, whatever the file format.
+
+        A row is semianalytic when it carries a finite, nonzero semianalytic
+        SNR and no finite search FAR (every FAR column non-finite, or no FAR
+        column at all).  On a cumulative mixture these are exactly its O1/O2
+        rows; on a single campaign (e.g. the GWTC-3 O1+O2+O3
+        real+semianalytic files) they are whatever rows the file simulated
+        semianalytically.  All-False when the file has no SNR column.
+        """
+        self._load()
+        n = len(self._m1det)
+        if self._snr is None:
+            return np.zeros(n, dtype=bool)
+        snr = np.asarray(self._snr, dtype=float)
+        has_snr = np.isfinite(snr) & (snr != 0.0)
+        if self._fars is None:
+            return has_snr
+        return has_snr & ~np.isfinite(self._fars).any(axis=1)
+
     def readme_detected_mask(self, far_threshold: float = 1.0,
                              snr_threshold=None) -> np.ndarray:
         """The release README's global rule, ``(snr > t_snr) | (min far < t_far)``.
@@ -1836,6 +1872,16 @@ class SelectionSet:
         if self._campaign_kind != CAMPAIGN_CUMULATIVE_MIXTURE:
             if self._fars is None:
                 raise ValueError("No FAR columns found in injection file.")
+            # A single campaign can carry semianalytic rows too (the GWTC-3
+            # O1+O2+O3 "real+semianalytic" files): rows whose SNR is set and
+            # whose every FAR is +inf.  A FAR-only cut detects none of them
+            # while their draws and exposure stay in the normalisation -- the
+            # same defect refused on the cumulative mixture.
+            if snr_threshold is None and not acknowledge_semianalytic_excluded:
+                n_semi = int(self.semianalytic_row_mask().sum())
+                if n_semi:
+                    raise MixtureDetectionError(
+                        _semianalytic_far_only_message(self.path, n_semi))
             det = np.any(self._fars < far_threshold, axis=1)
             if snr_threshold is not None:
                 if self._snr is None:

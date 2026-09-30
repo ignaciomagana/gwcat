@@ -91,6 +91,9 @@ INJECTION_SUPPORT_GPS = {
 #:     rows these are;
 #:   * O4 -- monthly wall-clock time ("constructed based on wall-time within
 #:     each month", README), which includes breaks and is NOT an observing time.
+#: Largest |N_k - round(N_k)| accepted for the solved O1/O2 draw counts.
+N_INTEGRALITY_TOL = 1e-5
+
 MIXTURE_COMPONENTS = (
     ("O1", ("O1",), "coincident_livetime_semianalytic"),
     ("O2", ("O2",), "coincident_livetime_semianalytic"),
@@ -257,7 +260,10 @@ def derive_mixture_bookkeeping(run, weights, total_generated,
     b = np.array([N12, T12 * N / T])
     N1, N2 = np.linalg.solve(A, b)
     resid = (float(N1 - np.round(N1)), float(N2 - np.round(N2)))
-    if max(abs(r) for r in resid) > 1e-3 or min(N1, N2) <= 0:
+    # The release's own residual is 7.2e-7 (float64 weights); 1e-5 leaves a
+    # margin for rounding while still catching any anchor that is off by one
+    # draw (the O4 anchor is checked only through this test).
+    if max(abs(r) for r in resid) > N_INTEGRALITY_TOL or min(N1, N2) <= 0:
         raise ValueError(
             f"solving the mixture weights with the O3/O4 anchors gives "
             f"N_O1={N1!r}, N_O2={N2!r}, which are not positive integers "

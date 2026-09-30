@@ -342,17 +342,30 @@ def test_per_run_attrs_written(tmp_path):
     np.testing.assert_array_equal(
         a["exposure_windows_gps_per_run"],
         [EXPOSURE_WINDOWS_GPS[r] for r in RUN_LABELS])
+    # Per RUN (aligned with run_labels) ...
     assert s(a["T_definition_per_run"]) == [
         "coincident_livetime_semianalytic", "coincident_livetime_semianalytic",
-        "endo3_analysis_time", "monthly_wall_clock"]
+        "endo3_analysis_time", "endo3_analysis_time", "monthly_wall_clock",
+        "monthly_wall_clock"]
+    assert s(a["component_of_run"]) == ["O1", "O2", "O3", "O3", "O4", "O4"]
+    assert int(a["n_detected_mixture"]) == int(det.sum())
+    # ... and per exposure COMPONENT (aligned with mixture_components).
     assert s(a["mixture_components"]) == ["O1", "O2", "O3", "O4"]
-    np.testing.assert_allclose(a["N_per_run"],
+    assert s(a["T_definition_per_component"]) == [
+        "coincident_livetime_semianalytic", "coincident_livetime_semianalytic",
+        "endo3_analysis_time", "monthly_wall_clock"]
+    np.testing.assert_allclose(a["N_per_component"],
                                [_N[c] for c in ("O1", "O2", "O3", "O4")],
                                rtol=1e-12)
-    np.testing.assert_allclose(a["T_per_run_s"],
+    np.testing.assert_allclose(a["T_per_component_s"],
                                [_T[c] for c in ("O1", "O2", "O3", "O4")],
                                rtol=1e-12)
-    assert np.all(np.abs(a["N_per_run_integrality_residual"]) < 1e-6)
+    assert np.all(np.abs(
+        a["N_integrality_residual_per_semianalytic_component"]) < 1e-6)
+    # No attr named *_per_run has a length other than len(run_labels).
+    for k, v in a.items():
+        if k.endswith("_per_run") and k != "mixture_weights_per_run":
+            assert np.asarray(v).shape[0] == len(RUN_LABELS), k
     assert a["mixture_bookkeeping_status"] == "derived_from_weights_and_anchors"
     w = json.loads(a["mixture_weights_per_run"])
     assert len(w["O4b"]) == 2 and len(w["O1"]) == 1
@@ -371,7 +384,7 @@ def test_bookkeeping_without_anchor_is_nan_and_warns(tmp_path):
         p = build_selection_product(SelectionSet(path),
                                     spin_basis="component",
                                     snr_threshold=10.0)
-    assert np.all(np.isnan(p.attrs["N_per_run"]))
+    assert np.all(np.isnan(p.attrs["N_per_component"]))
     assert p.attrs["mixture_bookkeeping_status"] == "unavailable_no_anchor"
 
 
@@ -444,6 +457,35 @@ def test_mixture_plus_disjoint_campaign_is_allowed(tmp_path):
                                 spin_basis="component", snr_threshold=10.0,
                                 mixture_anchors=_ANCHORS)
     assert p.attrs["n_campaigns"] == 2 and p.attrs["cumulative_mixture"]
+    # The per-run counts are the mixture's own; the product adds the later
+    # campaign's rows on top, and the validator compares like with like.
+    n_mix = int(p.attrs["n_detected_mixture"])
+    assert int(np.sum(p.attrs["n_detected_per_run"])) == n_mix
+    assert n_mix < int(p.attrs["n_detected"])
+    out = tmp_path / "sel_two.h5"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        from gwcat.selection import CombinedSelectionSet
+        CombinedSelectionSet([SelectionSet(path), SelectionSet(later)]).export(
+            str(out), spin_basis="component", snr_threshold=10.0,
+            mixture_anchors=_ANCHORS)
+    from test_validate_v2 import _pe_component
+    pe = _pe_component(tmp_path)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        results = validate_export_v2(str(pe), str(out))
+    assert results["sel_mixture_n_detected_per_run_sum"] is True
+    bad = [k for k, v in results.items() if k.startswith("sel_mixture") and not v]
+    assert not bad, bad
+
+
+def test_two_mixtures_in_one_product_are_refused(tmp_path):
+    a, _, _ = write_cumulative_mixture(tmp_path / "a.hdf", seed=1)
+    b, _, _ = write_cumulative_mixture(tmp_path / "b.hdf", seed=2)
+    with pytest.raises(OverlappingCampaignError, match="more than one"):
+        build_selection_product([SelectionSet(a), SelectionSet(b)],
+                                spin_basis="component", snr_threshold=10.0,
+                                mixture_anchors=_ANCHORS)
 
 
 # ======================================================================
@@ -654,11 +696,20 @@ class TestRealCumulativeMixture:
         a = p.attrs
         assert a["mixture_bookkeeping_status"] == \
             "derived_from_weights_and_anchors"
-        assert a["T_per_run_s"][3] == T_rpo and a["N_per_run"][3] == N_rpo
-        assert a["T_per_run_s"][2] == T_e3 and a["N_per_run"][2] == N_e3
-        assert np.all(np.abs(a["N_per_run_integrality_residual"]) < 1e-6)
-        assert sum(a["N_per_run"]) == pytest.approx(1568035640, abs=1e-3)
-        assert sum(a["T_per_run_s"]) == pytest.approx(96114016.0, abs=1e-3)
+        T_c, N_c = a["T_per_component_s"], a["N_per_component"]
+        assert T_c[3] == T_rpo and N_c[3] == N_rpo
+        assert T_c[2] == T_e3 and N_c[2] == N_e3
+        # G11: N_O1, N_O2 integers to 1e-6; T_O1, T_O2 to the second.
+        assert np.all(np.abs(
+            a["N_integrality_residual_per_semianalytic_component"]) < 1e-6)
+        np.testing.assert_allclose(N_c[:2], [189781582, 421480890], atol=1e-5)
+        np.testing.assert_allclose(T_c[:2], [4182739, 10218885], atol=1.0)
+        assert sum(N_c) == pytest.approx(1568035640, abs=1e-3)
+        assert sum(T_c) == pytest.approx(96114016.0, abs=1e-3)
+        assert a["n_detected_per_run"].tolist() == [
+            109093, 260902, 115779, 105545, 482163, 504666]
+        assert int(a["n_detected_mixture"]) == 1578148
+        assert a["detection_policy"] == "lvk-cumulative"
         assert a["n_detected"] == 1578148
         assert a["ndraw"] == 1568035640
         assert a["spin_reference_excluded_rows"] == 9120
@@ -718,3 +769,104 @@ class TestRealCumulativeMixture:
         det_s5 = s.detected_mask(1.0, snr_threshold=10.0)[o3]
         np.testing.assert_array_equal(det_s5, far_e3[idx] < 1.0)
         assert int(det_s5.sum()) == 221324
+
+
+# ======================================================================
+# Review fixes: semianalytic rows outside a mixture, recorded policy
+# ======================================================================
+def _injections_file_with_semianalytic_rows(tmp_path, n=40, n_semi=20):
+    """A GWTC-3-style injections-format file (single campaign) whose first
+    ``n_semi`` rows are semianalytic: nonzero SNR, every FAR +inf."""
+    p = write_endo3_full(tmp_path / "o1o2o3.hdf", n=n)
+    snr = np.zeros(n)
+    snr[:n_semi] = np.linspace(5.0, 20.0, n_semi)
+    with h5py.File(p, "r+") as f:
+        inj = f["injections"]
+        far = inj["far_gstlal"][:]
+        far[:n_semi] = np.inf
+        for k in ("far_gstlal", "far_pycbc_bbh"):
+            del inj[k]
+            inj.create_dataset(k, data=far)
+        inj.create_dataset(SNR_COLUMN, data=snr)
+    return p, snr
+
+
+def test_far_only_refused_on_single_campaign_with_semianalytic_rows(tmp_path):
+    p, snr = _injections_file_with_semianalytic_rows(tmp_path)
+    s = SelectionSet(p)
+    assert s.campaign_kind == "single_campaign"
+    assert int(s.semianalytic_row_mask().sum()) == 20
+    with pytest.raises(MixtureDetectionError, match="semianalytic row"):
+        build_selection_product(s, spin_basis="component")
+    with pytest.raises(MixtureDetectionError, match="semianalytic row"):
+        s.detected_mask(1.0)
+    rc = main(["export", "selection", p, "--out", str(tmp_path / "x.h5"),
+               "--parameter-space", "component"])
+    assert rc == 1 and not (tmp_path / "x.h5").exists()
+    # With the SNR rule the semianalytic rows are detected ...
+    prod = build_selection_product(s, spin_basis="component",
+                                   snr_threshold=10.0)
+    assert int(prod.attrs["n_detected"]) >= int((snr > 10).sum())
+    assert prod.attrs["detection_policy"] == "far_or_snr"
+    # ... and an acknowledged FAR-only cut drops them, saying so.
+    prod = build_selection_product(s, spin_basis="component",
+                                   acknowledge_semianalytic_excluded=True)
+    assert prod.attrs["detection_policy"] == \
+        "far(semianalytic_rows_excluded)"
+    # A file whose SNR column is all zero has no semianalytic rows.
+    o4 = write_o4_full(tmp_path / "o4z.hdf", n=20)
+    with h5py.File(o4, "r+") as f:
+        f["events"].create_dataset(SNR_COLUMN, data=np.zeros(20))
+    assert not SelectionSet(o4).semianalytic_row_mask().any()
+    build_selection_product(SelectionSet(o4), spin_basis="component")
+
+
+def test_recorded_policy_is_the_applied_rule(tmp_path):
+    path, _, _ = write_cumulative_mixture(tmp_path / "mix.hdf")
+    # The default policy name with an SNR threshold on a mixture applies the
+    # per-run LVK rule, and the file says so.
+    p = _build(path)
+    assert p.attrs["detection_policy"] == "lvk-cumulative"
+    assert p.attrs["detection_policy_requested"] == "far"
+    p = _build(path, detection_policy="lvk-cumulative")
+    assert p.attrs["detection_policy"] == "lvk-cumulative"
+    p = _build(path, snr_threshold=None,
+               acknowledge_semianalytic_excluded=True)
+    assert p.attrs["detection_policy"] == "far(semianalytic_rows_excluded)"
+
+
+def test_acknowledge_with_snr_threshold_is_refused(tmp_path):
+    path, _, _ = write_cumulative_mixture(tmp_path / "mix.hdf")
+    with pytest.raises(ValueError, match="one or the other"):
+        _build(path, acknowledge_semianalytic_excluded=True)
+    rc = main(["export", "selection", path, "--out", str(tmp_path / "x.h5"),
+               "--parameter-space", "component", "--snr-threshold", "10",
+               "--acknowledge-semianalytic-excluded"])
+    assert rc == 1 and not (tmp_path / "x.h5").exists()
+
+
+def test_integrality_tolerance_catches_a_small_anchor_error():
+    """An O4 anchor off by far less than one draw's worth of weight is still
+    refused: the solved N_O1, N_O2 stop being integers to 1e-5."""
+    from gwcat.observing_runs import (MIXTURE_RELEASE_ANCHORS,
+                                      N_INTEGRALITY_TOL)
+    assert N_INTEGRALITY_TOL <= 1e-5
+    run = np.array(["O1", "O2", "O3a", "O3b", "O4a"])
+    w = np.array([0.3595637562455014, 0.3955440252726014, 5.43372670317606,
+                  5.43372670317606, 0.9])
+    good = MIXTURE_RELEASE_ANCHORS[(1568035640, 96114016)]
+    book = derive_mixture_bookkeeping(run, w, 1568035640, 96114016.0, good)
+    assert max(abs(r) for r in book["N_integrality_residual"]) < 1e-6
+    bad = {"O3": good["O3"], "O4": dict(good["O4"], T_s=good["O4"]["T_s"]
+                                        + 0.05)}
+    with pytest.raises(ValueError, match="not positive integers"):
+        derive_mixture_bookkeeping(run, w, 1568035640, 96114016.0, bad)
+
+
+def test_cli_chieff_refusal_is_a_one_line_error(tmp_path, capsys):
+    path, _, _ = write_cumulative_mixture(tmp_path / "mix.hdf")
+    rc = main(["export", "selection", path, "--out", str(tmp_path / "x.h5"),
+               "--parameter-space", "chieff", "--snr-threshold", "10"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "error:" in err and "Traceback" not in err

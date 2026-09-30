@@ -301,10 +301,19 @@ Reads both LVK injection formats:
       --detection-policy lvk-cumulative --far-threshold 1.0 --snr-threshold 10 --sky-marginal
   ```
 
-  and the file records `run_labels`, `detection_rule_per_run`,
-  `n_detected_per_run`, `N_per_run`/`T_per_run_s` with `T_definition_per_run`
-  (O1/O2 coincident livetime, O3 endo3 analysis time, O4 monthly wall-clock
-  time) and `sky_marginalized` (the mixture has no sky columns).
+  and the file records, aligned with `run_labels` (one entry per run),
+  `detection_rule_per_run`, `n_detected_per_run` (summing to
+  `n_detected_mixture`) and `T_definition_per_run` (O1/O2 coincident
+  livetime, O3 endo3 analysis time, O4 monthly wall-clock time); aligned with
+  `mixture_components` (O1, O2, O3, O4 -- O3a/O3b and O4a/O4b share one
+  exposure each) the derived `N_per_component`/`T_per_component_s` with
+  `T_definition_per_component`, mapped by `component_of_run`;
+  `detection_policy` (the rule actually applied; the request is in
+  `detection_policy_requested`); and `sky_marginalized` (the mixture has no
+  sky columns).  A FAR-only cut is refused on ANY injection file with
+  semianalytic rows (nonzero semianalytic SNR, no finite FAR), not only on the
+  mixture; `--acknowledge-semianalytic-excluded` cannot be combined with
+  `--snr-threshold`.
 
 Selection products are **not BBH-only**.  Pass `source_class` to subset the
 injections by source class — BBH / NSBH / BNS / MassGap / `cbc` (all
