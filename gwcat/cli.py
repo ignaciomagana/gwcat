@@ -290,9 +290,37 @@ def build_parser() -> argparse.ArgumentParser:
                              "events do not; the validator refuses the pair.")
     p_xsel.add_argument("--snr-threshold", type=float, default=None,
                         metavar="SNR",
-                        help="Optional OR-branch: detection = far-detected OR "
-                             "(snr > SNR) via the cumulative-mixture "
-                             "semianalytic SNR column. Default: FAR cut only.")
+                        help="Semianalytic SNR threshold. On a cumulative "
+                             "multi-run mixture it is applied to the O1/O2 "
+                             "rows only (their FAR is +inf), with the FAR cut "
+                             "on the O3/O4 rows only; on any other file it is "
+                             "an OR-branch, detection = far-detected OR "
+                             "(snr > SNR). Default: FAR cut only.")
+    p_xsel.add_argument("--detection-policy", default="far",
+                        choices=["far", "lvk-cumulative"],
+                        help="'far' (default): the FAR cut (OR-ed with "
+                             "--snr-threshold when given). 'lvk-cumulative': "
+                             "the per-run rule of the LVK cumulative O1-O4b "
+                             "mixture (Zenodo 19500052) -- semianalytic SNR > "
+                             "--snr-threshold on O1/O2 rows, min search FAR < "
+                             "--far-threshold over each run's own searches on "
+                             "O3/O4 rows; requires --snr-threshold and a "
+                             "mixture file. A FAR-only cut on such a file is "
+                             "refused: it detects no O1/O2 row while their "
+                             "draws and exposure stay in the normalisation.")
+    p_xsel.add_argument("--acknowledge-semianalytic-excluded",
+                        action="store_true",
+                        help="Allow a FAR-only cut on a cumulative mixture "
+                             "with semianalytic O1/O2 rows, so none of them "
+                             "is detected. Correct ONLY for a deliberately "
+                             "O3+O4-only analysis whose PE file has no O1/O2 "
+                             "events.")
+    p_xsel.add_argument("--sky-marginal", action="store_true",
+                        help="Omit ra/dec and record sky_marginalized=True: "
+                             "pdraw carries no sky density and the population "
+                             "is isotropic, so the sky is marginalised. The "
+                             "cumulative mixtures ship no sky position at "
+                             "all. gwcat2 (2.0) format only.")
     p_xsel.add_argument("--H0", type=float, default=None,
                         help="Reference cosmology (default: Planck15) applied "
                              "to every injection file.")
@@ -521,6 +549,16 @@ def _cmd_export_pe(args) -> int:
 def _cmd_export_selection(args) -> int:
     from .selection import SelectionSet, CombinedSelectionSet
 
+    if args.detection_policy == "lvk-cumulative" and args.snr_threshold is None:
+        raise ValueError(
+            "--detection-policy lvk-cumulative requires --snr-threshold (10 in "
+            "the LVK analyses). The O1/O2 rows of a cumulative mixture are "
+            "semianalytic and carry no search FAR, so without an SNR "
+            "threshold none of them is detected -- while total_generated and "
+            "total_analysis_time still count their draws and their O1/O2 "
+            "exposure, which biases the detection probability low and the "
+            "inferred rate high.")
+
     kwargs = {}
     if args.H0 is not None:
         kwargs["H0"] = args.H0
@@ -540,6 +578,10 @@ def _cmd_export_selection(args) -> int:
         spin_reference_amax=args.spin_reference_amax,
         snr_threshold=args.snr_threshold,
         z_max=args.z_max,
+        detection_policy=args.detection_policy,
+        acknowledge_semianalytic_excluded=(
+            args.acknowledge_semianalytic_excluded),
+        sky_marginal=args.sky_marginal,
     )
     return 0
 
