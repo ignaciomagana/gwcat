@@ -220,19 +220,39 @@ gwcat validate --strict pe.h5 sel.h5 --spin-prior-allow-list allow.txt
   spin,dL}`; kinds are `own_analytic`, `sibling_inherited`,
   `config_file_declared` (LALInference `engine/a_spin{1,2}-max`),
   `assumed_default`, `release_reweighted`, `constituent_mixture`.  PE exports
-  carry them as `prior_source_kind_*_per_event`.
+  carry them as `prior_source_kind_*_per_event`.  **Changed meaning:**
+  `chi_eff_amax_source_per_event` now holds the spin prior's source KIND
+  (`own_analytic`, `sibling_inherited`, ...) whenever the ceiling came from
+  the store; the pre-GW-40 value (`analytic` / `fallback` / `caller`) moved to
+  `chi_eff_amax_resolution_per_event`.  A consumer that matched the string
+  `analytic` must read the resolution attr instead.  A combined `Mixed` row
+  also records what each constituent's config declares
+  (`spin_amax_config_per_constituent`; PE attr
+  `spin_amax_config_per_constituent_per_event`, JSON
+  `{label: [a1_max, a2_max] | null}`).
+* **Population resolver.** `population_resolver_inputs` records the resolved
+  names under two digest recipes, each labelled: `allowed_names_digest`
+  (gwcat's blake2b `event_list_digest`) and `allowed_names_sha256` (sha256 of
+  the sorted names one per line, the v1 recipe).  `population_resolver` says
+  the exported set EQUALS the bundled resolver's output; it is not a call
+  trace.
 * **`event-map`.** `sample_set_map.json` is `{event: label, ...,
   "substitutes": {event: reason | {"label": fallback, "reason": ...}}}` (or
   `{"events": {...}, "substitutes": {...}}`), or a popsummary file's
-  `events`/`event_sample_IDs`.  An unmapped event, or a mapped label the store
-  lacks with no declared substitute, fails.  `--nrsur-q-rule FRAC` refuses an
+  `events`/`event_sample_IDs`.  A substitute that names a `label` replaces the
+  mapped label (recorded as `original_label`) and must be in the store; a
+  reason-only substitute marks the mapped label itself as the substitute.  An
+  unmapped event, or a mapped label the store lacks with no declared
+  substitute, fails.  `--nrsur-q-rule FRAC` refuses an
   NRSur7dq4 label whose `IMRPhenomXPHM-SpinTaylor` posterior has more than FRAC
   of its mass at q < 1/6 (or substitutes it with `--nrsur-q-rule-substitute`)
   and verifies declared `nrsur_q_rule` substitutes.  Substitutes are written
   to the PE file with their reasons.
 * **`--drop-spin-above-ceiling`.** Drops raw samples with `a_i > amax_i` before
-  resampling (exact rejection to U(0, amax)); counts in
-  `n_dropped_spin_above_ceiling_per_event`.
+  resampling (exact rejection to U(0, amax)).  It runs after any `--z-max`
+  cut: `n_dropped_spin_above_ceiling_per_event` counts the samples removed
+  from the z <= z_max pool, `n_above_spin_ceiling_raw_per_event` the whole raw
+  label (equal when no z_max), and `spin_ceiling_cut_order` says which.
 * **`--constituent-mixture-prior`** (ingest; only for policies that use
   `C00:Mixed`): the equal-weight mixture of the constituents' own priors, with
   the mixing fractions verified row by row.

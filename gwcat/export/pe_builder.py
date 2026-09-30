@@ -279,9 +279,12 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     projection basis keeps the declared ceiling, so without the cut PE and a
     ``chieff_reference`` selection (zero density above a_ref) have different
     supports.  For a uniform-magnitude prior the cut is exact rejection to
-    ``U(0, amax)``.  The per-event counts are written as
-    ``n_dropped_spin_above_ceiling_per_event``; the draw then sees only the
-    kept samples, so ``replace="auto"`` resamples with replacement exactly when
+    ``U(0, amax)``.  The cut runs AFTER the ``z_max`` cut, so the per-event
+    counts written as ``n_dropped_spin_above_ceiling_per_event`` are samples
+    with ``z <= z_max``; ``n_above_spin_ceiling_raw_per_event`` counts the whole
+    raw label (before ``z_max``) -- the integer an independent raw-file count
+    reproduces -- and ``spin_ceiling_cut_order`` records which applies.  The
+    draw then sees only the kept samples, so ``replace="auto"`` resamples with replacement exactly when
     fewer than ``nsamp`` remain.  Off by default: the default draw is unchanged.
 
     Per-prior provenance (GW-40c)
@@ -633,10 +636,20 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         sel_prior_kind[_p] = [k or "unrecorded" for k in kinds]
         sel_prior_label[_p] = labels or [""] * sub.n_events
     spin_kind_recorded = _meta_str_sel("prior_source_kind_spin") is not None
+    # A5: the spin ceilings each constituent of a Mixed set declares in its
+    # config (JSON per row; "" for non-Mixed rows and pre-GW-40 stores).
+    sel_cfg_amax = (_meta_str_sel("spin_amax_config_per_constituent")
+                    or [""] * sub.n_events)
+    kept_cfg_amax = []
     kept_prior_kind = {p: [] for p in ("mass", "spin", "dL")}
     kept_prior_label = {p: [] for p in ("mass", "spin", "dL")}
-    #: Raw samples removed by the GW-40c spin-support cut, per kept event.
+    #: Raw samples removed by the GW-40c spin-support cut, per kept event --
+    #: counted AFTER the z_max cut (the samples the cut actually removed from
+    #: the pool the draw sees) ...
     n_dropped_spin = []
+    #: ... and the same count over the event's WHOLE raw label, before any
+    #: z_max cut: the number an independent count of the raw file reproduces.
+    n_above_spin_ceiling_raw = []
     if drop_spin_above_ceiling:
         avail_a1_cut = sub.param_available("a_1")
         avail_a2_cut = sub.param_available("a_2")
@@ -715,13 +728,19 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             # Reads the event's full a_1/a_2 (a sample read, but not an rng
             # call, so with the flag off nothing here runs and the draw is the
             # historical one bit for bit).
+            # Order: the z_max cut (above) runs first, so
+            # n_dropped_spin_above_ceiling counts only samples with z <= z_max;
+            # n_above_spin_ceiling_raw counts the whole raw label.
             n_drop_e = 0
+            n_raw_e = 0
             if drop_spin_above_ceiling:
                 c1, c2, _fb = _declared_ceiling(e)
                 ab = reader.read(e, ["a_1", "a_2"])
-                a1_all = np.asarray(ab["a_1"], dtype=float)[idx_map]
-                a2_all = np.asarray(ab["a_2"], dtype=float)[idx_map]
-                ok = (np.abs(a1_all) <= c1) & (np.abs(a2_all) <= c2)
+                a1_raw = np.asarray(ab["a_1"], dtype=float)
+                a2_raw = np.asarray(ab["a_2"], dtype=float)
+                above_raw = (np.abs(a1_raw) > c1) | (np.abs(a2_raw) > c2)
+                n_raw_e = int(np.sum(above_raw))
+                ok = ~above_raw[idx_map]
                 n_drop_e = int(np.sum(~ok))
                 if not ok.any():
                     raise ValueError(
@@ -796,9 +815,11 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             kept_mass_kind.append(mass_kind_e)
             n_cut_by_z_max.append(n_cut_e)
             n_dropped_spin.append(n_drop_e)
+            n_above_spin_ceiling_raw.append(n_raw_e)
             for _p in ("mass", "spin", "dL"):
                 kept_prior_kind[_p].append(sel_prior_kind[_p][e])
                 kept_prior_label[_p].append(sel_prior_label[_p][e])
+            kept_cfg_amax.append(sel_cfg_amax[e])
             kept_H0.append(float(per_event_H0[e]))
             kept_Om0.append(float(per_event_Om0[e]))
             row = sel_rows[e]
@@ -1342,14 +1363,28 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         "out_of_support_allowed": bool(allow_out_of_support),
         # ── The spin-support cut (GW-40c) ────────────────────────────────────
         "spin_ceiling_cut_applied": bool(drop_spin_above_ceiling),
+        # Removed from the pool the draw sees: samples with z <= z_max (every
+        # sample when no z_max) whose a_1 or a_2 exceeds the ceiling.
         "n_dropped_spin_above_ceiling_per_event": np.asarray(
             n_dropped_spin if drop_spin_above_ceiling else [0] * nobs,
             dtype=np.int64),
+        # The same count over the WHOLE raw label, before the z_max cut -- the
+        # integer an independent raw-file count reproduces.  Equal to the
+        # above when z_max is None.
+        "n_above_spin_ceiling_raw_per_event": np.asarray(
+            n_above_spin_ceiling_raw if drop_spin_above_ceiling
+            else [0] * nobs, dtype=np.int64),
+        "spin_ceiling_cut_order": ("after_z_max_cut" if z_max is not None
+                                   else "no_z_max_cut"),
         # ── Per-prior source provenance (GW-40c) ─────────────────────────────
         **{f"prior_source_kind_{p}_per_event": np.array(
             kept_prior_kind[p], dtype=_str) for p in ("mass", "spin", "dL")},
         **{f"prior_source_label_{p}_per_event": np.array(
             kept_prior_label[p], dtype=_str) for p in ("mass", "spin", "dL")},
+        # A5: per event, JSON {constituent: [a1_max, a2_max] | null} of the
+        # ceilings a Mixed set's constituents declare in their configs.
+        "spin_amax_config_per_constituent_per_event": np.array(
+            kept_cfg_amax, dtype=_str),
         "spin_prior_assumed_events": np.array(
             [str(n) for n, k in zip(kept, kept_prior_kind["spin"])
              if k == "assumed_default"], dtype=_str),
@@ -1423,6 +1458,7 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         "chi_p_definition": str(chi_p_definition),
         "spin_ceiling_cut_applied": bool(drop_spin_above_ceiling),
         "n_dropped_spin_above_ceiling": int(sum(n_dropped_spin)),
+        "n_above_spin_ceiling_raw": int(sum(n_above_spin_ceiling_raw)),
         "prior_source_kind_counts": {
             p: {k: int(kept_prior_kind[p].count(k))
                 for k in sorted(set(kept_prior_kind[p]))}
@@ -1439,6 +1475,16 @@ POPULATION_RESOLVER = ("gwcat.population_samples."
                        "resolve_gwtc5_bbh_population_names")
 
 
+def _names_sha256(names):
+    """sha256 of the sorted unique names, one per line with a trailing
+    newline -- the recipe the v1 ``allowed_names_digest`` reference
+    (``fe6e33da...``) was computed with."""
+    import hashlib
+    uniq = sorted({(n.decode() if isinstance(n, (bytes, bytearray))
+                    else str(n)) for n in names})
+    return hashlib.sha256(("\n".join(uniq) + "\n").encode()).hexdigest()
+
+
 def _population_resolver_attrs(cat, kept):
     """Whether the exported event set IS the bundled-population resolver's
     output, with the resolver's inputs (GW-40c).
@@ -1449,6 +1495,12 @@ def _population_resolver_attrs(cat, kept):
     bundled list it read and the resolved names' digest.  Otherwise (a subset,
     a different population, a synthetic store) ``population_resolver`` is ""
     and ``population_resolver_match`` False -- recorded, never guessed.
+
+    What this does NOT prove: it shows the exported set EQUALS the resolver's
+    output on the store's names, not that the caller obtained the set by
+    calling the resolver (an equal set from any other source records the same
+    attrs).  A call-trace claim (BUILD_PLAN G3g) must come from the build
+    wrapper's own audit log, not from these attrs.
     """
     import hashlib
     import json as _json
@@ -1474,7 +1526,16 @@ def _population_resolver_attrs(cat, kept):
         err = str(exc)[:200]
     inputs = {
         "bundled_list_sha256": shas,
+        # Two digests of the SAME resolved set, under two recipes, each
+        # labelled so a gate compares like with like:
         "allowed_names_digest": _digest(resolved) if resolved else "",
+        "allowed_names_digest_recipe": (
+            "gwcat.export.contract.event_list_digest: blake2b-64 of the JSON "
+            "list of sorted unique names"),
+        "allowed_names_sha256": (_names_sha256(resolved) if resolved else ""),
+        "allowed_names_sha256_recipe": (
+            "sha256 of the sorted unique names joined by '\\n' with a "
+            "trailing '\\n' (the v1 / BUILD_PLAN G3a recipe)"),
         "n_resolved": len(resolved),
         "n_aliases": len(aliases),
         "aliases": {str(k): str(v) for k, v in sorted(aliases.items())},

@@ -177,6 +177,43 @@ def test_declared_q_rule_substitutes_are_verified(tmp_path):
                 nrsur_q_rule=0.03)
 
 
+def test_named_substitute_replaces_a_mapped_label_the_store_has(tmp_path):
+    """A substitute that NAMES its label is used even when the mapped label
+    is also in the store (review fix): the export must never keep the mapped
+    label while recording the event as a substitute."""
+    store = _store(tmp_path, q_frac={E1: 0.03, E2: 0.005})
+    doc = {"events": {E1: f"C01:{NR}", E2: f"C01:{NR}", E3: f"C01:{MX}"},
+           "substitutes": {E1: {"label": f"C01:{XP}",
+                                "reason": "nrsur_q_rule"}}}
+    for kw, out in (({}, "noq.h5"), ({"nrsur_q_rule": 0.01}, "q.h5")):
+        attrs = _export(store, tmp_path / out, sample_set_map=doc, **kw)
+        got = dict(zip(_s(attrs["event_names"]),
+                       _s(attrs["sample_set_name_per_event"])))
+        assert got == {E1: f"C01:{XP}", E2: f"C01:{NR}", E3: f"C01:{MX}"}, kw
+        assert _s(attrs["sample_set_substitute_events"]) == [E1]
+        assert _s(attrs["sample_set_substitute_reasons"]) == ["nrsur_q_rule"]
+        assert _s(attrs["sample_set_substitute_original_labels"]) == [
+            f"C01:{NR}"]
+        reasons = dict(zip(_s(attrs["event_names"]),
+                           _s(attrs["sample_set_selection_reason"])))
+        assert reasons[E1] == f"event-map:substitute(nrsur_q_rule):C01:{XP}"
+    # With the rule set, the declared q-rule substitute is still verified: at
+    # a threshold above E1's 3% it is not justified and is refused.
+    with pytest.raises(NRSurQRuleError, match="NOT justified"):
+        _export(store, tmp_path / "unjust.h5", sample_set_map=doc,
+                nrsur_q_rule=0.05)
+
+
+def test_named_substitute_label_missing_from_store_fails(tmp_path):
+    store = _store(tmp_path)
+    doc = {"events": {E1: f"C01:{NR}", E2: f"C01:{XP}", E3: f"C01:{XP}"},
+           "substitutes": {E3: {"label": f"C01:{NR}",
+                                "reason": "not_in_release"}}}
+    with pytest.raises(MissingSampleSetError) as ei:
+        _export(store, tmp_path / "pe.h5", sample_set_map=doc)
+    assert E3 in str(ei.value) and f"C01:{NR}" in str(ei.value)
+
+
 def test_q_rule_off_does_not_touch_nrsur_labels(tmp_path):
     store = _store(tmp_path, q_frac={E1: 0.5})
     smap = {E1: f"C01:{NR}", E2: f"C01:{NR}", E3: f"C01:{MX}"}

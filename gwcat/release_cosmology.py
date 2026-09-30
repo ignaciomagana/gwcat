@@ -56,6 +56,8 @@ class ReleaseCosmologyRow:
     source: str
     citation: str
     corroboration: str = ""
+    #: The release record stating the reweighted prior's form (optional).
+    record_citation: str = ""
 
 
 @dataclass(frozen=True)
@@ -139,7 +141,9 @@ def load_release_cosmology_table(path: Optional[str] = None
         rows[str(cat)] = ReleaseCosmologyRow(
             catalog=str(cat), name=str(row["name"]), H0=H0, Om0=Om0,
             source=src, citation=" ".join(str(row["citation"]).split()),
-            corroboration=" ".join(str(row.get("corroboration", "")).split()))
+            corroboration=" ".join(str(row.get("corroboration", "")).split()),
+            record_citation=" ".join(
+                str(row.get("record_citation", "")).split()))
     table = ReleaseCosmologyTable(rows=rows, path=path, sha256=sha,
                                   table_id=str(doc.get("table_id", "")))
     _CACHE[path] = table

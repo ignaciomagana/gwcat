@@ -25,6 +25,11 @@
 #                                     support it;
 #            (the legacy table alone uses "legacy_gwcat_default")
 #   citation verbatim location of the statement the `source` rests on
+#   record_citation  the Zenodo PE-release record that states the REWEIGHTED
+#            prior's form (uniform merger rate in the source's comoving frame,
+#            i.e. with the (1+z)^-1 source-time factor), with the sha256 of
+#            the saved record JSON under gwpop-search-data/provenance/
+#            zenodo_records/ (the copy the v2 gate verifies against)
 #   corroboration  independent evidence, stated with its current status
 #
 # Operator decision OD-2 (2026-09-30, BUILD_PLAN.md Section 10): LAL Planck15
@@ -53,7 +58,18 @@ catalogs:
       follows a distribution uniform in comoving volume, using a flat LambdaCDM
       cosmology with Hubble constant H0 = 67.90 km s-1 Mpc-1 and matter density
       Omega_m = 0.3065 [176]", with [176] = Planck Collaboration, "Planck 2015
-      results. XIII. Cosmological parameters".
+      results. XIII. Cosmological parameters".  NOTE: this sentence documents
+      the COSMOLOGY (H0, Om0) of the original PE distance prior; it says
+      "uniform in comoving volume" and neither states the (1+z)^-1
+      source-time factor nor the word "reweighted" (checked against the
+      pdftotext of v2).  The reweighted prior's UniformSourceFrame form is
+      documented by the release record in record_citation.
+    record_citation: >-
+      Zenodo 6513631 (GWTC-2.1 PE release, v2) record description: "The
+      cosmologically reweighted posteriors are reweighted to have a
+      luminosity-distance prior that has a uniform merger rate in the source's
+      comoving frame." Saved record JSON record_6513631.json, sha256
+      3fddba3c12daf02eeedcee73ef99b5017f00b13c086c7cb130f4339bdc4ba353.
     corroboration: >-
       inferred_from_z(dL): the raw C01:Mixed redshift(luminosity_distance)
       columns of the GWTC-2.1 _cosmo files follow (67.90, 0.3065) to 3e-9..1e-8
@@ -74,6 +90,13 @@ catalogs:
       source's comoving frame for a Lambda-cold dark matter cosmology with
       H0 = 67.9 km s-1 Mpc-1 and Omega_m = 0.3065 [663]", with [663] = Planck
       Collaboration, "Planck 2015 results. XIII. Cosmological parameters".
+    record_citation: >-
+      Zenodo 8177023 (GWTC-3 PE release, v2; the version pinned under OD-4)
+      record description: "The cosmologically reweighted posteriors are
+      reweighted to have a luminosity-distance prior that has a uniform merger
+      rate in the source's comoving frame." Saved record JSON
+      record_8177023.json, sha256
+      9360536f3139a311ea348817e4492dac0e64c98ce05c8a47c9c58075bfc6b6fd.
     corroboration: >-
       inferred_from_z(dL): as for GWTC-2.1, the raw C01:Mixed redshift(dL)
       columns follow (67.90, 0.3065) (BUILD_PLAN.md rev 2, Section 2.6; to be

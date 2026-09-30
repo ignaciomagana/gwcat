@@ -144,6 +144,18 @@ def test_pre_gw40_pe_file_warns_instead_of_failing(tmp_path):
     assert "xcheck_reference_spin_prior_source" not in results
 
 
+def test_pre_gw40_pe_file_fails_under_strict(tmp_path):
+    """An older PE file without the provenance attr cannot bypass the
+    allow-list refusal when the pair is validated strictly."""
+    pe = _pe_with_six(tmp_path)
+    with h5py.File(pe, "r+") as f:
+        del f.attrs["prior_source_kind_spin_per_event"]
+    sel = _sel_reference(tmp_path, 0.99)
+    with pytest.raises(ValueError,
+                       match="xcheck_reference_spin_prior_source_recorded"):
+        validate_export_v2(str(pe), str(sel), strict=True)
+
+
 def test_allow_list_loader_forms(tmp_path):
     txt = tmp_path / "allow.txt"
     txt.write_text("# OD-7\nGWa_1 config_file_declared\nGWb_2\n\n")
@@ -220,6 +232,11 @@ def test_ingest_to_export_carries_config_file_declared(tmp_path, monkeypatch):
         "release_reweighted"]
     # the table's cosmology, per event
     assert float(attrs["cosmology_H0_per_event"][0]) == 67.90
+    # A5: what each constituent of the Mixed set declares, recorded per event
+    assert [_s(x) for x in attrs["sample_set_name_per_event"]] == ["C01:Mixed"]
+    assert json.loads(_s(
+        attrs["spin_amax_config_per_constituent_per_event"][0])) == {
+        "C01:IMRPhenomXPHM": [0.99, 0.99], "C01:SEOBNRv4PHM": [0.99, 0.99]}
 
 
 # --------------------------------------------------------------------------
@@ -241,6 +258,13 @@ def test_population_resolver_recorded_only_for_the_bundled_population(
     assert bool(attrs["population_resolver_match"]) is True
     inputs = json.loads(_s(attrs["population_resolver_inputs"]))
     assert inputs["allowed_names_digest"] == event_list_digest(BBH_ALL)
+    # The v1 / BUILD_PLAN G3a reference digest uses a different recipe
+    # (sha256 of the sorted names, one per line); both are recorded, each
+    # with its recipe, so a gate never compares the two.
+    assert inputs["allowed_names_sha256"] == (
+        "fe6e33da7e8de381aaa7c95f7e2905c5e8b868206eab837aaf0074f89b8c9da6")
+    assert "blake2b" in inputs["allowed_names_digest_recipe"]
+    assert "sha256" in inputs["allowed_names_sha256_recipe"]
     assert inputs["n_resolved"] == 259 and inputs["n_aliases"] == 0
     assert set(inputs["bundled_list_sha256"]) >= {
         "bbh_o1o2.txt", "bbh_o3a.txt", "bbh_o3b.txt", "bbh_o4a.txt",

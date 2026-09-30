@@ -108,10 +108,12 @@ class SampleSetMap:
     """An explicit ``{event: sample_set_name}`` map plus declared substitutes.
 
     ``substitutes[event]`` is ``{"reason": str, "label": str or None,
-    "original_label": str or None}``: ``label`` is a fallback used when the
-    mapped label is absent from the store; with no ``label`` the entry declares
-    that the MAPPED label is already a substitute (e.g. the three NRSur q-rule
-    fallbacks in operator decision OD-12), recorded with its reason.
+    "original_label": str or None}``: a ``label`` REPLACES the mapped label
+    (which is then recorded as ``original_label``), whether or not the mapped
+    label is also in the store, and must itself be in the store; with no
+    ``label`` the entry declares that the MAPPED label is already a substitute
+    (e.g. the three NRSur q-rule fallbacks in operator decision OD-12),
+    recorded with its reason.
     """
     labels: Dict[str, str]
     substitutes: Dict[str, dict] = field(default_factory=dict)
@@ -432,10 +434,13 @@ def resolve_event_map(event_names: Sequence, sel, meta: dict, sample_set_map,
                       nrsur_q_rule_substitute: bool = False):
     """Resolve ``waveform_policy="event-map"`` (GW-40e).
 
-    For every selected event: the map's label if the store has it; else the
-    map's declared substitute label (recorded with its reason); else FAIL.  An
-    event absent from the map fails too.  Every failure of one kind is
-    collected and reported together, naming the events.
+    For every selected event: the map's declared substitute label when the
+    substitute names one (recorded with its reason and the mapped label as
+    ``original_label``; FAIL if the store lacks it); else the map's label if
+    the store has it (recorded as a substitute when a reason-only substitute
+    entry exists); else FAIL.  An event absent from the map fails too.
+    Every failure of one kind is collected and reported together, naming the
+    events.
 
     NRSur q-rule (``nrsur_q_rule=frac``; requires ``q_frac_fn(event, label)``
     returning the fraction of ``label``'s posterior samples with
@@ -499,16 +504,27 @@ def resolve_event_map(event_names: Sequence, sel, meta: dict, sample_set_map,
             continue
         want = smap.labels[ev]
         sub = smap.substitutes.get(ev)
-        if want in rows:
+        if sub is not None and sub["label"] and sub["label"] != want:
+            # A substitute that NAMES its label replaces the mapped label,
+            # whether or not the mapped label is also in the store: the map
+            # declared the substitution, so the export carries it (and records
+            # it as one) -- it never keeps the mapped label while calling it a
+            # substitute.  A named label the store lacks fails loudly.
+            if sub["label"] not in rows:
+                missing.append((ev, sub["label"], sorted(rows)))
+                continue
+            label = sub["label"]
+            substitutes[ev] = {"label": label, "reason": sub["reason"],
+                               "original_label": sub["original_label"] or want}
+        elif want in rows:
+            # No named substitute label: the MAPPED label is final.  A
+            # reason-only entry declares that it already is a substitute (the
+            # OD-12 q-rule fallbacks), recorded with its reason.
             label = want
             if sub is not None:
                 substitutes[ev] = {"label": label, "reason": sub["reason"],
                                    "original_label": sub["original_label"]
                                    or ""}
-        elif sub is not None and sub["label"] and sub["label"] in rows:
-            label = sub["label"]
-            substitutes[ev] = {"label": label, "reason": sub["reason"],
-                               "original_label": sub["original_label"] or want}
         else:
             missing.append((ev, want, sorted(rows)))
             continue

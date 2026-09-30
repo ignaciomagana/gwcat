@@ -206,6 +206,14 @@ META_STR_FIELDS += PRIOR_SOURCE_STR_FIELDS
 # Constituent-mixture provenance (GW-40f): which constituents a combined set's
 # mixture prior was built from, and their VERIFIED row counts ("" elsewhere).
 META_STR_FIELDS += ["constituent_mixture_labels", "constituent_mixture_counts"]
+# The spin ceilings each constituent of a combined (``Mixed``) set DECLARES in
+# its LALInference ``config_file/engine/a_spin{1,2}-max`` (approximation A5 of
+# the v2 build plan): JSON ``{constituent_label: [a1_max, a2_max] or null}``
+# over the same-prefix siblings, "" for a non-Mixed row.  A Mixed set's spin
+# prior is inherited from ONE sibling's analytic group; this records what the
+# OTHER constituents (e.g. C01:SEOBNRv4PHM, which has no analytic group)
+# declared, so a per-half ceiling difference is visible on the row.
+META_STR_FIELDS += ["spin_amax_config_per_constituent"]
 
 # Default waveform priority when no Mixed set exists (O4b/GWTC-5 events).
 O4_WAVEFORM_PRIORITY = [
@@ -1196,6 +1204,32 @@ def _spin_amax_from_config(data, analysis, analyses=()):
     return a1, a2, [an for an, _v in hits], len(vals) == 1
 
 
+def constituent_spin_amax_config(data, analysis, analyses):
+    """JSON ``{sibling: [a1_max, a2_max] | null}`` for a ``Mixed`` label.
+
+    Every same-prefix, non-Mixed sibling of ``analysis`` is listed, with the
+    ceilings its ``config_file/engine/a_spin{1,2}-max`` declares, or ``null``
+    when its config declares none.  ``""`` for a label that is not a combined
+    ``Mixed`` set, or when ``data`` carries no config at all.
+    """
+    import json as _json
+    prefix, base, _variant = _label_parts(analysis)
+    if base != "Mixed":
+        return ""
+    cfg_all = getattr(data, "config", None)
+    if not isinstance(cfg_all, dict):
+        return ""
+    out = {}
+    for an in analyses:
+        p2, b2, _v2 = _label_parts(an)
+        if an == analysis or p2 != prefix or b2 == "Mixed":
+            continue
+        got = _spin_amax_from_config(data, an, ())
+        out[str(an)] = (None if got is None
+                        else [float(got[0]), float(got[1])])
+    return _json.dumps(out, sort_keys=True)
+
+
 def resolve_spin_prior(analysis, analyses, priors, a1_samples, a2_samples,
                        fallback_amax=0.99, allow_variant_mismatch=False):
     """Return ``(amax_1, amax_2, kind, source)`` for the spin-magnitude prior.
@@ -2124,6 +2158,8 @@ def build_store(paths, out_path, params=None, extra_params=None,
             meta["prior_source_kind_mass"].append(mp.source_kind)
             meta["prior_source_label_spin"].append(sp.source_label)
             meta["prior_source_kind_spin"].append(sp.source_kind)
+            meta["spin_amax_config_per_constituent"].append(
+                constituent_spin_amax_config(data, analysis, analyses))
             meta["prior_source_label_dL"].append(res.prior_source_label)
             meta["prior_source_kind_dL"].append(res.prior_source_kind)
             meta["mass_prior_chirp_min"].append(

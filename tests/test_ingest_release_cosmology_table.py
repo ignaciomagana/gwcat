@@ -103,6 +103,14 @@ def test_bundled_table_is_od2_lal_planck15_with_citations():
         assert arxiv in r.citation and "0.3065" in r.citation
         assert "Planck 2015" in r.citation
     assert t.sha256 == _sha(bundled_table_path())
+    # The reweighted prior's source-frame form rests on the release records,
+    # each cited with the sha256 of the saved record JSON (review fix).
+    import re
+    for cat, rec in (("GWTC-2.1", "6513631"), ("GWTC-3", "8177023")):
+        rc = t.rows[cat].record_citation
+        assert f"Zenodo {rec}" in rc and f"record_{rec}.json" in rc
+        assert "source's comoving frame" in rc
+        assert re.search(r"sha256 [0-9a-f]{64}\.", rc)
 
 
 def test_legacy_table_reproduces_the_pre_gw40_default_bitwise():

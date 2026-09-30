@@ -154,3 +154,50 @@ def test_cli_flag(tmp_path):
     _, attrs = _read(out)
     assert [int(x) for x in attrs["n_dropped_spin_above_ceiling_per_event"]] \
         == _independent_count(per, 0.9)
+
+
+def test_cut_with_z_max_records_raw_and_within_z_counts(tmp_path):
+    """With z_max in force the spin cut runs on the z <= z_max pool, so the
+    written drop count is the within-z count; the raw (pre-z_max) count is
+    written beside it and equals the independent whole-label count."""
+    from astropy.cosmology import FlatLambdaCDM
+    from gwcat.cosmology import z_of_dL
+    cosmo = FlatLambdaCDM(H0=_COSMO[0], Om0=_COSMO[1])
+    store, per = _store_with_spins_above(tmp_path, n_above=(7, 0))
+    with h5py.File(store, "r+") as f:
+        off = f["index/offsets"][:]
+        dL = f["samples/luminosity_distance"][:]
+        # Three of event 1's above-ceiling samples (rows 0..2) and three of
+        # event 2's ordinary samples sit far beyond any other sample.
+        far = 60000.0
+        dL[int(off[0]):int(off[0]) + 3] = far
+        dL[int(off[1]):int(off[1]) + 3] = far
+        f["samples/luminosity_distance"][...] = dL
+        dmax = max(float(np.max(dL[int(off[i]):int(off[i + 1])][3:]))
+                   for i in range(2))
+    z_hi = float(z_of_dL(np.array([dmax]), cosmo)[0])
+    z_far = float(z_of_dL(np.array([far]), cosmo)[0])
+    z_max = 0.5 * (z_hi + z_far)
+    assert z_hi < z_max < z_far
+    out = tmp_path / "pe_zmax.h5"
+    GWCatalog(store).export(str(out), format="gwcat2", spin_basis="chieff",
+                            nsamp=64, seed=0, cosmology=_COSMO, z_max=z_max,
+                            drop_spin_above_ceiling=True)
+    _, attrs = _read(out)
+    assert [int(x) for x in attrs["n_samples_cut_by_z_max"]] == [3, 3]
+    assert [int(x) for x in attrs["n_above_spin_ceiling_raw_per_event"]] \
+        == _independent_count(per, 0.9) == [7, 0]
+    assert [int(x) for x in
+            attrs["n_dropped_spin_above_ceiling_per_event"]] == [4, 0]
+    assert attrs["spin_ceiling_cut_order"] == "after_z_max_cut"
+
+    # Without z_max the two counts coincide.
+    out2 = tmp_path / "pe_noz.h5"
+    GWCatalog(store).export(str(out2), format="gwcat2", spin_basis="chieff",
+                            nsamp=64, seed=0, cosmology=_COSMO,
+                            drop_spin_above_ceiling=True)
+    _, a2 = _read(out2)
+    assert [int(x) for x in a2["n_above_spin_ceiling_raw_per_event"]] \
+        == [int(x) for x in a2["n_dropped_spin_above_ceiling_per_event"]] \
+        == [7, 0]
+    assert a2["spin_ceiling_cut_order"] == "no_z_max_cut"

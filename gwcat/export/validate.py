@@ -465,7 +465,8 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
         # (b) Basis-specific spin-amax handling.
         if reference_pair:
             _xcheck_reference_pair(_check, _fail, results, pe_attrs, sel_attrs,
-                                   spin_prior_allow_list=spin_prior_allow_list)
+                                   spin_prior_allow_list=spin_prior_allow_list,
+                                   strict=strict)
         elif pe_basis == "chieff":
             # Each side's ceiling is checked against ITS OWN provenance, and the
             # two are RECORDED rather than required to match -- see the
@@ -1036,7 +1037,7 @@ def load_spin_prior_allow_list(spec):
 
 
 def _xcheck_reference_spin_prior_source(_fail, results, pe_attrs,
-                                        allow_list):
+                                        allow_list, strict=False):
     """Refuse non-own-analytic spin priors in a reference pair (GW-40d).
 
     The reference basis divides the SAME U(0, a_ref) isotropic prior out of
@@ -1048,6 +1049,15 @@ def _xcheck_reference_spin_prior_source(_fail, results, pe_attrs,
     """
     kinds = pe_attrs.get("prior_source_kind_spin_per_event")
     names = pe_attrs.get("event_names")
+    if (kinds is None or names is None) and strict:
+        # Under --strict an older PE file must not bypass the refusal by
+        # simply not recording the provenance it would be refused on.
+        _fail("xcheck_reference_spin_prior_source_recorded",
+              "chieff_reference: the PE file records no "
+              "prior_source_kind_spin_per_event (written before GW-40c), so "
+              "whether each event's spin prior is its own declared "
+              "U(0, a_ref) cannot be checked, and a strict validation refuses "
+              "the pair. Re-export the PE file with this gwcat.")
     if kinds is None or names is None:
         warnings.warn(
             "chieff_reference: the PE file records no "
@@ -1099,7 +1109,7 @@ def _xcheck_reference_spin_prior_source(_fail, results, pe_attrs,
 
 
 def _xcheck_reference_pair(_check, _fail, results, pe_attrs, sel_attrs,
-                           spin_prior_allow_list=None):
+                           spin_prior_allow_list=None, strict=False):
     """A chieff PE file and a chieff_reference selection file: ONE ceiling.
 
     This is the cross-check that is stricter here than for chieff/chieff, and
@@ -1146,7 +1156,7 @@ def _xcheck_reference_pair(_check, _fail, results, pe_attrs, sel_attrs,
 
     # WHERE each event's ceiling came from, not only its value (GW-40d).
     _xcheck_reference_spin_prior_source(_fail, results, pe_attrs,
-                                        spin_prior_allow_list)
+                                        spin_prior_allow_list, strict=strict)
 
     from ..selection import PDRAW_STATE_CHIEFF_REFERENCE
     if sel_attrs.get("pdraw_state") != PDRAW_STATE_CHIEFF_REFERENCE:
