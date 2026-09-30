@@ -245,6 +245,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_pe.add_argument("--amax-fallback", type=float, default=0.99,
                       help="Fallback spin amax for events whose store meta "
                            "lacks spin_amax_1/2 (NaN); default 0.99.")
+    p_pe.add_argument("--drop-spin-above-ceiling", action="store_true",
+                      help="Before resampling, drop every raw sample with "
+                           "a_1 > amax_1 or a_2 > amax_2 at the event's "
+                           "resolved ceiling (GW-40c), so the PE spin support "
+                           "equals a chieff_reference selection's. Counts are "
+                           "written as n_dropped_spin_above_ceiling_per_event. "
+                           "Default: off (the historical draw).")
     p_pe.add_argument("--no-summary", action="store_true",
                       help="Skip writing validation_summary.json/.md "
                            "next to --out.")
@@ -514,6 +521,7 @@ def _cmd_export_pe(args) -> int:
         z_max=args.z_max,
         amax=args.amax,
         amax_fallback=args.amax_fallback,
+        drop_spin_above_ceiling=args.drop_spin_above_ceiling,
     )
     return 0
 

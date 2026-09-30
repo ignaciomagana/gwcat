@@ -203,7 +203,8 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                      chi_p_def_tol=1e-6,
                      max_out_of_support_frac=0.0,
                      allow_out_of_support=False,
-                     allow_projection_basis=False):
+                     allow_projection_basis=False,
+                     drop_spin_above_ceiling=False):
     """Build a PE :class:`ExportProduct` from a :class:`~gwcat.catalog.GWCatalog`.
 
     For ``spin_basis="chieff"`` this reproduces the legacy
@@ -249,6 +250,30 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     ``mass_prior_verified=False`` instead of being stamped as verified.  The
     file publishes ``q = m2det/m1det`` -- the coordinate the Jacobian belongs to
     -- with ``m2det`` kept as a derived, advisory column.
+
+    The spin-support cut (GW-40c)
+    -----------------------------
+    ``drop_spin_above_ceiling=True`` removes, BEFORE resampling, every raw
+    sample with ``a_1 > amax_1`` or ``a_2 > amax_2`` at the event's resolved
+    ceiling (the one the spin prior below is evaluated at).  The GWTC priors
+    declare 0.99 while 1,810 of 1.16M samples (71 of 282 events) exceed it; a
+    projection basis keeps the declared ceiling, so without the cut PE and a
+    ``chieff_reference`` selection (zero density above a_ref) have different
+    supports.  For a uniform-magnitude prior the cut is exact rejection to
+    ``U(0, amax)``.  The per-event counts are written as
+    ``n_dropped_spin_above_ceiling_per_event``; the draw then sees only the
+    kept samples, so ``replace="auto"`` resamples with replacement exactly when
+    fewer than ``nsamp`` remain.  Off by default: the default draw is unchanged.
+
+    Per-prior provenance (GW-40c)
+    -----------------------------
+    ``prior_source_{kind,label}_{mass,spin,dL}_per_event`` carry the store's
+    GW-40b provenance onto the file; ``chi_eff_amax_source_per_event`` is the
+    spin prior's source KIND when the ceiling came from the store (the
+    pre-GW-40 resolution -- analytic / fallback / caller -- is kept as
+    ``chi_eff_amax_resolution_per_event``); ``spin_prior_assumed_events`` lists
+    the events whose spin prior is ``assumed_default``.  An older store without
+    those columns yields ``"unrecorded"`` (and the legacy "analytic" source).
 
     Effective-selection provenance (GW-33)
     --------------------------------------
@@ -300,6 +325,12 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     forced_amax = parse_amax_option(amax, what="amax")
     # Every basis that divides out a SPIN prior needs a ceiling; nospin does not.
     need_amax = need_extras or spin_basis == "chieff"
+    if drop_spin_above_ceiling and not need_amax:
+        raise ValueError(
+            f"drop_spin_above_ceiling=True needs a spin prior ceiling to cut "
+            f"at, but spin_basis={spin_basis!r} divides out no spin prior. The "
+            f"cut exists to make the PE spin support equal the selection's "
+            f"reference support; drop the flag for this basis.")
 
     # chieff basis ALWAYS uses "include" semantics: the 1-D chi_eff prior is
     # multiplied into p_pe here (Mode A), matching the legacy default.  The
@@ -516,6 +547,70 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         samples_bound_events = []
         fallback_events, unrecognized_events, mismatch_events = [], [], []
 
+        def _declared_ceiling(e):
+            """``(amax_1, amax_2, used_fallback)`` BEFORE any samples_bound
+            widening: a forced numeric ``amax`` for every event, else this
+            event's stored ceilings, else ``amax_fallback``.  One function for
+            both the GW-40c spin cut (before the draw) and the prior (after), so
+            the cut and the density can never use different ceilings."""
+            if forced_amax is not None:
+                return float(forced_amax), float(forced_amax), False
+            a1 = (float(sel_amax1[e]) if sel_amax1 is not None
+                  else float("nan"))
+            a2 = (float(sel_amax2[e]) if sel_amax2 is not None
+                  else float("nan"))
+            fb = False
+            if not np.isfinite(a1):
+                a1, fb = float(amax_fallback), True
+            if not np.isfinite(a2):
+                a2, fb = float(amax_fallback), True
+            return a1, a2, fb
+
+    # ── Per-prior source provenance, per selected event (GW-40c) ─────────────
+    # A META read (no sample access), so the rng stream is untouched.  A store
+    # written before GW-40b has no prior_source_* columns: those events read
+    # "unrecorded" (or "assumed_default" where the legacy class column says so)
+    # rather than being silently promoted to a verified source.
+    def _meta_str_sel(name):
+        v = sub.meta.get(name)
+        if v is None:
+            return None
+        return [x.decode() if isinstance(x, (bytes, bytearray)) else str(x)
+                for x in np.asarray(v)[sel_idx]]
+
+    _legacy_kind_col = {"mass": "mass_prior_kind", "spin": "spin_prior_kind"}
+    sel_prior_kind, sel_prior_label = {}, {}
+    for _p in ("mass", "spin", "dL"):
+        kinds = _meta_str_sel(f"prior_source_kind_{_p}")
+        labels = _meta_str_sel(f"prior_source_label_{_p}")
+        if kinds is None or not any(kinds):
+            legacy = (_meta_str_sel(_legacy_kind_col[_p])
+                      if _p in _legacy_kind_col else
+                      _meta_str_sel("dL_prior_basis"))
+            kinds = ["assumed_default" if k == "assumed_default"
+                     else "release_reweighted" if k == "release_reweighted"
+                     else "unrecorded"
+                     for k in (legacy or [""] * sub.n_events)]
+            labels = [""] * sub.n_events
+        sel_prior_kind[_p] = [k or "unrecorded" for k in kinds]
+        sel_prior_label[_p] = labels or [""] * sub.n_events
+    spin_kind_recorded = _meta_str_sel("prior_source_kind_spin") is not None
+    kept_prior_kind = {p: [] for p in ("mass", "spin", "dL")}
+    kept_prior_label = {p: [] for p in ("mass", "spin", "dL")}
+    #: Raw samples removed by the GW-40c spin-support cut, per kept event.
+    n_dropped_spin = []
+    if drop_spin_above_ceiling:
+        avail_a1_cut = sub.param_available("a_1")
+        avail_a2_cut = sub.param_available("a_2")
+        no_spin = [str(sub.event_names[e]) for e in range(sub.n_events)
+                   if not (avail_a1_cut[e] and avail_a2_cut[e])]
+        if no_spin:
+            raise ValueError(
+                f"drop_spin_above_ceiling=True needs the a_1/a_2 sample columns "
+                f"to cut on, but {len(no_spin)} selected event(s) lack them: "
+                f"{no_spin[:10]}. Re-ingest with spin magnitudes, or exclude "
+                f"those events.")
+
     if need_extras:
         avail_a1 = sub.param_available("a_1")
         avail_a2 = sub.param_available("a_2")
@@ -578,6 +673,26 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             else:
                 idx_map = np.arange(n)
 
+            # ── The spin-support cut (GW-40c), BEFORE the draw ──────────────
+            # Reads the event's full a_1/a_2 (a sample read, but not an rng
+            # call, so with the flag off nothing here runs and the draw is the
+            # historical one bit for bit).
+            n_drop_e = 0
+            if drop_spin_above_ceiling:
+                c1, c2, _fb = _declared_ceiling(e)
+                ab = reader.read(e, ["a_1", "a_2"])
+                a1_all = np.asarray(ab["a_1"], dtype=float)[idx_map]
+                a2_all = np.asarray(ab["a_2"], dtype=float)[idx_map]
+                ok = (np.abs(a1_all) <= c1) & (np.abs(a2_all) <= c2)
+                n_drop_e = int(np.sum(~ok))
+                if not ok.any():
+                    raise ValueError(
+                        f"drop_spin_above_ceiling: every sample of event "
+                        f"{sub.event_names[e]} has a spin magnitude above its "
+                        f"ceiling ({c1:g}, {c2:g}); the event has no support "
+                        f"under its own spin prior.")
+                idx_map = idx_map[ok]
+
             n_kept = len(idx_map)
             rep = (n_kept < nsamp) if replace == "auto" else bool(replace)
             if n_kept < nsamp and not rep:
@@ -635,6 +750,10 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             kept.append(sub.event_names[e])
             kept_mass_kind.append(mass_kind_e)
             n_cut_by_z_max.append(n_cut_e)
+            n_dropped_spin.append(n_drop_e)
+            for _p in ("mass", "spin", "dL"):
+                kept_prior_kind[_p].append(sel_prior_kind[_p][e])
+                kept_prior_label[_p].append(sel_prior_label[_p][e])
             kept_H0.append(float(per_event_H0[e]))
             kept_Om0.append(float(per_event_Om0[e]))
             row = sel_rows[e]
@@ -652,22 +771,9 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                 # store for every event -- the caller has said which ceiling to use.
                 # Otherwise it comes from THIS event's prior provenance, and only a
                 # missing/NaN one falls back (recorded, and warned about below).
-                used_fallback = False
-                if forced_amax is not None:
-                    a1max = a2max = float(forced_amax)
-                else:
-                    a1max = (float(sel_amax1[e]) if sel_amax1 is not None
-                             else float("nan"))
-                    a2max = (float(sel_amax2[e]) if sel_amax2 is not None
-                             else float("nan"))
-                    if not np.isfinite(a1max):
-                        a1max = float(amax_fallback)
-                        used_fallback = True
-                    if not np.isfinite(a2max):
-                        a2max = float(amax_fallback)
-                        used_fallback = True
-                    if used_fallback:
-                        fallback_events.append(str(name))
+                a1max, a2max, used_fallback = _declared_ceiling(e)
+                if used_fallback:
+                    fallback_events.append(str(name))
 
                 # np.isclose, not exact float equality (GW-04): a single injected
                 # ceiling round-trips as 0.9980000000000001 vs 0.9979999999999999
@@ -969,8 +1075,19 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                 # declares none, "caller" = a numeric amax= overrode both).
                 "chi_eff_amax_1_per_event": amax1_arr,
                 "chi_eff_amax_2_per_event": amax2_arr,
-                "chi_eff_amax_source_per_event": np.array(amax_src1_list,
-                                                          dtype=_str),
+                # GW-40c: the SOURCE KIND of the ceiling -- where the spin
+                # prior it came from was declared (own_analytic /
+                # sibling_inherited / config_file_declared / assumed_default)
+                # -- whenever it came from the store; "caller"/"fallback" when
+                # it did not.  A pre-GW-40b store (no provenance columns)
+                # keeps the historical "analytic".  The historical resolution
+                # itself is kept as chi_eff_amax_resolution_per_event.
+                "chi_eff_amax_source_per_event": np.array(
+                    [(k if (r == "analytic" and spin_kind_recorded) else r)
+                     for r, k in zip(amax_src1_list,
+                                     kept_prior_kind["spin"])], dtype=_str),
+                "chi_eff_amax_resolution_per_event": np.array(
+                    amax_src1_list, dtype=_str),
                 "chi_eff_amax_mode": ("fixed" if forced_amax is not None
                                       else "per_event"),
                 "spin_amax_fallback": float(amax_fallback),
@@ -1178,7 +1295,24 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         "prior_reweight_ess_per_event": ess_per_event,
         "max_out_of_support_frac": float(max_out_of_support_frac),
         "out_of_support_allowed": bool(allow_out_of_support),
+        # ── The spin-support cut (GW-40c) ────────────────────────────────────
+        "spin_ceiling_cut_applied": bool(drop_spin_above_ceiling),
+        "n_dropped_spin_above_ceiling_per_event": np.asarray(
+            n_dropped_spin if drop_spin_above_ceiling else [0] * nobs,
+            dtype=np.int64),
+        # ── Per-prior source provenance (GW-40c) ─────────────────────────────
+        **{f"prior_source_kind_{p}_per_event": np.array(
+            kept_prior_kind[p], dtype=_str) for p in ("mass", "spin", "dL")},
+        **{f"prior_source_label_{p}_per_event": np.array(
+            kept_prior_label[p], dtype=_str) for p in ("mass", "spin", "dL")},
+        "spin_prior_assumed_events": np.array(
+            [str(n) for n, k in zip(kept, kept_prior_kind["spin"])
+             if k == "assumed_default"], dtype=_str),
+        "spin_prior_non_own_analytic_events": np.array(
+            [str(n) for n, k in zip(kept, kept_prior_kind["spin"])
+             if k != "own_analytic"], dtype=_str),
     }
+    attrs.update(_population_resolver_attrs(cat, kept))
     # ── The EFFECTIVE event selection (GW-33) ───────────────────────────────
     # The composed source_class_filter and cut estimator (GW-12: WHICH masses
     # the class threshold was applied to), every numeric cut as a number the
@@ -1240,10 +1374,70 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         "prior_reweight_ess_median": (float(np.median(ess_per_event))
                                       if ess_per_event.size else None),
         "chi_p_definition": str(chi_p_definition),
+        "spin_ceiling_cut_applied": bool(drop_spin_above_ceiling),
+        "n_dropped_spin_above_ceiling": int(sum(n_dropped_spin)),
+        "prior_source_kind_counts": {
+            p: {k: int(kept_prior_kind[p].count(k))
+                for k in sorted(set(kept_prior_kind[p]))}
+            for p in ("mass", "spin", "dL")},
+        "population_resolver": attrs.get("population_resolver", ""),
     })
 
     return ExportProduct(kind="pe", columns=columns, attrs=attrs,
                          spin_basis=spin_basis, summary=summary)
+
+
+#: The one resolver whose output is the bundled GWTC-5 BBH population.
+POPULATION_RESOLVER = ("gwcat.population_samples."
+                       "resolve_gwtc5_bbh_population_names")
+
+
+def _population_resolver_attrs(cat, kept):
+    """Whether the exported event set IS the bundled-population resolver's
+    output, with the resolver's inputs (GW-40c).
+
+    The resolver is re-run here on the store's names (a pure, local function of
+    the bundled lists -- no GWOSC); when its output equals the exported event
+    set, the file records the resolver's qualified name, the sha256 of every
+    bundled list it read and the resolved names' digest.  Otherwise (a subset,
+    a different population, a synthetic store) ``population_resolver`` is ""
+    and ``population_resolver_match`` False -- recorded, never guessed.
+    """
+    import hashlib
+    import json as _json
+    from .contract import event_list_digest as _digest
+    from ..bbh_allowed_names import _event_list_path
+
+    files = ("bbh_o1o2.txt", "bbh_o3a.txt", "bbh_o3b.txt", "bbh_o4a.txt",
+             "bbh_o4b.txt", "non_bbh_exclusions.txt", "provenance.yaml")
+    shas = {}
+    for fn in files:
+        try:
+            with open(_event_list_path(fn), "rb") as f:
+                shas[fn] = hashlib.sha256(f.read()).hexdigest()
+        except OSError:
+            shas[fn] = ""
+    match, resolved, aliases, err = False, [], {}, ""
+    try:
+        from ..population_samples import resolve_gwtc5_bbh_population_names
+        resolved, aliases = resolve_gwtc5_bbh_population_names(
+            [str(n) for n in cat.names])
+        match = sorted(resolved) == sorted(str(k) for k in kept)
+    except ValueError as exc:
+        err = str(exc)[:200]
+    inputs = {
+        "bundled_list_sha256": shas,
+        "allowed_names_digest": _digest(resolved) if resolved else "",
+        "n_resolved": len(resolved),
+        "n_aliases": len(aliases),
+        "aliases": {str(k): str(v) for k, v in sorted(aliases.items())},
+        "error": err,
+    }
+    return {
+        "population_resolver": POPULATION_RESOLVER if match else "",
+        "population_resolver_match": bool(match),
+        "population_resolver_inputs": _json.dumps(inputs, sort_keys=True),
+    }
 
 
 def _ss_meta(sub, row, field):
