@@ -209,7 +209,7 @@ def test_spin_prior_sibling_search(tmp_path, monkeypatch):
     analyses = {"C00:Mixed": mixed, "C00:IMRPhenomXPHM": sib}
     priors = _uniform_isotropic_priors("C00:IMRPhenomXPHM", amax=0.99)
     cat = _ingest_one(tmp_path, monkeypatch, analyses, priors=priors,
-                      name="GWTC-4_GW240101_000101_cosmo.h5")
+                      name="GWTC-4_GW240101_000101.hdf5")  # native O4 name (GW-40a)
     assert cat.meta["spin_prior_kind"][0] == "uniform_magnitude_isotropic"
     assert "C00:IMRPhenomXPHM" in cat.meta["spin_prior_source"][0]
 

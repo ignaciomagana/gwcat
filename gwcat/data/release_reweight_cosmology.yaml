@@ -1,0 +1,82 @@
+# Release-reweight cosmology table (GW-40a).
+#
+# WHAT THIS IS
+#   The GWTC-2.1 and GWTC-3 `*_cosmo.h5` PE releases carry posteriors that the
+#   LVK REWEIGHTED to a luminosity-distance prior uniform in comoving volume and
+#   source-frame time (bilby's UniformSourceFrame), while each file's
+#   `priors/analytic` group still records the original PowerLaw(alpha=2)
+#   SAMPLING prior.  The effective prior gwcat divides out of p_pe for those
+#   rows is therefore UniformSourceFrame at the cosmology the LVK reweighted
+#   with -- a cosmology the file itself does not declare anywhere reliable:
+#     * `priors/analytic/luminosity_distance` is the stale PowerLaw(2) and names
+#       no cosmology at all;
+#     * `meta_data/meta_data/cosmology` exists only on the C01:IMRPhenomXPHM /
+#       C01:SEOBNRv4PHM labels, is ABSENT on C01:Mixed (90 of 90 files), and
+#       contradicts the stored z(dL) for several GWTC-4.1/5 labels.
+#   gwcat therefore never reads `meta_data` for this decision.  This table is
+#   the single, explicit, cited authority, keyed by CATALOG (never by label
+#   prefix).  Its sha256 is recorded on every store row it resolves.
+#
+# ROW SCHEMA
+#   name     cosmology token recorded as dL_prior_cosmology_name
+#   H0, Om0  flat LambdaCDM parameters the density is evaluated at
+#   source   "documented"          -- the catalog paper states the value;
+#            "inferred_from_z(dL)" -- only the raw files' redshift(dL) columns
+#                                     support it;
+#            (the legacy table alone uses "legacy_gwcat_default")
+#   citation verbatim location of the statement the `source` rests on
+#   corroboration  independent evidence, stated with its current status
+#
+# Operator decision OD-2 (2026-09-30, BUILD_PLAN.md Section 10): LAL Planck15
+# (67.90, 0.3065) for both O1-O3 release-reweighted catalogs.
+#
+# Effect relative to the pre-GW-40 default (astropy Planck15, 67.74/0.3075):
+# ln p_dL changes by about -4e-4 to +2.9e-3 nat per sample, for the 69 O1-O3
+# population events only (BUILD_PLAN.md Section 2.6).
+#
+# The legacy (pre-GW-40) row set is bundled separately as
+# release_reweight_cosmology_legacy_astropy.yaml, for the R2 code-path
+# regression ONLY; it is not a production table.
+
+schema_version: "1.0"
+table_id: "release_reweight_cosmology/OD-2/2026-09-30"
+
+catalogs:
+  GWTC-2.1:
+    name: "Planck15_LAL"
+    H0: 67.90
+    Om0: 0.3065
+    source: "documented"
+    citation: >-
+      GWTC-2.1, LVK, arXiv:2108.01045v2, Sec. V ("Estimation of source
+      parameters"), subsec. C ("Priors"): "The prior on the luminosity distance
+      follows a distribution uniform in comoving volume, using a flat LambdaCDM
+      cosmology with Hubble constant H0 = 67.90 km s-1 Mpc-1 and matter density
+      Omega_m = 0.3065 [176]", with [176] = Planck Collaboration, "Planck 2015
+      results. XIII. Cosmological parameters".
+    corroboration: >-
+      inferred_from_z(dL): the raw C01:Mixed redshift(luminosity_distance)
+      columns of the GWTC-2.1 _cosmo files follow (67.90, 0.3065) to 3e-9..1e-8
+      against ~2e-3 for astropy Planck15 (BUILD_PLAN.md rev 2, finding 4 and
+      Section 2.6). That measurement is a revision-1 research trial; it counts
+      as evidence only once re-run into provenance/v2/research/ (gate G0).
+      The pesummary version that wrote each file is recorded per store row
+      (meta/release_pesummary_version), e.g. 0.13.3+4.gf4e1c37 for GW150914.
+  GWTC-3:
+    name: "Planck15_LAL"
+    H0: 67.90
+    Om0: 0.3065
+    source: "documented"
+    citation: >-
+      GWTC-3, LVK, arXiv:2111.03606v3, Appendix E ("Parameter-estimation
+      methods"): "Following GWTC-2 [3], we reweight posteriors to have a
+      luminosity-distance prior corresponding to a uniform merger rate in the
+      source's comoving frame for a Lambda-cold dark matter cosmology with
+      H0 = 67.9 km s-1 Mpc-1 and Omega_m = 0.3065 [663]", with [663] = Planck
+      Collaboration, "Planck 2015 results. XIII. Cosmological parameters".
+    corroboration: >-
+      inferred_from_z(dL): as for GWTC-2.1, the raw C01:Mixed redshift(dL)
+      columns follow (67.90, 0.3065) (BUILD_PLAN.md rev 2, Section 2.6; to be
+      re-run into provenance/v2/research/ under gate G0). The pesummary
+      version that wrote each file is recorded per store row
+      (meta/release_pesummary_version), e.g. 0.13.0 for GW200129.

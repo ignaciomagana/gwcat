@@ -1,0 +1,36 @@
+# LEGACY release-reweight cosmology table -- NOT A PRODUCTION TABLE.
+#
+# This reproduces exactly what gwcat did before GW-40a: every GWTC-2.1/GWTC-3
+# `_cosmo` row was evaluated at IngestConfig.o3_default_cosmo, i.e. astropy's
+# Planck15 (H0 = 67.74, Om0 = 0.3075).  Those values were a code default, not a
+# statement from any release; they do NOT match the documented LVK reweighting
+# cosmology (see release_reweight_cosmology.yaml).
+#
+# It exists for one purpose: the R2 code-path regression of BUILD_PLAN.md
+# Section 5 (C3), which must reproduce the pre-GW-40 p_pe bit for bit at the new
+# code pin.  Pass it explicitly:
+#     gwcat ingest ... --release-reweight-cosmology-table \
+#         <gwcat>/data/release_reweight_cosmology_legacy_astropy.yaml
+
+schema_version: "1.0"
+table_id: "release_reweight_cosmology/legacy-astropy-Planck15/pre-GW-40"
+
+catalogs:
+  GWTC-2.1:
+    name: "Planck15"
+    H0: 67.74
+    Om0: 0.3075
+    source: "legacy_gwcat_default"
+    citation: >-
+      gwcat <= 8f9e2f1 IngestConfig.o3_default_cosmo = astropy.cosmology.Planck15
+      (67.74, 0.3075); a code default, not a release statement.
+    corroboration: "none (contradicted by the raw z(dL) columns)"
+  GWTC-3:
+    name: "Planck15"
+    H0: 67.74
+    Om0: 0.3075
+    source: "legacy_gwcat_default"
+    citation: >-
+      gwcat <= 8f9e2f1 IngestConfig.o3_default_cosmo = astropy.cosmology.Planck15
+      (67.74, 0.3075); a code default, not a release statement.
+    corroboration: "none (contradicted by the raw z(dL) columns)"

@@ -70,6 +70,7 @@ include = ["gwcat*"]
 gwcat = [
     "data/event_lists/*.txt",
     "data/event_lists/*.yaml",
+    "data/*.yaml",
     "manifests/releases/*.yaml",
     "manifests/injections/*.yaml",
 ]

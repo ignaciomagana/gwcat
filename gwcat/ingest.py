@@ -49,6 +49,8 @@ from .source_class import (normalize_source_class, classify_by_mass,
                           DEFAULT_NSBH_MASS_THRESHOLD)
 from .spin import chi_p_from_components
 from .event_metadata import PASTRO_KEYS, resolve_pastro, resolve_pastro_column
+from .release_cosmology import (load_release_cosmology_table,
+                                ReleaseReweightCosmologyError)
 
 # --------------------------------------------------------------------------
 # Parameter sets
@@ -123,6 +125,15 @@ META_STR_FIELDS = [
     # token ("Planck15_LAL" vs "Planck15" -- matched exactly, never by substring).
     "dL_prior_kind", "dL_prior_sampling_kind", "dL_prior_cosmology_name",
     "dL_prior_release_flavour", "dL_prior_basis",
+    # WHERE the (H0, Om0) the distance prior is evaluated at came from (GW-40a):
+    # "analytic_declared" (the prior repr names it), "catalog_default" (nothing
+    # declared, the per-CATALOG IngestConfig default), or -- for a reweighted
+    # `_cosmo` release -- the release-reweight table row's own `source`
+    # ("documented" / "inferred_from_z(dL)"), with that table's sha256 beside
+    # it.  The pesummary version that wrote the file (its `version/pesummary`)
+    # is recorded too: it is what the table's citations are checked against.
+    "dL_prior_cosmology_source", "dL_prior_cosmology_table_sha256",
+    "release_pesummary_version",
     # where f_ref came from, e.g. "meta_data[C01:IMRPhenomXPHM]:sibling" (GW-07).
     # Spins, tilts and chi_p are all defined AT f_ref, so a borrowed value has to
     # say whose it is.  mass_prior_source likewise records which analysis's
@@ -192,8 +203,17 @@ class IngestConfig:
     nsbh_mass_threshold: float = DEFAULT_NSBH_MASS_THRESHOLD
     o4_waveform_priority: list = field(default_factory=lambda: list(O4_WAVEFORM_PRIORITY))
     o3_waveform_priority: list = field(default_factory=lambda: list(O3_WAVEFORM_PRIORITY))
-    o3_default_cosmo: tuple = (PLANCK15.H0.value, PLANCK15.Om0)   # used when no analytic
+    #: Cosmology for an O1-O3 row whose distance prior declares none and which
+    #: is NOT a reweighted `_cosmo` release (those use the release-reweight
+    #: table below).  Chosen by CATALOG since GW-40a, not by label prefix.
+    o3_default_cosmo: tuple = (PLANCK15.H0.value, PLANCK15.Om0)
     o4_fallback_cosmo: tuple = (O4_FALLBACK.H0.value, O4_FALLBACK.Om0)
+    #: The release-reweight cosmology table (GW-40a): path to a YAML table, or
+    #: None for the bundled production table
+    #: (``gwcat/data/release_reweight_cosmology.yaml``, operator decision OD-2).
+    #: Every `_cosmo` (release_reweighted) row takes its (H0, Om0) from the row
+    #: for its CATALOG; a catalog the table lacks is refused, never defaulted.
+    release_reweight_cosmology_table: Optional[str] = None
     validate_prior: bool = True
     compression: str = "gzip"
     #: Which UniformSourceFrame implementation evaluates p_dL_pe (GW-01).
@@ -241,6 +261,54 @@ def detect_catalog(path: str) -> str:
 
 def _prefix_for(analyses) -> str:
     return "C01" if any(a.startswith("C01") for a in analyses) else "C00"
+
+
+#: Catalog -> observing-run era, for choosing IngestConfig defaults (GW-40a).
+#: The defaults used to be keyed by the label PREFIX (``C01`` = O3), which is
+#: wrong for GWTC-5's GW240925_005809: an O4 event released with ``C01`` labels
+#: was ranked with the O3 waveform list and would have been given the O3
+#: default cosmology.
+CATALOG_ERA = {
+    "GWTC-1": "O1-O3", "GWTC-2": "O1-O3", "GWTC-2.1": "O1-O3",
+    "GWTC-3": "O1-O3",
+    "GWTC-4": "O4", "GWTC-4.1": "O4", "GWTC-5": "O4",
+}
+
+
+def _catalog_era(catalog, prefix: str = "") -> str:
+    """``"O1-O3"`` or ``"O4"`` for ``catalog``; the prefix only as a last resort.
+
+    An unrecognised catalog (a file name gwcat cannot place) keeps the historical
+    prefix rule, so nothing that used to ingest changes behaviour.
+    """
+    era = CATALOG_ERA.get(str(catalog) if catalog is not None else "")
+    if era is not None:
+        return era
+    return "O1-O3" if str(prefix).startswith("C01") else "O4"
+
+
+def _default_cosmo_for(catalog, analysis: str, cfg: "IngestConfig"):
+    """The per-catalog fallback cosmology for a prior that declares none."""
+    era = _catalog_era(catalog, _label_parts(analysis)[0])
+    return cfg.o3_default_cosmo if era == "O1-O3" else cfg.o4_fallback_cosmo
+
+
+def _priority_for(catalog, prefix: str, cfg: "IngestConfig"):
+    """The waveform-priority list for a file, chosen by CATALOG (GW-40a).
+
+    The era's list is re-expressed with the FILE's own prefix, so an O4 file
+    released with ``C01`` labels ranks ``C01:IMRPhenomXPHM-SpinTaylor`` where a
+    ``C00`` file ranks ``C00:IMRPhenomXPHM-SpinTaylor``.
+    """
+    era = _catalog_era(catalog, prefix)
+    base = cfg.o3_waveform_priority if era == "O1-O3" else cfg.o4_waveform_priority
+    out = []
+    for want in base:
+        _p, b, v = _label_parts(want)
+        lab = f"{prefix}:{b}" + (f":{v}" if v else "")
+        if lab not in out:
+            out.append(lab)
+    return out
 
 
 def event_name_from_path(path: str) -> str:
@@ -343,7 +411,7 @@ def _priority_matches(analyses, priority):
     return out
 
 
-def select_analysis(analyses, prefix: str, cfg: IngestConfig):
+def select_analysis(analyses, prefix: str, cfg: IngestConfig, catalog=None):
     """Pick the single preferred analysis label for one PE file.
 
     This is the historical one-sample-set-per-event heuristic (kept as the
@@ -353,22 +421,29 @@ def select_analysis(analyses, prefix: str, cfg: IngestConfig):
     carrying the file's prefix.  :func:`select_analyses` builds on it to support
     ingesting several sample sets per event.
     """
-    ordered = rank_analyses(analyses, prefix, cfg)
+    ordered = rank_analyses(analyses, prefix, cfg, catalog=catalog)
     if not ordered:
         raise RuntimeError(f"No usable analysis among {analyses}")
     return ordered[0]
 
 
-def rank_analyses(analyses, prefix: str, cfg: IngestConfig):
+def rank_analyses(analyses, prefix: str, cfg: IngestConfig, catalog=None):
     """Order the prefix's analyses by ingest preference (most preferred first).
 
     ``{prefix}:Mixed`` (if present) ranks first, then the configured
     waveform-priority list in order, then any remaining prefixed analyses in
     their original order.  The index into this list becomes each sample set's
     ``priority_rank``; the first element is what :func:`select_analysis` returns.
+
+    ``catalog`` (GW-40a) chooses the waveform-priority list by observing-run
+    era; without it the historical prefix rule applies.
     """
     prefixed = [a for a in analyses if _label_parts(a)[0] == prefix]
-    priority = cfg.o3_waveform_priority if prefix == "C01" else cfg.o4_waveform_priority
+    if catalog is None:
+        priority = (cfg.o3_waveform_priority if prefix == "C01"
+                    else cfg.o4_waveform_priority)
+    else:
+        priority = _priority_for(catalog, prefix, cfg)
     ordered = []
     # Every Mixed set first, best spin variant first (GW-07).
     for a in find_mixed_analyses(prefixed, prefix):
@@ -385,7 +460,7 @@ def rank_analyses(analyses, prefix: str, cfg: IngestConfig):
 
 
 def select_analyses(analyses, prefix: str, cfg: IngestConfig,
-                    sample_sets="preferred"):
+                    sample_sets="preferred", catalog=None):
     """Return the list of analysis labels to ingest for one PE file.
 
     Parameters
@@ -402,9 +477,9 @@ def select_analyses(analyses, prefix: str, cfg: IngestConfig,
     """
     if isinstance(sample_sets, str):
         if sample_sets == "preferred":
-            return [select_analysis(analyses, prefix, cfg)]
+            return [select_analysis(analyses, prefix, cfg, catalog=catalog)]
         if sample_sets == "all":
-            ordered = rank_analyses(analyses, prefix, cfg)
+            ordered = rank_analyses(analyses, prefix, cfg, catalog=catalog)
             if not ordered:
                 raise RuntimeError(f"No usable analysis among {analyses}")
             return ordered
@@ -695,6 +770,16 @@ class ResolvedDLPrior:
     cosmology_name: str = ""
     flavour: str = "native"
     basis: str = ""
+    #: Where (H0, Om0) came from (GW-40a): "analytic_declared",
+    #: "catalog_default", or a release-reweight table row's `source`.
+    cosmology_source: str = ""
+    #: sha256 of the release-reweight table used ("" when none was consulted).
+    cosmology_table_sha256: str = ""
+    #: Per-prior provenance (GW-40b): the label whose analytic group supplied
+    #: the prior ("" when none did) and its kind -- "own_analytic",
+    #: "sibling_inherited", "assumed_default" or "release_reweighted".
+    prior_source_label: str = ""
+    prior_source_kind: str = ""
 
     @property
     def cosmology(self):
@@ -702,19 +787,27 @@ class ResolvedDLPrior:
 
 
 def resolve_dL_prior(catalog, analysis, analyses, priors, dL_samples,
-                     cfg: IngestConfig, flavour: str = "native"):
+                     cfg: IngestConfig, flavour: str = "native",
+                     release_table=None):
     """Resolve the effective distance prior for one ingested analysis.
 
-    Strategy for the bounds/cosmology is unchanged: read analytic from the chosen
+    Strategy for the bounds is unchanged: read analytic from the chosen
     analysis; if absent (e.g. the GWTC-2.1/3 ``Mixed`` sets, whose analytic AND
     prior-sample groups are both empty), search sibling analyses; if still absent
-    use the catalog default cosmology with bounds from the dL sample range.
+    use the bounds of the dL sample range.
 
-    What GW-02 adds is the distribution CLASS, which was never parsed, and an
-    exact cosmology-token mapping.  The effective class is the declared one
-    EXCEPT for a reweighted ``_cosmo`` release, where it is UniformSourceFrame by
-    release convention -- recorded as ``basis="release_reweighted"`` so the
-    assumption is visible in the store rather than implicit in a filename.
+    GW-02 added the distribution CLASS and an exact cosmology-token mapping.  The
+    effective class is the declared one EXCEPT for a reweighted ``_cosmo``
+    release, where it is UniformSourceFrame by release convention -- recorded as
+    ``basis="release_reweighted"``.
+
+    GW-40a: the COSMOLOGY of a ``release_reweighted`` row comes from the explicit
+    per-catalog release-reweight table (``release_table``, or the one
+    ``cfg.release_reweight_cosmology_table`` names, or the bundled production
+    table), NEVER from the file's ``meta_data`` and never from a label-prefix
+    default; a catalog the table lacks raises
+    :class:`~gwcat.release_cosmology.ReleaseReweightCosmologyError`.  Any other
+    row whose prior declares no cosmology takes the per-CATALOG default.
 
     Returns a :class:`ResolvedDLPrior`.
     """
@@ -732,39 +825,76 @@ def resolve_dL_prior(catalog, analysis, analyses, priors, dL_samples,
 
     parsed = _try(analysis)
     src = f"analytic[{analysis}]"
+    src_label = analysis if parsed is not None else ""
     if parsed is None:
         for an in analyses:  # sibling search (handles O4 Mixed w/o priors)
             parsed = _try(an)
             if parsed is not None:
                 src = f"analytic[{an}]"
+                src_label = an
                 break
 
     dmin = float(np.min(dL_samples))
     dmax = float(np.max(dL_samples))
-    default_cosmo = (cfg.o3_default_cosmo if analysis.startswith("C01")
-                     else cfg.o4_fallback_cosmo)
+    default_cosmo = _default_cosmo_for(catalog, analysis, cfg)
+
+    reweighted = flavour == "cosmo"
+    table_row, table_sha = None, ""
+    if reweighted:
+        table = release_table or load_release_cosmology_table(
+            cfg.release_reweight_cosmology_table)
+        table_row = table.lookup(catalog)
+        table_sha = table.sha256
 
     if parsed is None:
         # No analytic anywhere (9 of the GWTC-2.1 rows).  A cosmo-flavour
         # release is still reweighted, so UniformSourceFrame remains the
         # effective prior; there is simply no declaration to compare it to.
+        if reweighted:
+            return ResolvedDLPrior(
+                kind="UniformSourceFrame", H0=table_row.H0, Om0=table_row.Om0,
+                dmin=dmin, dmax=dmax,
+                source="default(no_analytic)",
+                sampling_kind="", cosmology_name=table_row.name,
+                flavour=flavour, basis="release_reweighted",
+                cosmology_source=table_row.source,
+                cosmology_table_sha256=table_sha,
+                prior_source_label="", prior_source_kind="release_reweighted")
         H0, Om0 = default_cosmo
         return ResolvedDLPrior(
             kind="UniformSourceFrame", H0=H0, Om0=Om0, dmin=dmin, dmax=dmax,
             source="default(no_analytic)", sampling_kind="",
-            flavour=flavour,
-            basis=("release_reweighted" if flavour == "cosmo"
-                   else "assumed_default"))
+            flavour=flavour, basis="assumed_default",
+            cosmology_source="catalog_default",
+            prior_source_label="", prior_source_kind="assumed_default")
 
     if parsed.dmin is not None:
         dmin = parsed.dmin
     if parsed.dmax is not None:
         dmax = parsed.dmax
 
+    sampling_kind = parsed.kind or ""
+    if reweighted:
+        # Reweighted release: the declared class is the sampling prior only,
+        # and the cosmology is the table's -- whatever the stale repr says.
+        H0, Om0 = table_row.H0, table_row.Om0
+        src += f"+release_table[{catalog}]"
+        return ResolvedDLPrior(
+            kind="UniformSourceFrame", H0=H0, Om0=Om0, dmin=dmin, dmax=dmax,
+            source=src, alpha=None, sampling_kind=sampling_kind,
+            sampling_alpha=parsed.alpha, cosmology_name=table_row.name,
+            flavour=flavour, basis="release_reweighted",
+            cosmology_source=table_row.source,
+            cosmology_table_sha256=table_sha,
+            prior_source_label=src_label,
+            prior_source_kind="release_reweighted")
+
     H0, Om0 = parsed.H0, parsed.Om0
+    cosmology_source = "analytic_declared"
     if H0 is None:
         H0, Om0 = default_cosmo
         src += "+default_cosmo"
+        cosmology_source = "catalog_default"
         if parsed.cosmology_recognized is False:
             warnings.warn(
                 f"{analysis}: analytic distance prior names an unrecognised "
@@ -774,30 +904,32 @@ def resolve_dL_prior(catalog, analysis, analyses, priors, dL_samples,
                 f"check against the file's own prior samples is the only thing "
                 f"standing between this guess and a wrong p_dL_pe.")
 
-    sampling_kind = parsed.kind or ""
-    if flavour == "cosmo":
-        # Reweighted release: the declared class is the sampling prior only.
-        kind, alpha, basis = "UniformSourceFrame", None, "release_reweighted"
-    else:
-        kind = sampling_kind or "UniformSourceFrame"
-        alpha = parsed.alpha
-        basis = "analytic_declared" if sampling_kind else "assumed_default"
-        if kind not in DL_PRIOR_KINDS:
-            raise DistancePriorKindError(
-                f"{analysis}: analytic distance prior declares class "
-                f"{kind!r}, which gwcat cannot evaluate (known: "
-                f"{list(DL_PRIOR_KINDS)}). Refusing to substitute "
-                f"UniformSourceFrame -- that substitution is the GW-02 defect.")
-        if kind in DL_PRIOR_NEEDS_ALPHA and alpha is None:
-            raise ValueError(
-                f"{analysis}: analytic distance prior declares {kind} but no "
-                f"alpha could be parsed from {parsed.raw[:120]!r}.")
+    kind = sampling_kind or "UniformSourceFrame"
+    alpha = parsed.alpha
+    basis = "analytic_declared" if sampling_kind else "assumed_default"
+    if kind not in DL_PRIOR_KINDS:
+        raise DistancePriorKindError(
+            f"{analysis}: analytic distance prior declares class "
+            f"{kind!r}, which gwcat cannot evaluate (known: "
+            f"{list(DL_PRIOR_KINDS)}). Refusing to substitute "
+            f"UniformSourceFrame -- that substitution is the GW-02 defect.")
+    if kind in DL_PRIOR_NEEDS_ALPHA and alpha is None:
+        raise ValueError(
+            f"{analysis}: analytic distance prior declares {kind} but no "
+            f"alpha could be parsed from {parsed.raw[:120]!r}.")
 
+    if not sampling_kind:
+        psk = "assumed_default"
+    elif src_label == analysis:
+        psk = "own_analytic"
+    else:
+        psk = "sibling_inherited"
     return ResolvedDLPrior(
         kind=kind, H0=H0, Om0=Om0, dmin=dmin, dmax=dmax, source=src,
         alpha=alpha, sampling_kind=sampling_kind,
         sampling_alpha=parsed.alpha, cosmology_name=parsed.cosmology_name,
-        flavour=flavour, basis=basis)
+        flavour=flavour, basis=basis, cosmology_source=cosmology_source,
+        prior_source_label=src_label, prior_source_kind=psk)
 
 
 # --------------------------------------------------------------------------
@@ -1240,8 +1372,8 @@ def inspect(path: str, cfg: Optional[IngestConfig] = None):
     catalog = detect_catalog(path)
     data, samples_dict, analyses, priors = _read_event_pesummary(path)
     prefix = _prefix_for(analyses)
-    analysis = select_analysis(analyses, prefix, cfg)
-    ranked = rank_analyses(analyses, prefix, cfg)
+    analysis = select_analysis(analyses, prefix, cfg, catalog=catalog)
+    ranked = rank_analyses(analyses, prefix, cfg, catalog=catalog)
     s = samples_dict[analysis]
     dL = np.asarray(s["luminosity_distance"], float)
     flavour = detect_release_flavour(path)
@@ -1280,6 +1412,8 @@ def inspect(path: str, cfg: Optional[IngestConfig] = None):
                      "sampling_kind": res.sampling_kind,
                      "sampling_alpha": res.sampling_alpha,
                      "cosmology_name": res.cosmology_name,
+                     "cosmology_source": res.cosmology_source,
+                     "cosmology_table_sha256": res.cosmology_table_sha256,
                      "release_flavour": res.flavour, "basis": res.basis,
                      # GW-01: which implementation evaluates p_dL_pe, and how
                      # many samples the recorded bounds fail to cover.
@@ -1399,6 +1533,26 @@ def _resolve_event_table(event_table, cache_dir=None, offline=None):
         return {}
 
 
+def _release_pesummary_version(path) -> str:
+    """The pesummary version that wrote a PE release file ("" if unreadable).
+
+    Read from the file's own ``version/pesummary`` dataset with h5py (a few
+    bytes; the samples are not touched).  It is provenance for the
+    release-reweight table's citations, never an input to any density.
+    """
+    try:
+        with h5py.File(path, "r") as f:
+            if "version" in f and "pesummary" in f["version"]:
+                v = np.asarray(f["version/pesummary"][()]).ravel()
+                if v.size:
+                    x = v[0]
+                    return (x.decode() if isinstance(x, (bytes, bytearray))
+                            else str(x))
+    except (OSError, KeyError, TypeError, ValueError):
+        pass
+    return ""
+
+
 def build_store(paths, out_path, params=None, extra_params=None,
                 cfg: Optional[IngestConfig] = None, event_table=None,
                 sample_sets="preferred", file_provenance: Optional[dict] = None,
@@ -1456,6 +1610,10 @@ def build_store(paths, out_path, params=None, extra_params=None,
     event_table = _resolve_event_table(event_table, cache_dir=cache_dir,
                                        offline=offline)
     file_provenance = file_provenance or {}
+    # The release-reweight cosmology table (GW-40a) is loaded on first use by
+    # resolve_dL_prior (cached per path+sha256), so a build with no `_cosmo`
+    # file never reads it and every row records the sha256 of the bytes used.
+    release_table = None
 
     records = []   # per row: (name, n_samples, {param: array}) -- union schema
     offsets = [0]
@@ -1467,15 +1625,18 @@ def build_store(paths, out_path, params=None, extra_params=None,
         data, samples_dict, analyses, priors = _read_event_pesummary(path)
         prefix = _prefix_for(analyses)
         # Sample-set contract (PR 6): one or more analyses per file, each a row.
-        preferred_label = select_analysis(analyses, prefix, cfg)
-        ranked = rank_analyses(analyses, prefix, cfg)
-        labels = select_analyses(analyses, prefix, cfg, sample_sets)
+        # Defaults keyed by CATALOG, not label prefix (GW-40a).
+        preferred_label = select_analysis(analyses, prefix, cfg,
+                                          catalog=catalog)
+        ranked = rank_analyses(analyses, prefix, cfg, catalog=catalog)
+        labels = select_analyses(analyses, prefix, cfg, sample_sets,
+                                 catalog=catalog)
         # Which labels the waveform-priority list actually matched, so
         # selection_reason can distinguish a priority hit from the last resort.
         priority_labels = _priority_matches(
             [a for a in analyses if _label_parts(a)[0] == prefix],
-            cfg.o3_waveform_priority if prefix == "C01"
-            else cfg.o4_waveform_priority)
+            _priority_for(catalog, prefix, cfg))
+        pesummary_version = _release_pesummary_version(path)
         et = event_table.get(name, {})
         prov = file_provenance.get(os.path.basename(path), {})
         # Whether this release's posteriors are still on the prior its
@@ -1494,7 +1655,8 @@ def build_store(paths, out_path, params=None, extra_params=None,
 
             dL = np.asarray(s["luminosity_distance"], float)
             res = resolve_dL_prior(catalog, analysis, analyses, priors, dL, cfg,
-                                   flavour=flavour)
+                                   flavour=flavour,
+                                   release_table=release_table)
             H0, Om0, dmin, dmax, src = (res.H0, res.Om0, res.dmin, res.dmax,
                                         res.source)
             ks_val = None
@@ -1685,6 +1847,10 @@ def build_store(paths, out_path, params=None, extra_params=None,
             meta["dL_prior_cosmology_name"].append(res.cosmology_name)
             meta["dL_prior_release_flavour"].append(res.flavour)
             meta["dL_prior_basis"].append(res.basis)
+            meta["dL_prior_cosmology_source"].append(res.cosmology_source)
+            meta["dL_prior_cosmology_table_sha256"].append(
+                res.cosmology_table_sha256)
+            meta["release_pesummary_version"].append(pesummary_version)
             meta["dL_prior_alpha"].append(
                 np.nan if res.alpha is None else float(res.alpha))
             meta["dL_prior_sampling_alpha"].append(
@@ -1955,12 +2121,23 @@ SCHEMA_VERSION_SAMPLESETS = "1.2"
 #: which is why GW-16 re-ingests rather than back-filling.
 SCHEMA_VERSION_DL_PRIOR = "1.3"
 
+#: 1.4 adds the release-reweight cosmology provenance (GW-40a:
+#: dL_prior_cosmology_source / _table_sha256, release_pesummary_version) and
+#: the per-prior source provenance (GW-40b: prior_source_{label,kind}_{mass,
+#: spin,dL}).  Every one is read-optional, so 1.1-1.3 stores still load; they
+#: simply carry no record of where each prior came from.
+SCHEMA_VERSION_PRIOR_PROVENANCE = "1.4"
+
 #: The meta columns whose presence marks a 1.3 store.
 _SCHEMA_13_FIELDS = ("dL_prior_kind", "dL_prior_sampling_kind",
                      "dL_prior_cosmology_name", "dL_prior_release_flavour",
                      "dL_prior_basis", "dL_prior_impl", "dL_prior_alpha",
                      "dL_prior_sampling_alpha", "dL_prior_ks",
                      "n_samples_outside_dL_prior_bounds")
+
+
+#: The meta columns whose (non-empty) presence marks a 1.4 store.
+_SCHEMA_14_FIELDS = ("dL_prior_cosmology_source",)
 
 
 def _store_schema_version(meta):
@@ -1972,6 +2149,10 @@ def _store_schema_version(meta):
     # 1.3 when the distance-prior provenance is present (GW-01/GW-02), else 1.2
     # when sample-set columns are, else 1.1.
     has_dL_prov = any(k in meta and len(meta[k]) for k in _SCHEMA_13_FIELDS)
+    has_prior_prov = any(k in meta and len(meta[k]) and any(meta[k])
+                         for k in _SCHEMA_14_FIELDS)
+    if has_prior_prov:
+        return SCHEMA_VERSION_PRIOR_PROVENANCE
     if has_dL_prov:
         return SCHEMA_VERSION_DL_PRIOR
     if has_sampleset:
@@ -2505,6 +2686,15 @@ def _cli(
     ap.add_argument("--no-summary", action="store_true",
                     help="Skip writing validation_summary.json/.md next to "
                          "--out.")
+    ap.add_argument("--release-reweight-cosmology-table", default=None,
+                    metavar="YAML",
+                    help="Release-reweight cosmology table for the GWTC-2.1/3 "
+                         "_cosmo releases (GW-40a). Default: the bundled "
+                         "gwcat/data/release_reweight_cosmology.yaml (LAL "
+                         "Planck15 67.90/0.3065, cited). The pre-GW-40 "
+                         "astropy behaviour is bundled as "
+                         "release_reweight_cosmology_legacy_astropy.yaml, for "
+                         "regressions only.")
     a = ap.parse_args(argv)
     if a.inspect:
         inspect(a.inspect)
@@ -2528,8 +2718,10 @@ def _cli(
     offline = True if a.offline else None
     write_summary = default_write_summary and not a.no_summary
 
+    cfg = IngestConfig(
+        release_reweight_cosmology_table=a.release_reweight_cosmology_table)
     build_store(paths, a.out, event_table=event_table, sample_sets=sample_sets,
-                cache_dir=a.cache_dir, offline=offline,
+                cache_dir=a.cache_dir, offline=offline, cfg=cfg,
                 file_provenance=file_provenance, write_summary=write_summary)
 
 

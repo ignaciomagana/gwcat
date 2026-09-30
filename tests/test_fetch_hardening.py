@@ -90,7 +90,7 @@ def _one_event_store(tmp_path, monkeypatch, event_name, seed=0):
     rng = np.random.default_rng(seed)
     analyses = {"C00:Mixed": _rand_analysis(rng)}
     monkeypatch.setattr(ing, "_read_event_pesummary", _fake_reader_factory(analyses))
-    path = tmp_path / f"GWTC-5_{event_name}_cosmo.h5"
+    path = tmp_path / f"GWTC-5_{event_name}.hdf5"  # native, as real O4 files (GW-40a)
     path.write_bytes(b"")
     return path
 
