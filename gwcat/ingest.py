@@ -188,6 +188,22 @@ SPIN_STR_FIELDS = ["spin_prior_kind", "spin_prior_source", "derived_params"]
 META_FLOAT_FIELDS += SPIN_FLOAT_FIELDS
 META_STR_FIELDS += SPIN_STR_FIELDS
 
+# ── Per-prior source provenance (GW-40b) ─────────────────────────────────────
+# For each of the mass, spin and distance priors: WHICH label's declaration the
+# resolved prior came from (``prior_source_label_*``, "" when none) and WHAT
+# KIND of source that is (``prior_source_kind_*``), one of
+# :data:`PRIOR_SOURCE_KINDS`.  The legacy ``*_prior_kind`` columns say what the
+# prior IS; these say where gwcat got it -- a combined ``Mixed`` set has no
+# priors group of its own, so its "analytic" prior is a sibling's, and until
+# now nothing on the row said so.
+PRIOR_SOURCE_KINDS = ("own_analytic", "sibling_inherited",
+                      "config_file_declared", "assumed_default",
+                      "release_reweighted", "constituent_mixture")
+PRIOR_SOURCE_STR_FIELDS = [f"prior_source_{w}_{p}"
+                           for p in ("mass", "spin", "dL")
+                           for w in ("label", "kind")]
+META_STR_FIELDS += PRIOR_SOURCE_STR_FIELDS
+
 # Default waveform priority when no Mixed set exists (O4b/GWTC-5 events).
 O4_WAVEFORM_PRIORITY = [
     "C00:IMRPhenomXPHM-SpinTaylor", "C00:SEOBNRv5PHM",
@@ -1001,9 +1017,19 @@ class ResolvedMassPrior:
     q_min: Optional[float] = None
     q_max: Optional[float] = None
     source: str = ""
+    #: GW-40b: whose analytic group it came from, and the provenance kind
+    #: ("own_analytic" / "sibling_inherited" / "assumed_default").
+    source_label: str = ""
+    source_kind: str = ""
+    #: Parsed ``Constraint`` bounds on the detector-frame component masses
+    #: (GW-40f; None when the group records none).
+    m1_min: Optional[float] = None
+    m1_max: Optional[float] = None
+    m2_min: Optional[float] = None
+    m2_max: Optional[float] = None
 
 
-def resolve_mass_prior(analysis, analyses, priors):
+def resolve_mass_prior(analysis, analyses, priors, *, siblings=True):
     """Parse the analytic mass prior for one ingested analysis.
 
     Searches the chosen analysis then its siblings, exactly as the distance and
@@ -1012,6 +1038,9 @@ def resolve_mass_prior(analysis, analyses, priors):
     -- a *constraint*, not a prior -- with the actual prior on
     ``(chirp_mass, mass_ratio)``, so the class of that pair is what decides
     whether the mass Jacobian is right.
+
+    ``siblings=False`` (GW-40f) restricts the search to ``analysis`` itself, for
+    a constituent whose OWN prior is required.
     """
     analytic = priors.get("analytic", {}) if isinstance(priors, dict) else {}
 
@@ -1020,10 +1049,15 @@ def resolve_mass_prior(analysis, analyses, priors):
         if not node:
             return None
         got = {k: node[k] for k in ("chirp_mass", "mass_ratio") if k in node}
-        return got if len(got) == 2 else None
+        if len(got) != 2:
+            return None
+        for k in ("mass_1", "mass_2"):
+            if k in node:
+                got[k] = node[k]
+        return got
 
     found, src_an = _find(analysis), analysis
-    if found is None:
+    if found is None and siblings:
         for an in analyses:
             found = _find(an)
             if found is not None:
@@ -1031,28 +1065,151 @@ def resolve_mass_prior(analysis, analyses, priors):
                 break
     if found is None:
         return ResolvedMassPrior(kind="assumed_default",
-                                 source="default(no_analytic_prior)")
+                                 source="default(no_analytic_prior)",
+                                 source_label="",
+                                 source_kind="assumed_default")
+    src_kind = "own_analytic" if src_an == analysis else "sibling_inherited"
+
+    def _constraint(key):
+        got = _parse_analytic_spin(found[key]) if key in found else None
+        if got is None or got[0] != "Constraint":
+            return None, None
+        return (None if got[1] is None else float(got[1]),
+                None if got[2] is None else float(got[2]))
 
     mc = _parse_analytic_spin(found["chirp_mass"])
     q = _parse_analytic_spin(found["mass_ratio"])
     kinds = (mc[0] if mc else None, q[0] if q else None)
     if kinds == _UNIFORM_IN_COMPONENTS:
+        m1lo, m1hi = _constraint("mass_1")
+        m2lo, m2hi = _constraint("mass_2")
         return ResolvedMassPrior(
             kind="uniform_detector_frame",
             chirp_min=None if mc[1] is None else float(mc[1]),
             chirp_max=None if mc[2] is None else float(mc[2]),
             q_min=None if q[1] is None else float(q[1]),
             q_max=None if q[2] is None else float(q[2]),
-            source=f"analytic[{src_an}]")
-    raw = "; ".join(f"{k}={str(found[k])[:80]!r}" for k in sorted(found))
+            source=f"analytic[{src_an}]",
+            source_label=src_an, source_kind=src_kind,
+            m1_min=m1lo, m1_max=m1hi, m2_min=m2lo, m2_max=m2hi)
+    raw = "; ".join(f"{k}={str(found[k])[:80]!r}" for k in sorted(found)
+                    if k in ("chirp_mass", "mass_ratio"))
     return ResolvedMassPrior(
         kind="unrecognized",
-        source=f"analytic[{src_an}]:unrecognized({raw})")
+        source=f"analytic[{src_an}]:unrecognized({raw})",
+        source_label=src_an, source_kind=src_kind)
+
+
+@dataclass(frozen=True)
+class ResolvedSpinPrior:
+    """The spin-magnitude prior plus where it came from (GW-40b).
+
+    ``kind``/``source`` are the legacy PR-2 fields (what the prior IS).
+    ``source_label``/``source_kind`` say WHOSE declaration it is: the ingested
+    label's own analytic group ("own_analytic"), a sibling's
+    ("sibling_inherited"), a LALInference ``config_file/engine/a_spin{1,2}-max``
+    pair ("config_file_declared"), or nothing ("assumed_default").
+    """
+    amax_1: float
+    amax_2: float
+    kind: str
+    source: str
+    source_label: str = ""
+    source_kind: str = ""
+
+
+#: The LALInference ``[engine]`` keys that declare the spin-magnitude ceilings.
+_CONFIG_SPIN_KEYS = ("a_spin1-max", "a_spin2-max")
+
+
+def _config_float(val):
+    """A finite float from a config value (str / bytes / 1-element array)."""
+    if isinstance(val, (bytes, bytearray)):
+        val = val.decode()
+    if isinstance(val, (list, tuple, np.ndarray)):
+        arr = np.asarray(val).ravel()
+        if arr.size != 1:
+            return None
+        val = arr[0]
+        if isinstance(val, (bytes, bytearray)):
+            val = val.decode()
+    try:
+        v = float(str(val).strip().strip("'\""))
+    except (TypeError, ValueError):
+        return None
+    return v if np.isfinite(v) else None
+
+
+def _spin_amax_from_config(data, analysis, analyses=()):
+    """Spin ceilings DECLARED by a LALInference config (GW-40b).
+
+    The six GWTC-2.1 LALInference events (GW170608_020116, GW190707_093326,
+    GW190720_000836, GW190725_174728, GW190728_064510, GW190924_021846) carry no
+    analytic priors group anywhere, so their spin prior used to be recorded as
+    ``assumed_default``.  Their constituent runs' ``config_file/engine`` DOES
+    declare ``a_spin1-max = a_spin2-max = 0.99``.
+
+    Search order: ``analysis``'s own config, else every sibling that declares
+    the keys.  Returns ``(amax_1, amax_2, labels, consistent)`` or ``None``;
+    ``consistent`` is False when siblings declare different ceilings (then the
+    caller must NOT upgrade the provenance -- a Mixed set built from runs with
+    different ceilings is not a single declared prior).
+    """
+    cfg_all = getattr(data, "config", None)
+    if not isinstance(cfg_all, dict):
+        return None
+
+    def _one(an):
+        try:
+            cfgd = cfg_all.get(an)
+        except Exception:
+            return None
+        if not isinstance(cfgd, dict):
+            return None
+        eng = cfgd.get("engine")
+        if not isinstance(eng, dict):
+            return None
+        vals = [_config_float(eng.get(k)) for k in _CONFIG_SPIN_KEYS]
+        if any(v is None for v in vals):
+            return None
+        return float(vals[0]), float(vals[1])
+
+    own = _one(analysis)
+    if own is not None:
+        return own[0], own[1], [analysis], True
+    hits = [(an, _one(an)) for an in analyses if an != analysis]
+    hits = [(an, v) for an, v in hits if v is not None]
+    if not hits:
+        return None
+    vals = {v for _an, v in hits}
+    a1, a2 = hits[0][1]
+    return a1, a2, [an for an, _v in hits], len(vals) == 1
 
 
 def resolve_spin_prior(analysis, analyses, priors, a1_samples, a2_samples,
                        fallback_amax=0.99, allow_variant_mismatch=False):
     """Return ``(amax_1, amax_2, kind, source)`` for the spin-magnitude prior.
+
+    The legacy 4-tuple view of :func:`resolve_spin_prior_full`; see there.
+    """
+    r = resolve_spin_prior_full(
+        analysis, analyses, priors, a1_samples, a2_samples,
+        fallback_amax=fallback_amax,
+        allow_variant_mismatch=allow_variant_mismatch)
+    return r.amax_1, r.amax_2, r.kind, r.source
+
+
+def resolve_spin_prior_full(analysis, analyses, priors, a1_samples,
+                            a2_samples, fallback_amax=0.99,
+                            allow_variant_mismatch=False, data=None):
+    """Resolve the spin-magnitude prior AND its provenance (GW-40b).
+
+    ``data`` (the pesummary read object) enables the LALInference config path:
+    when no analytic spin prior exists for the label or any sibling, a
+    ``config_file/engine/a_spin{1,2}-max`` declaration upgrades the provenance
+    from ``assumed_default`` to ``config_file_declared`` and supplies the
+    ceilings.  The legacy ``kind`` stays ``"assumed_default"`` there: the config
+    declares the bounds, not the distribution class.
 
     Mirrors :func:`resolve_dL_prior`: read the analytic spin priors of the
     chosen ``analysis``; if that analysis carries no priors group (e.g. an O4
@@ -1085,6 +1242,7 @@ def resolve_spin_prior(analysis, analyses, priors, a1_samples, a2_samples,
 
     found = _find(analysis)
     src_an = analysis
+    src_label = analysis if found is not None else ""
     if found is None:
         # Sibling search (an O4 Mixed set carries no priors group of its own).
         #
@@ -1107,6 +1265,7 @@ def resolve_spin_prior(analysis, analyses, priors, a1_samples, a2_samples,
         for an in same:
             found = _find(an)
             src_an = an
+            src_label = an
             break
 
         if found is None and other:
@@ -1129,6 +1288,7 @@ def resolve_spin_prior(analysis, analyses, priors, a1_samples, a2_samples,
                     raise SpinPriorMismatchError(msg)
                 warnings.warn(msg)
                 found, src_an = _find(other[0]), f"{other[0]}:variant_mismatch"
+                src_label = other[0]
             else:
                 # The ingested label declares NO spin restriction (a plain
                 # `C01:Mixed`), while every candidate sibling does.  Which one
@@ -1154,6 +1314,7 @@ def resolve_spin_prior(analysis, analyses, priors, a1_samples, a2_samples,
                     f"variant_assumed in spin_prior_source.")
                 found = _find(best)
                 src_an = f"{best}:variant_assumed({tok})"
+                src_label = best
 
     def _is_uniform_zero(p):
         return (p is not None and p[0] == "Uniform"
@@ -1163,10 +1324,30 @@ def resolve_spin_prior(analysis, analyses, priors, a1_samples, a2_samples,
     def _is_sine_or_absent(p):
         return p is None or p[0] == "Sine"
 
+    src_kind = ("" if found is None else
+                "own_analytic" if src_label == analysis else "sibling_inherited")
     if found is None:
         amax_1 = amax_2 = float(fallback_amax)
         kind = "assumed_default"
         source = "default(no_analytic_prior)"
+        src_label, src_kind = "", "assumed_default"
+        declared = (_spin_amax_from_config(data, analysis, analyses)
+                    if data is not None else None)
+        if declared is not None:
+            c1, c2, clabels, consistent = declared
+            where = ",".join(clabels)
+            if consistent:
+                amax_1, amax_2 = c1, c2
+                source = (f"config_file[{where}]/engine/"
+                          f"a_spin1-max={c1:g},a_spin2-max={c2:g}")
+                src_label, src_kind = where, "config_file_declared"
+            else:
+                warnings.warn(
+                    f"{analysis}: the constituent configs {clabels} declare "
+                    f"DIFFERENT spin ceilings (engine/a_spin1-max, "
+                    f"a_spin2-max); not treating them as one declared prior. "
+                    f"Spin provenance stays assumed_default.")
+                source += f" | config_file_inconsistent({where})"
     else:
         p_a1 = _parse_analytic_spin(found["a_1"]) if "a_1" in found else None
         p_a2 = _parse_analytic_spin(found["a_2"]) if "a_2" in found else None
@@ -1200,7 +1381,9 @@ def resolve_spin_prior(analysis, analyses, priors, a1_samples, a2_samples,
                       f"({'; '.join(viol)}); prior bounds may be wrong")
         source += " | sample_exceeds_amax(" + "; ".join(viol) + ")"
 
-    return amax_1, amax_2, kind, source
+    return ResolvedSpinPrior(amax_1=amax_1, amax_2=amax_2, kind=kind,
+                             source=source, source_label=src_label,
+                             source_kind=src_kind)
 
 
 #: The single chi_p implementation (GW-08).  ``ingest`` previously carried a
@@ -1388,9 +1571,12 @@ def inspect(path: str, cfg: Optional[IngestConfig] = None):
     f_ref, f_ref_source = _read_f_ref(data, analysis, analyses)
     a1_samp = np.asarray(s["a_1"], float) if "a_1" in s else None
     a2_samp = np.asarray(s["a_2"], float) if "a_2" in s else None
-    spin_amax_1, spin_amax_2, spin_kind, spin_src = resolve_spin_prior(
+    sp = resolve_spin_prior_full(
         analysis, analyses, priors, a1_samp, a2_samp,
-        allow_variant_mismatch=cfg.spin_prior_allow_variant_mismatch)
+        allow_variant_mismatch=cfg.spin_prior_allow_variant_mismatch,
+        data=data)
+    spin_amax_1, spin_amax_2, spin_kind, spin_src = (sp.amax_1, sp.amax_2,
+                                                     sp.kind, sp.source)
     mass_prior = resolve_mass_prior(analysis, analyses, priors)
     avail = [p for p in DEFAULT_PARAMS if p in s]
     missing = [p for p in WAVEFORM_PARAMS if p not in s]
@@ -1422,7 +1608,16 @@ def inspect(path: str, cfg: Optional[IngestConfig] = None):
                      "frac_outside_bounds": dL_info["frac_outside_bounds"]},
         # Spin-magnitude prior resolution (PR 2).
         "spin_prior": {"amax_1": spin_amax_1, "amax_2": spin_amax_2,
-                       "kind": spin_kind, "source": spin_src},
+                       "kind": spin_kind, "source": spin_src,
+                       "source_label": sp.source_label,
+                       "source_kind": sp.source_kind},
+        # Per-prior source provenance (GW-40b).
+        "prior_source": {
+            "mass": {"label": mass_prior.source_label,
+                     "kind": mass_prior.source_kind},
+            "spin": {"label": sp.source_label, "kind": sp.source_kind},
+            "dL": {"label": res.prior_source_label,
+                   "kind": res.prior_source_kind}},
         # Parsed mass prior (GW-07): "uniform_detector_frame" is the only value
         # that justifies the export's |dm2det/dq| = m1det Jacobian.
         "mass_prior": {"kind": mass_prior.kind, "source": mass_prior.source,
@@ -1739,9 +1934,12 @@ def build_store(paths, out_path, params=None, extra_params=None,
             # Spin-magnitude prior resolution (PR 2), mirroring resolve_dL_prior.
             a1_samp = np.asarray(s["a_1"], float) if "a_1" in s else None
             a2_samp = np.asarray(s["a_2"], float) if "a_2" in s else None
-            spin_amax_1, spin_amax_2, spin_kind, spin_src = resolve_spin_prior(
+            sp = resolve_spin_prior_full(
                 analysis, analyses, priors, a1_samp, a2_samp,
-                allow_variant_mismatch=cfg.spin_prior_allow_variant_mismatch)
+                allow_variant_mismatch=cfg.spin_prior_allow_variant_mismatch,
+                data=data)
+            spin_amax_1, spin_amax_2, spin_kind, spin_src = (
+                sp.amax_1, sp.amax_2, sp.kind, sp.source)
             records.append((name, n, rec))
 
             # metadata
@@ -1807,6 +2005,13 @@ def build_store(paths, out_path, params=None, extra_params=None,
                     f"|dm2det/dq| = m1det Jacobian that assumes it is.")
             meta["mass_prior_kind"].append(mp.kind)
             meta["mass_prior_source"].append(mp.source)
+            # ── Per-prior source provenance (GW-40b) ────────────────────────
+            meta["prior_source_label_mass"].append(mp.source_label)
+            meta["prior_source_kind_mass"].append(mp.source_kind)
+            meta["prior_source_label_spin"].append(sp.source_label)
+            meta["prior_source_kind_spin"].append(sp.source_kind)
+            meta["prior_source_label_dL"].append(res.prior_source_label)
+            meta["prior_source_kind_dL"].append(res.prior_source_kind)
             meta["mass_prior_chirp_min"].append(
                 np.nan if mp.chirp_min is None else mp.chirp_min)
             meta["mass_prior_chirp_max"].append(
@@ -2137,7 +2342,8 @@ _SCHEMA_13_FIELDS = ("dL_prior_kind", "dL_prior_sampling_kind",
 
 
 #: The meta columns whose (non-empty) presence marks a 1.4 store.
-_SCHEMA_14_FIELDS = ("dL_prior_cosmology_source",)
+_SCHEMA_14_FIELDS = ("dL_prior_cosmology_source", "prior_source_kind_spin",
+                     "prior_source_kind_mass", "prior_source_kind_dL")
 
 
 def _store_schema_version(meta):
