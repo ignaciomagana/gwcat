@@ -256,6 +256,37 @@ gwcat validate --strict pe.h5 sel.h5 --spin-prior-allow-list allow.txt
 * **`--constituent-mixture-prior`** (ingest; only for policies that use
   `C00:Mixed`): the equal-weight mixture of the constituents' own priors, with
   the mixing fractions verified row by row.
+* **Exact priors (GW-40i).** Both analytic factors of `p_pe` and of a
+  chieff-type `pdraw` are evaluated exactly, not interpolated:
+  * the isotropic uniform-magnitude `p_iso(chi_eff | q, amax)` by the
+    closed-form convolution of `gwcat.chi_eff_exact` (non-cancelling split at
+    the two log singularities, `Li2` via `scipy.special.spence`, graded
+    Gauss-Legendre at the support edge, double-double geometry): <= 3.1e-14
+    relative against an independent mpmath quadrature on 5,365 points spanning
+    q = 1e-8 ... 1, chi_eff = 0, every kink and |chi_eff| -> amax; ~3 s for
+    3.6M rows.  The legacy 200 x 2000 bilinear table (`ChiEffPrior`) was up to
+    ~1e-2 off in ln p (4.2e-3 relative on the 259-event PE);
+  * the `UniformSourceFrame` / `UniformComovingVolume` distance prior at the
+    row's resolved cosmology, normalised over the declared `[dmin, dmax]`, from
+    Gauss-Legendre cosmology integrals and a Newton `z(dL)` (no table):
+    <= 1.4e-15 relative against mpmath.  The legacy bilby object interpolates a
+    1000-point grid (ln-shape error up to 3.4e-3 on the 259-event PE).
+
+  Products record `chi_eff_prior_impl` (`exact` / `grid`) with
+  `chi_eff_prior_method`, and `dL_prior_impl` per store row (PE attr
+  `dL_prior_impl_per_event`); `gwcat validate` refuses a PE/selection pair
+  whose `chi_eff_prior_impl` differs.  **`--legacy-grid-priors`** (on `ingest`,
+  `export pe`, `export selection`, `export-darksirens`, `selection`) restores
+  the pre-GW-40i interpolated evaluations bit for bit, for regressions against
+  older products only; in Python, `with gwcat.spin.chi_eff_prior_impl("grid"):`
+  and `IngestConfig(dL_prior_impl="auto")`.  A legacy regression needs the
+  flag on BOTH the ingest and the export: an exact store exported with the
+  flag (or a legacy store exported without it) is a *mixed* product, which the
+  PE builder warns about and `gwcat validate --strict` refuses (as it refuses a
+  pair where only one file records `chi_eff_prior_impl`).
+  **`gwcat validate --require-exact-priors`** refuses anything but an exact
+  product: every `dL_prior_impl_per_event` `exact`/`analytic`, and
+  `chi_eff_prior_impl == "exact"` on each side that carries a chi_eff factor.
 
 ### Validation summaries
 
@@ -831,8 +862,9 @@ them.
   store's PE spin-prior metadata (`spin_amax_1`/`spin_amax_2`), falling back to
   `--amax-fallback` (default `0.99`) with a warning for older stores; the
   resolved values are recorded in `spin_amax_1_per_event`/`spin_amax_2_per_event`.
-- **`chieff`** — the 1-D isotropic `chi_eff` analytic prior (`gwcat.spin`) at
-  `--amax` (default `0.99`), applied exactly as in `to_darksirens`.
+- **`chieff`** — the 1-D isotropic `chi_eff` analytic prior (`gwcat.spin`,
+  evaluated exactly since GW-40i) at `--amax` (default `auto`), applied exactly
+  as in `to_darksirens`.
 - **`chieff_chip`** — the joint `(chi_eff, chi_p)` analytic prior at the event's
   `amax₁`; a per-event `amax₁ ≠ amax₂` warns and uses `amax₁`
   (`spin_amax_mismatch_events`).
@@ -1001,7 +1033,7 @@ density it is has to be recorded rather than assumed. Schema 1.3 stores:
 | `dL_prior_release_flavour` | `cosmo` / `nocosmo` / `native` |
 | `dL_prior_basis` | why the effective class was chosen: `analytic_declared`, `release_reweighted`, `assumed_default` |
 | `dL_prior_ks` | KS of the **declared** class against the file's own prior samples |
-| `dL_prior_impl` | which implementation evaluated it: `bilby`, `astropy` or `analytic` |
+| `dL_prior_impl` | which implementation evaluated it: `exact` (default since GW-40i), the legacy `bilby` / `astropy`, or `analytic` (closed-form power law) |
 | `n_samples_outside_dL_prior_bounds` | samples outside the recorded `[dL_prior_min, dL_prior_max]` |
 
 Two things this makes explicit that used to be implicit:
@@ -1061,6 +1093,8 @@ is wrong. `IngestConfig(prior_ks_fatal=True)` makes that a hard error.
 - `o4_waveform_priority`: fallback order when a GWTC-5 event has no `C00:Mixed`.
 - `o3_default_cosmo`: assumed for GWTC-2.1 (no analytic prior); KS-validated.
 - `nsbh_mass_threshold`: source-frame mass cut for BBH/NSBH/BNS classification.
+- `dL_prior_impl`: `exact` (default, GW-40i); `auto` / `bilby` / `astropy` are
+  the legacy interpolated distance priors (`ingest --legacy-grid-priors`).
 
 ## Known limitations
 

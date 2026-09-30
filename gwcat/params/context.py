@@ -41,6 +41,12 @@ class PEContext:
     dL_prior_kind: str = ""
     dL_prior_alpha: Optional[float] = None
     dL_prior_bounds: tuple = ()
+    #: Which implementation evaluated this event's distance prior at ingest
+    #: (the store's per-row ``dL_prior_impl``: "exact", "analytic", or the
+    #: legacy "bilby"/"astropy").  Empty means "unknown" and gets the default
+    #: exact evaluation; a block that re-evaluates the prior uses THIS, so it
+    #: reproduces the store under --legacy-grid-priors too (GW-40i).
+    dL_prior_impl: str = ""
     cosmology: Any = None
     #: Parsed mass-prior class; the m1det Jacobian is valid only for
     #: "uniform_detector_frame" (GW-07).

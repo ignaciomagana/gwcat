@@ -262,3 +262,40 @@ def format_diff(diff) -> str:
     if not diff:
         return "(no field-level differences)"
     return "; ".join(f"{k}: PE={a!r} vs selection={b!r}" for k, a, b in diff)
+
+
+# ---------------------------------------------------------------------------
+# Prior-implementation families (GW-40i)
+# ---------------------------------------------------------------------------
+#: ``dL_prior_impl`` values that evaluate the declared analytic distance prior
+#: to rounding: the exact UniformSourceFrame/UniformComovingVolume density, and
+#: the closed-form classes (``"analytic"``), which have no implementation choice.
+DL_PRIOR_IMPLS_EXACT = ("exact", "analytic")
+#: The pre-GW-40i interpolated UniformSourceFrame implementations.
+DL_PRIOR_IMPLS_LEGACY = ("bilby", "astropy")
+
+
+def _impl_str(x) -> str:
+    if isinstance(x, (bytes, bytearray)):
+        x = x.decode()
+    return "" if x is None else str(x)
+
+
+def mixed_prior_impl_events(chi_eff_impl, dL_impls, names) -> list:
+    """Events whose ``p_dL_pe`` implementation is of the OTHER family than the
+    product's chi_eff implementation.
+
+    ``chi_eff_impl == "exact"`` flags events whose distance prior was evaluated
+    by a legacy interpolation (``"bilby"``/``"astropy"``); ``"grid"`` flags
+    events evaluated ``"exact"``.  ``"analytic"`` rows (a closed-form class,
+    identical in both families) and ``""`` (unrecorded) are never flagged.
+    """
+    chi = _impl_str(chi_eff_impl)
+    if chi == "exact":
+        other = DL_PRIOR_IMPLS_LEGACY
+    elif chi == "grid":
+        other = ("exact",)
+    else:
+        return []
+    return [str(_impl_str(n)) for n, d in zip(names, dL_impls)
+            if _impl_str(d) in other]

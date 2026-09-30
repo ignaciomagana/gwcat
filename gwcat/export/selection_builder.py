@@ -1320,6 +1320,16 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             spin_basis == "component" or spin_basis in _REFERENCE_BASES),
     })
 
+    # WHICH chi_eff density every chi_eff factor of this pdraw is (GW-40i):
+    # the exact closed form by default, the legacy interpolated table only
+    # when the caller scoped it (CLI --legacy-grid-priors).  The PE side
+    # records the same pair and the validator refuses a pair that differs.
+    if spin_basis in ("chieff", "chieff_reference", "chieff_chip"):
+        from ..spin import CHI_EFF_PRIOR_METHODS, current_chi_eff_prior_impl
+        _chi_impl = current_chi_eff_prior_impl()
+        attrs["chi_eff_prior_impl"] = _chi_impl
+        attrs["chi_eff_prior_method"] = CHI_EFF_PRIOR_METHODS[_chi_impl]
+
     # Basis-specific spin-prior contract attrs (mirror the v1 / PE naming).
     if spin_basis == "chieff":
         attrs["spin_prior_mode"] = "include"

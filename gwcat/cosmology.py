@@ -6,10 +6,10 @@ elsewhere (exclusively in GWCatalog.to_darksirens).
 
 The cosmo files (GWTC-2.1/3 *cosmo.h5 and the O4 combined files) use a
 luminosity-distance prior that is uniform in comoving volume and source-frame
-time -- i.e. bilby's UniformSourceFrame. We reproduce *that exact object* when
-bilby is available, so the prior we divide out is identical to the one the LVK
-PE used. A self-contained astropy fallback is provided for environments without
-bilby; it implements the same density up to normalisation.
+time -- i.e. bilby's UniformSourceFrame. Since GW-40i gwcat evaluates THAT
+DENSITY exactly (``impl="exact"``, below) rather than bilby's interpolated
+object of it; the legacy bilby object and a self-contained astropy fallback
+remain selectable for regressions against older products.
 
 Note on normalisation: the darksirens loader normalises p_pe per event, so any
 per-event-constant factor (including the prior's normalisation over [dmin,dmax])
@@ -20,22 +20,40 @@ Note on bounds (GW-01): the recorded [dmin, dmax] frequently come from a
 *sibling* analysis's analytic prior (see ingest.resolve_dL_prior), so posterior
 samples of the ingested analysis legitimately fall outside them.  Zeroing the
 density there would hand those samples ``p_dL_pe = 0`` -> ``p_pe = 0``, which
-darksirens turns into a ``-inf`` log-weight that still counts in ``n``.  Since
-the normalisation cancels anyway, the density is evaluated over a range widened
-to cover every finite sample instead; the recorded bounds are kept for
-provenance and the count of samples outside them is reported so the mismatch is
-visible rather than silently destructive.
+darksirens turns into a ``-inf`` log-weight that still counts in ``n``.  The
+density is therefore evaluated everywhere, never truncated: the exact
+implementation normalises over the recorded bounds and evaluates the same
+formula outside them, and the legacy (interpolated) ones widen their evaluation
+range to cover every finite sample (the normalisation cancels anyway).  The
+recorded bounds are kept for provenance and the count of samples outside them
+is reported so the mismatch is visible rather than silently destructive.
 
-Note on implementation choice: bilby and the astropy fallback do NOT agree to
-machine precision (they differ by ~3% at the low-distance end, and by far more
-below ~10 Mpc, where bilby's own interpolant -- built across the recorded
-[dmin, dmax] -- is coarse while the fallback is refined there, see
-``_usf_z_grid``), and that difference does not cancel in the per-event
-normalisation.  Which one produced a
-given ``p_dL_pe`` is therefore part of the provenance, returned as
-``info["impl"]`` and stored per row as ``dL_prior_impl``.  There is no silent
-fallback: only a missing bilby install falls back to astropy, and any other
-failure propagates.
+Note on implementation choice (GW-40i): the default is ``impl="exact"``, which
+evaluates the UniformSourceFrame / UniformComovingVolume density from accurate
+cosmology integrals -- the comoving distance by composite Gauss-Legendre
+quadrature of ``1/E(z)`` (no table), ``z(dL)`` by Newton iteration to machine
+precision, and the normalisation over the DECLARED ``[dmin, dmax]`` by
+composite Gauss-Legendre quadrature in ``z`` -- to <= 1.4e-15 relative against
+an independent mpmath evaluation (``tests/fixtures/usf_mpmath_reference.json``:
+three flat cosmologies including LAL Planck15, five bound pairs from 1 to
+50000 Mpc, inside and outside the bounds); ~2 s per 1e6 samples.  It is
+evaluated everywhere and never widened (see GW-01
+above: the declared normalisation is kept, and samples outside the bounds get
+the same untruncated formula).
+
+The two older implementations are LEGACY, kept only to reproduce products built
+before GW-40i: ``"bilby"`` (bilby's own object, which interpolates its density
+from a 1000-point grid across ``[dmin, dmax]`` -- up to 3.4e-3 off in ln-shape
+against the exact density) and ``"astropy"`` (a 4000-point interpolated
+fallback).  ``impl="auto"`` is the pre-GW-40i default and means "bilby, else
+astropy".  bilby and the astropy fallback do NOT agree to machine precision
+(they differ by ~3% at the low-distance end, and by far more below ~10 Mpc,
+where bilby's own interpolant is coarse while the fallback is refined there, see
+``_usf_z_grid``), and neither difference cancels in the per-event
+normalisation.  Which one produced a given ``p_dL_pe`` is therefore part of the
+provenance, returned as ``info["impl"]`` and stored per row as
+``dL_prior_impl``.  There is no silent fallback: only a missing bilby install
+turns ``"auto"`` into astropy, and any other failure propagates.
 """
 from __future__ import annotations
 
@@ -129,27 +147,32 @@ def z_of_dL(dL_mpc, cosmology: FlatLambdaCDM, zmax: float = 10.0, n: int = 4000)
     return np.interp(dL, dl, z)
 
 
-#: Implementations of the UniformSourceFrame density, in preference order.
-USF_IMPLS = ("bilby", "astropy")
+#: Implementations of the UniformSourceFrame density.  ``"exact"`` (GW-40i) is
+#: the default; ``"bilby"`` and ``"astropy"`` are the legacy interpolated ones.
+USF_IMPLS = ("exact", "bilby", "astropy")
+
+#: The default implementation of every public entry point (GW-40i).
+USF_IMPL_DEFAULT = "exact"
 
 
 class DistancePriorImplError(RuntimeError):
     """The requested distance-prior implementation is unavailable."""
 
 
-def resolve_usf_impl(impl: str = "auto") -> str:
+def resolve_usf_impl(impl: str = USF_IMPL_DEFAULT) -> str:
     """Resolve ``impl`` to a concrete implementation name.
 
-    ``"auto"`` prefers bilby and falls back to astropy **only** when bilby is
-    not importable.  ``"bilby"`` raises :class:`DistancePriorImplError` when
-    bilby is missing rather than silently degrading to a density that differs
-    by a few percent.
+    ``"exact"`` (the default) and ``"astropy"`` need nothing optional.  The
+    LEGACY ``"auto"`` prefers bilby and falls back to astropy **only** when
+    bilby is not importable.  ``"bilby"`` raises :class:`DistancePriorImplError`
+    when bilby is missing rather than silently degrading to a density that
+    differs by a few percent.
     """
     if impl not in ("auto",) + USF_IMPLS:
         raise ValueError(
             f"impl must be 'auto' or one of {USF_IMPLS}; got {impl!r}")
-    if impl == "astropy":
-        return "astropy"
+    if impl in ("exact", "astropy"):
+        return impl
     try:
         importlib.import_module("bilby.gw.prior")
     except ImportError as exc:
@@ -166,24 +189,29 @@ def resolve_usf_impl(impl: str = "auto") -> str:
 
 def uniform_source_frame_prob(dL_mpc, cosmology: FlatLambdaCDM,
                               dmin: float, dmax: float, *,
-                              impl: str = "auto", return_info: bool = False,
+                              impl: str = USF_IMPL_DEFAULT,
+                              return_info: bool = False,
                               time_dilation: bool = True):
     """p(dL) for a UniformSourceFrame prior, evaluated everywhere. dL in Mpc.
 
     ``time_dilation=False`` gives UniformComovingVolume instead (same shape
     without the ``1/(1+z)`` source-frame-time factor).
 
-    The density is **not** truncated at ``[dmin, dmax]``: when finite samples
-    fall outside the recorded bounds, the evaluation range is widened to cover
-    them (which only changes the per-event-constant normalisation, see the
-    module docstring).  ``dmin``/``dmax`` are still used to count and report the
-    mismatch.
+    The density is **not** truncated at ``[dmin, dmax]``.  With ``impl="exact"``
+    it is normalised over exactly the declared ``[dmin, dmax]`` and the same
+    formula is evaluated outside it.  The legacy implementations interpolate a
+    density that is only defined on their evaluation range, so for them, when
+    finite samples fall outside the recorded bounds, the range is widened to
+    cover them (which only changes the per-event-constant normalisation, see
+    the module docstring).  ``dmin``/``dmax`` are always used to count and
+    report the mismatch.
 
     Parameters
     ----------
-    impl : {"auto", "bilby", "astropy"}
-        Which implementation to use.  ``"auto"`` prefers bilby, falling back to
-        astropy only when bilby is not installed.
+    impl : {"exact", "auto", "bilby", "astropy"}
+        Which implementation to use (default ``"exact"``, GW-40i).  The legacy
+        ``"auto"`` prefers bilby, falling back to astropy only when bilby is not
+        installed.
     return_info : bool
         When True, return ``(p, info)`` where ``info`` records the
         implementation actually used, the widened evaluation range, and how many
@@ -198,8 +226,9 @@ def uniform_source_frame_prob(dL_mpc, cosmology: FlatLambdaCDM,
     n_above = int(np.sum(finite > dmax))
     n_outside = n_below + n_above
 
+    impl_used = resolve_usf_impl(impl)
     eval_min, eval_max = dmin, dmax
-    if n_outside:
+    if n_outside and impl_used != "exact":
         # Widen just enough to cover every finite sample, with a small pad so
         # no sample sits exactly on an implementation's support boundary.
         lo = min(dmin, float(finite.min()))
@@ -210,8 +239,10 @@ def uniform_source_frame_prob(dL_mpc, cosmology: FlatLambdaCDM,
 
     cls_name = ("UniformSourceFrame" if time_dilation
                 else "UniformComovingVolume")
-    impl_used = resolve_usf_impl(impl)
-    if impl_used == "bilby":
+    if impl_used == "exact":
+        p = usf_prob_exact(dL, cosmology, dmin, dmax,
+                           time_dilation=time_dilation)
+    elif impl_used == "bilby":
         p = _usf_prob_bilby(dL, cosmology, eval_min, eval_max,
                             cls_name=cls_name)
     else:
@@ -227,7 +258,7 @@ def uniform_source_frame_prob(dL_mpc, cosmology: FlatLambdaCDM,
         "dmax": dmax,
         "eval_min": float(eval_min),
         "eval_max": float(eval_max),
-        "widened": bool(n_outside),
+        "widened": bool(eval_min != dmin or eval_max != dmax),
         "n_samples": int(dL.size),
         "n_below_dmin": n_below,
         "n_above_dmax": n_above,
@@ -249,6 +280,222 @@ def _usf_prob_bilby(dL, cosmology, dmin, dmax, *,
         latex_label="$d_L$", unit="Mpc", boundary=None,
     )
     return np.asarray(prior.prob(dL), dtype=float)
+
+
+# --------------------------------------------------------------------------
+# The exact UniformSourceFrame density (GW-40i)
+# --------------------------------------------------------------------------
+#: Gauss-Legendre rule of the comoving-distance and normalisation quadratures.
+_EX_GL_X, _EX_GL_W = np.polynomial.legendre.leggauss(32)
+#: Panel edges in z of the comoving-distance quadrature.  ``1/E(z)`` is analytic
+#: with its nearest complex singularities ~1.2 from the real axis (flat LCDM,
+#: Om0 ~ 0.3), so 32 nodes on a panel no longer than its distance from 0 --
+#: geometric panels -- are exact to rounding.
+_EX_EDGES = np.concatenate(([0.0, 0.125, 0.25, 0.5], 2.0 ** np.arange(0, 15)))
+#: Sub-panels per panel for the normalisation integral (the integrand
+#: ``D_C^2 / (E (1+z))`` is smooth; 8 x 32 nodes is converged to rounding).
+_EX_NORM_SUB = 8
+#: Newton iterations for z(dL): the interpolated start is good to ~1e-6
+#: relative, so 2-3 steps reach rounding; the loop stops once converged.
+_EX_NEWTON_MAX = 12
+_EX_CHUNK = 262144
+_EX_CACHE = {}
+
+
+class _ExactFlatDistances:
+    """Comoving/luminosity distance of one flat cosmology without any table.
+
+    ``D_C(z) = D_H INT_0^z dz'/E(z')`` is the sum of precomputed whole-panel
+    integrals (:data:`_EX_EDGES`) and a 32-node Gauss-Legendre integral over
+    the last, partial panel; ``E`` comes from the cosmology object itself
+    (``inv_efunc``), so radiation or massive neutrinos are honoured.  Only flat
+    cosmologies are supported (``D_L = (1+z) D_C``); anything else raises.
+    """
+
+    def __init__(self, cosmology):
+        ok0 = float(getattr(cosmology, "Ok0", 0.0))
+        if abs(ok0) > 0.0:
+            raise NotImplementedError(
+                f"exact distance prior needs a FLAT cosmology (Ok0 = 0); got "
+                f"Ok0={ok0!r} for {cosmology!r}.")
+        self.cosmology = cosmology
+        self.dH = float(cosmology.hubble_distance.to(u.Mpc).value)
+        a, b = _EX_EDGES[:-1], _EX_EDGES[1:]
+        # whole panels, each split in 4 for margin
+        sub = np.linspace(0.0, 1.0, 5)
+        lo = (a[:, None] + (b - a)[:, None] * sub[None, :-1]).ravel()
+        hi = (a[:, None] + (b - a)[:, None] * sub[None, 1:]).ravel()
+        panel = self._gl(lo, hi).reshape(a.size, 4).sum(axis=1)
+        self.cum = np.concatenate(([0.0], np.cumsum(panel)))
+
+    def inv_e(self, z):
+        return np.asarray(self.cosmology.inv_efunc(z), dtype=float)
+
+    def _gl(self, lo, hi):
+        """INT_lo^hi dz/E(z) per pair, 32-node Gauss-Legendre."""
+        lo = np.asarray(lo, dtype=float)
+        hi = np.asarray(hi, dtype=float)
+        half = 0.5 * (hi - lo)
+        mid = 0.5 * (hi + lo)
+        z = mid[:, None] + half[:, None] * _EX_GL_X[None, :]
+        return half * (self.inv_e(z) @ _EX_GL_W)
+
+    def comoving(self, z):
+        """D_C(z) in Mpc (z >= 0, vectorised, chunked)."""
+        z = np.asarray(z, dtype=float)
+        flat = z.ravel()
+        if flat.size and not (np.nanmax(flat) <= _EX_EDGES[-1]):
+            raise ValueError(
+                f"exact distance prior: z={np.nanmax(flat):.4g} beyond the "
+                f"supported z <= {_EX_EDGES[-1]:g}.")
+        out = np.empty(flat.shape, dtype=float)
+        for i in range(0, flat.size, _EX_CHUNK):
+            zz = flat[i:i + _EX_CHUNK]
+            k = np.clip(np.searchsorted(_EX_EDGES, zz, side="right") - 1,
+                        0, _EX_EDGES.size - 2)
+            out[i:i + _EX_CHUNK] = self.dH * (self.cum[k]
+                                              + self._gl(_EX_EDGES[k], zz))
+        return out.reshape(z.shape)
+
+    def luminosity(self, z):
+        z = np.asarray(z, dtype=float)
+        return (1.0 + z) * self.comoving(z)
+
+    def z_of_dL(self, dL):
+        """z(dL) by Newton iteration on D_L(z) = dL, to rounding.  dL >= 0."""
+        dL = np.asarray(dL, dtype=float)
+        # A starting guess only: log-(1+z) grid covering max(dL).
+        zmax = 2.0
+        top = float(np.max(dL)) if dL.size else 0.0
+        while True:
+            zg = np.expm1(np.linspace(0.0, np.log1p(zmax), 2049))
+            dg = self.luminosity(zg)
+            if dg[-1] >= top or zmax >= _EX_EDGES[-1]:
+                break
+            zmax = min(2.0 * zmax, float(_EX_EDGES[-1]))
+        if dg[-1] < top:
+            raise ValueError(
+                f"exact distance prior: dL={top:.6g} Mpc is beyond "
+                f"z={_EX_EDGES[-1]:g}.")
+        z = np.interp(dL, dg, zg)
+        for _ in range(_EX_NEWTON_MAX):
+            dc = self.comoving(z)
+            f = (1.0 + z) * dc - dL
+            fp = dc + (1.0 + z) * self.dH * self.inv_e(z)
+            step = f / fp
+            z = np.maximum(z - step, 0.0)
+            # Quadratic convergence: once every step is below 1e-10 relative,
+            # the one just taken has left an error of order (1e-10)^2, i.e.
+            # below rounding.  (A tighter test never fires: at convergence the
+            # step is rounding noise of f, a few ulp of z.)
+            if not np.any(np.abs(step) > 1e-10 * np.maximum(z, 1e-300)):
+                break
+        return z
+
+    def density_shape(self, z, time_dilation=True):
+        """dVc/dz [/(1+z)] * dz/dL, up to the constant 4 pi D_H (Mpc)."""
+        dc = self.comoving(z)
+        ie = self.inv_e(z)
+        num = dc * dc * ie
+        if time_dilation:
+            num = num / (1.0 + z)
+        return num / (dc + (1.0 + z) * self.dH * ie)
+
+    def norm(self, zlo, zhi, time_dilation=True):
+        """INT_zlo^zhi D_C^2 / E [/(1+z)] dz -- the normalisation of
+        :meth:`density_shape` over dL in [dL(zlo), dL(zhi)]."""
+        if not zhi > zlo:
+            return 0.0
+        inner = _EX_EDGES[(_EX_EDGES > zlo) & (_EX_EDGES < zhi)]
+        br = np.concatenate(([zlo], inner, [zhi]))
+        t = np.linspace(0.0, 1.0, _EX_NORM_SUB + 1)
+        lo = (br[:-1, None] + np.diff(br)[:, None] * t[None, :-1]).ravel()
+        hi = (br[:-1, None] + np.diff(br)[:, None] * t[None, 1:]).ravel()
+        half = 0.5 * (hi - lo)
+        z = (0.5 * (hi + lo))[:, None] + half[:, None] * _EX_GL_X[None, :]
+        dc = self.comoving(z)
+        f = dc * dc * self.inv_e(z)
+        if time_dilation:
+            f = f / (1.0 + z)
+        return float(np.sum(half * (f @ _EX_GL_W)))
+
+
+def _cosmology_cache_key(cosmology) -> tuple:
+    """A cache key that identifies ``cosmology`` by the VALUES of its
+    parameters at full float precision.
+
+    ``repr`` is not such a key: astropy prints ``H0`` (and other Quantities) to
+    8 significant digits, so ``FlatLambdaCDM(67.9 + 1e-9, ...)`` shared the
+    cached distances of ``FlatLambdaCDM(67.9, ...)`` (review of GW-40i: 2e-11
+    relative error, up to ~5e-9 near a collision -- above the 1e-10 target).
+    The key is the class plus every declared parameter, each Quantity reduced
+    to its value in its own unit (the unit string is kept too), arrays as
+    tuples; ``name`` is not a parameter and does not enter.
+    """
+    params = getattr(cosmology, "parameters", None)
+    if params is None:
+        # Not an astropy >= 6 Cosmology: fall back to identity, never to repr
+        # (an object we cannot inspect is never shared with another).
+        return ("id", id(cosmology))
+    items = []
+    for name in sorted(params):
+        v = params[name]
+        if v is None:
+            items.append((name, None))
+            continue
+        unit = getattr(v, "unit", None)
+        val = np.asarray(getattr(v, "value", v), dtype=float)
+        items.append((name, str(unit) if unit is not None else "",
+                      tuple(val.ravel().tolist())))
+    return (type(cosmology).__module__, type(cosmology).__qualname__,
+            tuple(items))
+
+
+def _exact_distances(cosmology) -> _ExactFlatDistances:
+    key = ("dist", _cosmology_cache_key(cosmology))
+    obj = _EX_CACHE.get(key)
+    if obj is None:
+        obj = _ExactFlatDistances(cosmology)
+        _EX_CACHE[key] = obj
+    return obj
+
+
+def usf_prob_exact(dL_mpc, cosmology, dmin: float, dmax: float, *,
+                   time_dilation: bool = True):
+    """Exact UniformSourceFrame (``time_dilation=False``: UniformComovingVolume)
+    density in dL [1/Mpc], normalised over exactly ``[dmin, dmax]``.
+
+    ``p(dL) = [D_C^2 / (E(z) (1+z))] / (dD_L/dz) / Z``,
+    ``Z = INT_{z(dmin)}^{z(dmax)} D_C^2 / (E (1+z)) dz``, with every distance
+    and ``z(dL)`` computed as in :class:`_ExactFlatDistances` -- no
+    interpolation anywhere in the returned value.  The formula is evaluated
+    for every ``dL >= 0`` (not truncated at the bounds); ``dL < 0`` and
+    non-finite ``dL`` give NaN, so a validator sees them.
+    """
+    dL = np.asarray(dL_mpc, dtype=float)
+    dmin, dmax = float(dmin), float(dmax)
+    if not (dmax > dmin >= 0.0):
+        raise ValueError(
+            f"exact distance prior: need dmax > dmin >= 0, got "
+            f"[{dmin!r}, {dmax!r}] Mpc.")
+    ex = _exact_distances(cosmology)
+    zkey = ("norm", _cosmology_cache_key(cosmology), dmin, dmax,
+            bool(time_dilation))
+    Z = _EX_CACHE.get(zkey)
+    if Z is None:
+        zlo, zhi = ex.z_of_dL(np.array([dmin, dmax]))
+        Z = ex.norm(float(zlo), float(zhi), time_dilation=time_dilation)
+        if not (Z > 0 and np.isfinite(Z)):
+            raise ValueError(
+                f"exact distance prior: [{dmin:.6g}, {dmax:.6g}] Mpc encloses "
+                f"no normalisable probability.")
+        _EX_CACHE[zkey] = Z
+    out = np.full(dL.shape, np.nan, dtype=float)
+    ok = np.isfinite(dL) & (dL >= 0.0)
+    if ok.any():
+        z = ex.z_of_dL(dL[ok])
+        out[ok] = ex.density_shape(z, time_dilation=time_dilation) / Z
+    return out
 
 
 #: Near-zero refinement of the fallback's redshift grid (GW-29).  A log-(1+z)
@@ -427,7 +674,7 @@ def power_law_dL_prob(dL_mpc, alpha: float, dmin: float, dmax: float):
 
 def dL_prior_prob(dL_mpc, *, kind: str, dmin: float, dmax: float,
                   cosmology: FlatLambdaCDM = None, alpha: float = None,
-                  impl: str = "auto", return_info: bool = False):
+                  impl: str = USF_IMPL_DEFAULT, return_info: bool = False):
     """Evaluate the recorded analytic distance prior, dispatched on its CLASS.
 
     This is the single entry point ingest should use: it guarantees the density

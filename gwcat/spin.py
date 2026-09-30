@@ -12,22 +12,40 @@ The marginal p(s_iz) = −log(|s_iz|/amax) / amax   for |s_iz| < amax
 (a log-triangular distribution).  χ_eff is a mass-weighted sum of two such
 variables, so its PDF is a convolution of two scaled log-triangulars.
 
-The class precomputes p(χ_eff | q, amax) on a (q, χ_eff) grid and evaluates
-via fast bilinear interpolation — O(N) for N samples.
+Two implementations (GW-40i), selected by ``impl``:
+
+* ``"exact"`` (the default): :class:`ChiEffPriorExact`, the closed-form
+  convolution of :mod:`gwcat.chi_eff_exact`, <= 3.1e-14 relative against an
+  independent mpmath quadrature everywhere on the support.
+* ``"grid"`` (LEGACY): :class:`ChiEffPrior`, which precomputes p(χ_eff | q, amax)
+  on a 200 x 2000 (q, χ_eff) grid and interpolates bilinearly -- up to ~1e-2 in
+  ln p on isotropic draws at q >= 0.05 (4.2e-3 relative on the 259-event PE;
+  median ~2e-4), and far worse near the support edge and at q < 0.05, which
+  the grid clamps.  Kept, bit-for-bit, only to reproduce products
+  built before GW-40i (the v1 regression, darksirens' port); it must be asked
+  for explicitly.
+
+``impl=None`` everywhere means "the current default", which is ``"exact"``
+unless a caller scoped another one with :func:`chi_eff_prior_impl`::
+
+    with chi_eff_prior_impl("grid"):      # e.g. the CLI's --legacy-grid-priors
+        ...                               # every p_pe / pdraw built in here
 
 Usage:
-    from gwcat.spin import chi_eff_prior_logprob, ChiEffPrior
+    from gwcat.spin import chi_eff_prior_logprob, ChiEffPriorExact
 
-    # Quick function call (builds table on first use, caches it)
     logp = chi_eff_prior_logprob(chieff, m1_source, m2_source, amax=0.99)
-
-    # Or manage the object explicitly for repeated calls with different amax
-    prior = ChiEffPrior(amax=0.99)
+    prior = ChiEffPriorExact(amax=0.99)
     logp = prior.logprob(chieff, m1_source, m2_source)
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
+
 import numpy as np
+
+from .chi_eff_exact import EXACT_METHOD, chi_eff_iso_prob
 
 _trapz = getattr(np, "trapezoid", getattr(np, "trapz", None))
 
@@ -252,6 +270,108 @@ class ChiEffPrior:
 
 
 # ------------------------------------------------------------------
+# The exact implementation (GW-40i) and the implementation switch
+# ------------------------------------------------------------------
+#: The chi_eff-prior implementations.  ``"exact"`` is the closed-form
+#: convolution; ``"grid"`` is the legacy interpolated table (:class:`ChiEffPrior`).
+CHI_EFF_PRIOR_IMPLS = ("exact", "grid")
+
+#: What each implementation IS, recorded next to the densities it produced
+#: (export attr ``chi_eff_prior_method``).
+CHI_EFF_PRIOR_METHODS = {
+    "exact": EXACT_METHOD,
+    "grid": "bilinear_interpolation_of_200x2000_(q,chi_eff)_table_"
+            "built_by_4000-point_convolution",
+}
+
+#: The process default.  Changing it is what :func:`chi_eff_prior_impl` scopes.
+CHI_EFF_PRIOR_IMPL_DEFAULT = "exact"
+
+_IMPL_VAR = contextvars.ContextVar("gwcat_chi_eff_prior_impl",
+                                   default=CHI_EFF_PRIOR_IMPL_DEFAULT)
+
+
+def resolve_chi_eff_prior_impl(impl=None) -> str:
+    """``impl`` itself, or the current scoped default when ``None``.
+
+    Anything but ``"exact"``/``"grid"`` raises: there is no silent fallback
+    between two densities that differ by up to 4e-3.
+    """
+    if impl is None:
+        impl = _IMPL_VAR.get()
+    if impl not in CHI_EFF_PRIOR_IMPLS:
+        raise ValueError(
+            f"chi_eff prior impl must be one of {CHI_EFF_PRIOR_IMPLS}, got "
+            f"{impl!r}.  'grid' is the legacy interpolated table, kept only to "
+            f"reproduce pre-GW-40i products.")
+    return impl
+
+
+def current_chi_eff_prior_impl() -> str:
+    """The implementation ``impl=None`` resolves to right now."""
+    return resolve_chi_eff_prior_impl(None)
+
+
+@contextlib.contextmanager
+def chi_eff_prior_impl(impl):
+    """Scope the default chi_eff-prior implementation (``"exact"``/``"grid"``).
+
+    Every density built inside -- PE ``p_pe`` and selection ``pdraw`` alike --
+    uses ``impl`` unless a call passes its own, and the builders record the
+    resolved value as ``chi_eff_prior_impl``.  Nested scopes restore on exit.
+    """
+    token = _IMPL_VAR.set(resolve_chi_eff_prior_impl(impl))
+    try:
+        yield
+    finally:
+        _IMPL_VAR.reset(token)
+
+
+class ChiEffPriorExact:
+    """Exact ``p(χ_eff | m1, m2, amax)`` -- the drop-in for :class:`ChiEffPrior`.
+
+    Same public surface (``amax``, ``amax_1``, ``amax_2``, ``prob``,
+    ``logprob``, ``support``), evaluated by :func:`gwcat.chi_eff_exact.
+    chi_eff_iso_prob` instead of a table, so there is nothing to build and no
+    grid clamp: the density is exactly zero on and beyond the true support edge
+    ``|χ_eff| >= w1 amax_1 + w2 amax_2``, and ``logprob`` is ``-inf`` there.
+
+    Body 1 is the body passed as ``m1`` and carries ``amax_1``.  Unlike the
+    table (tabulated in the primary fraction, hence its refusal of ``m2 > m1``
+    when ``amax_1 != amax_2``), nothing here assumes ``m1 >= m2``, so no
+    ordering is required and none is imposed.
+    """
+
+    impl = "exact"
+
+    def __init__(self, amax: float = 0.99, amax_2: float = None):
+        self.amax_1 = float(amax)
+        self.amax_2 = self.amax_1 if amax_2 is None else float(amax_2)
+        #: The χ_eff support bound, max(amax_1, amax_2) (see ChiEffPrior).
+        self.amax = max(self.amax_1, self.amax_2)
+        self._shared = amax_2 is None or self.amax_2 == self.amax_1
+
+    def prob(self, chi_eff, m1, m2):
+        """p(χ_eff | m1, m2, amax).  Vectorized over inputs."""
+        if self._shared:
+            return chi_eff_iso_prob(chi_eff, m1, m2, self.amax_1)
+        return chi_eff_iso_prob(chi_eff, m1, m2, self.amax_1, self.amax_2)
+
+    def support(self, chi_eff):
+        """Whether each ``chi_eff`` is inside ``|χ| <= amax`` (see ChiEffPrior)."""
+        chi = np.abs(np.asarray(chi_eff, dtype=float))
+        return np.asarray(chi <= self.amax)
+
+    def logprob(self, chi_eff, m1, m2):
+        """log p(χ_eff | m1, m2, amax); ``-inf`` where the density is zero/NaN."""
+        p = np.asarray(self.prob(chi_eff, m1, m2), dtype=float)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            logp = np.where(p > 0, np.log(np.where(p > 0, p, 1.0)), -np.inf)
+        logp = np.where(np.isnan(p), -np.inf, logp)
+        return float(logp) if logp.ndim == 0 else logp
+
+
+# ------------------------------------------------------------------
 # Module-level convenience (cached singleton)
 # ------------------------------------------------------------------
 _CACHE = {}
@@ -284,36 +404,42 @@ def parse_amax_option(amax, *, what="amax"):
     return float(amax)
 
 
-def get_chi_eff_prior(amax=0.99, amax_2=None):
-    """Cached :class:`ChiEffPrior` for a ``(amax_1, amax_2)`` pair.
+def get_chi_eff_prior(amax=0.99, amax_2=None, impl=None):
+    """Cached chi_eff prior for a ``(amax_1, amax_2)`` pair and an ``impl``.
 
-    The per-body pair is the cache key (GW-04): a restricted secondary is a real
-    configuration, and it must not collide with the symmetric prior of the same
-    primary ceiling.
+    ``impl=None`` is the current default (``"exact"`` unless scoped otherwise by
+    :func:`chi_eff_prior_impl`): a :class:`ChiEffPriorExact`.  ``impl="grid"``
+    is the legacy :class:`ChiEffPrior` table.  The per-body pair is part of the
+    cache key (GW-04): a restricted secondary is a real configuration, and it
+    must not collide with the symmetric prior of the same primary ceiling.
     """
-    key = (float(amax), None if amax_2 is None else float(amax_2))
+    impl = resolve_chi_eff_prior_impl(impl)
+    key = (impl, float(amax), None if amax_2 is None else float(amax_2))
     prior = _CACHE.get(key)
     if prior is None:
-        prior = ChiEffPrior(amax=amax, amax_2=amax_2)
+        if impl == "grid":
+            prior = ChiEffPrior(amax=amax, amax_2=amax_2)
+        else:
+            prior = ChiEffPriorExact(amax=amax, amax_2=amax_2)
         _CACHE[key] = prior
     return prior
 
 
 def chi_eff_prior_logprob(chi_eff, m1_source, m2_source, amax=0.99,
-                          amax_2=None):
+                          amax_2=None, impl=None):
     """log p(χ_eff | m1_source, m2_source, amax).
 
-    Builds a ChiEffPrior on first call for each ``(amax, amax_2)`` and caches it.
-    NOTE this is :meth:`ChiEffPrior.logprob`, which does NOT mask the support --
-    see :func:`chi_eff_prior_logprob_in_support` for the gated version every
-    density consumer should use.
+    ``impl`` as in :func:`get_chi_eff_prior`.  NOTE this is the prior's
+    ``logprob``, which does NOT mask the support (the legacy grid clamps past
+    ``amax``) -- see :func:`chi_eff_prior_logprob_in_support` for the gated
+    version every density consumer should use.
     """
-    return get_chi_eff_prior(amax, amax_2).logprob(chi_eff, m1_source,
-                                                   m2_source)
+    return get_chi_eff_prior(amax, amax_2, impl).logprob(chi_eff, m1_source,
+                                                         m2_source)
 
 
 def chi_eff_prior_logprob_in_support(chi_eff, m1_source, m2_source, amax=0.99,
-                                     amax_2=None):
+                                     amax_2=None, impl=None):
     """``(logprob, in_support)`` with the prior's SUPPORT actually applied.
 
     :meth:`ChiEffPrior.logprob` deliberately leaves the support unmasked (its
@@ -330,8 +456,10 @@ def chi_eff_prior_logprob_in_support(chi_eff, m1_source, m2_source, amax=0.99,
     prior excluded instead of discovering it downstream.
 
     Returns arrays (never scalars), broadcast to the shape of ``chi_eff``.
+    ``impl`` as in :func:`get_chi_eff_prior`; the exact prior is zero on and
+    past its edge, so there the mask and the density agree by construction.
     """
-    prior = get_chi_eff_prior(amax, amax_2)
+    prior = get_chi_eff_prior(amax, amax_2, impl)
     sup = np.asarray(prior.support(chi_eff), dtype=bool)
     logp = np.asarray(prior.logprob(chi_eff, m1_source, m2_source), dtype=float)
     logp = np.where(sup, logp, -np.inf)
@@ -470,8 +598,9 @@ class ChiEffChiPPrior:
 
         p(χ_eff, χ_p | q, amax) = p(χ_eff | q, amax) · p(χ_p | χ_eff, q, amax),
 
-    where the *marginal* p(χ_eff | q, amax) is delegated to the existing
-    :class:`ChiEffPrior` (reused verbatim) and the *conditional*
+    where the *marginal* p(χ_eff | q, amax) is delegated to
+    :class:`ChiEffPriorExact` (or, with ``impl="grid"``, to the legacy
+    :class:`ChiEffPrior` table) and the *conditional*
     p(χ_p | χ_eff, q, amax) is built semi-analytically here.
 
     Construction (Callister arXiv:2104.09508; Callister et al. arXiv:2106.00521,
@@ -536,13 +665,19 @@ class ChiEffChiPPrior:
     """
 
     def __init__(self, amax: float = 0.99, order: int = 24,
-                 grade_levels: int = 3, grade_ratio: float = 0.2):
+                 grade_levels: int = 3, grade_ratio: float = 0.2,
+                 impl: str = None):
         self.amax = float(amax)
         self.order = int(order)
         self.grade_levels = int(grade_levels)
         self.grade_ratio = float(grade_ratio)
+        #: Which chi_eff MARGINAL this joint prior uses (GW-40i), resolved at
+        #: construction: the exact closed form by default, the legacy table
+        #: only when asked for.  The chi_p conditional is unaffected.
+        self.impl = resolve_chi_eff_prior_impl(impl)
         # Reuse the existing marginal prior verbatim.
-        self._chi_eff_prior = ChiEffPrior(amax=amax)
+        self._chi_eff_prior = (ChiEffPrior(amax=amax) if self.impl == "grid"
+                               else ChiEffPriorExact(amax=amax))
         self._gl_nodes, self._gl_weights = \
             np.polynomial.legendre.leggauss(self.order)
         # Number of sub-intervals: 7 fixed break-points (endpoints, the two
@@ -707,7 +842,7 @@ class ChiEffChiPPrior:
         Masses may be given in any frame and in any order; the more massive
         body is treated as the primary and ``q = m_secondary / m_primary`` is
         used for the χ_p conditional, while the same primary/secondary
-        assignment is passed to the reused :class:`ChiEffPrior` marginal.
+        assignment is passed to the chi_eff marginal (``self.impl``).
         """
         chi_eff = np.asarray(chi_eff, dtype=float)
         chi_p = np.asarray(chi_p, dtype=float)
@@ -774,28 +909,30 @@ class ChiEffChiPPrior:
 _CHIP_CACHE = {}
 
 
-def get_chi_eff_chi_p_prior(amax=0.99):
-    """Cached :class:`ChiEffChiPPrior` for one ``amax``."""
-    prior = _CHIP_CACHE.get(amax)
+def get_chi_eff_chi_p_prior(amax=0.99, impl=None):
+    """Cached :class:`ChiEffChiPPrior` for one ``amax`` and marginal ``impl``."""
+    impl = resolve_chi_eff_prior_impl(impl)
+    key = (impl, amax)
+    prior = _CHIP_CACHE.get(key)
     if prior is None:
-        prior = ChiEffChiPPrior(amax=amax)
-        _CHIP_CACHE[amax] = prior
+        prior = ChiEffChiPPrior(amax=amax, impl=impl)
+        _CHIP_CACHE[key] = prior
     return prior
 
 
 def chi_eff_chi_p_prior_logprob(chi_eff, chi_p, m1_source, m2_source,
-                                amax=0.99):
+                                amax=0.99, impl=None):
     """log p(χ_eff, χ_p | m1_source, m2_source, amax).
 
-    Builds a :class:`ChiEffChiPPrior` on first call for each amax and caches
-    it (like :func:`chi_eff_prior_logprob`).
+    Builds a :class:`ChiEffChiPPrior` on first call for each ``(amax, impl)``
+    and caches it (like :func:`chi_eff_prior_logprob`).
     """
-    return get_chi_eff_chi_p_prior(amax).logprob(chi_eff, chi_p, m1_source,
-                                                 m2_source)
+    return get_chi_eff_chi_p_prior(amax, impl).logprob(chi_eff, chi_p,
+                                                       m1_source, m2_source)
 
 
 def chi_eff_chi_p_prior_logprob_in_support(chi_eff, chi_p, m1_source,
-                                           m2_source, amax=0.99):
+                                           m2_source, amax=0.99, impl=None):
     """``(logprob, in_support)`` for the joint prior, support APPLIED.
 
     The twin of :func:`chi_eff_prior_logprob_in_support`.  The joint density
@@ -804,7 +941,7 @@ def chi_eff_chi_p_prior_logprob_in_support(chi_eff, chi_p, m1_source,
     number here -- but the builders must not go on inferring support from
     finiteness, because that inference is what was wrong for the 1-D prior.
     """
-    prior = get_chi_eff_chi_p_prior(amax)
+    prior = get_chi_eff_chi_p_prior(amax, impl)
     sup = np.asarray(prior.support(chi_eff, chi_p), dtype=bool)
     logp = np.asarray(prior.logprob(chi_eff, chi_p, m1_source, m2_source),
                       dtype=float)

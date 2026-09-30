@@ -166,3 +166,65 @@ def test_config_declared_event_refused_without_allow_list(real_export,
     assert "xcheck_reference_spin_prior_source" in msg
     assert "config_file_declared [1]" in msg and "GW170608_020116" in msg
     assert "sibling_inherited [2]" in msg
+
+
+def test_exact_priors_reproduce_p_pe_on_released_files(real_export):
+    """GW-40i on real rows: p_pe = m1det * p_dL_exact * p_iso_exact.
+
+    The distance factor is recomputed from the store's recorded bounds and
+    cosmology with the exact UniformSourceFrame density (pinned to mpmath in
+    test_dL_prior_exact) and the chi_eff factor with the exact prior (pinned in
+    test_chi_eff_prior_exact); the product must equal the exported p_pe to
+    1e-12 relative, i.e. no interpolated factor survives anywhere.  For the
+    labels whose (own or sibling) analytic prior string declares bounds, the
+    recorded bounds must be the string's.
+    """
+    import re
+    from gwcat.cosmology import make_cosmology, usf_prob_exact
+    from gwcat.chi_eff_exact import chi_eff_iso_prob
+
+    store, pe, a = real_export
+    assert _s(a["chi_eff_prior_impl"]) == ["exact"]
+    assert set(_s(a["dL_prior_impl_per_event"])) == {"exact"}
+    names = _s(a["event_names"])
+    labels = _s(a["sample_set_name_per_event"])
+    nsamp = int(a["nsamp"])
+    with h5py.File(store, "r") as f:
+        m = f["meta"]
+        rows = {(n, l): j for j, (n, l) in enumerate(zip(
+            _s(m["name"][:]), _s(m["analysis_used"][:])))}
+        meta = {k: m[k][:] for k in ("dL_prior_min", "dL_prior_max",
+                                     "dL_prior_H0", "dL_prior_Om0",
+                                     "dL_prior_kind")}
+    with h5py.File(pe, "r") as f:
+        X = {k: f[k][:] for k in ("m1det", "m1src", "m2src", "chieff", "dL",
+                                  "p_pe")}
+    n_checked_bounds = 0
+    for i, (ev, lab) in enumerate(zip(names, labels)):
+        j = rows[(ev, lab)]
+        sl = slice(i * nsamp, (i + 1) * nsamp)
+        assert _s(meta["dL_prior_kind"][j]) == ["UniformSourceFrame"]
+        dmin, dmax = float(meta["dL_prior_min"][j]), float(meta["dL_prior_max"][j])
+        cos = make_cosmology(float(meta["dL_prior_H0"][j]),
+                             float(meta["dL_prior_Om0"][j]))
+        want = (X["m1det"][sl] * usf_prob_exact(X["dL"][sl], cos, dmin, dmax)
+                * chi_eff_iso_prob(X["chieff"][sl], X["m1src"][sl],
+                                   X["m2src"][sl], 0.99))
+        np.testing.assert_allclose(X["p_pe"][sl], want, rtol=1e-12, atol=0,
+                                   err_msg=ev)
+        # bounds: the analytic prior string's, where one exists
+        with h5py.File(_raw_path(ev), "r") as f:
+            strs = []
+            for g in [lab] + sorted(k for k in f.keys() if k != lab):
+                node = f.get(f"{g}/priors/analytic/luminosity_distance")
+                if isinstance(node, h5py.Dataset):
+                    v = node[()]
+                    strs.append(v[0] if np.ndim(v) else v)
+        if strs:
+            s = strs[0].decode() if isinstance(strs[0], bytes) else str(strs[0])
+            lo = float(re.search(r"minimum=([-+0-9.eE]+)", s).group(1))
+            hi = float(re.search(r"maximum=([-+0-9.eE]+)", s).group(1))
+            assert (dmin, dmax) == (lo, hi), ev
+            n_checked_bounds += 1
+    # GW170608 (LALInference) is the only one of the four with no string.
+    assert n_checked_bounds == 3

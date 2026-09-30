@@ -754,6 +754,11 @@ def _write_chieff_amax_attrs(f, amax_pairs, amax_sources, mode):
     f.attrs["chi_eff_amax_2_per_campaign"] = np.asarray(a2s, dtype=float)
     f.attrs["chi_eff_amax_source_per_campaign"] = [str(s) for s in amax_sources]
     f.attrs["chi_eff_amax_mode"] = str(mode)
+    # WHICH chi_eff density the swap multiplied in (GW-40i).
+    from .spin import CHI_EFF_PRIOR_METHODS, current_chi_eff_prior_impl
+    impl = current_chi_eff_prior_impl()
+    f.attrs["chi_eff_prior_impl"] = impl
+    f.attrs["chi_eff_prior_method"] = CHI_EFF_PRIOR_METHODS[impl]
 
 
 def _ddL_dz(z, dL_mpc, H0, Om0):

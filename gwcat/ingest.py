@@ -251,9 +251,13 @@ class IngestConfig:
     validate_prior: bool = True
     compression: str = "gzip"
     #: Which UniformSourceFrame implementation evaluates p_dL_pe (GW-01).
-    #: "auto" prefers bilby (the object the LVK PE used) and falls back to
-    #: astropy only when bilby is not installed; "bilby"/"astropy" pin it.
-    dL_prior_impl: str = "auto"
+    #: "exact" (the default since GW-40i) evaluates the density from accurate
+    #: cosmology integrals, normalised over the declared bounds, at each row's
+    #: resolved cosmology.  The LEGACY "auto" (the pre-GW-40i default) prefers
+    #: bilby's 1000-point interpolated object and falls back to astropy only
+    #: when bilby is not installed; "bilby"/"astropy" pin one of those.  The
+    #: CLI's --legacy-grid-priors selects "auto", to reproduce older stores.
+    dL_prior_impl: str = "exact"
     #: Accept an analytic spin prior borrowed from a sibling analysis with a
     #: DIFFERENT spin variant (GW-07).  Off by default: a LowSpin(Secondary) run
     #: restricts a_2 to U(0, 0.05) while HighSpin uses U(0, 0.99), so a
@@ -1539,7 +1543,7 @@ def _ks_against_prior_samples(dlp, *, kind, cosmo, dmin, dmax, alpha, impl,
 
 
 def validate_prior_against_samples(priors, analyses_to_try, resolved,
-                                   *, impl: str = "auto"):
+                                   *, impl: str = "exact"):
     """Check the parsed distance prior against the file's own prior samples.
 
     The prior samples are draws from the **sampling** prior, so they validate
@@ -2048,6 +2052,18 @@ def build_store(paths, out_path, params=None, extra_params=None,
                 return_info=True)
             rec["p_dL_pe"] = p_dL
             if dL_info["frac_outside_bounds"] > cfg.dL_outside_warn_frac:
+                if dL_info.get("widened"):
+                    # Legacy interpolations: the table had to be widened.
+                    how = (f"The density was evaluated over "
+                           f"[{dL_info['eval_min']:.4g}, "
+                           f"{dL_info['eval_max']:.4g}] Mpc instead of "
+                           f"zeroing them")
+                else:
+                    # Exact / closed form: the same formula, normalised over
+                    # the declared bounds, is evaluated at every sample.
+                    how = ("The density's formula, normalised over the "
+                           "declared bounds, was evaluated at those samples "
+                           "instead of zeroing them")
                 warnings.warn(
                     f"{name} [{analysis}]: {dL_info['n_outside_bounds']} of "
                     f"{dL_info['n_samples']} dL samples "
@@ -2055,9 +2071,7 @@ def build_store(paths, out_path, params=None, extra_params=None,
                     f"outside the recorded distance-prior bounds "
                     f"[{dmin:.4g}, {dmax:.4g}] Mpc from {src} "
                     f"({dL_info['n_below_dmin']} below, "
-                    f"{dL_info['n_above_dmax']} above).  The density was "
-                    f"evaluated over [{dL_info['eval_min']:.4g}, "
-                    f"{dL_info['eval_max']:.4g}] Mpc instead of zeroing them, "
+                    f"{dL_info['n_above_dmax']} above).  {how}, "
                     f"but the recorded bounds describe a different analysis "
                     f"than the one ingested.")
             if dL_info["n_nonfinite"]:
@@ -3091,6 +3105,12 @@ def _cli(
                          "astropy behaviour is bundled as "
                          "release_reweight_cosmology_legacy_astropy.yaml, for "
                          "regressions only.")
+    ap.add_argument("--legacy-grid-priors", action="store_true",
+                    help="Evaluate p_dL_pe with the pre-GW-40i interpolated "
+                         "implementation (bilby's 1000-point UniformSourceFrame, "
+                         "astropy fallback) instead of the exact one. For "
+                         "reproducing stores built before GW-40i only (the v1 "
+                         "regression); recorded per row as dL_prior_impl.")
     ap.add_argument("--constituent-mixture-prior", action="store_true",
                     help="Build each C00:Mixed row's prior as the equal-weight "
                          "mixture of its constituents' own normalised priors, "
@@ -3122,7 +3142,8 @@ def _cli(
 
     cfg = IngestConfig(
         release_reweight_cosmology_table=a.release_reweight_cosmology_table,
-        constituent_mixture_prior=a.constituent_mixture_prior)
+        constituent_mixture_prior=a.constituent_mixture_prior,
+        dL_prior_impl="auto" if a.legacy_grid_priors else "exact")
     build_store(paths, a.out, event_table=event_table, sample_sets=sample_sets,
                 cache_dir=a.cache_dir, offline=offline, cfg=cfg,
                 file_provenance=file_provenance, write_summary=write_summary)

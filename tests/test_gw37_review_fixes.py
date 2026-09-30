@@ -250,15 +250,27 @@ def test_chieff_support_is_the_priors_own_predicate_not_isfinite():
     from gwcat.spin import (chi_eff_prior_logprob,
                             chi_eff_prior_logprob_in_support)
 
+    # The clamp is a property of the LEGACY grid (GW-40i made the exact prior
+    # the default), so the premise is asserted on the grid explicitly.
     unmasked = np.asarray(chi_eff_prior_logprob([0.995], 50.0, 25.0,
-                                                amax=0.99), dtype=float)
+                                                amax=0.99, impl="grid"),
+                          dtype=float)
     assert np.all(np.isfinite(unmasked)), \
         "the premise changed: logprob no longer returns a finite value here"
 
     logp, sup = chi_eff_prior_logprob_in_support([0.995], 50.0, 25.0,
-                                                 amax=0.99)
+                                                 amax=0.99, impl="grid")
     assert not sup[0]
     assert logp[0] == -np.inf
+
+    # The exact prior has no clamp: zero density past the edge, even unmasked,
+    # and the gated helper agrees.
+    exact = np.asarray(chi_eff_prior_logprob([0.995], 50.0, 25.0, amax=0.99),
+                       dtype=float)
+    assert exact[0] == -np.inf
+    logp, sup = chi_eff_prior_logprob_in_support([0.995], 50.0, 25.0,
+                                                 amax=0.99)
+    assert not sup[0] and logp[0] == -np.inf
 
 
 # ======================================================================

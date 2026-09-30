@@ -94,7 +94,7 @@ from ..params import (DEFAULT_PARAMETER_SPACE, PEContext,
 from ..params.blocks.mass import UNSTATED_MASS_PRIOR, classify_mass_prior
 from ..source_class import CUT_ESTIMATOR_ATTR, PE_MEDIAN_CUT_WARNING
 from ..spin import AMAX_AUTO, parse_amax_option
-from .contract import event_list_digest
+from .contract import event_list_digest, mixed_prior_impl_events
 from .product import ExportProduct
 
 
@@ -641,6 +641,11 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     sel_cfg_amax = (_meta_str_sel("spin_amax_config_per_constituent")
                     or [""] * sub.n_events)
     kept_cfg_amax = []
+    # Which implementation evaluated each event's p_dL_pe AT INGEST (GW-40i:
+    # "exact" by default; "bilby"/"astropy"/"analytic" in older stores or under
+    # --legacy-grid-priors).  A meta read, like the provenance above.
+    sel_dL_impl = _meta_str_sel("dL_prior_impl") or [""] * sub.n_events
+    kept_dL_impl = []
     kept_prior_kind = {p: [] for p in ("mass", "spin", "dL")}
     kept_prior_label = {p: [] for p in ("mass", "spin", "dL")}
     #: Raw samples removed by the GW-40c spin-support cut, per kept event --
@@ -792,7 +797,8 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             else:
                 ctx_e = PEContext(event_name=str(sub.event_names[e]),
                                   m1det=m1, m2det=m2, dL=dL, cosmology=cosmo_e,
-                                  mass_prior_kind=mass_kind_e)
+                                  mass_prior_kind=mass_kind_e,
+                                  dL_prior_impl=str(sel_dL_impl[e]))
                 p_pe = block_prior_factor_pe(
                     mass_block, {"m1det": m1, "m2det": m2, "q": q},
                     ctx_e) * p_dL
@@ -820,6 +826,7 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                 kept_prior_kind[_p].append(sel_prior_kind[_p][e])
                 kept_prior_label[_p].append(sel_prior_label[_p][e])
             kept_cfg_amax.append(sel_cfg_amax[e])
+            kept_dL_impl.append(sel_dL_impl[e])
             kept_H0.append(float(per_event_H0[e]))
             kept_Om0.append(float(per_event_Om0[e]))
             row = sel_rows[e]
@@ -1391,7 +1398,29 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         "spin_prior_non_own_analytic_events": np.array(
             [str(n) for n, k in zip(kept, kept_prior_kind["spin"])
              if k != "own_analytic"], dtype=_str),
+        # ── How the two analytic prior factors were evaluated (GW-40i) ──────
+        "dL_prior_impl_per_event": np.array(
+            [str(x) for x in kept_dL_impl], dtype=_str),
     }
+    if chi_eff_included:
+        from ..spin import CHI_EFF_PRIOR_METHODS, current_chi_eff_prior_impl
+        _chi_impl = current_chi_eff_prior_impl()
+        attrs["chi_eff_prior_impl"] = _chi_impl
+        attrs["chi_eff_prior_method"] = CHI_EFF_PRIOR_METHODS[_chi_impl]
+        # A MIXED product -- exact chi_eff over a legacy-dL store, or the
+        # legacy chi_eff grid over an exact store -- is legal (each factor is
+        # still the declared prior to its implementation's accuracy) but is
+        # neither the exact product nor a legacy regression; say so, and let
+        # `gwcat validate --strict` / --require-exact-priors refuse it.
+        _mixed = mixed_prior_impl_events(_chi_impl, kept_dL_impl, kept)
+        if _mixed:
+            warnings.warn(
+                f"PE export mixes prior implementations: chi_eff_prior_impl="
+                f"{_chi_impl!r} but the store evaluated p_dL_pe with a "
+                f"{'legacy' if _chi_impl == 'exact' else 'exact'} "
+                f"implementation for {len(_mixed)} event(s) (e.g. "
+                f"{_mixed[:3]}). Re-ingest (or re-export) with "
+                f"--legacy-grid-priors on both or on neither.")
     attrs.update(_population_resolver_attrs(cat, kept))
     attrs.update(_sample_set_map_attrs(
         getattr(sub, "_sample_set_map_report", None), kept))
