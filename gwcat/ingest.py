@@ -203,6 +203,9 @@ PRIOR_SOURCE_STR_FIELDS = [f"prior_source_{w}_{p}"
                            for p in ("mass", "spin", "dL")
                            for w in ("label", "kind")]
 META_STR_FIELDS += PRIOR_SOURCE_STR_FIELDS
+# Constituent-mixture provenance (GW-40f): which constituents a combined set's
+# mixture prior was built from, and their VERIFIED row counts ("" elsewhere).
+META_STR_FIELDS += ["constituent_mixture_labels", "constituent_mixture_counts"]
 
 # Default waveform priority when no Mixed set exists (O4b/GWTC-5 events).
 O4_WAVEFORM_PRIORITY = [
@@ -230,6 +233,13 @@ class IngestConfig:
     #: Every `_cosmo` (release_reweighted) row takes its (H0, Om0) from the row
     #: for its CATALOG; a catalog the table lacks is refused, never defaulted.
     release_reweight_cosmology_table: Optional[str] = None
+    #: Build a ``C00:Mixed`` row's prior as the equal-weight mixture of its
+    #: constituents' own normalised analytic priors (GW-40f), with the mixing
+    #: fractions verified row by row, instead of borrowing one sibling's.
+    #: Needed only for label policies that USE C00:Mixed (BUILD_PLAN OD-1
+    #: options b/c).  Off by default so existing stores and the v1 exporter
+    #: are unchanged; a row whose mixture cannot be verified is refused.
+    constituent_mixture_prior: bool = False
     validate_prior: bool = True
     compression: str = "gzip"
     #: Which UniformSourceFrame implementation evaluates p_dL_pe (GW-01).
@@ -1728,6 +1738,100 @@ def _resolve_event_table(event_table, cache_dir=None, offline=None):
         return {}
 
 
+def _constituent_mixture_prior(catalog, analysis, analyses, samples_dict,
+                               priors, cfg, flavour):
+    """The equal-weight constituent-mixture prior of a ``C00:Mixed`` row.
+
+    See :mod:`gwcat.constituent_mixture`.  Every contributing constituent must
+    carry its OWN analytic mass (uniform in components), distance and spin
+    priors; the spin priors and the distance-prior cosmology must agree across
+    constituents; every Mixed row must equal one constituent row and each
+    constituent must supply exactly ``n_Mixed / K`` rows.  Anything else is
+    refused (:class:`~gwcat.constituent_mixture.ConstituentMixtureError`).
+    """
+    from .constituent_mixture import (ConstituentMixtureError,
+                                      match_constituent_rows,
+                                      mixture_prior_densities,
+                                      truncated_dL_density, uic_normalisation)
+    pfx, _base, variant = _label_parts(analysis)
+    want = _spin_variant_token(variant)
+    cands = {a: samples_dict[a] for a in analyses
+             if a != analysis and _label_parts(a)[0] == pfx
+             and _label_parts(a)[1] != "Mixed"
+             and _spin_variant_token(_label_parts(a)[2]) == want}
+    labels, counts = match_constituent_rows(samples_dict[analysis], cands)
+
+    comps, amaxes, cosmos, dl_kinds, bad = [], set(), set(), set(), []
+    for lab in labels:
+        smp = samples_dict[lab]
+        mp = resolve_mass_prior(lab, [lab], priors, siblings=False)
+        rd = resolve_dL_prior(catalog, lab, [lab], priors,
+                              np.asarray(smp["luminosity_distance"], float),
+                              cfg, flavour=flavour)
+        sp = resolve_spin_prior_full(
+            lab, [lab], priors,
+            np.asarray(smp["a_1"], float) if "a_1" in smp else None,
+            np.asarray(smp["a_2"], float) if "a_2" in smp else None)
+        if mp.kind != "uniform_detector_frame" or mp.source_kind != "own_analytic":
+            bad.append(f"{lab}: mass prior {mp.kind}/{mp.source_kind}")
+            continue
+        if rd.prior_source_kind != "own_analytic":
+            bad.append(f"{lab}: distance prior {rd.prior_source_kind}")
+            continue
+        if (sp.kind != "uniform_magnitude_isotropic"
+                or sp.source_kind != "own_analytic"):
+            bad.append(f"{lab}: spin prior {sp.kind}/{sp.source_kind}")
+            continue
+        amaxes.add((sp.amax_1, sp.amax_2))
+        cosmos.add((rd.H0, rd.Om0, rd.cosmology_name))
+        dl_kinds.add(rd.kind)
+        bounds = dict(mc_min=mp.chirp_min, mc_max=mp.chirp_max,
+                      q_min=mp.q_min, q_max=mp.q_max, m1_min=mp.m1_min,
+                      m1_max=mp.m1_max, m2_min=mp.m2_min, m2_max=mp.m2_max)
+        comps.append(dict(
+            bounds, label=lab, Z=uic_normalisation(**bounds),
+            dmin=rd.dmin, dmax=rd.dmax, dl_kind=rd.kind,
+            p_dL=truncated_dL_density(rd.kind, rd.cosmology, rd.dmin, rd.dmax,
+                                      rd.alpha, impl=cfg.dL_prior_impl)))
+    if bad:
+        raise ConstituentMixtureError(
+            f"{analysis}: cannot build the constituent-mixture prior -- every "
+            f"constituent must carry its own analytic priors: {bad}.")
+    if len(amaxes) != 1:
+        raise ConstituentMixtureError(
+            f"{analysis}: constituents declare different spin priors "
+            f"{sorted(amaxes)}; the chi_eff prior would not factor out of the "
+            f"mixture. Refusing rather than approximating.")
+    if len(cosmos) != 1:
+        raise ConstituentMixtureError(
+            f"{analysis}: constituents' distance priors use different "
+            f"cosmologies {sorted(cosmos)}; one exported z(dL) cannot describe "
+            f"them.")
+    mixed = samples_dict[analysis]
+    m1 = np.asarray(mixed["mass_1"], float)
+    q = np.asarray(mixed["mass_2"], float) / m1
+    dL = np.asarray(mixed["luminosity_distance"], float)
+    joint, marg = mixture_prior_densities(m1, q, dL, comps)
+    n_zero = int(np.sum(~(joint > 0)))
+    if n_zero:
+        raise ConstituentMixtureError(
+            f"{analysis}: {n_zero} Mixed sample(s) lie outside EVERY "
+            f"constituent's prior support; the mixture assigns them zero "
+            f"density.")
+    (a1, a2), = amaxes
+    (H0, Om0, cname), = cosmos
+    return dict(labels=labels, counts=counts, p_mass_dL=joint, p_dL=marg,
+                amax_1=a1, amax_2=a2, H0=H0, Om0=Om0, cosmology_name=cname,
+                dl_kind=(dl_kinds.pop() if len(dl_kinds) == 1 else "mixture"),
+                dmin=min(c["dmin"] for c in comps),
+                dmax=max(c["dmax"] for c in comps),
+                chirp_min=min(c["mc_min"] for c in comps),
+                chirp_max=max(c["mc_max"] for c in comps),
+                q_min=min(c["q_min"] for c in comps),
+                q_max=max(c["q_max"] for c in comps),
+                Z={c["label"]: c["Z"] for c in comps})
+
+
 def _release_pesummary_version(path) -> str:
     """The pesummary version that wrote a PE release file ("" if unreadable).
 
@@ -1940,6 +2044,16 @@ def build_store(paths, out_path, params=None, extra_params=None,
                 data=data)
             spin_amax_1, spin_amax_2, spin_kind, spin_src = (
                 sp.amax_1, sp.amax_2, sp.kind, sp.source)
+            # ── Constituent-mixture prior for C00:Mixed (GW-40f, opt-in) ─────
+            cmix = None
+            if (cfg.constituent_mixture_prior
+                    and _label_parts(analysis)[0] == "C00"
+                    and _label_parts(analysis)[1] == "Mixed"):
+                cmix = _constituent_mixture_prior(
+                    catalog, analysis, analyses, samples_dict, priors, cfg,
+                    flavour)
+                rec["p_dL_pe"] = cmix["p_dL"]
+                rec["p_mass_dL_pe"] = cmix["p_mass_dL"]
             records.append((name, n, rec))
 
             # metadata
@@ -2088,6 +2202,46 @@ def build_store(paths, out_path, params=None, extra_params=None,
                                   priority_labels=priority_labels)
             for k, val in ss.items():
                 meta[k].append(val)
+            if cmix is None:
+                meta["constituent_mixture_labels"].append("")
+                meta["constituent_mixture_counts"].append("")
+            else:
+                joined = "+".join(cmix["labels"])
+                over = {
+                    "constituent_mixture_labels": joined,
+                    "constituent_mixture_counts": ",".join(
+                        str(cmix["counts"][lab]) for lab in cmix["labels"]),
+                    "mass_prior_kind": "constituent_mixture",
+                    "mass_prior_source": f"constituent_mixture[{joined}]",
+                    "mass_prior_chirp_min": cmix["chirp_min"],
+                    "mass_prior_chirp_max": cmix["chirp_max"],
+                    "mass_prior_q_min": cmix["q_min"],
+                    "mass_prior_q_max": cmix["q_max"],
+                    "dL_prior_kind": cmix["dl_kind"],
+                    "dL_prior_basis": "constituent_mixture",
+                    "dL_prior_source": f"constituent_mixture[{joined}]",
+                    "dL_prior_min": cmix["dmin"],
+                    "dL_prior_max": cmix["dmax"],
+                    "dL_prior_H0": float(cmix["H0"]),
+                    "dL_prior_Om0": float(cmix["Om0"]),
+                    "dL_prior_cosmology_name": cmix["cosmology_name"],
+                    "spin_amax_1": float(cmix["amax_1"]),
+                    "spin_amax_2": float(cmix["amax_2"]),
+                    "spin_prior_kind": "uniform_magnitude_isotropic",
+                    "spin_prior_source": f"constituent_mixture[{joined}]",
+                }
+                for p in ("mass", "spin", "dL"):
+                    over[f"prior_source_label_{p}"] = joined
+                    over[f"prior_source_kind_{p}"] = "constituent_mixture"
+                meta["constituent_mixture_labels"].append(
+                    over.pop("constituent_mixture_labels"))
+                meta["constituent_mixture_counts"].append(
+                    over.pop("constituent_mixture_counts"))
+                # Every other field was already appended for this row from the
+                # sibling-borrowed resolution; the mixture REPLACES it.
+                for k, val in over.items():
+                    meta[k][-1] = val
+                src = f"constituent_mixture[{joined}]"
             print(f"[{catalog}] {name}: {n} samp, sample_set={analysis}, "
                   f"prior={src}")
 
@@ -2097,7 +2251,7 @@ def build_store(paths, out_path, params=None, extra_params=None,
     # stored and correctly marked available even when a caller passed a custom
     # ``params`` that omitted them (a column absent from every rec is dropped by
     # _assemble_union, so this is harmless when nothing was derived).
-    candidate_params = list(params) + ["p_dL_pe"]
+    candidate_params = list(params) + ["p_dL_pe", "p_mass_dL_pe"]
     for p in ("cos_tilt_1", "cos_tilt_2", "chi_p"):
         if p not in candidate_params:
             candidate_params.append(p)
@@ -2901,6 +3055,12 @@ def _cli(
                          "astropy behaviour is bundled as "
                          "release_reweight_cosmology_legacy_astropy.yaml, for "
                          "regressions only.")
+    ap.add_argument("--constituent-mixture-prior", action="store_true",
+                    help="Build each C00:Mixed row's prior as the equal-weight "
+                         "mixture of its constituents' own normalised priors, "
+                         "with the mixing fractions verified row by row "
+                         "(GW-40f; needed only for label policies that use "
+                         "C00:Mixed). Default: off.")
     a = ap.parse_args(argv)
     if a.inspect:
         inspect(a.inspect)
@@ -2925,7 +3085,8 @@ def _cli(
     write_summary = default_write_summary and not a.no_summary
 
     cfg = IngestConfig(
-        release_reweight_cosmology_table=a.release_reweight_cosmology_table)
+        release_reweight_cosmology_table=a.release_reweight_cosmology_table,
+        constituent_mixture_prior=a.constituent_mixture_prior)
     build_store(paths, a.out, event_table=event_table, sample_sets=sample_sets,
                 cache_dir=a.cache_dir, offline=offline, cfg=cfg,
                 file_provenance=file_provenance, write_summary=write_summary)

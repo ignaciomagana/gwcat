@@ -188,6 +188,23 @@ class ChiPDefinitionError(ValueError):
     components, so a joint (chi_eff, chi_p) prior would not describe it."""
 
 
+#: The mass-prior class of a constituent-mixture row (GW-40f).
+CONSTITUENT_MIXTURE = "constituent_mixture"
+
+
+def _mass_state(kind) -> str:
+    """:func:`classify_mass_prior`, plus the constituent mixture (GW-40f).
+
+    A ``constituent_mixture`` row's density is not the ``m1det`` Jacobian the
+    mass block gates, so the block would call it unsupported; it is instead a
+    parsed, row-verified prior carried as ``p_mass_dL_pe`` -- verified, but
+    applied here rather than through the block.
+    """
+    if str(kind) == CONSTITUENT_MIXTURE:
+        return "verified"
+    return classify_mass_prior(kind)
+
+
 def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                      nsamp=4096, seed=0,
                      far_max=None, pastro_min=None, z_max=None,
@@ -426,10 +443,19 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     # refuses a NaN-filled required column outright.)
     extra_avail = {p: sub.param_available(p) for p in extra_params}
 
+    # A constituent-mixture row (GW-40f) carries its joint mass x distance
+    # prior as a sample column; only those events read it.
+    has_cmix_col = "p_mass_dL_pe" in sub._param_index
+    cmix_avail = (sub.param_available("p_mass_dL_pe") if has_cmix_col
+                  else np.zeros(sub.n_events, dtype=bool))
+
     def _read_plan(e):
         """The columns event ``e`` will actually be asked for."""
-        return need + [p for p in extra_params
+        plan = need + [p for p in extra_params
                        if p not in need and extra_avail[p][e]]
+        if _mass_kind(e) == CONSTITUENT_MIXTURE:
+            plan = plan + ["p_mass_dL_pe"]
+        return plan
 
     # ── Resolve cosmology: per-event (default) or a single override ─────────
     sel_idx = np.asarray(sub._sel)
@@ -501,7 +527,14 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     # time.  The rule is the block's own classifier, so the two cannot diverge.
     unsupported_mass = [(str(sub.event_names[e]), _mass_kind(e))
                         for e in range(sub.n_events)
-                        if classify_mass_prior(_mass_kind(e)) == "unsupported"]
+                        if _mass_state(_mass_kind(e)) == "unsupported"]
+    no_cmix = [str(sub.event_names[e]) for e in range(sub.n_events)
+               if _mass_kind(e) == CONSTITUENT_MIXTURE and not cmix_avail[e]]
+    if no_cmix:
+        raise ValueError(
+            f"{len(no_cmix)} event(s) declare a constituent_mixture mass prior "
+            f"but the store carries no p_mass_dL_pe samples for them: "
+            f"{no_cmix[:10]}. Re-ingest with constituent_mixture_prior=True.")
     if unsupported_mass:
         listed = ", ".join(f"{n}: {k!r}" for n, k in unsupported_mass[:10])
         more = ("" if len(unsupported_mass) <= 10
@@ -732,11 +765,18 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             # the same function distance.dl calls; see gwcat.params.compose.)
             mass_kind_e = _mass_kind(e)
             q = m2 / m1
-            ctx_e = PEContext(event_name=str(sub.event_names[e]),
-                              m1det=m1, m2det=m2, dL=dL, cosmology=cosmo_e,
-                              mass_prior_kind=mass_kind_e)
-            p_pe = block_prior_factor_pe(
-                mass_block, {"m1det": m1, "m2det": m2, "q": q}, ctx_e) * p_dL
+            if mass_kind_e == CONSTITUENT_MIXTURE:
+                # GW-40f: the equal-weight mixture of the constituents' own
+                # normalised (m1det, q) x dL priors, built and verified at
+                # ingest -- NOT m1det * p_dL, which is one constituent's shape.
+                p_pe = np.asarray(drawn["p_mass_dL_pe"], dtype=float)
+            else:
+                ctx_e = PEContext(event_name=str(sub.event_names[e]),
+                                  m1det=m1, m2det=m2, dL=dL, cosmology=cosmo_e,
+                                  mass_prior_kind=mass_kind_e)
+                p_pe = block_prior_factor_pe(
+                    mass_block, {"m1det": m1, "m2det": m2, "q": q},
+                    ctx_e) * p_dL
 
             # Redshift and source masses under THIS event's PE cosmology
             z = z_of_dL(dL, cosmo_e)
@@ -1202,7 +1242,7 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                         else ("mixed" if uniq_mass_kinds
                               else UNSTATED_MASS_PRIOR))
     mass_unverified = [str(n) for n, k in zip(kept, mass_kinds)
-                       if classify_mass_prior(k) != "verified"]
+                       if _mass_state(k) != "verified"]
     mass_prior_verified = bool(mass_kinds) and not mass_unverified
     if mass_unverified:
         warnings.warn(
