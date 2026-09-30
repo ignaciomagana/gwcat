@@ -33,6 +33,8 @@ import h5py
 #: legitimately wrote (nospin PE files failed here) or accept one it could
 #: never have produced.
 from .pe_builder import SUPPORTED_SPIN_BASES as _PE_BASES
+from .contract import (DL_PRIOR_IMPLS_EXACT, _impl_str,
+                       mixed_prior_impl_events)
 from .selection_builder import SUPPORTED_SPIN_BASES as _SEL_BASES
 
 #: Format versions this validator understands, per side.  2.1 adds the contract
@@ -144,7 +146,7 @@ def _amax_provenance(attrs, names):
 
 
 def validate_export_v2(pe_path, selection_path=None, strict=False, *,
-                       spin_prior_allow_list=None):
+                       spin_prior_allow_list=None, require_exact_priors=False):
     """Validate a gwcat-2.0 PE export (and optionally a paired selection export).
 
     Internal-consistency checks
@@ -241,6 +243,13 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
         their spin prior is NOT the label's own analytic one (GW-40d; see
         :func:`load_spin_prior_allow_list` for the accepted forms).  Without it
         every such event is refused.
+    require_exact_priors : bool, default False
+        Refuse (always raise) unless every analytic prior factor was evaluated
+        EXACTLY (GW-40i): the PE's ``dL_prior_impl_per_event`` all
+        ``"exact"``/``"analytic"``, and ``chi_eff_prior_impl == "exact"`` on
+        every side that carries a chi_eff factor.  A file that does not record
+        its implementation is refused too.  Without it, a legacy or a mixed
+        product is only warned about (and refused under ``strict``).
 
     Returns
     -------
@@ -331,6 +340,10 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
     _range_checks(_check, pe_cols, pe_amax, prefix="pe")
     _sky_checks(_check, pe_cols, prefix="pe")
     _fit_columns_present(_check, pe_attrs, pe_present, prefix="pe")
+
+    # How the PE's analytic prior factors were evaluated (GW-40i).
+    _check_pe_prior_impl(_fail, results, pe_attrs, strict=strict,
+                         require_exact=require_exact_priors)
 
     # ── Selection file (internal) + cross-checks ────────────────────────────
     if selection_path is not None:
@@ -724,7 +737,9 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
         _xcheck_campaign_cosmology(_check, results, sel_attrs)
 
         # (e3) The same chi_eff prior implementation on both sides (GW-40i).
-        _xcheck_chi_eff_prior_impl(_fail, results, pe_attrs, sel_attrs)
+        _xcheck_chi_eff_prior_impl(_fail, results, pe_attrs, sel_attrs,
+                                   strict=strict,
+                                   require_exact=require_exact_priors)
 
         # (f) 2.1 pairing hash.  Only when BOTH sides carry one -- and never as
         # a substitute for the checks above, which name the offending field.
@@ -777,7 +792,7 @@ def export_generation(version):
 
 
 def validate_export_any(pe_path, selection_path=None, strict=False, *,
-                        spin_prior_allow_list=None):
+                        spin_prior_allow_list=None, require_exact_priors=False):
     """Validate an export (and optionally its paired selection export),
     dispatching on each file's declared ``format_version``.
 
@@ -806,6 +821,8 @@ def validate_export_any(pe_path, selection_path=None, strict=False, *,
     strict : bool, default False
         Raise on the first internal-consistency failure.  Cross-file contract
         checks always raise on mismatch regardless of this flag.
+    require_exact_priors : bool, default False
+        See :func:`validate_export_v2`; a v1 pair is refused.
 
     Returns
     -------
@@ -839,11 +856,17 @@ def validate_export_any(pe_path, selection_path=None, strict=False, *,
 
     if pe_gen == "v2":
         return validate_export_v2(pe_path, selection_path, strict=strict,
-                                  spin_prior_allow_list=spin_prior_allow_list)
+                                  spin_prior_allow_list=spin_prior_allow_list,
+                                  require_exact_priors=require_exact_priors)
     from ..catalog import validate_export as _validate_export_v1
     if spin_prior_allow_list is not None:
         warnings.warn("spin_prior_allow_list applies only to the gwcat-2 "
                       "validator; ignored for this v1 pair.")
+    if require_exact_priors:
+        raise ValueError(
+            "require_exact_priors: a v1 (gwcat-1.0) pair predates the exact "
+            "prior evaluations (GW-40i) and records no implementation; it "
+            "cannot satisfy the requirement.")
     return _validate_export_v1(pe_path, selection_path, strict=strict)
 
 
@@ -1003,7 +1026,75 @@ def _xcheck_detection_cut(_fail, results, pe_attrs, sel_attrs):
     results["xcheck_detection_cut"] = True
 
 
-def _xcheck_chi_eff_prior_impl(_fail, results, pe_attrs, sel_attrs):
+#: Bases whose p_pe (PE) / pdraw (selection) carries an isotropic chi_eff factor.
+_PE_CHI_EFF_BASES = ("chieff", "chieff_chip")
+_SEL_CHI_EFF_BASES = ("chieff", "chieff_reference", "chieff_chip")
+
+
+def _check_pe_prior_impl(_fail, results, pe_attrs, *, strict=False,
+                         require_exact=False):
+    """The PE file's two analytic prior factors: same family, and (on request)
+    exact (GW-40i).
+
+    * **Mixed** -- ``chi_eff_prior_impl="exact"`` over a store whose
+      ``p_dL_pe`` came from a legacy interpolation, or the legacy ``"grid"``
+      over an exact store.  Each factor is still its declared prior to its own
+      accuracy, so this is not a cancellation error, but the file is neither
+      the exact product nor a legacy regression: WARN, and FAIL under
+      ``strict``.
+    * ``require_exact`` -- every ``dL_prior_impl_per_event`` must be
+      ``"exact"`` or ``"analytic"`` and, for a basis with a chi_eff factor,
+      ``chi_eff_prior_impl`` must be ``"exact"``; an unrecorded implementation
+      is refused as well.  Always raises.
+    """
+    basis = _impl_str(pe_attrs.get("spin_basis"))
+    chi = pe_attrs.get("chi_eff_prior_impl")
+    chi = None if chi is None else _impl_str(chi)
+    dl = pe_attrs.get("dL_prior_impl_per_event")
+    dl = None if dl is None else [_impl_str(x) for x in np.atleast_1d(dl)]
+    names = pe_attrs.get("event_names")
+    names = ([_impl_str(x) for x in np.atleast_1d(names)]
+             if names is not None else [f"#{i}" for i in range(len(dl or []))])
+
+    if chi is not None and dl is not None:
+        mixed = mixed_prior_impl_events(chi, dl, names)
+        if mixed:
+            msg = (f"PE chi_eff_prior_impl={chi!r} but p_dL_pe of "
+                   f"{len(mixed)} event(s) was evaluated by the other family "
+                   f"(e.g. {mixed[:3]}; dL_prior_impl_per_event). The file is "
+                   f"neither the exact product nor a legacy regression: "
+                   f"re-ingest and re-export with --legacy-grid-priors on both "
+                   f"steps or on neither.")
+            if strict:
+                _fail("pe_prior_impl_consistent", msg)
+            warnings.warn(msg)
+    results["pe_prior_impl_consistent"] = True
+
+    if not require_exact:
+        return
+    if dl is None or any(x == "" for x in dl):
+        _fail("pe_prior_impl_exact",
+              "require_exact_priors: the PE file does not record "
+              "dL_prior_impl_per_event for every event (written before GW-40i, "
+              "or from a store that predates the record), so an exact "
+              "distance prior cannot be verified. Re-ingest and re-export.")
+    bad = [(n, x) for n, x in zip(names, dl) if x not in DL_PRIOR_IMPLS_EXACT]
+    if bad:
+        _fail("pe_prior_impl_exact",
+              f"require_exact_priors: p_dL_pe of {len(bad)} event(s) was not "
+              f"evaluated exactly (e.g. {bad[:3]}); expected every "
+              f"dL_prior_impl_per_event in {DL_PRIOR_IMPLS_EXACT}. Re-ingest "
+              f"without --legacy-grid-priors.")
+    if basis in _PE_CHI_EFF_BASES and chi != "exact":
+        _fail("pe_prior_impl_exact",
+              f"require_exact_priors: PE spin_basis={basis!r} carries a "
+              f"chi_eff prior factor but chi_eff_prior_impl={chi!r} (expected "
+              f"'exact'). Re-export without --legacy-grid-priors.")
+    results["pe_prior_impl_exact"] = True
+
+
+def _xcheck_chi_eff_prior_impl(_fail, results, pe_attrs, sel_attrs, *,
+                               strict=False, require_exact=False):
     """PE ``p_pe`` and selection ``pdraw`` must carry the SAME chi_eff density.
 
     The chi_eff factor of a chieff-type pair is the same analytic prior on both
@@ -1014,17 +1105,17 @@ def _xcheck_chi_eff_prior_impl(_fail, results, pe_attrs, sel_attrs):
 
     Both sides recording ``chi_eff_prior_impl`` and disagreeing -> FAIL.  One
     side recording it and the other not (a file from before the record) ->
-    WARN: unknown is not evidence of a mismatch, but the older file almost
-    certainly used the grid.
+    WARN (unknown is not evidence of a mismatch, but the older file almost
+    certainly used the grid), and FAIL under ``strict``.  ``require_exact``
+    additionally refuses a selection whose chieff-type pdraw is not
+    ``chi_eff_prior_impl == "exact"``.
     """
     pe_impl = pe_attrs.get("chi_eff_prior_impl")
     sel_impl = sel_attrs.get("chi_eff_prior_impl")
-    if isinstance(pe_impl, bytes):
-        pe_impl = pe_impl.decode()
-    if isinstance(sel_impl, bytes):
-        sel_impl = sel_impl.decode()
+    pe_impl = None if pe_impl is None else _impl_str(pe_impl)
+    sel_impl = None if sel_impl is None else _impl_str(sel_impl)
     if pe_impl is not None and sel_impl is not None:
-        if str(pe_impl) != str(sel_impl):
+        if pe_impl != sel_impl:
             _fail("xcheck_chi_eff_prior_impl",
                   f"PE chi_eff_prior_impl={pe_impl!r} but selection "
                   f"chi_eff_prior_impl={sel_impl!r}: p_pe and pdraw carry "
@@ -1033,10 +1124,22 @@ def _xcheck_chi_eff_prior_impl(_fail, results, pe_attrs, sel_attrs):
                   f"difference does not cancel). Rebuild both with the same "
                   f"implementation (--legacy-grid-priors on both or neither).")
     elif (pe_impl is None) != (sel_impl is None):
-        warnings.warn(
-            f"chi_eff_prior_impl recorded on one side only (PE={pe_impl!r}, "
-            f"selection={sel_impl!r}); the unrecorded file predates GW-40i and "
-            f"almost certainly used the legacy interpolated grid.")
+        msg = (f"chi_eff_prior_impl recorded on one side only (PE={pe_impl!r}, "
+               f"selection={sel_impl!r}); the unrecorded file predates GW-40i "
+               f"and almost certainly used the legacy interpolated grid.")
+        if strict:
+            _fail("xcheck_chi_eff_prior_impl_recorded",
+                  msg + " A strict validation refuses the pair; re-export the "
+                        "older file with this gwcat.")
+        warnings.warn(msg)
+    if require_exact:
+        sel_basis = _impl_str(sel_attrs.get("spin_basis"))
+        if sel_basis in _SEL_CHI_EFF_BASES and sel_impl != "exact":
+            _fail("xcheck_chi_eff_prior_impl_exact",
+                  f"require_exact_priors: selection spin_basis={sel_basis!r} "
+                  f"carries a chi_eff prior factor in pdraw but "
+                  f"chi_eff_prior_impl={sel_impl!r} (expected 'exact'). "
+                  f"Re-export without --legacy-grid-priors.")
     results["xcheck_chi_eff_prior_impl"] = True
 
 

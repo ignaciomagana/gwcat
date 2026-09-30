@@ -2052,6 +2052,18 @@ def build_store(paths, out_path, params=None, extra_params=None,
                 return_info=True)
             rec["p_dL_pe"] = p_dL
             if dL_info["frac_outside_bounds"] > cfg.dL_outside_warn_frac:
+                if dL_info.get("widened"):
+                    # Legacy interpolations: the table had to be widened.
+                    how = (f"The density was evaluated over "
+                           f"[{dL_info['eval_min']:.4g}, "
+                           f"{dL_info['eval_max']:.4g}] Mpc instead of "
+                           f"zeroing them")
+                else:
+                    # Exact / closed form: the same formula, normalised over
+                    # the declared bounds, is evaluated at every sample.
+                    how = ("The density's formula, normalised over the "
+                           "declared bounds, was evaluated at those samples "
+                           "instead of zeroing them")
                 warnings.warn(
                     f"{name} [{analysis}]: {dL_info['n_outside_bounds']} of "
                     f"{dL_info['n_samples']} dL samples "
@@ -2059,9 +2071,7 @@ def build_store(paths, out_path, params=None, extra_params=None,
                     f"outside the recorded distance-prior bounds "
                     f"[{dmin:.4g}, {dmax:.4g}] Mpc from {src} "
                     f"({dL_info['n_below_dmin']} below, "
-                    f"{dL_info['n_above_dmax']} above).  The density was "
-                    f"evaluated over [{dL_info['eval_min']:.4g}, "
-                    f"{dL_info['eval_max']:.4g}] Mpc instead of zeroing them, "
+                    f"{dL_info['n_above_dmax']} above).  {how}, "
                     f"but the recorded bounds describe a different analysis "
                     f"than the one ingested.")
             if dL_info["n_nonfinite"]:

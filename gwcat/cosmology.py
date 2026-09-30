@@ -420,8 +420,39 @@ class _ExactFlatDistances:
         return float(np.sum(half * (f @ _EX_GL_W)))
 
 
+def _cosmology_cache_key(cosmology) -> tuple:
+    """A cache key that identifies ``cosmology`` by the VALUES of its
+    parameters at full float precision.
+
+    ``repr`` is not such a key: astropy prints ``H0`` (and other Quantities) to
+    8 significant digits, so ``FlatLambdaCDM(67.9 + 1e-9, ...)`` shared the
+    cached distances of ``FlatLambdaCDM(67.9, ...)`` (review of GW-40i: 2e-11
+    relative error, up to ~5e-9 near a collision -- above the 1e-10 target).
+    The key is the class plus every declared parameter, each Quantity reduced
+    to its value in its own unit (the unit string is kept too), arrays as
+    tuples; ``name`` is not a parameter and does not enter.
+    """
+    params = getattr(cosmology, "parameters", None)
+    if params is None:
+        # Not an astropy >= 6 Cosmology: fall back to identity, never to repr
+        # (an object we cannot inspect is never shared with another).
+        return ("id", id(cosmology))
+    items = []
+    for name in sorted(params):
+        v = params[name]
+        if v is None:
+            items.append((name, None))
+            continue
+        unit = getattr(v, "unit", None)
+        val = np.asarray(getattr(v, "value", v), dtype=float)
+        items.append((name, str(unit) if unit is not None else "",
+                      tuple(val.ravel().tolist())))
+    return (type(cosmology).__module__, type(cosmology).__qualname__,
+            tuple(items))
+
+
 def _exact_distances(cosmology) -> _ExactFlatDistances:
-    key = ("dist", repr(cosmology))
+    key = ("dist", _cosmology_cache_key(cosmology))
     obj = _EX_CACHE.get(key)
     if obj is None:
         obj = _ExactFlatDistances(cosmology)
@@ -448,7 +479,8 @@ def usf_prob_exact(dL_mpc, cosmology, dmin: float, dmax: float, *,
             f"exact distance prior: need dmax > dmin >= 0, got "
             f"[{dmin!r}, {dmax!r}] Mpc.")
     ex = _exact_distances(cosmology)
-    zkey = ("norm", repr(cosmology), dmin, dmax, bool(time_dilation))
+    zkey = ("norm", _cosmology_cache_key(cosmology), dmin, dmax,
+            bool(time_dilation))
     Z = _EX_CACHE.get(zkey)
     if Z is None:
         zlo, zhi = ex.z_of_dL(np.array([dmin, dmax]))

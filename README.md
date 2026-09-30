@@ -279,7 +279,14 @@ gwcat validate --strict pe.h5 sel.h5 --spin-prior-allow-list allow.txt
   `export pe`, `export selection`, `export-darksirens`, `selection`) restores
   the pre-GW-40i interpolated evaluations bit for bit, for regressions against
   older products only; in Python, `with gwcat.spin.chi_eff_prior_impl("grid"):`
-  and `IngestConfig(dL_prior_impl="auto")`.
+  and `IngestConfig(dL_prior_impl="auto")`.  A legacy regression needs the
+  flag on BOTH the ingest and the export: an exact store exported with the
+  flag (or a legacy store exported without it) is a *mixed* product, which the
+  PE builder warns about and `gwcat validate --strict` refuses (as it refuses a
+  pair where only one file records `chi_eff_prior_impl`).
+  **`gwcat validate --require-exact-priors`** refuses anything but an exact
+  product: every `dL_prior_impl_per_event` `exact`/`analytic`, and
+  `chi_eff_prior_impl == "exact"` on each side that carries a chi_eff factor.
 
 ### Validation summaries
 

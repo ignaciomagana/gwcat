@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from ...cosmology import DL_PRIOR_KINDS, dL_prior_prob
+from ...cosmology import (DL_PRIOR_KINDS, USF_IMPL_DEFAULT, USF_IMPLS,
+                          dL_prior_prob)
 from ..block import ParameterBlock, Range
 
 
@@ -25,8 +26,14 @@ def ln_prior_pe(cols, ctx):
             f"in the per-event normalisation.")
     lo, hi = (ctx.dL_prior_bounds if len(ctx.dL_prior_bounds) == 2
               else (float(np.nanmin(dL)), float(np.nanmax(dL))))
+    # The implementation the STORE used for this row (GW-40i): exact by
+    # default, the legacy interpolation only when the row was ingested with it
+    # ("analytic" -- a closed-form class -- and "" take the default, which the
+    # closed-form classes ignore anyway).
+    impl = (ctx.dL_prior_impl if ctx.dL_prior_impl in USF_IMPLS
+            else USF_IMPL_DEFAULT)
     p = dL_prior_prob(dL, kind=kind, cosmology=ctx.cosmology, dmin=lo, dmax=hi,
-                      alpha=ctx.dL_prior_alpha)
+                      alpha=ctx.dL_prior_alpha, impl=impl)
     p = np.asarray(p, dtype=float)
     with np.errstate(divide="ignore"):
         return np.where(p > 0, np.log(p), -np.inf)

@@ -437,6 +437,13 @@ def build_parser() -> argparse.ArgumentParser:
                             "{event: prior_source_kind} map, or a text file "
                             "of 'NAME [KIND]' lines. Without it every such "
                             "event is refused.")
+    p_val.add_argument("--require-exact-priors", action="store_true",
+                       help="Refuse unless every analytic prior factor was "
+                            "evaluated exactly (GW-40i): the PE's "
+                            "dL_prior_impl_per_event all exact/analytic and "
+                            "chi_eff_prior_impl='exact' on every side with a "
+                            "chi_eff factor. For gating production products; "
+                            "a --legacy-grid-priors or mixed product fails.")
 
     return parser
 
@@ -716,7 +723,8 @@ def _cmd_validate(args) -> int:
     try:
         results = validate_export_any(
             args.pe_path, args.selection_path, strict=args.strict,
-            spin_prior_allow_list=args.spin_prior_allow_list)
+            spin_prior_allow_list=args.spin_prior_allow_list,
+            require_exact_priors=args.require_exact_priors)
     except (ValueError, AssertionError) as e:
         print(f"validate: FAILED: {e}", file=sys.stderr)
         return 1

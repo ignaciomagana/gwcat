@@ -94,7 +94,7 @@ from ..params import (DEFAULT_PARAMETER_SPACE, PEContext,
 from ..params.blocks.mass import UNSTATED_MASS_PRIOR, classify_mass_prior
 from ..source_class import CUT_ESTIMATOR_ATTR, PE_MEDIAN_CUT_WARNING
 from ..spin import AMAX_AUTO, parse_amax_option
-from .contract import event_list_digest
+from .contract import event_list_digest, mixed_prior_impl_events
 from .product import ExportProduct
 
 
@@ -797,7 +797,8 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             else:
                 ctx_e = PEContext(event_name=str(sub.event_names[e]),
                                   m1det=m1, m2det=m2, dL=dL, cosmology=cosmo_e,
-                                  mass_prior_kind=mass_kind_e)
+                                  mass_prior_kind=mass_kind_e,
+                                  dL_prior_impl=str(sel_dL_impl[e]))
                 p_pe = block_prior_factor_pe(
                     mass_block, {"m1det": m1, "m2det": m2, "q": q},
                     ctx_e) * p_dL
@@ -1406,6 +1407,20 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         _chi_impl = current_chi_eff_prior_impl()
         attrs["chi_eff_prior_impl"] = _chi_impl
         attrs["chi_eff_prior_method"] = CHI_EFF_PRIOR_METHODS[_chi_impl]
+        # A MIXED product -- exact chi_eff over a legacy-dL store, or the
+        # legacy chi_eff grid over an exact store -- is legal (each factor is
+        # still the declared prior to its implementation's accuracy) but is
+        # neither the exact product nor a legacy regression; say so, and let
+        # `gwcat validate --strict` / --require-exact-priors refuse it.
+        _mixed = mixed_prior_impl_events(_chi_impl, kept_dL_impl, kept)
+        if _mixed:
+            warnings.warn(
+                f"PE export mixes prior implementations: chi_eff_prior_impl="
+                f"{_chi_impl!r} but the store evaluated p_dL_pe with a "
+                f"{'legacy' if _chi_impl == 'exact' else 'exact'} "
+                f"implementation for {len(_mixed)} event(s) (e.g. "
+                f"{_mixed[:3]}). Re-ingest (or re-export) with "
+                f"--legacy-grid-priors on both or on neither.")
     attrs.update(_population_resolver_attrs(cat, kept))
     attrs.update(_sample_set_map_attrs(
         getattr(sub, "_sample_set_map_report", None), kept))
