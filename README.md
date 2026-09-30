@@ -189,6 +189,54 @@ The standalone `gwcat-fetch` / `gwcat-ingest` scripts still work unchanged
 (same flags, same behavior) but are deprecated: they print a one-line pointer
 to `gwcat fetch` / `gwcat ingest` on stderr before delegating.
 
+### PE provenance: release cosmology, label maps, spin support (GW-40)
+
+```bash
+# Ingest every sample set, no live GWOSC fetch.  The GWTC-2.1/3 `_cosmo`
+# (release-reweighted) distance priors take their cosmology from the cited
+# per-catalog table gwcat/data/release_reweight_cosmology.yaml (LAL Planck15
+# 67.90/0.3065); pass --release-reweight-cosmology-table to use another.
+gwcat ingest --glob "$R/GWTC-2p1/*.h5" --glob "$R/GWTC-3/*.h5" \
+    --glob "$R/GWTC-4p1/*.hdf5" --glob "$R/GWTC-5/*.hdf5" \
+    --out store.h5 --sample-sets all --no-event-table
+
+# Explicit per-event labels, spin support cut to the declared ceiling.
+gwcat export pe store.h5 --out pe.h5 --format gwcat2 --parameter-space chieff \
+    --event-list population_259.txt \
+    --waveform-policy event-map --sample-set-map sample_set_map.json \
+    --drop-spin-above-ceiling --nsamp 4096 --seed 0 --amax auto
+
+# A chieff PE + chieff_reference selection pair refuses events whose spin prior
+# is not their label's own analytic declaration unless they are allow-listed.
+gwcat validate --strict pe.h5 sel.h5 --spin-prior-allow-list allow.txt
+```
+
+* **Release-reweight table.** Every store row records `dL_prior_cosmology_name`,
+  `dL_prior_cosmology_source` (`documented` / `inferred_from_z(dL)`) and the
+  table's sha256.  `meta_data/cosmology` is never read.  A `_cosmo` file of a
+  catalog the table lacks is refused.  The pre-GW-40 astropy default is bundled
+  as `release_reweight_cosmology_legacy_astropy.yaml`, for regressions only.
+* **Per-prior provenance.** Each row records `prior_source_{label,kind}_{mass,
+  spin,dL}`; kinds are `own_analytic`, `sibling_inherited`,
+  `config_file_declared` (LALInference `engine/a_spin{1,2}-max`),
+  `assumed_default`, `release_reweighted`, `constituent_mixture`.  PE exports
+  carry them as `prior_source_kind_*_per_event`.
+* **`event-map`.** `sample_set_map.json` is `{event: label, ...,
+  "substitutes": {event: reason | {"label": fallback, "reason": ...}}}` (or
+  `{"events": {...}, "substitutes": {...}}`), or a popsummary file's
+  `events`/`event_sample_IDs`.  An unmapped event, or a mapped label the store
+  lacks with no declared substitute, fails.  `--nrsur-q-rule FRAC` refuses an
+  NRSur7dq4 label whose `IMRPhenomXPHM-SpinTaylor` posterior has more than FRAC
+  of its mass at q < 1/6 (or substitutes it with `--nrsur-q-rule-substitute`)
+  and verifies declared `nrsur_q_rule` substitutes.  Substitutes are written
+  to the PE file with their reasons.
+* **`--drop-spin-above-ceiling`.** Drops raw samples with `a_i > amax_i` before
+  resampling (exact rejection to U(0, amax)); counts in
+  `n_dropped_spin_above_ceiling_per_event`.
+* **`--constituent-mixture-prior`** (ingest; only for policies that use
+  `C00:Mixed`): the equal-weight mixture of the constituents' own priors, with
+  the mixing fractions verified row by row.
+
 ### Validation summaries
 
 Every `gwcat ingest` / `gwcat export-darksirens` / `gwcat selection` run
