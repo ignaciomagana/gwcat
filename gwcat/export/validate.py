@@ -143,7 +143,8 @@ def _amax_provenance(attrs, names):
     return np.concatenate(parts)
 
 
-def validate_export_v2(pe_path, selection_path=None, strict=False):
+def validate_export_v2(pe_path, selection_path=None, strict=False, *,
+                       spin_prior_allow_list=None):
     """Validate a gwcat-2.0 PE export (and optionally a paired selection export).
 
     Internal-consistency checks
@@ -235,6 +236,11 @@ def validate_export_v2(pe_path, selection_path=None, strict=False):
     strict : bool, default False
         Raise on the first internal-consistency failure.  Cross-file contract
         checks always raise on mismatch regardless of this flag.
+    spin_prior_allow_list : optional
+        The events a ``chieff`` / ``chieff_reference`` pair may carry although
+        their spin prior is NOT the label's own analytic one (GW-40d; see
+        :func:`load_spin_prior_allow_list` for the accepted forms).  Without it
+        every such event is refused.
 
     Returns
     -------
@@ -242,6 +248,7 @@ def validate_export_v2(pe_path, selection_path=None, strict=False):
         ``{check_name: passed_bool}``.
     """
     results = {}
+    spin_prior_allow_list = load_spin_prior_allow_list(spin_prior_allow_list)
 
     def _check(name, cond, msg=""):
         results[name] = bool(cond)
@@ -457,7 +464,8 @@ def validate_export_v2(pe_path, selection_path=None, strict=False):
 
         # (b) Basis-specific spin-amax handling.
         if reference_pair:
-            _xcheck_reference_pair(_check, _fail, results, pe_attrs, sel_attrs)
+            _xcheck_reference_pair(_check, _fail, results, pe_attrs, sel_attrs,
+                                   spin_prior_allow_list=spin_prior_allow_list)
         elif pe_basis == "chieff":
             # Each side's ceiling is checked against ITS OWN provenance, and the
             # two are RECORDED rather than required to match -- see the
@@ -696,7 +704,8 @@ def export_generation(version):
     return "unknown"
 
 
-def validate_export_any(pe_path, selection_path=None, strict=False):
+def validate_export_any(pe_path, selection_path=None, strict=False, *,
+                        spin_prior_allow_list=None):
     """Validate an export (and optionally its paired selection export),
     dispatching on each file's declared ``format_version``.
 
@@ -757,8 +766,12 @@ def validate_export_any(pe_path, selection_path=None, strict=False):
             f"check the file.")
 
     if pe_gen == "v2":
-        return validate_export_v2(pe_path, selection_path, strict=strict)
+        return validate_export_v2(pe_path, selection_path, strict=strict,
+                                  spin_prior_allow_list=spin_prior_allow_list)
     from ..catalog import validate_export as _validate_export_v1
+    if spin_prior_allow_list is not None:
+        warnings.warn("spin_prior_allow_list applies only to the gwcat-2 "
+                      "validator; ignored for this v1 pair.")
     return _validate_export_v1(pe_path, selection_path, strict=strict)
 
 
@@ -973,7 +986,120 @@ def _xcheck_campaign_cosmology(_check, results, sel_attrs):
         all(results.get(k, True) for k in subs))
 
 
-def _xcheck_reference_pair(_check, _fail, results, pe_attrs, sel_attrs):
+#: The only spin-prior source a reference pair accepts without an allow-list.
+_SPIN_PRIOR_SOURCE_OK = "own_analytic"
+
+
+def load_spin_prior_allow_list(spec):
+    """Normalise a spin-prior allow-list to ``{event_name: kind_or_None}``.
+
+    Accepted forms (GW-40d):
+
+    * ``None`` -- no allow-list (every non-``own_analytic`` event is refused);
+    * a mapping ``{event: kind}`` (or ``{event: {"kind": kind, ...}}``) -- the
+      event is allowed ONLY with that exact ``prior_source_kind``;
+    * an iterable of names -- allowed with any kind;
+    * a path: ``.json`` holding either of the above, or a text file with one
+      ``NAME`` or ``NAME KIND`` per line (``#`` comments allowed).
+
+    Being explicit about the kind is recommended: the operator-approved list
+    (OD-7) says WHY each event is an exception, and an event whose provenance
+    changed underneath it should then fail rather than pass silently.
+    """
+    import json
+    import os
+
+    if spec is None:
+        return None
+    if isinstance(spec, (str, os.PathLike)):
+        path = os.fspath(spec)
+        with open(path) as f:
+            text = f.read()
+        if path.lower().endswith(".json"):
+            return load_spin_prior_allow_list(json.loads(text))
+        out = {}
+        for line in text.splitlines():
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            bits = line.split()
+            out[bits[0]] = bits[1] if len(bits) > 1 else None
+        return out
+    if isinstance(spec, dict):
+        out = {}
+        for k, v in spec.items():
+            if isinstance(v, dict):
+                v = v.get("kind")
+            out[str(k)] = None if v in (None, "", "*") else str(v)
+        return out
+    return {str(k): None for k in spec}
+
+
+def _xcheck_reference_spin_prior_source(_fail, results, pe_attrs,
+                                        allow_list):
+    """Refuse non-own-analytic spin priors in a reference pair (GW-40d).
+
+    The reference basis divides the SAME U(0, a_ref) isotropic prior out of
+    both files.  That is exact for an event whose spin prior is its label's own
+    analytic declaration.  It is an ASSUMPTION for an event whose prior was
+    inherited from a sibling (a ``Mixed`` set), read from a LALInference config,
+    or not declared at all -- so each such event must be named on an explicit,
+    operator-approved allow-list (OD-7), or the pair is refused.
+    """
+    kinds = pe_attrs.get("prior_source_kind_spin_per_event")
+    names = pe_attrs.get("event_names")
+    if kinds is None or names is None:
+        warnings.warn(
+            "chieff_reference: the PE file records no "
+            "prior_source_kind_spin_per_event (written before GW-40c), so "
+            "whether each event's spin prior is its own declared "
+            "U(0, a_ref) cannot be checked. Re-export the PE file to have it "
+            "checked.")
+        return
+    dec = [x.decode() if isinstance(x, (bytes, bytearray)) else str(x)
+           for x in np.atleast_1d(kinds)]
+    nms = [x.decode() if isinstance(x, (bytes, bytearray)) else str(x)
+           for x in np.atleast_1d(names)]
+    allow = allow_list or {}
+    offenders, wrong_kind = [], []
+    for n, k in zip(nms, dec):
+        if k == _SPIN_PRIOR_SOURCE_OK:
+            continue
+        if n not in allow:
+            offenders.append((n, k))
+        elif allow[n] is not None and allow[n] != k:
+            wrong_kind.append((n, k, allow[n]))
+    if offenders or wrong_kind:
+        by_kind = {}
+        for n, k in offenders:
+            by_kind.setdefault(k, []).append(n)
+        parts = [f"{k} [{len(v)}]: {v[:10]}"
+                 + ("" if len(v) <= 10 else f" (+{len(v) - 10} more)")
+                 for k, v in sorted(by_kind.items())]
+        if wrong_kind:
+            parts.append("allow-listed with a DIFFERENT kind: "
+                         + ", ".join(f"{n} is {k}, list says {w}"
+                                     for n, k, w in wrong_kind[:10]))
+        _fail("xcheck_reference_spin_prior_source",
+              f"{len(offenders) + len(wrong_kind)} PE event(s) divide out a "
+              f"spin prior that is NOT their label's own analytic declaration, "
+              f"and are not on the spin-prior allow-list: "
+              + "; ".join(parts)
+              + ". The chieff_reference pair assumes each event's spin prior "
+                "IS the declared U(0, a_ref) reference; for these that is an "
+                "assumption (sibling-inherited, config-declared or assumed "
+                "default), so it must be approved explicitly -- pass "
+                "spin_prior_allow_list= (CLI: --spin-prior-allow-list FILE) "
+                "naming each event (and its kind), or drop the events.")
+    unused = sorted(set(allow) - set(nms))
+    if unused:
+        warnings.warn(f"spin_prior_allow_list names {len(unused)} event(s) "
+                      f"not in the PE file: {unused[:10]}")
+    results["xcheck_reference_spin_prior_source"] = True
+
+
+def _xcheck_reference_pair(_check, _fail, results, pe_attrs, sel_attrs,
+                           spin_prior_allow_list=None):
     """A chieff PE file and a chieff_reference selection file: ONE ceiling.
 
     This is the cross-check that is stricter here than for chieff/chieff, and
@@ -1017,6 +1143,10 @@ def _xcheck_reference_pair(_check, _fail, results, pe_attrs, sel_attrs):
                   f"file with spin_reference_amax equal to the PE ceiling (or "
                   f"the PE file at that amax).")
         results["xcheck_reference_amax_matches"] = True
+
+    # WHERE each event's ceiling came from, not only its value (GW-40d).
+    _xcheck_reference_spin_prior_source(_fail, results, pe_attrs,
+                                        spin_prior_allow_list)
 
     from ..selection import PDRAW_STATE_CHIEFF_REFERENCE
     if sel_attrs.get("pdraw_state") != PDRAW_STATE_CHIEFF_REFERENCE:

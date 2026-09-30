@@ -357,6 +357,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_val.add_argument("--strict", action="store_true",
                        help="Raise on the first internal-consistency failure "
                             "(cross-file contract checks always raise).")
+    p_val.add_argument("--spin-prior-allow-list", default=None, metavar="FILE",
+                       help="Events a chieff/chieff_reference pair may carry "
+                            "whose spin prior is not their label's own "
+                            "analytic one (GW-40d): a .json list or "
+                            "{event: prior_source_kind} map, or a text file "
+                            "of 'NAME [KIND]' lines. Without it every such "
+                            "event is refused.")
 
     return parser
 
@@ -595,8 +602,9 @@ def _cmd_validate(args) -> int:
     from .export.validate import validate_export_any
 
     try:
-        results = validate_export_any(args.pe_path, args.selection_path,
-                                      strict=args.strict)
+        results = validate_export_any(
+            args.pe_path, args.selection_path, strict=args.strict,
+            spin_prior_allow_list=args.spin_prior_allow_list)
     except (ValueError, AssertionError) as e:
         print(f"validate: FAILED: {e}", file=sys.stderr)
         return 1
