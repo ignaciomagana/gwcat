@@ -357,6 +357,15 @@ def validate_export_v2(pe_path, selection_path=None, strict=False):
         # never raises, so a consumer reading columns independently pairs
         # injection i's draw density with injection j's masses and distance.
         sel_required = list(_SEL_LEGACY)
+        # GW-39: a sky-marginalised product omits ra/dec by construction, and
+        # must then really omit them (a file that says marginalised and ships
+        # a sky would be ambiguous about which it is).
+        _sky_marg = bool(sel_attrs.get("sky_marginalized", False))
+        if _sky_marg:
+            sel_required = [c for c in sel_required if c not in ("ra", "dec")]
+            _check("sel_sky_marginalized_has_no_radec",
+                   "ra" not in sel_present and "dec" not in sel_present,
+                   "sky_marginalized=True but the file carries ra/dec")
         if sel_basis == "component":
             sel_required += _SPIN_COLUMNS
         elif sel_basis == "chieff_reference":
@@ -402,6 +411,65 @@ def validate_export_v2(pe_path, selection_path=None, strict=False):
         for a in ("injected_spin_format", "injected_spin_amax_detected",
                   "injected_spin_uniform_isotropic"):
             _check(f"sel_has_{a}", a in sel_attrs, f"attr {a!r} missing")
+
+        # GW-39: a cumulative-mixture product must say how each run was
+        # detected and how its exposure is defined, and its per-run written
+        # counts must add up to the file.
+        if bool(sel_attrs.get("cumulative_mixture", False)):
+            for a in ("run_labels", "n_detected_per_run",
+                      "detection_rule_per_run", "T_definition_per_run",
+                      "component_of_run", "mixture_components",
+                      "N_per_component", "T_per_component_s",
+                      "T_definition_per_component"):
+                _check(f"sel_mixture_has_{a}", a in sel_attrs,
+                       f"cumulative_mixture=True but attr {a!r} is missing")
+            # Every *_per_run attr is aligned with run_labels and every
+            # *_per_component attr with mixture_components, so a consumer can
+            # zip them without guessing the granularity.
+            if "run_labels" in sel_attrs:
+                _nr = len(np.atleast_1d(sel_attrs["run_labels"]))
+                for a in sorted(k for k in sel_attrs
+                                if k.endswith("_per_run")
+                                and k != "mixture_weights_per_run"):
+                    _v = sel_attrs[a]
+                    _len = (np.asarray(_v).shape[0]
+                            if np.ndim(_v) >= 1 else 1)
+                    _check(f"sel_mixture_{a}_aligned_with_run_labels",
+                           _len == _nr,
+                           f"len({a})={_len} != len(run_labels)={_nr}")
+            if "mixture_components" in sel_attrs:
+                _nc = len(np.atleast_1d(sel_attrs["mixture_components"]))
+                for a in ("N_per_component", "T_per_component_s",
+                          "T_definition_per_component"):
+                    if a in sel_attrs:
+                        _len = len(np.atleast_1d(sel_attrs[a]))
+                        _check(f"sel_mixture_{a}_aligned_with_components",
+                               _len == _nc,
+                               f"len({a})={_len} != "
+                               f"len(mixture_components)={_nc}")
+            if "n_detected_per_run" in sel_attrs:
+                # The per-run counts are the MIXTURE campaign's own rows; a
+                # product may add a campaign disjoint from it in time, so
+                # compare with the mixture's own written count, which can
+                # never exceed the product's.
+                _nper = np.asarray(sel_attrs["n_detected_per_run"]).ravel()
+                _n_camp = len(np.atleast_1d(
+                    sel_attrs.get("campaign_kind_per_campaign", [""])))
+                _n_mix = sel_attrs.get("n_detected_mixture")
+                if _n_mix is None and _n_camp == 1:
+                    _n_mix = n_det
+                _check("sel_mixture_has_n_detected_mixture",
+                       _n_mix is not None,
+                       "a multi-campaign cumulative-mixture product must "
+                       "record n_detected_mixture")
+                if _n_mix is not None:
+                    _check("sel_mixture_n_detected_per_run_sum",
+                           int(np.sum(_nper)) == int(_n_mix)
+                           and int(_n_mix) <= n_det
+                           and (_n_camp > 1 or int(_n_mix) == n_det),
+                           f"sum(n_detected_per_run)={int(np.sum(_nper))}, "
+                           f"n_detected_mixture={int(_n_mix)}, "
+                           f"n_detected={n_det}, n_campaigns={_n_camp}")
 
         # Magnitude bound for the range checks.  A campaign's detected amax
         # only bounds its injections when that campaign's draw really is

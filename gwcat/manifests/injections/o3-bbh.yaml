@@ -2,9 +2,14 @@
 #
 # Ported verbatim from the pre-PR7 hardcoded registry in gwcat/fetch.py
 # (INJECTION_RELEASES["injections-O3-BBH"] + _is_o3_bbhpop_full file filter).
+#
+# GW-39: the port above was verbatim, including a wrong run list.  The file this
+# manifest selects, endo3_bbhpop-LIGO-T2100113-v12.hdf5, holds O3 injections
+# only (O3a+O3b); the O1+O2+O3 cumulative GWTC-3 products are a different
+# record (Zenodo 5636816) and are not selected here.
 release: injections-O3-BBH
-observing_runs: [O1, O2, O3]
-description: "O3 BBH search sensitivity (GWTC-3, full O1+O2+O3)"
+observing_runs: [O3a, O3b]
+description: "O3-only BBH-pop search sensitivity (GWTC-3, endo3_bbhpop, O3a+O3b)"
 
 records:
   - provider: zenodo

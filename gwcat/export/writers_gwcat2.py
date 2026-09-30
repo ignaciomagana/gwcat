@@ -170,6 +170,16 @@ def _write_selection(product, out_path, format_version, *, with_contract=False,
             f"write_selection_gwcat2 expects a kind='selection' product, got "
             f"kind={product.kind!r}.")
 
+    if with_contract and bool(product.attrs.get("sky_marginalized", False)):
+        # GW-39.  The 2.1 contract declares the space's fit_columns, which put
+        # ra/dec in the fit (sky.radec, -ln 4pi on both sides); a
+        # sky-marginalised product has no ra/dec, so its contract would
+        # describe coordinates the file does not contain.
+        raise ValueError(
+            "a sky-marginalised selection product (sky_marginalized=True, no "
+            "ra/dec columns) cannot be written as gwcat-selection-2.1: the 2.1 "
+            "contract's fit_columns include ra/dec. Write it with the default "
+            "'gwcat2' (2.0) format.")
     extra_attrs = _contract_attrs(product, "selection") if with_contract else {}
 
     with atomic_output_path(out_path) as tmp_path:

@@ -11,7 +11,9 @@ Both formats go through the same processing pipeline:
   3. Remove the spin component from the draw PDF
   4. Apply (m1src,m2src,z) → (m1det,q,dL) coordinate Jacobian
   5. Normalise by observing time and injection weights
-  6. Apply FAR-based detection cut
+  6. Apply FAR-based detection cut -- or, for a cumulative multi-run mixture
+     (GW-39), the release's per-run rule: semianalytic SNR on the O1/O2 rows,
+     each run's own search FARs on the O3/O4 rows (``detected_mask``)
 
 CombinedSelectionSet merges multiple campaigns (e.g. O3 + O4ab) following
 the multi-campaign VT estimator in Essick et al. (2023):
@@ -57,6 +59,9 @@ from .source_class import (classify_by_mass, normalize_source_class,
                            CUT_ESTIMATOR_ATTR, selection_cut_estimator)
 from . import selection_spin as _sspin
 from .spin import AMAX_AUTO, chi_p_from_components
+from .observing_runs import (INJECTION_SUPPORT_GPS, REAL_RUNS,
+                             RUN_SEARCH_PREFIX, SEMIANALYTIC_RUNS,
+                             RunWindowError, run_of_gps)
 
 # Human-readable description of what the exported ``pdraw`` represents after all
 # of the code's manipulations (see the module docstring / to_darksirens).  Both
@@ -117,6 +122,80 @@ SOURCE_CLASS_FILTER_NOTE = (
     "selection file with a PE export filtered to the same source class(es)."
 )
 
+# ── Cumulative multi-run mixtures (GW-39) ─────────────────────────────────────
+#: The semianalytic O1/O2 detection statistic of the cumulative mixtures
+#: (Essick 2023): the simulated observed network SNR.  Exactly 0.0 on every
+#: real-injection row, per the release README.
+SNR_COLUMN = "semianalytic_observed_phase_maximized_snr_net"
+
+#: ``SelectionSet.campaign_kind`` of a cumulative multi-run mixture: one file
+#: whose rows come from several runs, with semianalytic O1/O2 rows (detected
+#: by SNR) next to real O3/O4 rows (detected by search FAR), per-row mixture
+#: ``weights`` and one joint draw density.
+CAMPAIGN_CUMULATIVE_MIXTURE = "cumulative_mixture"
+#: ``campaign_kind`` of every other injection file.
+CAMPAIGN_SINGLE = "single_campaign"
+
+
+class MixtureInvariantError(ValueError):
+    """A cumulative mixture breaks an invariant its per-run detection rule needs.
+
+    The per-run rule (SNR on O1/O2 rows, that run's own search FARs on O3/O4
+    rows) equals the release README's global ``(snr > t) | (far < t)`` only
+    because semianalytic rows carry no finite FAR and real rows carry SNR 0 and
+    no other run's FAR.  A file that breaks any of these is not the file the
+    rule was written for, so it is refused rather than thresholded.
+    """
+
+
+class MixtureDetectionError(ValueError):
+    """A detection rule was requested that silently drops mixture rows.
+
+    Raised for a FAR-only cut on a cumulative mixture that has semianalytic
+    O1/O2 rows: those rows have no FAR, so the cut detects none of them while
+    ``total_generated`` and ``total_analysis_time`` still count their draws and
+    their exposure -- the O1/O2 part of the selection integral is silently zero.
+    """
+
+
+def _mixture_far_only_message(path, n_semi):
+    """The one message every FAR-only-on-a-mixture refusal raises."""
+    return (
+        f"{path}: this is a cumulative multi-run mixture with {n_semi} "
+        f"semianalytic O1/O2 row(s), and a FAR-only detection cut was "
+        f"requested. Those rows carry no search FAR (every FAR is +inf), so a "
+        f"FAR cut detects NONE of them -- while total_generated and "
+        f"total_analysis_time still count their draws and their O1/O2 "
+        f"exposure. The O1/O2 contribution to the selection integral would be "
+        f"silently zero, which biases the detection probability LOW for every "
+        f"population (and so the inferred rate HIGH), and it pairs an "
+        f"O1/O2-blind selection with any O1/O2 events in the PE file. Use the "
+        f"release's per-run rule, semianalytic SNR on O1/O2 rows and search "
+        f"FAR on O3/O4 rows: `gwcat export selection --detection-policy "
+        f"lvk-cumulative --snr-threshold 10 --far-threshold 1` "
+        f"(snr_threshold= in the Python API). Pass "
+        f"--acknowledge-semianalytic-excluded "
+        f"(acknowledge_semianalytic_excluded=True) ONLY for a deliberately "
+        f"O3+O4-only analysis whose PE file has no O1/O2 events: each row's "
+        f"weight carries its own run's T_k/N_k, so dropping the O1/O2 rows "
+        f"leaves exactly the O3+O4 selection.")
+
+
+def _semianalytic_far_only_message(path, n_semi):
+    """The FAR-only refusal for a SINGLE campaign that has semianalytic rows."""
+    return (
+        f"{path}: this injection file has {n_semi} semianalytic row(s) -- a "
+        f"nonzero {SNR_COLUMN!r} and no finite search FAR -- and a FAR-only "
+        f"detection cut was requested. A FAR cut detects NONE of those rows, "
+        f"while the file's total_generated and analysis time still count "
+        f"their draws and their exposure, so their contribution to the "
+        f"selection integral would be silently zero: the detection "
+        f"probability is biased LOW and the inferred rate HIGH. Apply the "
+        f"file's SNR rule with --snr-threshold (snr_threshold= in the Python "
+        f"API), or pass --acknowledge-semianalytic-excluded "
+        f"(acknowledge_semianalytic_excluded=True) ONLY for an analysis whose "
+        f"PE file has no event from the semianalytically simulated runs.")
+
 
 def _h5_field_names(table):
     """Return available column names for an HDF group or compound dataset."""
@@ -173,6 +252,9 @@ _EVENTS_CORE_FIELDS = (
     "right_ascension", "declination", "z", "redshift",
     "mass1_detector", "mass2_detector", "chi_eff", "weights",
     "dluminosity_distance_dredshift",
+    # GW-39: the row's time, which is the ONLY run label a cumulative mixture
+    # carries, and the semianalytic O1/O2 detection statistic.
+    "time_geocenter", "semianalytic_observed_phase_maximized_snr_net",
 )
 #: Cartesian spin components (read verbatim when the file ships them).
 _EVENTS_SPIN_CARTESIAN = ("spin1x", "spin1y", "spin1z",
@@ -756,6 +838,17 @@ class SelectionSet:
         # Names of the FAR/significance columns actually used for thresholding;
         # populated by _read_events / _read_injections (explicit provenance).
         self._far_columns = []
+        # GW-39: what kind of campaign this is, the per-row run label (a
+        # cumulative mixture only; None otherwise), the per-row time and the
+        # semianalytic SNR column (None when the file carries none), and the
+        # GPS range the campaign's rows span (for the overlap refusal).
+        self._campaign_kind = None
+        self._run = None
+        self._time = None
+        self._snr = None
+        self._gps_range = None
+        self._gps_range_source = None
+        self._total_analysis_time_s = None
         self._loaded = False
 
     # ------------------------------------------------------------------
@@ -1140,6 +1233,25 @@ class SelectionSet:
         self._fars = np.column_stack(fars_per_search) if fars_per_search else None
         self._far_columns = far_columns
 
+        # GW-39: row times, the semianalytic SNR, and the campaign kind.
+        self._time = (_h5_read_field(ev, "time_geocenter")
+                      if _h5_has_field(ev, "time_geocenter") else None)
+        self._snr = (_h5_read_field(ev, SNR_COLUMN)
+                     if _h5_has_field(ev, SNR_COLUMN) else None)
+        self._total_analysis_time_s = float(f.attrs["total_analysis_time"])
+        self._set_gps_range(f.attrs)
+        if (self._snr is not None
+                and spin_fmt in ("joint_cartesian", "joint_polar")):
+            # The semianalytic SNR column, the per-row mixture weights (always
+            # read above) and ONE joint draw density: the GWTC-5.0 cumulative
+            # O1-O4b release and its polar twin.
+            self._campaign_kind = CAMPAIGN_CUMULATIVE_MIXTURE
+            self._assign_mixture_runs()
+            self._check_mixture_invariants()
+        else:
+            self._campaign_kind = CAMPAIGN_SINGLE
+            self._run = None
+
         # Store
         self._m1det = m1det
         self._m2det = m2det
@@ -1431,6 +1543,20 @@ class SelectionSet:
         self._fars = np.column_stack(fars_per_search) if fars_per_search else None
         self._far_columns = far_columns
 
+        # GW-39: an injections-format file is always a single campaign.  Its
+        # row times (when shipped) bound it in GPS for the overlap refusal.
+        self._campaign_kind = CAMPAIGN_SINGLE
+        self._run = None
+        self._time = None
+        for col in ("gps_time", "time_geocenter"):
+            if col in inj:
+                self._time = np.asarray(inj[col], float)
+                break
+        self._snr = (np.asarray(inj[SNR_COLUMN], float)
+                     if SNR_COLUMN in inj else None)
+        self._total_analysis_time_s = float(T_s)
+        self._set_gps_range(f.attrs, inj.attrs)
+
         # Store (same attributes as _read_events)
         self._m1det = m1det
         self._m2det = m2det
@@ -1534,14 +1660,287 @@ class SelectionSet:
         }
 
     # ------------------------------------------------------------------
+    # GW-39: cumulative multi-run mixtures
+    # ------------------------------------------------------------------
+    def _set_gps_range(self, *attr_sets):
+        """Record the GPS range this campaign's rows span, and how it is known.
+
+        From the per-row times when the file ships them (exact), else from a
+        ``gps_start``/``gps_end`` attr pair (the campaign's declared span), else
+        unknown (``None``) -- which the overlap refusal treats as "cannot rule
+        out an overlap", not as "no overlap".
+        """
+        if self._time is not None and np.size(self._time):
+            t = np.asarray(self._time, dtype=float)
+            t = t[np.isfinite(t)]
+            if t.size:
+                self._gps_range = (float(t.min()), float(t.max()))
+                self._gps_range_source = "row_times"
+                return
+        for attrs in attr_sets:
+            if "gps_start" in attrs and "gps_end" in attrs:
+                self._gps_range = (float(attrs["gps_start"]),
+                                   float(attrs["gps_end"]))
+                self._gps_range_source = "attrs_gps_start_end"
+                return
+        self._gps_range = None
+        self._gps_range_source = "unknown"
+
+    def _assign_mixture_runs(self):
+        """Label every mixture row with its run, from ``time_geocenter`` alone.
+
+        A cumulative mixture carries no run column: a row's run is WHEN it is.
+        Assignment uses :data:`gwcat.observing_runs.INJECTION_SUPPORT_GPS`, and
+        a row outside every window is refused -- that is what re-verifies the
+        table against the file at runtime.
+        """
+        if self._time is None:
+            raise MixtureInvariantError(
+                f"{self.path}: cumulative mixture without a 'time_geocenter' "
+                f"column; its rows cannot be assigned to runs, so no per-run "
+                f"detection rule can be applied.")
+        try:
+            self._run = run_of_gps(self._time, INJECTION_SUPPORT_GPS)
+        except RunWindowError as exc:
+            raise MixtureInvariantError(
+                f"{self.path}: a cumulative-mixture row lies outside every "
+                f"injection-support window, so the window table no longer "
+                f"describes this file: {exc}") from exc
+
+    def _run_far_columns(self, run):
+        """Indices (into ``self._fars``) of run ``run``'s OWN search FARs."""
+        prefix = RUN_SEARCH_PREFIX[run]
+        return [i for i, c in enumerate(self._far_columns)
+                if str(c).startswith(prefix)]
+
+    def _check_mixture_invariants(self):
+        """Refuse a mixture on which the per-run rule is not the README rule.
+
+        Checked on every row (:class:`MixtureInvariantError` names the first
+        offender):
+
+        * every row: no NaN FAR (the documented missing value is +inf);
+        * semianalytic (O1/O2) rows: SNR finite and every FAR non-finite;
+        * real (O3a-O4b) rows: SNR exactly 0.0, at least one FAR column of the
+          row's own run, and every OTHER run's FAR non-finite.
+
+        Together these make ``detected_mask(per_run=True)`` identical to the
+        release README's ``(snr > snr_thr) | (min far < far_thr)``;
+        ``detected_mask`` re-checks that equality on every call.
+        """
+        run = np.asarray(self._run)
+        semi = np.isin(run, SEMIANALYTIC_RUNS)
+        real = ~semi
+        snr = np.asarray(self._snr, dtype=float)
+
+        def _refuse(what, mask):
+            idx = np.flatnonzero(mask)
+            raise MixtureInvariantError(
+                f"{self.path}: cumulative-mixture invariant broken -- {what} "
+                f"on {idx.size} row(s) (first at row {int(idx[0])}, run "
+                f"{run[idx[0]]!r}). The per-run detection rule (semianalytic "
+                f"SNR on O1/O2 rows, the run's own search FARs on O3/O4 rows) "
+                f"is exact only when semianalytic rows carry SNR and no FAR "
+                f"and real rows carry SNR 0 and only their own run's FARs; "
+                f"this file does not, so it is refused rather than "
+                f"thresholded.")
+
+        if (semi & ~np.isfinite(snr)).any():
+            _refuse("non-finite semianalytic SNR on an O1/O2 row",
+                    semi & ~np.isfinite(snr))
+        if (real & (snr != 0.0)).any():
+            _refuse("nonzero semianalytic SNR on a real (O3/O4) row",
+                    real & (snr != 0.0))
+        fars = self._fars
+        if fars is None:
+            if real.any():
+                _refuse("no FAR column at all for real (O3/O4) rows", real)
+            return
+        nan_far = np.isnan(fars).any(axis=1)
+        if nan_far.any():
+            _refuse("a NaN FAR (the release's missing-value default is +inf, "
+                    "and min() over a NaN is not the README rule)", nan_far)
+        finite = np.isfinite(fars)
+        if (semi[:, None] & finite).any():
+            _refuse("a finite FAR on a semianalytic (O1/O2) row",
+                    semi & finite.any(axis=1))
+        for r in REAL_RUNS:
+            m = run == r
+            if not m.any():
+                continue
+            own = self._run_far_columns(r)
+            if not own:
+                _refuse(f"no {RUN_SEARCH_PREFIX[r]}* FAR column for run {r}",
+                        m)
+            other = np.ones(fars.shape[1], dtype=bool)
+            other[own] = False
+            if other.any():
+                cross = m & finite[:, other].any(axis=1)
+                if cross.any():
+                    _refuse(f"a finite FAR from another run's search on a "
+                            f"{r} row", cross)
+
+    @property
+    def campaign_kind(self) -> str:
+        """``"cumulative_mixture"`` or ``"single_campaign"`` (GW-39)."""
+        self._load()
+        return self._campaign_kind
+
+    @property
+    def run(self):
+        """Per-row run label of a cumulative mixture; ``None`` otherwise."""
+        self._load()
+        return self._run
+
+    @property
+    def gps_range(self):
+        """``(min, max)`` GPS span of the campaign's rows, or ``None``."""
+        self._load()
+        return self._gps_range
+
+    def semianalytic_row_mask(self) -> np.ndarray:
+        """Rows only an SNR cut can detect, whatever the file format.
+
+        A row is semianalytic when it carries a finite, nonzero semianalytic
+        SNR and no finite search FAR (every FAR column non-finite, or no FAR
+        column at all).  On a cumulative mixture these are exactly its O1/O2
+        rows; on a single campaign (e.g. the GWTC-3 O1+O2+O3
+        real+semianalytic files) they are whatever rows the file simulated
+        semianalytically.  All-False when the file has no SNR column.
+        """
+        self._load()
+        n = len(self._m1det)
+        if self._snr is None:
+            return np.zeros(n, dtype=bool)
+        snr = np.asarray(self._snr, dtype=float)
+        has_snr = np.isfinite(snr) & (snr != 0.0)
+        if self._fars is None:
+            return has_snr
+        return has_snr & ~np.isfinite(self._fars).any(axis=1)
+
+    def readme_detected_mask(self, far_threshold: float = 1.0,
+                             snr_threshold=None) -> np.ndarray:
+        """The release README's global rule, ``(snr > t_snr) | (min far < t_far)``.
+
+        ``snr_threshold=None`` drops the SNR leg.  This is the reference the
+        per-run rule is checked against; it is not what the exporters use.
+        """
+        self._load()
+        n = len(self._m1det)
+        if self._fars is not None:
+            det = np.min(self._fars, axis=1) < far_threshold
+        else:
+            det = np.zeros(n, dtype=bool)
+        if snr_threshold is not None:
+            if self._snr is None:
+                raise ValueError(
+                    f"snr_threshold={snr_threshold} was requested but "
+                    f"injection file {self.path} has no {SNR_COLUMN!r} "
+                    f"column; only cumulative mixture files carry it. Drop "
+                    f"snr_threshold (=None) to use the FAR cut alone.")
+            det = det | (np.asarray(self._snr, dtype=float) > snr_threshold)
+        return det
+
+    # ------------------------------------------------------------------
     # Detection cut
     # ------------------------------------------------------------------
-    def detected_mask(self, far_threshold: float = 1.0) -> np.ndarray:
-        """Boolean mask: True for injections detected below FAR threshold (yr^-1)."""
+    def detected_mask(self, far_threshold: float = 1.0, snr_threshold=None,
+                      per_run: bool = True,
+                      acknowledge_semianalytic_excluded: bool = False
+                      ) -> np.ndarray:
+        """Boolean mask of the injections that pass the detection rule.
+
+        Single campaign (unchanged): ``min over searches FAR < far_threshold``
+        (yr^-1), OR-ed with ``snr > snr_threshold`` when a threshold is given
+        and the file carries the semianalytic SNR column.
+
+        Cumulative mixture (GW-39), ``per_run=True`` (default): the LVK rule of
+        the release, applied run by run -- on O1/O2 rows ``semianalytic SNR >
+        snr_threshold`` and nothing else; on O3a/O3b/O4a/O4b rows ``min FAR <
+        far_threshold`` over THAT run's own searches and nothing else.  It is
+        checked against the README's global ``(snr > t) | (far < t)``
+        (:meth:`readme_detected_mask`) on every call and refused
+        (:class:`MixtureInvariantError`) if the two ever differ.
+        ``per_run=False`` returns the README rule itself.
+
+        On a mixture with semianalytic rows, ``snr_threshold=None`` raises
+        :class:`MixtureDetectionError` -- a FAR-only cut detects no O1/O2 row
+        while the O1/O2 draws and exposure stay in the normalisation -- unless
+        ``acknowledge_semianalytic_excluded=True``.
+        """
         self._load()
-        if self._fars is None:
-            raise ValueError("No FAR columns found in injection file.")
-        return np.any(self._fars < far_threshold, axis=1)
+        if self._campaign_kind != CAMPAIGN_CUMULATIVE_MIXTURE:
+            if self._fars is None:
+                raise ValueError("No FAR columns found in injection file.")
+            # A single campaign can carry semianalytic rows too (the GWTC-3
+            # O1+O2+O3 "real+semianalytic" files): rows whose SNR is set and
+            # whose every FAR is +inf.  A FAR-only cut detects none of them
+            # while their draws and exposure stay in the normalisation -- the
+            # same defect refused on the cumulative mixture.
+            if snr_threshold is None and not acknowledge_semianalytic_excluded:
+                n_semi = int(self.semianalytic_row_mask().sum())
+                if n_semi:
+                    raise MixtureDetectionError(
+                        _semianalytic_far_only_message(self.path, n_semi))
+            det = np.any(self._fars < far_threshold, axis=1)
+            if snr_threshold is not None:
+                if self._snr is None:
+                    raise ValueError(
+                        f"snr_threshold={snr_threshold} was requested but "
+                        f"injection file {self.path} has no {SNR_COLUMN!r} "
+                        f"column; only cumulative mixture files carry it. "
+                        f"Drop snr_threshold (=None) to use the FAR cut "
+                        f"alone.")
+                det = det | (np.asarray(self._snr, dtype=float)
+                             > snr_threshold)
+            return det
+
+        run = np.asarray(self._run)
+        semi = np.isin(run, SEMIANALYTIC_RUNS)
+        if (semi.any() and snr_threshold is None
+                and not acknowledge_semianalytic_excluded):
+            raise MixtureDetectionError(
+                _mixture_far_only_message(self.path, int(semi.sum())))
+        readme = self.readme_detected_mask(far_threshold, snr_threshold)
+        if not per_run:
+            return readme
+        det = np.zeros(run.shape, dtype=bool)
+        if snr_threshold is not None:
+            det[semi] = np.asarray(self._snr, dtype=float)[semi] > snr_threshold
+        for r in REAL_RUNS:
+            m = run == r
+            if not m.any():
+                continue
+            own = self._run_far_columns(r)
+            det[m] = np.any(self._fars[np.ix_(m, own)] < far_threshold, axis=1)
+        if not np.array_equal(det, readme):
+            diff = np.flatnonzero(det != readme)
+            raise MixtureInvariantError(
+                f"{self.path}: the per-run detection rule and the release "
+                f"README's (snr > {snr_threshold}) | (far < {far_threshold}) "
+                f"disagree on {diff.size} row(s) (first at row "
+                f"{int(diff[0])}, run {run[diff[0]]!r}); refusing to choose "
+                f"between them.")
+        return det
+
+    def detection_rule_per_run(self, far_threshold, snr_threshold):
+        """``{run: rule string}`` for a mixture's runs, as :meth:`detected_mask`
+        applies them (e.g. ``semianalytic_observed_phase_maximized_snr_net>10``,
+        ``min(o3_cwb_far,...)<1``).  Empty for a single campaign."""
+        self._load()
+        if self._run is None:
+            return {}
+        out = {}
+        for r in dict.fromkeys(np.asarray(self._run).tolist()):
+            if r in SEMIANALYTIC_RUNS:
+                out[r] = ("none(semianalytic_rows_excluded)"
+                          if snr_threshold is None
+                          else f"{SNR_COLUMN}>{float(snr_threshold):g}")
+            else:
+                cols = ",".join(str(self._far_columns[i])
+                                for i in self._run_far_columns(r))
+                out[r] = f"min({cols})<{float(far_threshold):g}"
+        return out
 
     # ------------------------------------------------------------------
     # Source-class filtering (PR 9)
@@ -1605,7 +2004,8 @@ class SelectionSet:
         """
         return self.n_retained
 
-    def detection_efficiency(self, far_threshold: float = 1.0) -> float:
+    def detection_efficiency(self, far_threshold: float = 1.0,
+                             snr_threshold=None, **detect_kwargs) -> float:
         """Fraction of the campaign's GENERATED draws detected at this FAR.
 
         The denominator is :attr:`n_generated` (``total_generated``), not the
@@ -1617,7 +2017,9 @@ class SelectionSet:
         available as ``detected_mask(far).sum() / n_retained`` for anyone who
         wants it.
         """
-        return self.detected_mask(far_threshold).sum() / self.n_generated
+        return (self.detected_mask(far_threshold, snr_threshold,
+                                   **detect_kwargs).sum()
+                / self.n_generated)
 
     # ── PR4 component-basis spin accessors (additive, read-only) ───────────
     @property

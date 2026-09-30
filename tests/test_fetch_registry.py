@@ -137,12 +137,15 @@ OLD_INJECTION_RELEASES: Dict[str, _OldReleaseInfo] = {
         description="O4a+O4b-only search sensitivity (GWTC-5.0)",
         observing_run="O4a+O4b",
     ),
+    # GW-39: the ONE deliberate departure from the verbatim port.  The old
+    # registry called endo3_bbhpop "full O1+O2+O3"; the file is O3a+O3b only.
     "injections-O3-BBH": _OldReleaseInfo(
         record_ids=[7890437],
         concept_ids=[None],
         file_filter=_old_is_o3_bbhpop_full,
-        description="O3 BBH search sensitivity (GWTC-3, full O1+O2+O3)",
-        observing_run="O1+O2+O3",
+        description=("O3-only BBH-pop search sensitivity (GWTC-3, "
+                     "endo3_bbhpop, O3a+O3b)"),
+        observing_run="O3a+O3b",
     ),
 }
 OLD_RELEASES.update(OLD_INJECTION_RELEASES)

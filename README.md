@@ -283,6 +283,37 @@ m1s, m2s = bbh.source_masses(cosmology=(67.74, 0.3089))
 Reads both LVK injection formats:
 - **`events/` format** (O4 sets, Zenodo 19500064): modern format with log-joint draw PDF
 - **`injections/` format** (O3 BBH, Zenodo 7890437): legacy format with factored draw PDF components
+- **cumulative multi-run mixtures** (GWTC-5.0 O1–O4b, Zenodo 19500052): one
+  `events` file whose rows come from six runs. gwcat recognises it
+  (`SelectionSet.campaign_kind == "cumulative_mixture"`), assigns each row to a
+  run from `time_geocenter` alone (`gwcat.observing_runs`), and applies the
+  release's detection rule **per run**: semianalytic SNR on the O1/O2 rows,
+  that run's own search FARs on the O3/O4 rows.  Three silent footguns are
+  refused rather than exported: a FAR-only cut (it detects no O1/O2 row while
+  their draws and exposure stay in the normalisation), the `chieff`
+  substitution basis (the spins are not isotropic and a joint density cannot
+  prove they are), and combining the mixture with endo3/rpo4ab (double-counted
+  exposure).  The production command is
+
+  ```bash
+  gwcat export selection mixture-semi_o1_o2-real_o3_o4a_o4b-cartesian_spins_20260410130052UTC-clipped.hdf \
+      --out selection.h5 --parameter-space chieff_reference --spin-reference-amax 0.99 \
+      --detection-policy lvk-cumulative --far-threshold 1.0 --snr-threshold 10 --sky-marginal
+  ```
+
+  and the file records, aligned with `run_labels` (one entry per run),
+  `detection_rule_per_run`, `n_detected_per_run` (summing to
+  `n_detected_mixture`) and `T_definition_per_run` (O1/O2 coincident
+  livetime, O3 endo3 analysis time, O4 monthly wall-clock time); aligned with
+  `mixture_components` (O1, O2, O3, O4 -- O3a/O3b and O4a/O4b share one
+  exposure each) the derived `N_per_component`/`T_per_component_s` with
+  `T_definition_per_component`, mapped by `component_of_run`;
+  `detection_policy` (the rule actually applied; the request is in
+  `detection_policy_requested`); and `sky_marginalized` (the mixture has no
+  sky columns).  A FAR-only cut is refused on ANY injection file with
+  semianalytic rows (nonzero semianalytic SNR, no finite FAR), not only on the
+  mixture; `--acknowledge-semianalytic-excluded` cannot be combined with
+  `--snr-threshold`.
 
 Selection products are **not BBH-only**.  Pass `source_class` to subset the
 injections by source class — BBH / NSBH / BNS / MassGap / `cbc` (all
@@ -387,7 +418,7 @@ fetch_catalog("GWTC-2.1")                        # → ./GWTC/GWTC-2p1/
 fetch_catalog("GWTC-5")                           # both Part 1 + Part 2
 
 # Injection sets
-fetch_catalog("injections-O3-BBH")                # O1+O2+O3 BBH (Zenodo 7890437)
+fetch_catalog("injections-O3-BBH")                # O3a+O3b BBH-pop (Zenodo 7890437)
 fetch_catalog("injections-O4ab")                  # O4a+b (Zenodo 19500064)
 fetch_catalog("injections-O1O2O3O4")              # cumulative O1–O4b (Zenodo 19500052)
 ```
@@ -534,14 +565,31 @@ manifests are the source of truth; update them first when a record changes.
 
 | Name | Record | Run |
 |------|--------|-----|
-| injections-O3-BBH    | [7890437](https://zenodo.org/records/7890437)   | O1+O2+O3 BBH only |
+| injections-O3-BBH    | [7890437](https://zenodo.org/records/7890437)   | O3a+O3b only, BBH-pop (`endo3_bbhpop`) |
 | injections-O4ab      | [19500064](https://zenodo.org/records/19500064) | O4a+b only |
-| injections-O1O2O3O4  | [19500052](https://zenodo.org/records/19500052) | O1–O4b cumulative |
+| injections-O1O2O3O4  | [19500052](https://zenodo.org/records/19500052) | O1–O4b cumulative mixture (semianalytic O1+O2, real O3+O4) |
 
-For dark-siren cosmology, use `injections-O3-BBH` + `injections-O4ab` combined
-via `CombinedSelectionSet`.  The cumulative record (O1O2O3O4) mixes
-semi-analytical O1+O2 estimates (no sky location / FAR) with proper O3+O4
-injections, making it harder to combine consistently.
+Not bundled: [5636816](https://zenodo.org/records/5636816) (GWTC-3, O1+O2+O3
+real+semianalytic).  Its BBH file is
+`o1+o2+o3_bbhpop_real+semianalytic-LIGO-T2100377-v2.hdf5` (63,149,928 B, md5
+`c21337a25b7318fdfd471cce549a547e`); the record's multi-population
+`o1+o2+o3_mixture_real+semianalytic-LIGO-T2100377-v2.hdf5` (361,745,836 B) is
+a different file.
+
+Two consistent selection recipes:
+
+- **O1–O4b (events from all runs):** the cumulative mixture ALONE, exported
+  with `--detection-policy lvk-cumulative --snr-threshold 10 --sky-marginal`
+  (see `SelectionSet` above).  Its O3 rows are the endo3 multi-population
+  mixture, not `endo3_bbhpop`.
+- **O3+O4 only (no O1/O2 events):** `injections-O3-BBH` + `injections-O4ab`
+  combined via `CombinedSelectionSet`, or the cumulative mixture with its O1/O2
+  rows excluded (`--acknowledge-semianalytic-excluded`; each row's weight
+  carries its own run's T_k/N_k, so this is exact).
+
+Never combine the cumulative mixture with `injections-O3-BBH` or
+`injections-O4ab`: it already holds their exposure, and the export refuses it
+(`OverlappingCampaignError`).
 
 ## darksirens integration
 
