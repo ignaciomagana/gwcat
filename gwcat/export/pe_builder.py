@@ -204,7 +204,9 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                      max_out_of_support_frac=0.0,
                      allow_out_of_support=False,
                      allow_projection_basis=False,
-                     drop_spin_above_ceiling=False):
+                     drop_spin_above_ceiling=False,
+                     sample_set_map=None, nrsur_q_rule=None,
+                     nrsur_q_rule_substitute=False):
     """Build a PE :class:`ExportProduct` from a :class:`~gwcat.catalog.GWCatalog`.
 
     For ``spin_basis="chieff"`` this reproduces the legacy
@@ -363,7 +365,10 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                      allow_missing_far=allow_missing_far,
                      require_far=require_far,
                      waveform_policy=waveform_policy,
-                     approximant=approximant)
+                     approximant=approximant,
+                     sample_set_map=sample_set_map,
+                     nrsur_q_rule=nrsur_q_rule,
+                     nrsur_q_rule_substitute=nrsur_q_rule_substitute)
 
     # The EFFECTIVE selection (GW-33): this call's filters composed with those
     # `cat` already carried.  `select()` intersects rows with the view it is
@@ -1313,6 +1318,8 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
              if k != "own_analytic"], dtype=_str),
     }
     attrs.update(_population_resolver_attrs(cat, kept))
+    attrs.update(_sample_set_map_attrs(
+        getattr(sub, "_sample_set_map_report", None), kept))
     # ── The EFFECTIVE event selection (GW-33) ───────────────────────────────
     # The composed source_class_filter and cut estimator (GW-12: WHICH masses
     # the class threshold was applied to), every numeric cut as a number the
@@ -1437,6 +1444,40 @@ def _population_resolver_attrs(cat, kept):
         "population_resolver": POPULATION_RESOLVER if match else "",
         "population_resolver_match": bool(match),
         "population_resolver_inputs": _json.dumps(inputs, sort_keys=True),
+    }
+
+
+def _sample_set_map_attrs(report, kept):
+    """The event-map provenance on the file (GW-40e); empty for other policies.
+
+    Restricted to the EXPORTED events, in export order, so the substitute and
+    q-fraction lists describe exactly what the file holds.
+    """
+    import h5py
+    _str = h5py.string_dtype()
+    kept = [str(k) for k in kept]
+    report = report or {}
+    subs = report.get("substitutes", {}) or {}
+    qf = report.get("nrsur_q_frac", {}) or {}
+    sub_ev = [k for k in kept if k in subs]
+    q_ev = [k for k in kept if k in qf]
+    thr = report.get("nrsur_q_rule")
+    return {
+        "sample_set_map_source": str(report.get("map_source", "")),
+        "sample_set_map_sha256": str(report.get("map_sha256", "")),
+        "sample_set_substitute_events": np.array(sub_ev, dtype=_str),
+        "sample_set_substitute_labels": np.array(
+            [subs[k]["label"] for k in sub_ev], dtype=_str),
+        "sample_set_substitute_original_labels": np.array(
+            [subs[k].get("original_label", "") for k in sub_ev], dtype=_str),
+        "sample_set_substitute_reasons": np.array(
+            [subs[k]["reason"] for k in sub_ev], dtype=_str),
+        "nrsur_q_rule": float("nan") if thr is None else float(thr),
+        "nrsur_q_rule_substitute": bool(report.get("nrsur_q_rule_substitute",
+                                                   False)),
+        "nrsur_q_frac_events": np.array(q_ev, dtype=_str),
+        "nrsur_q_frac_below_floor": np.asarray([qf[k] for k in q_ev],
+                                               dtype=float),
     }
 
 

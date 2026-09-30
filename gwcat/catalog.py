@@ -533,6 +533,7 @@ class GWCatalog:
         self._waveform_approximant = None
         self._selection_reasons = None
         self._homogeneous_sample_sets = True
+        self._sample_set_map_report = None
 
     # ---- selection (operates on metadata only; cheap) --------------------
     @property
@@ -602,7 +603,9 @@ class GWCatalog:
                sky_area_max=None, names=None, allowed_names=None,
                allowed_names_authoritative=True, source_class=None,
                event_list=None, allow_missing_far=False, require_far=False,
-               waveform_policy="preferred", approximant=None):
+               waveform_policy="preferred", approximant=None,
+               sample_set_map=None, nrsur_q_rule=None,
+               nrsur_q_rule_substitute=False):
         """Return a filtered view of the catalog (no sample copy).
 
         Source-class / event-list / FAR options (PR 2)
@@ -645,6 +648,14 @@ class GWCatalog:
         approximant : str or None
             Required approximant for ``waveform_policy="strict-approximant"``;
             matched against each row's ``approximant`` or ``waveform`` family.
+        sample_set_map, nrsur_q_rule, nrsur_q_rule_substitute
+            ``waveform_policy="event-map"`` only (GW-40e): the explicit
+            ``{event: label}`` map (JSON / popsummary path, mapping, or
+            :class:`gwcat.waveform_policy.SampleSetMap`) and the optional NRSur
+            q-rule threshold, evaluated on this store's
+            ``{prefix}:IMRPhenomXPHM-SpinTaylor`` samples.  See
+            :func:`gwcat.waveform_policy.resolve_event_map`.  The resolution
+            report is kept on the view as ``_sample_set_map_report``.
 
         Effective selection provenance (GW-33)
         --------------------------------------
@@ -856,10 +867,19 @@ class GWCatalog:
         # ── Waveform / sample-set policy resolution (PR 6) ────────────────────
         # Collapse the metadata-selected rows to one sample set per event
         # (unless waveform_policy="all").  A no-op for single-sample-set stores.
-        from .waveform_policy import resolve_policy
-        kept, reasons, homogeneous = resolve_policy(
-            self.names, sel, self.meta, policy=waveform_policy,
-            approximant=approximant)
+        from .waveform_policy import resolve_policy, resolve_event_map
+        map_report = None
+        if waveform_policy == "event-map":
+            kept, reasons, homogeneous, map_report = resolve_event_map(
+                self.names, sel, self.meta, sample_set_map,
+                q_frac_fn=self._q_below_nrsur_floor_frac,
+                nrsur_q_rule=nrsur_q_rule,
+                nrsur_q_rule_substitute=nrsur_q_rule_substitute)
+        else:
+            kept, reasons, homogeneous = resolve_policy(
+                self.names, sel, self.meta, policy=waveform_policy,
+                approximant=approximant, sample_set_map=sample_set_map,
+                nrsur_q_rule=nrsur_q_rule)
 
         # ── The EFFECTIVE selection (GW-33) ───────────────────────────────────
         # Composed with the spec of the view this call was made on, because the
@@ -895,7 +915,30 @@ class GWCatalog:
         result._waveform_approximant = approximant
         result._selection_reasons = np.asarray(reasons, dtype=object)
         result._homogeneous_sample_sets = bool(homogeneous)
+        result._sample_set_map_report = map_report
         return result
+
+    def _q_below_nrsur_floor_frac(self, event, label):
+        """Fraction of ``label``'s posterior samples for ``event`` with
+        ``m2/m1 < 1/6`` (the NRSur7dq4 prior floor), or None when the store has
+        no such row (GW-40e).  Reads the whole STORE, not only this view: the
+        reference set is a different sample set of the same event."""
+        from .waveform_policy import NRSUR_Q_FLOOR
+        ss = self.meta.get("sample_set_name")
+        if ss is None:
+            return None
+        rows = np.nonzero((self.names == event)
+                          & (np.asarray(ss) == label))[0]
+        if rows.size == 0:
+            return None
+        r = int(rows[0])
+        lo, hi = int(self.offsets[r]), int(self.offsets[r + 1])
+        if hi <= lo:
+            return None
+        with h5py.File(self.path, "r") as f:
+            m1 = np.asarray(f["samples/mass_1"][lo:hi], dtype=float)
+            m2 = np.asarray(f["samples/mass_2"][lo:hi], dtype=float)
+        return float(np.mean((m2 / m1) < NRSUR_Q_FLOOR))
 
     # ---- sample access ---------------------------------------------------
     def _slices(self):

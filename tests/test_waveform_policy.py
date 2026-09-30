@@ -102,8 +102,9 @@ def _one_event_three_sets(name="GW850101_010101"):
 # 0. resolver unit sanity + declared policy set
 # ==========================================================================
 def test_policy_names_declared():
+    # "event-map" added by GW-40e (tests/test_waveform_event_map.py).
     assert WAVEFORM_POLICIES == ("preferred", "mixed-first",
-                                 "strict-approximant", "all")
+                                 "strict-approximant", "all", "event-map")
 
 
 def test_resolve_policy_rejects_unknown():

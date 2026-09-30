@@ -223,6 +223,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_pe.add_argument("--approximant", default=None,
                       help="Required with "
                            "--waveform-policy=strict-approximant.")
+    p_pe.add_argument("--sample-set-map", default=None, metavar="FILE",
+                      help="Required with --waveform-policy=event-map "
+                           "(GW-40e): a JSON {event: label} map (optionally "
+                           "with 'substitutes': {event: reason | {label, "
+                           "reason}}), or a popsummary file whose "
+                           "events/event_sample_IDs give the map. An unmapped "
+                           "event, or a mapped label the store lacks without "
+                           "a declared substitute, fails.")
+    p_pe.add_argument("--nrsur-q-rule", type=float, default=None,
+                      metavar="FRAC",
+                      help="event-map only: refuse an NRSur7dq4 label whose "
+                           "C00:IMRPhenomXPHM-SpinTaylor posterior has more "
+                           "than FRAC of its mass at q < 1/6, and verify every "
+                           "declared 'nrsur_q_rule' substitute.")
+    p_pe.add_argument("--nrsur-q-rule-substitute", action="store_true",
+                      help="With --nrsur-q-rule: substitute XPHM-SpinTaylor "
+                           "for a violating NRSur label (recorded, reason "
+                           "'nrsur_q_rule') instead of refusing.")
     p_pe.add_argument("--cosmology", default=None, metavar="H0,Om0",
                       help="Override cosmology applied to every exported "
                            "event. Omit (default) to use each event's own "
@@ -529,6 +547,9 @@ def _cmd_export_pe(args) -> int:
         amax=args.amax,
         amax_fallback=args.amax_fallback,
         drop_spin_above_ceiling=args.drop_spin_above_ceiling,
+        sample_set_map=args.sample_set_map,
+        nrsur_q_rule=args.nrsur_q_rule,
+        nrsur_q_rule_substitute=args.nrsur_q_rule_substitute,
     )
     return 0
 
