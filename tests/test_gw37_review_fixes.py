@@ -545,11 +545,20 @@ def test_download_file_leaves_nothing_behind_on_a_checksum_mismatch(
                             lambda *a, **kw: _Resp())})(),
                         raising=False)
     dest = tmp_path / "data.h5"
+    # download_file() imports requests and tqdm inside the function, so the
+    # stand-ins have to be in sys.modules.  They go in through monkeypatch so
+    # the real modules (or their absence) come back after the test (GW-42):
+    # writing sys.modules directly left a module-typed stub named "requests"
+    # behind whenever requests had not been imported yet, and every later
+    # "import requests.exceptions" in the session then failed with
+    # "'requests' is not a package".
     import sys
-    sys.modules.setdefault("tqdm", type(sys)("tqdm"))
-    sys.modules["tqdm"].tqdm = lambda *a, **kw: None
-    sys.modules.setdefault("requests", type(sys)("requests"))
-    sys.modules["requests"].get = lambda *a, **kw: _Resp()
+    fake_tqdm = type(sys)("tqdm")
+    fake_tqdm.tqdm = lambda *a, **kw: None
+    fake_requests = type(sys)("requests")
+    fake_requests.get = lambda *a, **kw: _Resp()
+    monkeypatch.setitem(sys.modules, "tqdm", fake_tqdm)
+    monkeypatch.setitem(sys.modules, "requests", fake_requests)
 
     with pytest.raises(RuntimeError, match="Checksum mismatch"):
         fetch.download_file("https://example.invalid/x", str(dest),
