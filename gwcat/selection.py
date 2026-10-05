@@ -854,6 +854,9 @@ class SelectionSet:
         self._gps_range = None
         self._gps_range_source = None
         self._total_analysis_time_s = None
+        # Mock-data provenance: True when the injection file's root attrs say
+        # mock_data=True (a synthetic campaign). Read in _load().
+        self._mock_data = False
         self._loaded = False
 
     # ------------------------------------------------------------------
@@ -925,6 +928,9 @@ class SelectionSet:
         if self._loaded:
             return
         with h5py.File(self.path, "r") as f:
+            # The file's own mock-data flag (absent on every released
+            # campaign, i.e. False); carried onto every selection export.
+            self._mock_data = bool(f.attrs.get("mock_data", False))
             if "events" in f:
                 self._read_events(f)
             elif "injections" in f:
@@ -1792,6 +1798,16 @@ class SelectionSet:
         return self._campaign_kind
 
     @property
+    def mock_data(self) -> bool:
+        """True when the injection file is flagged synthetic.
+
+        A file whose root attrs carry ``mock_data=True`` (a mock campaign
+        written for gwcat's builders); released campaigns carry no such attr.
+        """
+        self._load()
+        return self._mock_data
+
+    @property
     def run(self):
         """Per-row run label of a cumulative mixture; ``None`` otherwise."""
         self._load()
@@ -2185,6 +2201,9 @@ class SelectionSet:
 
         with h5py.File(out_path, "w") as f:
             f.attrs["format_version"] = "gwcat-selection-1.0"
+            if self.mock_data:
+                # Only when True: a real-data file keeps its exact attrs.
+                f.attrs["mock_data"] = True
 
             # Which gwcat wrote this file (DS-10 provenance; also on the v2
             # writers).  Commit, not version: an editable install moves per
@@ -2352,6 +2371,11 @@ class CombinedSelectionSet:
     # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------
+    @property
+    def mock_data(self) -> bool:
+        """True when ANY campaign is flagged synthetic."""
+        return any(s.mock_data for s in self._sets)
+
     @property
     def n_campaigns(self) -> int:
         return len(self._sets)
@@ -2560,6 +2584,9 @@ class CombinedSelectionSet:
         # Write
         with h5py.File(out_path, "w") as f:
             f.attrs["format_version"] = "gwcat-selection-1.0"
+            if self.mock_data:
+                # Only when True: a real-data file keeps its exact attrs.
+                f.attrs["mock_data"] = True
 
             # Which gwcat wrote this file (DS-10 provenance; also on the v2
             # writers).  Commit, not version: an editable install moves per

@@ -288,6 +288,34 @@ gwcat validate --strict pe.h5 sel.h5 --spin-prior-allow-list allow.txt
   product: every `dL_prior_impl_per_event` `exact`/`analytic`, and
   `chi_eff_prior_impl == "exact"` on each side that carries a chi_eff factor.
 
+### Mock data
+
+A synthetic campaign run through gwcat's own builders is labelled by its
+inputs, not by the exporter, so the label travels with the data:
+
+* **Store.** `build_store(..., mock_data=True)` (or the record writer
+  `ingest._write_store_from_records(..., mock_data=True)` a mock bridge calls)
+  writes a file-level `mock_data=True` attr. `GWCatalog(...).mock_data` reads
+  it, every view inherits it, and a merge holding any mock row is mock (with
+  a warning when a mock and a real store are merged).
+* **Injections.** An injection file whose root attrs carry `mock_data=True`
+  is synthetic; `SelectionSet(...).mock_data` reads it, and a
+  `CombinedSelectionSet` is mock when any campaign is.
+* **Exports.** Every PE export (2.x and the v1 `to_darksirens`) writes
+  `mock_data` from the store, which is what darksirens reads to announce
+  mock data. Selection exports write `mock_data=True` when the injections are
+  flagged. `build_pe_product` / `build_selection_product` take
+  `mock_data=None` (inherit); `True` adds the label to an input written
+  outside gwcat, and `False` asserts a real input (it raises on a flagged one).
+* **Real data is untouched.** The attr is written only when True on stores
+  and selection exports (absent means real), and a PE export from a real
+  store still writes `mock_data=False`, so real-data stores and exports are
+  byte-identical to before.
+* **Validation.** `gwcat validate` accepts `mock_data=True`, requires a boolean
+  on the PE side, and warns (does not fail) when only one side of a pair is
+  mock. The flag is provenance, not a pairing declaration, so it is not in
+  the 2.1 `contract` or `contract_hash`.
+
 ### Validation summaries
 
 Every `gwcat ingest` / `gwcat export-darksirens` / `gwcat selection` run

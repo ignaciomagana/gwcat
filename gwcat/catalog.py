@@ -484,10 +484,16 @@ class _SampleReader:
 
 class GWCatalog:
     def __init__(self, store_path, _sel=None):
+        from .ingest import read_store_mock_data
         self.path = store_path
         with h5py.File(store_path, "r") as f:
             self.params = [p.decode() if isinstance(p, bytes) else str(p)
                            for p in f.attrs["param_names"]]
+            #: True when the store holds SYNTHETIC samples (written with
+            #: ``mock_data=True``; see :data:`gwcat.ingest.STORE_MOCK_DATA_ATTR`).
+            #: Every view re-reads it from the same file, and every PE exporter
+            #: stamps it as the ``mock_data`` attr darksirens reads.
+            self.mock_data = read_store_mock_data(f)
             self.offsets = f["index/offsets"][:]
             self.names = np.array([n for n in f["index/event_names"][:]])
             self.meta = {k: f[f"meta/{k}"][:] for k in f["meta"].keys()}
@@ -1642,7 +1648,9 @@ class GWCatalog:
             # --- Attributes darksirens reads ---
             f.attrs["nsamp"] = int(nsamp)
             f.attrs["nobs"] = int(nobs)
-            f.attrs["mock_data"] = False
+            # From the store (GW mock-data provenance), not a constant: a mock
+            # campaign written through gwcat's store writer is not real data.
+            f.attrs["mock_data"] = bool(getattr(sub, "mock_data", False))
             # --- Provenance (gwcat-specific) ---
             f.attrs["format_version"] = "gwcat-1.0"
 
