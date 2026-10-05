@@ -162,6 +162,8 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
         truncated distance prior, and darksirens turns a zero weight into a
         ``-inf`` log-weight that still counts in ``n``;
       * ``nobs * nsamp`` length consistency across the legacy datasets;
+      * a boolean ``mock_data`` attr -- ``True`` (a synthetic campaign, from the
+        store's provenance) and ``False`` are both valid;
       * physical ranges when spin columns are present: ``a1``/``a2`` in
         ``[0, max(spin_amax)*1.001]``, ``|cost{1,2}| <= 1``, ``chip`` in
         ``[0, max(spin_amax)*1.001]``, ``chieff`` in ``[-1, 1]``.
@@ -173,6 +175,8 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
       * the per-campaign injected-spin provenance attrs
         (``injected_spin_format`` / ``injected_spin_amax_detected`` /
         ``injected_spin_uniform_isotropic``) are present;
+      * ``mock_data``, when present, is boolean (it is written only when True;
+        absent means real data);
       * physical ranges as above when spin columns are present.
 
     Cross-file contract checks (ALWAYS raise on mismatch)
@@ -330,6 +334,15 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
                f"p_pe is empty (nobs={nobs}). Every event was dropped by the "
                f"export's cuts; the file has no posterior samples at all.")
 
+    # Mock-data provenance: a boolean, True or False.  True is a legitimate
+    # export (a synthetic campaign run through these builders), not a defect.
+    _check("pe_mock_data_attr",
+           "mock_data" in pe_attrs and _is_flag(pe_attrs["mock_data"]),
+           f"mock_data={pe_attrs.get('mock_data', '<absent>')!r}; every gwcat "
+           f"PE export records a boolean mock_data attr.")
+    if _is_flag(pe_attrs.get("mock_data")) and bool(pe_attrs["mock_data"]):
+        print("  NOTE: PE export is flagged mock_data=True (synthetic data).")
+
     # Physical ranges.
     pe_amax = _amax_bound(pe_attrs.get("spin_amax_1_per_event", []),
                           pe_attrs.get("spin_amax_2_per_event", []),
@@ -426,6 +439,11 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
         # compared the declaration against the file, so 70/70 checks passed on a
         # product whose contract described coordinates it did not contain.
         _fit_columns_present(_check, sel_attrs, sel_present, prefix="sel")
+
+        # Mock-data provenance: written only when True, so absence is valid.
+        _check("sel_mock_data_attr",
+               "mock_data" not in sel_attrs or _is_flag(sel_attrs["mock_data"]),
+               f"mock_data={sel_attrs.get('mock_data')!r} is not boolean.")
 
         # Per-campaign injected-spin provenance attrs must be present.
         for a in ("injected_spin_format", "injected_spin_amax_detected",
@@ -736,6 +754,9 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
         # (e2) Per-campaign selection cosmology (GW-09).
         _xcheck_campaign_cosmology(_check, results, sel_attrs)
 
+        # (e2b) Mock-data provenance on the two sides.
+        _xcheck_mock_data(results, pe_attrs, sel_attrs)
+
         # (e3) The same chi_eff prior implementation on both sides (GW-40i).
         _xcheck_chi_eff_prior_impl(_fail, results, pe_attrs, sel_attrs,
                                    strict=strict,
@@ -868,6 +889,34 @@ def validate_export_any(pe_path, selection_path=None, strict=False, *,
             "prior evaluations (GW-40i) and records no implementation; it "
             "cannot satisfy the requirement.")
     return _validate_export_v1(pe_path, selection_path, strict=strict)
+
+
+def _is_flag(v) -> bool:
+    """A boolean HDF5 attr as h5py reads it back (or a 0/1 integer)."""
+    if isinstance(v, (bool, np.bool_)):
+        return True
+    return isinstance(v, (int, np.integer)) and int(v) in (0, 1)
+
+
+def _xcheck_mock_data(results, pe_attrs, sel_attrs):
+    """Warn when exactly one side of a pair is flagged mock_data.
+
+    Not a failure: synthetic events paired with a real campaign's injections is
+    a legitimate design (events drawn through the real sensitivity), and a mock
+    campaign with real events is at least conceivable.  It is still worth
+    saying, because the usual cause is a mock export paired with the wrong
+    file.  An absent selection attr means False (the builder writes it only
+    when True).
+    """
+    pe_mock = bool(pe_attrs.get("mock_data", False))
+    sel_mock = bool(sel_attrs.get("mock_data", False))
+    if pe_mock != sel_mock:
+        warnings.warn(
+            f"PE mock_data={pe_mock} but selection mock_data={sel_mock}: one "
+            f"side of this pair is synthetic and the other is not. Intended "
+            f"for a mock-events-through-real-injections design; otherwise the "
+            f"pair is mismatched.")
+    results["xcheck_mock_data"] = True
 
 
 def _xcheck_source_class_estimator(_fail, results, pe_attrs, sel_attrs):

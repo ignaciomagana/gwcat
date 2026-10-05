@@ -60,6 +60,14 @@ The PE and selection ``amax`` are in neither: they legitimately DIFFER, because
 the PE side removes the posterior's own spin prior (ceiling ~0.99) while the
 selection side swaps the injected draw (endo3 injects 0.998).  That stays a
 warn-not-fail cross-check.
+
+``mock_data`` is in neither, deliberately.  The contract declares the density
+and the cuts a pair must share; whether the samples are synthetic is data
+PROVENANCE (it travels from the store / injection file into the ``mock_data``
+attr), not a declaration about the density.  Hashing it would make the two
+sides of a legitimate mock-events-through-real-injections pair mismatch, and
+adding a field would change the written contract of every real-data 2.1
+export.  The validator compares the two flags instead (warn, not fail).
 """
 from __future__ import annotations
 

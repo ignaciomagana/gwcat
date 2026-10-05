@@ -184,7 +184,7 @@ from ..observing_runs import (RUN_LABELS, SEMIANALYTIC_RUNS,
                               INJECTION_SUPPORT_GPS, EXPOSURE_WINDOWS_GPS,
                               MIXTURE_COMPONENTS, MIXTURE_RELEASE_ANCHORS,
                               derive_mixture_bookkeeping)
-from .product import ExportProduct
+from .product import ExportProduct, resolve_mock_data
 
 #: Spin bases the selection builder implements.  A registry space outside this
 #: tuple is declarable but not yet buildable; the CLI and the validator read
@@ -837,7 +837,8 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                             snr_threshold=None, z_max=None, strict=True,
                             detection_policy="far",
                             acknowledge_semianalytic_excluded=False,
-                            sky_marginal=False, mixture_anchors=None):
+                            sky_marginal=False, mixture_anchors=None,
+                            mock_data=None):
     """Build a selection :class:`ExportProduct` from one or more SelectionSets.
 
     Parameters
@@ -920,6 +921,15 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         The O3/O4 component ``{"O3": {"T_s", "N", "source"}, "O4": {...}}``
         used to derive a mixture's per-run N_k/T_k; defaults to the bundled
         :data:`gwcat.observing_runs.MIXTURE_RELEASE_ANCHORS` entry.
+    mock_data : bool or None, default None
+        Mock-data provenance.  ``None`` inherits it from the injection files: a
+        campaign whose root attrs carry ``mock_data=True`` is synthetic, and the
+        export is then stamped ``mock_data=True``.  ``True`` adds the label to
+        an input that does not carry it; ``False`` asserts a real input and
+        raises if any campaign is flagged mock (see
+        :func:`gwcat.export.product.resolve_mock_data`).  The attr is written
+        only when True, so a real-data selection export is byte-identical to
+        one written before the flag existed; absent means real.
 
     Returns
     -------
@@ -951,6 +961,10 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
 
     for s in set_list:
         s._load()
+    mock_data = resolve_mock_data(
+        any(s.mock_data for s in set_list), mock_data,
+        source="the injection campaign(s) "
+               + repr([str(s.path) for s in set_list if s.mock_data]))
 
     # A cumulative mixture already holds every run's exposure (GW-39).
     is_mixture = [s.campaign_kind == CAMPAIGN_CUMULATIVE_MIXTURE
@@ -1253,6 +1267,11 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         far_columns=far_columns_union, far_threshold=far_threshold))
     # pdraw_state is basis-specific (overrides the v1 default the dict carries).
     attrs["pdraw_state"] = PDRAW_STATE_BY_BASIS[spin_basis]
+    if mock_data:
+        # Mock-data provenance, from the injection files (or the caller).
+        # Written only when True: a real-data export keeps its exact attrs, and
+        # an absent attr reads as False (every file before the flag existed).
+        attrs["mock_data"] = True
 
     attrs.update({
         "spin_basis": spin_basis,

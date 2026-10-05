@@ -1895,7 +1895,8 @@ def build_store(paths, out_path, params=None, extra_params=None,
                 sample_sets="preferred", file_provenance: Optional[dict] = None,
                 cache_dir=None, offline: Optional[bool] = None,
                 write_summary: bool = False,
-                summary_context: Optional[dict] = None):
+                summary_context: Optional[dict] = None,
+                mock_data: bool = False):
     """Ingest a list of cosmo-file paths into a single concatenated store.
 
     params       : column list to store (default DEFAULT_PARAMS).
@@ -1939,6 +1940,12 @@ def build_store(paths, out_path, params=None, extra_params=None,
                    Extra fields merged into the written summary (e.g. a release
                    manifest name/version a caller already knows about). Never
                    populated automatically.
+    mock_data    : bool, default False
+                   Flag the store as SYNTHETIC (:data:`STORE_MOCK_DATA_ATTR`).
+                   The flag is part of the store, so every PE export built from
+                   it carries ``mock_data=True`` without the exporter being
+                   told.  Default False writes no attr: a real-data store is
+                   byte-identical to one written before the flag existed.
     """
     cfg = cfg or IngestConfig()
     params = list(params or DEFAULT_PARAMS)
@@ -2310,7 +2317,7 @@ def build_store(paths, out_path, params=None, extra_params=None,
     # rather than the records plus a second copy of the whole catalog (GW-24).
     union_params = _write_store_from_records(out_path, records,
                                              candidate_params, offsets, names,
-                                             meta, cfg)
+                                             meta, cfg, mock_data=mock_data)
     print(f"\nWrote {out_path}: {len(names)} events, "
           f"{offsets[-1]} total samples, params={union_params}")
 
@@ -2537,6 +2544,25 @@ SCHEMA_VERSION_DL_PRIOR = "1.3"
 #: simply carry no record of where each prior came from.
 SCHEMA_VERSION_PRIOR_PROVENANCE = "1.4"
 
+#: File-level store attr marking a store whose samples are SYNTHETIC (a mock
+#: campaign written through gwcat's own store writer), not released PE.
+#:
+#: Provenance travels with the data: the flag is written into the store by
+#: :func:`build_store` / :func:`_write_store_from_records` (``mock_data=True``),
+#: survives :func:`merge_stores` / :func:`merge_store` (a merge holding any mock
+#: row is mock), is read by :class:`gwcat.catalog.GWCatalog`, and is stamped by
+#: every PE exporter as the ``mock_data`` attr darksirens reads.  It is written
+#: ONLY when True, so a real-data store is byte-identical to what gwcat wrote
+#: before the flag existed; an absent attr reads as False, which is what every
+#: store written before it means.
+STORE_MOCK_DATA_ATTR = "mock_data"
+
+
+def read_store_mock_data(f) -> bool:
+    """Whether an open store (or any ``h5py`` object with ``attrs``) is mock."""
+    return bool(f.attrs.get(STORE_MOCK_DATA_ATTR, False))
+
+
 #: The meta columns whose presence marks a 1.3 store.
 _SCHEMA_13_FIELDS = ("dL_prior_kind", "dL_prior_sampling_kind",
                      "dL_prior_cosmology_name", "dL_prior_release_flavour",
@@ -2570,12 +2596,18 @@ def _store_schema_version(meta):
     return SCHEMA_VERSION
 
 
-def _write_store_attrs(f, stored_params, names, meta):
-    """Write the file-level attributes (schema, column names, row count)."""
+def _write_store_attrs(f, stored_params, names, meta, mock_data=False):
+    """Write the file-level attributes (schema, column names, row count).
+
+    ``mock_data`` adds :data:`STORE_MOCK_DATA_ATTR` -- only when True, so a
+    real-data store's attrs are exactly what they were before the flag existed.
+    """
     f.attrs["schema_version"] = _store_schema_version(meta)
     f.attrs.create("param_names",
                    np.array(stored_params, dtype=h5py.string_dtype()))
     f.attrs["n_events"] = len(names)
+    if mock_data:
+        f.attrs[STORE_MOCK_DATA_ATTR] = True
 
 
 def _write_store_index(f, offsets, names, avail, meta, cfg):
@@ -2598,7 +2630,7 @@ def _write_store_index(f, offsets, names, avail, meta, cfg):
 
 
 def _write_store(out_path, stored_params, columns, offsets, names, avail, meta,
-                 cfg):
+                 cfg, mock_data=False):
     """Write a store.h5 with the union parameter set + availability mask.
 
     ``columns`` maps each stored parameter to a full-length (already
@@ -2606,7 +2638,7 @@ def _write_store(out_path, stored_params, columns, offsets, names, avail, meta,
     aligned with ``names`` (rows) and ``stored_params`` (columns).
     """
     with h5py.File(out_path, "w") as f:
-        _write_store_attrs(f, stored_params, names, meta)
+        _write_store_attrs(f, stored_params, names, meta, mock_data)
         g = f.create_group("samples")
         for p in stored_params:
             arr = np.asarray(columns.get(p, np.array([])), dtype=np.float64)
@@ -2628,7 +2660,7 @@ def _create_sample_column(g, p, n, cfg):
 
 
 def _write_store_from_records(out_path, records, candidate_params, offsets,
-                              names, meta, cfg):
+                              names, meta, cfg, mock_data=False):
     """Write a store straight from per-event arrays, one event slice at a time.
 
     The concatenating path (:func:`_assemble_union` + :func:`_write_store`)
@@ -2637,12 +2669,16 @@ def _write_store_from_records(out_path, records, candidate_params, offsets,
     from the record into its slice of a preallocated column, so the union is
     never built in memory (GW-24).
 
+    ``mock_data=True`` flags the store as synthetic (:data:`STORE_MOCK_DATA_ATTR`);
+    this is how a mock campaign written through this writer is exported with
+    ``mock_data=True`` instead of being labelled real data.
+
     Returns the stored parameter list (the union, in ``candidate_params`` order).
     """
     union_params, avail = _union_params_and_avail(records, candidate_params)
     total = int(offsets[-1]) if len(offsets) else 0
     with h5py.File(out_path, "w") as f:
-        _write_store_attrs(f, union_params, names, meta)
+        _write_store_attrs(f, union_params, names, meta, mock_data)
         g = f.create_group("samples")
         for p in union_params:
             ds = _create_sample_column(g, p, total, cfg)
@@ -2683,6 +2719,7 @@ def _read_store_meta(path):
     """
     with h5py.File(path, "r") as f:
         params = [_decode(p) for p in f.attrs["param_names"]]
+        mock_data = read_store_mock_data(f)
         offsets = f["index/offsets"][:].astype(np.int64)
         names = [_decode(n) for n in f["index/event_names"][:]]
         n_events = len(names)
@@ -2700,7 +2737,8 @@ def _read_store_meta(path):
                     meta[k] = [_decode(v) for v in f[f"meta/{k}"][:]]
     slices = [(int(offsets[i]), int(offsets[i + 1])) for i in range(n_events)]
     return dict(params=params, offsets=offsets, names=names, avail=avail,
-                meta=meta, n_events=n_events, path=str(path), slices=slices)
+                meta=meta, n_events=n_events, path=str(path), slices=slices,
+                mock_data=mock_data)
 
 
 def _read_store(path):
@@ -2731,7 +2769,8 @@ def _subset_meta(S, keep):
     meta = {k: [v[i] for i in keep] for k, v in S["meta"].items()}
     return dict(params=S["params"], offsets=np.asarray(offs, dtype=np.int64),
                 names=[S["names"][i] for i in keep], avail=avail, meta=meta,
-                n_events=len(keep), path=S["path"], slices=slices)
+                n_events=len(keep), path=S["path"], slices=slices,
+                mock_data=bool(S.get("mock_data", False)))
 
 
 #: Largest number of float64 samples moved in one read/write step when the merge
@@ -2775,7 +2814,7 @@ def _copy_column(src_ds, dst_ds, runs):
 
 
 def _write_store_streaming(out_path, stored_params, sources, offsets, names,
-                           avail, meta, cfg):
+                           avail, meta, cfg, mock_data=False):
     """Write a store whose sample columns are COPIED from existing stores.
 
     ``sources`` is a list of ``(store metadata dict, destination start offset)``
@@ -2788,7 +2827,7 @@ def _write_store_streaming(out_path, stored_params, sources, offsets, names,
     """
     total = int(offsets[-1]) if len(offsets) else 0
     with h5py.File(out_path, "w") as f:
-        _write_store_attrs(f, stored_params, names, meta)
+        _write_store_attrs(f, stored_params, names, meta, mock_data)
         g = f.create_group("samples")
         dsets = {p: _create_sample_column(g, p, total, cfg)
                  for p in stored_params}
@@ -2933,10 +2972,22 @@ def merge_stores(store_a, store_b, out_path, cfg: Optional[IngestConfig] = None,
     # h5py.File(..., "w"), so a merge that raised part-way left the file that
     # was already there destroyed. A previous good store is not ours to lose
     # because the merge producing its replacement failed.
+    # A merge holding ANY synthetic row is synthetic: the flag is file-level,
+    # and labelling a partly-mock store as real is the error it exists to stop.
+    a_mock, b_mock = bool(A.get("mock_data")), bool(B.get("mock_data"))
+    mock_data = a_mock or b_mock
+    if a_mock != b_mock:
+        warnings.warn(
+            f"merging a mock-data store with a real-data store "
+            f"({store_a!r} mock_data={a_mock}, {store_b!r} mock_data={b_mock}); "
+            f"the merged store is flagged mock_data=True, and so is every "
+            f"export built from it.")
+
     write_path = f"{out_path}.gwcat-merge-tmp"
     try:
         _write_store_streaming(write_path, union_params, [(A, 0), (B, a_total)],
-                               offsets, names, avail, merged_meta, cfg)
+                               offsets, names, avail, merged_meta, cfg,
+                               mock_data=mock_data)
     except BaseException:
         if os.path.exists(write_path):
             os.remove(write_path)

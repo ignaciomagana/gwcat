@@ -95,7 +95,7 @@ from ..params.blocks.mass import UNSTATED_MASS_PRIOR, classify_mass_prior
 from ..source_class import CUT_ESTIMATOR_ATTR, PE_MEDIAN_CUT_WARNING
 from ..spin import AMAX_AUTO, parse_amax_option
 from .contract import event_list_digest, mixed_prior_impl_events
-from .product import ExportProduct
+from .product import ExportProduct, resolve_mock_data
 
 
 def space_ordered_required(space, spin_basis):
@@ -223,7 +223,7 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                      allow_projection_basis=False,
                      drop_spin_above_ceiling=False,
                      sample_set_map=None, nrsur_q_rule=None,
-                     nrsur_q_rule_substitute=False):
+                     nrsur_q_rule_substitute=False, mock_data=None):
     """Build a PE :class:`ExportProduct` from a :class:`~gwcat.catalog.GWCatalog`.
 
     For ``spin_basis="chieff"`` this reproduces the legacy
@@ -305,7 +305,18 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     call's defaults.  ``pastro_min`` (from either side) is REFUSED unless
     ``allow_unpaired_pastro_min=True``: the injection campaigns carry no
     per-injection p_astro, so no selection function can reproduce that cut.
+
+    Mock-data provenance
+    --------------------
+    The ``mock_data`` attr (which darksirens reads to announce "This is using
+    mock data.") comes from the STORE: ``cat.mock_data``, set when the store was
+    written with ``mock_data=True`` (:func:`gwcat.ingest.build_store` /
+    ``_write_store_from_records``).  The ``mock_data`` argument can only add the
+    label (``True``) or assert a real input (``False``, which raises on a mock
+    store); ``None`` inherits.  See :func:`gwcat.export.product.resolve_mock_data`.
     """
+    mock_data = resolve_mock_data(getattr(cat, "mock_data", False), mock_data,
+                                  source=f"the store {getattr(cat, 'path', cat)!r}")
     if spin_basis not in _KNOWN_SPIN_BASES:
         raise ValueError(
             f"unknown spin_basis={spin_basis!r}; known bases are "
@@ -1303,7 +1314,9 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         # darksirens core
         "nsamp": int(nsamp),
         "nobs": int(nobs),
-        "mock_data": False,
+        # From the store's provenance (or the caller's explicit True), never a
+        # constant: a mock campaign run through these builders was labelled real.
+        "mock_data": bool(mock_data),
         # ── The per-sample redshift truncation (GW-37) ──────────────────────
         # NaN when unused, because HDF5 has no null and "no truncation" must be
         # distinguishable from "this file predates the record".  It appeared in

@@ -54,3 +54,34 @@ class ExportProduct:
     attrs: Dict[str, Any] = field(default_factory=dict)
     spin_basis: str = "chieff"
     summary: Dict[str, Any] = field(default_factory=dict)
+
+
+def resolve_mock_data(input_flag, explicit, *, source) -> bool:
+    """The ``mock_data`` attr an export carries.
+
+    The flag is PROVENANCE of the input, so it comes from the input: a store
+    written with ``mock_data=True`` (see :data:`gwcat.ingest.STORE_MOCK_DATA_ATTR`)
+    or an injection file whose root attrs carry ``mock_data=True``.  The
+    builders' explicit ``mock_data`` argument can only ADD the label:
+
+    * ``None`` (the default) -- inherit the input's flag;
+    * ``True`` -- label the export mock even though the input does not say so
+      (inputs written outside gwcat's writers);
+    * ``False`` -- assert the input is real; raises if the input is flagged mock,
+      because relabelling synthetic data as real is exactly the error the flag
+      exists to prevent.
+
+    ``source`` names the input in the error message.
+    """
+    input_flag = bool(input_flag)
+    if explicit is None:
+        return input_flag
+    if not isinstance(explicit, (bool, np.bool_)):
+        raise TypeError(
+            f"mock_data must be None, True or False; got {explicit!r}.")
+    if not explicit and input_flag:
+        raise ValueError(
+            f"mock_data=False was requested, but {source} is flagged "
+            f"mock_data=True. A synthetic input cannot be exported as real "
+            f"data; drop the argument to inherit the flag.")
+    return bool(explicit) or input_flag
