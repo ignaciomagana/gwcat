@@ -182,3 +182,51 @@ def test_snr_min_on_a_store_without_the_column_is_refused(tmp_path):
     cat = GWCatalog(_store(tmp_path, rows, drop_meta=("snr_med",)))
     with pytest.raises(ValueError, match="'snr_med' meta column"):
         cat.select(snr_min=8.0)
+
+
+# ==========================================================================
+# The v1 exporter records its z_max truncation, and the v1 pair refuses it
+# ==========================================================================
+def _zmax_store(tmp_path):
+    rng = np.random.default_rng(5)
+    rows = [_row("GW900001_000001", n=60,
+                 luminosity_distance=rng.uniform(300, 800, 60)),
+            _row("GW900002_000002", n=60,
+                 luminosity_distance=rng.uniform(5000, 6000, 60))]
+    return _store(tmp_path, rows, name="zmax_store.h5")
+
+
+def test_v1_z_max_is_recorded_and_a_whole_event_drop_is_named(tmp_path):
+    out = tmp_path / "pe_z.h5"
+    with pytest.warns(UserWarning, match="GW900002_000002"):
+        GWCatalog(_zmax_store(tmp_path)).to_darksirens(
+            str(out), nsamp=16, seed=0, cosmology=_COSMO, z_max=0.12)
+    with h5py.File(out, "r") as f:
+        assert float(f.attrs["z_max"]) == 0.12
+        assert int(f.attrs["nobs"]) == 1
+        cut = np.asarray(f.attrs["n_samples_cut_by_z_max"])
+        assert cut.shape == (1,) and 0 < cut[0] < 60
+        dropped = [x.decode() if isinstance(x, bytes) else x
+                   for x in f.attrs["events_dropped_by_z_max"]]
+        assert dropped == ["GW900002_000002"]
+
+
+def test_v1_truncated_pe_file_is_refused_against_a_v1_selection(tmp_path):
+    out = tmp_path / "pe_z.h5"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        GWCatalog(_zmax_store(tmp_path)).to_darksirens(
+            str(out), nsamp=16, seed=0, cosmology=_COSMO, z_max=0.12)
+    sel = _make_combined_selection(tmp_path)
+    with pytest.raises(ValueError, match="xcheck_z_max"):
+        validate_export(str(out), sel)
+
+
+def test_v1_untruncated_file_records_no_z_max(tmp_path):
+    out = tmp_path / "pe_noz.h5"
+    GWCatalog(_three(tmp_path)).to_darksirens(str(out), nsamp=8, seed=0,
+                                              cosmology=_COSMO)
+    with h5py.File(out, "r") as f:
+        assert np.isnan(float(f.attrs["z_max"]))
+    results = validate_export(str(out), _make_combined_selection(tmp_path))
+    assert results["xcheck_z_max"] is True

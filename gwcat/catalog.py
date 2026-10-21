@@ -1588,6 +1588,11 @@ class GWCatalog:
 
         kept_amax1, kept_amax2, kept_amax_src = [], [], []
         amax_fallback_events = []
+        # The z_max truncation, recorded (review 2026-10-20) as the 2.0
+        # builder records it: per kept event, the samples the cut removed, and
+        # the events it removed entirely.  It used to leave no trace, so a
+        # truncated v1 file paired with an untruncated selection.
+        n_cut_by_z_max, z_max_dropped_events = [], []
 
         for e in range(sub.n_events):
             n = len(per["luminosity_distance"][e])
@@ -1602,10 +1607,13 @@ class GWCatalog:
             m2_e = per["mass_2"][e]
 
             # Per-sample z_max cut
+            n_cut_e = 0
             if z_max is not None:
                 z_e = z_of_dL(dL_e, cosmo_e)
                 keep = z_e <= z_max
+                n_cut_e = int(np.sum(~keep))
                 if not keep.any():
+                    z_max_dropped_events.append(str(sub.event_names[e]))
                     continue
                 dL_e = dL_e[keep]
                 m1_e = m1_e[keep]
@@ -1666,6 +1674,7 @@ class GWCatalog:
             cols["m2src"].append(m2 / (1 + z))
             kept.append(sub.event_names[e])
             kept_mass_kind.append(mass_kind_e)
+            n_cut_by_z_max.append(n_cut_e)
             a1_e, a2_e, asrc_e = _event_amax(e)
             kept_amax1.append(a1_e)
             kept_amax2.append(a2_e)
@@ -1790,6 +1799,20 @@ class GWCatalog:
                   "n_unique_samples_per_event, which records how many distinct "
                   "posterior samples actually back each event.")
 
+        if z_max is not None and (any(n_cut_by_z_max) or z_max_dropped_events):
+            warnings.warn(
+                f"z_max={z_max} dropped {sum(n_cut_by_z_max)} posterior "
+                f"sample(s) across {sum(1 for n in n_cut_by_z_max if n)} of "
+                f"{nobs} exported event(s)"
+                + (f", and removed {len(z_max_dropped_events)} event(s) whose "
+                   f"every sample lies above it: {z_max_dropped_events[:10]}"
+                   if z_max_dropped_events else "")
+                + ". The paired selection must be truncated at the SAME z_max "
+                  "or mu integrates over redshifts the events do not cover; a "
+                  "gwcat-selection-1.0 file cannot state one, so validate_export "
+                  "refuses this file against it. Recorded as z_max, "
+                  "n_samples_cut_by_z_max and events_dropped_by_z_max.")
+
         with h5py.File(out_path, "w") as f:
             # --- Attributes darksirens reads ---
             f.attrs["nsamp"] = int(nsamp)
@@ -1912,6 +1935,17 @@ class GWCatalog:
             f.attrs["resampled_with_replacement"] = bool(upsampled_events)
             f.attrs["n_events_resampled_with_replacement"] = int(
                 len(upsampled_events))
+            # The per-sample redshift truncation (review 2026-10-20), under the
+            # 2.0 builder's names: NaN = no truncation.
+            f.attrs["z_max"] = (float("nan") if z_max is None
+                                else float(z_max))
+            f.attrs["n_samples_cut_by_z_max"] = np.asarray(
+                n_cut_by_z_max, dtype=np.int64)
+            if z_max is not None:
+                # Only under a truncation: the 2.0 builder does not write this
+                # attr yet, and the v2 file must stay a superset of the v1 one.
+                f.attrs["events_dropped_by_z_max"] = np.array(
+                    z_max_dropped_events, dtype=h5py.string_dtype())
             f.attrs.create("sample_set_name_per_event",
                            np.array([str(x) for x in kept_ss_name],
                                     dtype=h5py.string_dtype()))
@@ -1949,6 +1983,8 @@ class GWCatalog:
                 "n_events_skipped_after_selection": int(sub.n_events - nobs),
                 "event_names_exported": [str(k) for k in kept],
                 "nsamp_per_event": int(nsamp),
+                "z_max": None if z_max is None else float(z_max),
+                "events_dropped_by_z_max": list(z_max_dropped_events),
                 # The EFFECTIVE selection (GW-33), the same record the file's
                 # attrs carry.
                 "selection_spec": spec.to_dict(),
@@ -2428,6 +2464,31 @@ def validate_export(gw_path: str, selection_path: str = None, strict: bool = Fal
             from .export.validate import _xcheck_detection_cut
             _xcheck_detection_cut(_fail, results, dict(fg.attrs),
                                   dict(fs.attrs))
+
+            # (d2) The redshift truncation (review 2026-10-20).  The shared
+            # check above warns when only one side states a z_max, because a
+            # 2.x file without the attr may predate it.  A gwcat-selection-1.0
+            # file can never state one -- no v1 selection writer truncates --
+            # so a truncated v1 PE file against it is a known mismatch: the
+            # events cover z <= z_max while mu covers every redshift.
+            def _zmax(attrs):
+                try:
+                    v = float(attrs.get("z_max", float("nan")))
+                except (TypeError, ValueError):
+                    return float("nan")
+                return v
+            pe_zmax, sel_zmax = _zmax(fg.attrs), _zmax(fs.attrs)
+            if np.isfinite(pe_zmax) and not (
+                    np.isfinite(sel_zmax) and sel_zmax == pe_zmax):
+                _fail("xcheck_z_max",
+                      f"the PE file truncates its posteriors at z_max="
+                      f"{pe_zmax:g} but the selection file states "
+                      f"z_max={sel_zmax:g}; a gwcat-selection-1.0 file covers "
+                      f"every redshift, so mu would integrate over a range the "
+                      f"events do not cover. Re-export the PE file without "
+                      f"z_max, or build a 2.x pair with the same z_max on both "
+                      f"sides (gwcat export pe/selection --z-max).")
+            results["xcheck_z_max"] = True
 
             # (e) Cuts on per-event point estimates (review 2026-10-20).  A
             # file cut on posterior-median masses or on sky area describes an
