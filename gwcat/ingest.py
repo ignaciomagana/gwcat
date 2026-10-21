@@ -3758,7 +3758,8 @@ def merge_store(existing_path: str, new_paths, out_path: str = None,
                 extra_params=None, sample_sets="preferred",
                 file_provenance: Optional[dict] = None, cache_dir=None,
                 offline: Optional[bool] = None,
-                on_duplicate_key: str = "skip"):
+                on_duplicate_key: str = "skip",
+                mock_data: Optional[bool] = None):
     """Append new events to an existing store without re-ingesting everything.
 
     Schema-preserving (PR 5): the merged store holds the UNION of parameters.
@@ -3784,6 +3785,13 @@ def merge_store(existing_path: str, new_paths, out_path: str = None,
         without re-ingesting the catalog.  Note that a new SAMPLE SET for an
         event already in the store is not a duplicate at all: it is added under
         either setting (GW-14).
+    mock_data : bool or None
+        Whether the NEW files are synthetic (:data:`STORE_MOCK_DATA_ATTR`).
+        ``None`` (default) inherits the existing store's flag, so appending to
+        a mock store stays mock without a spurious mixing warning; ``True``
+        marks appended synthetic PE as mock, which makes the merged store mock
+        (review 2026-10-20, medium-54: there was no way to say so, and the
+        merge came out labelled real).
 
     Returns
     -------
@@ -3800,6 +3808,7 @@ def merge_store(existing_path: str, new_paths, out_path: str = None,
     # decide which parameters to ingest for the new events, not its samples,
     # which merge_stores then copies straight from the file (GW-24).
     old = _read_store_meta(existing_path)
+    new_mock = bool(old["mock_data"]) if mock_data is None else bool(mock_data)
 
     # Candidate columns for the new events: the generous default set plus any
     # columns the existing store already has (minus the computed p_dL_pe, which
@@ -3826,7 +3835,7 @@ def merge_store(existing_path: str, new_paths, out_path: str = None,
         tmp_new = os.path.join(tmpdir, "new.h5")
         build_store(new_paths, tmp_new, params=candidates, cfg=cfg,
                     event_table=event_table, sample_sets=sample_sets,
-                    file_provenance=file_provenance)
+                    file_provenance=file_provenance, mock_data=new_mock)
 
         tmp_merged = os.path.join(tmpdir, "merged.h5")
         merge_stores(existing_path, tmp_new, tmp_merged, cfg=cfg,

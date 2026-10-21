@@ -675,3 +675,39 @@ def test_sky_area_nside_is_stored(tmp_path, monkeypatch):
     store = _ingest(tmp_path, monkeypatch, {O3_NAME: _gw191109_like()})
     assert np.isnan(float(_meta(store, "sky_area_90_nside")))
     assert np.isnan(float(_meta(store, "sky_area_90")))
+
+
+# ==========================================================================
+# medium-54: merge_store could not flag appended synthetic PE as mock
+# ==========================================================================
+_E1 = "IGWN-GWTC3p0-v1-GW950101_000001_PEDataRelease_mixed_cosmo.h5"
+_E2 = "IGWN-GWTC3p0-v1-GW950102_000002_PEDataRelease_mixed_cosmo.h5"
+
+
+def _merge_new(tmp_path, monkeypatch, *, existing_mock, **kw):
+    files = {_E1: _one_label_file(1), _E2: _one_label_file(2)}
+    store = _ingest(tmp_path, monkeypatch, {_E1: files[_E1]}, name="a.h5",
+                    mock_data=existing_mock)
+    (tmp_path / _E2).write_bytes(b"")
+    monkeypatch.setattr(ing, "_read_event_pesummary",
+                        lambda path: (lambda d, sd, pr: (d, sd, list(sd), pr))(
+                            *files[os.path.basename(path)]))
+    out = tmp_path / "merged.h5"
+    ing.merge_store(store, [str(tmp_path / _E2)], out_path=str(out),
+                    cfg=ing.IngestConfig(**_CFG), event_table={}, **kw)
+    with h5py.File(out, "r") as f:
+        return ing.read_store_mock_data(f)
+
+
+def test_merge_store_marks_appended_synthetic_pe_as_mock(tmp_path,
+                                                          monkeypatch):
+    with pytest.warns(UserWarning, match="mock"):
+        assert _merge_new(tmp_path, monkeypatch, existing_mock=False,
+                          mock_data=True) is True
+
+
+def test_merge_store_into_a_mock_store_stays_mock_without_warning(
+        tmp_path, monkeypatch):
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", message=".*mock-data store with")
+        assert _merge_new(tmp_path, monkeypatch, existing_mock=True) is True
