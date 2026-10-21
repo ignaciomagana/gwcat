@@ -147,3 +147,86 @@ def test_store_without_the_columns_records_empty_provenance(tmp_path):
         "", ""]
     assert np.all(np.isnan(attrs["sample_set_priority_rank_per_event"]))
     assert json.loads(attrs["release_reweight_cosmology_table_ids"]) == {}
+
+
+# ==========================================================================
+# A NaN coordinate is an error, not an out-of-support sample
+# ==========================================================================
+def _store_with_nan(tmp_path, column, name="nan_store.h5"):
+    """Two events; event 2 carries one NaN sample in ``column`` although the
+    availability mask marks the column present."""
+    store = _two_event_store(tmp_path, name=name)
+    with h5py.File(store, "r+") as f:
+        offs = f["index/offsets"][()] if "offsets" in f["index"] else None
+        col = f[f"samples/{column}"]
+        arr = col[()]
+        start = int(offs[1]) if offs is not None else arr.size // 2
+        arr[start + 3] = np.nan
+        col[...] = arr
+    return store
+
+
+def test_in_support_helper_refuses_a_nan_chi_eff():
+    from gwcat.spin import (NonFiniteSpinInputError,
+                            chi_eff_prior_logprob_in_support)
+    chi = np.array([np.nan, 0.1])
+    m = np.array([30.0, 30.0]), np.array([20.0, 20.0])
+    with pytest.raises(NonFiniteSpinInputError, match="non-finite"):
+        chi_eff_prior_logprob_in_support(chi, *m, amax=0.99)
+    with pytest.raises(NonFiniteSpinInputError, match="m2_source"):
+        chi_eff_prior_logprob_in_support(np.array([0.1, 0.1]), m[0],
+                                         np.array([20.0, np.nan]), amax=0.99)
+
+
+def test_in_support_helper_keeps_finite_semantics():
+    from gwcat.spin import chi_eff_prior_logprob_in_support
+    lp, sup = chi_eff_prior_logprob_in_support(
+        np.array([0.1, 0.995, -0.999]), np.array([50.0] * 3),
+        np.array([25.0] * 3), amax=0.99)
+    assert sup.tolist() == [True, False, False]
+    assert np.isfinite(lp[0]) and np.all(lp[1:] == -np.inf)
+
+
+@pytest.mark.parametrize("column", ["chi_eff", "mass_2"])
+def test_pe_export_names_the_nan_column_and_event(tmp_path, column):
+    """The failure scenario: a NaN chi_eff (or mass) was reported as 'the
+    declared amax does not cover the samples'.  It now names the column and
+    the event."""
+    from gwcat.schema import NonFiniteSampleError
+    store = _store_with_nan(tmp_path, column)
+    with pytest.raises(NonFiniteSampleError, match="GW230708_053705: 1"):
+        _export(store, tmp_path / "pe.h5", nsamp=200)   # every sample drawn
+
+
+def test_nospin_export_refuses_a_nan_mass(tmp_path):
+    """Review scenario: nospin with a NaN mass_2 was written and passed
+    validate --strict."""
+    from gwcat.schema import NonFiniteSampleError
+    store = _store_with_nan(tmp_path, "mass_2")
+    with pytest.raises(NonFiniteSampleError, match="'m2det'"):
+        _export(store, tmp_path / "pe.h5", spin_basis="nospin", nsamp=200)
+
+
+# ==========================================================================
+# The chi_eff support is the true, mass-dependent edge
+# ==========================================================================
+def test_grid_density_past_the_true_edge_is_masked():
+    """amax = (0.99, 0.05): the true edge is (m1 0.99 + m2 0.05)/(m1+m2).
+    The legacy grid interpolates positive density past it between its q rows;
+    the in-support helper now masks it to zero."""
+    from gwcat.spin import chi_eff_prior_logprob_in_support, get_chi_eff_prior
+    prior = get_chi_eff_prior(0.99, 0.05, "grid")
+    qq = 0.5 * (prior.q_grid[60] + prior.q_grid[61])
+    m1 = np.full(50, qq * 50.0)
+    m2 = np.full(50, (1.0 - qq) * 50.0)
+    edge = (m1 * 0.99 + m2 * 0.05) / (m1 + m2)
+    chi = edge + np.linspace(1e-5, 0.01, 50)
+    assert np.any(prior.prob(chi, m1, m2) > 0)       # the leak itself
+    assert np.all(prior.support(chi))                 # the necessary bound
+    assert not np.any(prior.support(chi, m1, m2))     # the true edge
+    lp, sup = chi_eff_prior_logprob_in_support(chi, m1, m2, amax=0.99,
+                                               amax_2=0.05, impl="grid")
+    assert not sup.any() and np.all(lp == -np.inf)
+    lp_x, sup_x = chi_eff_prior_logprob_in_support(chi, m1, m2, amax=0.99,
+                                                   amax_2=0.05, impl="exact")
+    assert not sup_x.any()

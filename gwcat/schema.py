@@ -315,6 +315,52 @@ def check_required_alternatives(alternative_groups, store_params, avail,
             + ". Provide one alternative per group (or drop the events).")
 
 
+class NonFiniteSampleError(MissingParameterError):
+    """An exported coordinate column holds NaN/inf samples.
+
+    The availability mask records only whether a column is PRESENT for an
+    event (:func:`check_required`), so a present column with NaN samples used
+    to pass every export guard -- and in a spin projection the NaN then read
+    as "outside the spin ceiling" (review 2026-10-20).
+    """
+
+
+def check_columns_finite(columns, event_names=None, nsamp=None, *,
+                         context: str = "export") -> None:
+    """Refuse exported coordinate columns that are not finite per sample.
+
+    ``columns`` maps a column name to its concatenated ``nobs * nsamp``
+    array; with ``event_names``/``nsamp`` the message names the events.  Only
+    the columns passed are checked, so a caller passes the coordinates the
+    density is a function of (an advisory column may legitimately be NaN).
+    """
+    import numpy as np
+
+    problems = []
+    for name, col in columns.items():
+        v = np.asarray(col, dtype=float)
+        bad = ~np.isfinite(v)
+        if not bad.any():
+            continue
+        where = ""
+        if event_names is not None and nsamp:
+            names = np.asarray(event_names)
+            per_event = bad.reshape(len(names), int(nsamp)).sum(axis=1)
+            hit = np.nonzero(per_event)[0]
+            where = " in " + ", ".join(
+                f"{names[i]}: {int(per_event[i])}" for i in hit[:10]) + (
+                "" if hit.size <= 10 else f", ... (+{hit.size - 10} more)")
+        problems.append(f"{name!r}: {int(bad.sum())} sample(s){where}")
+    if problems:
+        raise NonFiniteSampleError(
+            f"{context}: exported coordinate column(s) hold non-finite "
+            f"samples although the store marks them available: "
+            + "; ".join(problems)
+            + ". The availability mask records only that a column is present "
+              "for an event; NaN samples inside it are a broken ingest, not "
+              "a prior-support problem. Re-ingest, or drop those events.")
+
+
 # --------------------------------------------------------------------------
 # Exported-weight support contract (GW-01)
 # --------------------------------------------------------------------------

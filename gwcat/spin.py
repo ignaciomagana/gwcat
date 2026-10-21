@@ -50,6 +50,43 @@ from .chi_eff_exact import EXACT_METHOD, chi_eff_iso_prob
 _trapz = getattr(np, "trapezoid", getattr(np, "trapz", None))
 
 
+def _chi_eff_support(chi_eff, amax_1, amax_2, m1=None, m2=None):
+    """``|χ_eff|`` inside the support of the isotropic uniform-magnitude prior.
+
+    Equal ceilings: ``|χ| <= amax`` (no masses needed, bit-for-bit the
+    historical predicate).  Unequal ceilings: the true edge
+    ``(m1·amax_1 + m2·amax_2)/(m1+m2)`` when the masses are given, else the
+    necessary bound ``max(amax_1, amax_2)``.
+    """
+    chi = np.abs(np.asarray(chi_eff, dtype=float))
+    if amax_1 == amax_2 or m1 is None or m2 is None:
+        return np.asarray(chi <= max(amax_1, amax_2))
+    m1 = np.asarray(m1, dtype=float)
+    m2 = np.asarray(m2, dtype=float)
+    return np.asarray(chi <= (m1 * amax_1 + m2 * amax_2) / (m1 + m2))
+
+
+class NonFiniteSpinInputError(ValueError):
+    """A spin-prior density was asked for at a NaN/inf coordinate.
+
+    Raised rather than reported as "out of support": a NaN chi_eff or mass is
+    a broken input, not a sample beyond the spin ceiling, and calling it the
+    latter sends the reader after the wrong fix (review 2026-10-20).
+    """
+
+
+def _require_finite(what, **arrays):
+    bad = {k: int(np.sum(~np.isfinite(np.asarray(v, dtype=float))))
+           for k, v in arrays.items()}
+    bad = {k: n for k, n in bad.items() if n}
+    if bad:
+        raise NonFiniteSpinInputError(
+            f"{what}: non-finite input coordinate(s) {bad} (count per "
+            f"argument). A NaN/inf coordinate is a broken sample, not one "
+            f"outside the spin prior's support; find the event and column it "
+            f"came from instead of widening the ceiling.")
+
+
 class ChiEffPrior:
     """Precomputed 1-D χ_eff prior on a (q, χ_eff) grid.
 
@@ -72,11 +109,14 @@ class ChiEffPrior:
 
     Notes
     -----
-    The support of χ_eff is ``|χ_eff| ≤ max(amax_1, amax_2)``: the primary term
-    ``q1·s1z`` reaches ``q1·amax_1`` and the secondary ``q2·s2z`` reaches
-    ``q2·amax_2``, and with ``q1 + q2 = 1`` the sum is bounded by the larger of
-    the two.  :attr:`amax` therefore reports that bound, while ``amax_1`` and
-    ``amax_2`` record the per-body priors the density was built from.
+    The support of χ_eff is ``|χ_eff| ≤ q1·amax_1 + q2·amax_2`` with
+    ``q_i = m_i/(m1+m2)``: the primary term ``q1·s1z`` reaches ``q1·amax_1``
+    and the secondary ``q2·s2z`` reaches ``q2·amax_2``.  That edge depends on
+    the masses whenever ``amax_1 != amax_2``; ``max(amax_1, amax_2)`` is only a
+    NECESSARY bound on it (the two agree when the ceilings are equal).
+    :attr:`amax` reports that mass-free bound, ``amax_1``/``amax_2`` the
+    per-body priors the density was built from, and :meth:`support` gives the
+    true edge when it is handed the masses.
     """
 
     def __init__(self, amax: float = 0.99, nq: int = 200,
@@ -201,14 +241,16 @@ class ChiEffPrior:
         p = self._interp2d(q, chi)
         return float(p[0]) if scalar else p
 
-    def support(self, chi_eff):
-        """Whether each ``chi_eff`` is inside the prior's support, ``|χ| ≤ amax``.
+    def support(self, chi_eff, m1=None, m2=None):
+        """Whether each ``chi_eff`` is inside the prior's support.
 
         An explicit predicate, so a caller can count and report out-of-support
-        samples instead of discovering them as a ``-inf`` (GW-03).
+        samples instead of discovering them as a ``-inf`` (GW-03).  With the
+        masses it is the TRUE support ``|χ| ≤ (m1·amax_1 + m2·amax_2)/(m1+m2)``;
+        without them only the necessary bound ``|χ| ≤ max(amax_1, amax_2)``
+        (see the class notes).  Equal ceilings give ``|χ| ≤ amax`` either way.
         """
-        chi = np.abs(np.asarray(chi_eff, dtype=float))
-        return np.asarray(chi <= self.amax)
+        return _chi_eff_support(chi_eff, self.amax_1, self.amax_2, m1, m2)
 
     def logprob(self, chi_eff, m1, m2):
         """log p(χ_eff | m1, m2, amax).  ``-inf`` outside the support.
@@ -357,10 +399,10 @@ class ChiEffPriorExact:
             return chi_eff_iso_prob(chi_eff, m1, m2, self.amax_1)
         return chi_eff_iso_prob(chi_eff, m1, m2, self.amax_1, self.amax_2)
 
-    def support(self, chi_eff):
-        """Whether each ``chi_eff`` is inside ``|χ| <= amax`` (see ChiEffPrior)."""
-        chi = np.abs(np.asarray(chi_eff, dtype=float))
-        return np.asarray(chi <= self.amax)
+    def support(self, chi_eff, m1=None, m2=None):
+        """Whether each ``chi_eff`` is in the support (see :meth:`ChiEffPrior.
+        support`: the true, mass-dependent edge when the masses are given)."""
+        return _chi_eff_support(chi_eff, self.amax_1, self.amax_2, m1, m2)
 
     def logprob(self, chi_eff, m1, m2):
         """log p(χ_eff | m1, m2, amax); ``-inf`` where the density is zero/NaN."""
@@ -458,12 +500,51 @@ def chi_eff_prior_logprob_in_support(chi_eff, m1_source, m2_source, amax=0.99,
     Returns arrays (never scalars), broadcast to the shape of ``chi_eff``.
     ``impl`` as in :func:`get_chi_eff_prior`; the exact prior is zero on and
     past its edge, so there the mask and the density agree by construction.
+
+    The mask is "excluded BY THE PRIOR" and nothing else (review 2026-10-20):
+
+    * support is the TRUE edge ``(m1·amax_1 + m2·amax_2)/(m1+m2)``, so with
+      unequal ceilings the legacy grid's density past that edge (it is
+      tabulated to ``max(amax_1, amax_2)``) is masked to zero too;
+    * a non-finite ``chi_eff``/mass raises :class:`NonFiniteSpinInputError`
+      instead of becoming an "out-of-support" zero that the builders exempt
+      from their positivity check and report as a spin-ceiling problem;
+    * a NaN density at a finite, supported point raises as well.
     """
+    _require_finite("chi_eff prior", chi_eff=chi_eff, m1_source=m1_source,
+                    m2_source=m2_source)
     prior = get_chi_eff_prior(amax, amax_2, impl)
-    sup = np.asarray(prior.support(chi_eff), dtype=bool)
+    sup = np.asarray(prior.support(chi_eff, m1_source, m2_source), dtype=bool)
     logp = np.asarray(prior.logprob(chi_eff, m1_source, m2_source), dtype=float)
+    _require_density_defined(prior, sup, logp, chi_eff, m1_source, m2_source)
     logp = np.where(sup, logp, -np.inf)
     return logp, sup & np.isfinite(logp)
+
+
+def _require_density_defined(prior, sup, logp, *args):
+    """Raise when the density is NaN (not zero) at a supported point.
+
+    ``logprob`` maps NaN to ``-inf``, so the zero-density points inside the
+    support are re-evaluated with ``prob`` to tell the two apart.  On real
+    inputs there are none (the density vanishes only on the edge itself), so
+    this costs nothing.
+    """
+    sup = np.asarray(sup, dtype=bool)
+    if sup.ndim == 0:
+        sup = sup.reshape(1)
+    logp = np.broadcast_to(np.asarray(logp, dtype=float), sup.shape)
+    zero = sup & ~np.isfinite(logp)
+    if not zero.any():
+        return
+    sub = [np.broadcast_to(np.asarray(a, dtype=float), sup.shape)[zero]
+           for a in args]
+    p = np.asarray(prior.prob(*sub), dtype=float)
+    n_nan = int(np.sum(np.isnan(p)))
+    if n_nan:
+        raise NonFiniteSpinInputError(
+            f"{type(prior).__name__}: the density is NaN at {n_nan} finite "
+            f"point(s) inside its support; refusing to treat that as zero "
+            f"density.")
 
 
 # ==================================================================
@@ -941,9 +1022,13 @@ def chi_eff_chi_p_prior_logprob_in_support(chi_eff, chi_p, m1_source,
     number here -- but the builders must not go on inferring support from
     finiteness, because that inference is what was wrong for the 1-D prior.
     """
+    _require_finite("(chi_eff, chi_p) prior", chi_eff=chi_eff, chi_p=chi_p,
+                    m1_source=m1_source, m2_source=m2_source)
     prior = get_chi_eff_chi_p_prior(amax, impl)
     sup = np.asarray(prior.support(chi_eff, chi_p), dtype=bool)
     logp = np.asarray(prior.logprob(chi_eff, chi_p, m1_source, m2_source),
                       dtype=float)
+    _require_density_defined(prior, sup, logp, chi_eff, chi_p, m1_source,
+                             m2_source)
     logp = np.where(sup, logp, -np.inf)
     return logp, sup & np.isfinite(logp)

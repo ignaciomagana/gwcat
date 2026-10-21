@@ -1036,6 +1036,18 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     import h5py
     _str = h5py.string_dtype()
 
+    # ── Per-sample finiteness of the coordinates (review 2026-10-20) ────────
+    # The availability mask only says a column is PRESENT; a NaN sample inside
+    # it would otherwise reach the spin step and read as "out of support".
+    from ..schema import check_columns_finite
+    _coords = ("ra", "dec", "m1det", "m2det", "q", "dL", "redshift", "m1src",
+               "m2src") + (("chieff",) if "chieff" in space.fit_columns
+                           else ())
+    check_columns_finite({c: data[c] for c in _coords if c in data},
+                         event_names=kept, nsamp=nsamp,
+                         context=f"gwcat-pe-2.0 export (spin_basis="
+                                 f"{spin_basis!r})")
+
     # ── Spin-basis-specific step (columns + p_pe spin factor) ───────────────
     spin_attrs: dict = {}
     # Per-event ceilings, resolved above, broadcast to one value per sample.
@@ -1068,6 +1080,12 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             }
         elif emit_extras:  # nobs == 0
             extras = {k: np.array([]) for k in ("a1", "a2", "cost1", "cost2")}
+        # The spin coordinates the basis's density and support read.
+        check_columns_finite(
+            dict(extras or {}, **({"chip": chip} if spin_basis == "chieff_chip"
+                                  else {})),
+            event_names=kept, nsamp=nsamp,
+            context=f"gwcat-pe-2.0 export (spin_basis={spin_basis!r})")
 
         if spin_basis == "component":
             columns = _apply_component_basis(data, amax1_ps, amax2_ps,
