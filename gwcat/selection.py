@@ -692,8 +692,14 @@ def _v1_chieff_swap(set_list, keeps, amax, *, strict=True):
     copy, both exporters now call the v2 helpers outright -- one implementation,
     so the two generations cannot drift again.
 
-    Returns ``(ln_factor, in_support, amax_pairs, amax_sources, mode)`` with the
-    factor concatenated in campaign order over each campaign's ``keep`` mask.
+    Returns ``(ln_factor, in_support, amax_pairs, amax_sources, mode,
+    violations)`` with the factor concatenated in campaign order over each
+    campaign's ``keep`` mask.  ``violations`` is what the gate let through
+    under ``strict=False`` (review 2026-10-20, medium-14): it used to be a
+    throwaway list, so a v1 file written past a failed gate carried no
+    ``spin_basis_assumption_violations`` and core's only spin-swap guard
+    (which reads that attr and ``injected_spin_uniform_isotropic``) accepted
+    it.  :func:`_write_spin_swap_validity_attrs` writes both.
     """
     # Function-local: gwcat.export.selection_builder imports this module.
     from .export.selection_builder import (
@@ -702,7 +708,8 @@ def _v1_chieff_swap(set_list, keeps, amax, *, strict=True):
     from .spin import parse_amax_option
 
     forced_amax = parse_amax_option(amax, what="amax")
-    _check_chieff_swap_valid(set_list, strict=strict, violations=[])
+    violations = []
+    _check_chieff_swap_valid(set_list, strict=strict, violations=violations)
 
     ln_parts, sup_parts, pairs, sources = [], [], [], []
     for s, keep in zip(set_list, keeps):
@@ -714,7 +721,25 @@ def _v1_chieff_swap(set_list, keeps, amax, *, strict=True):
         sources.append(src)
     mode = "fixed" if forced_amax is not None else "per_campaign"
     return (np.concatenate(ln_parts), np.concatenate(sup_parts),
-            pairs, sources, mode)
+            pairs, sources, mode, violations)
+
+
+def _write_spin_swap_validity_attrs(f, set_list, violations):
+    """The spin-swap validity record, on a v1 file exactly as on the v2 one.
+
+    ``injected_spin_uniform_isotropic`` per campaign and the gate's
+    ``spin_basis_assumption_violations`` (JSON; ``"[]"`` when the gate passed)
+    with its two summary booleans -- the attrs the 2.0 builder writes and
+    darksirens-core's ``_require_valid_spin_swap`` reads (medium-14).
+    """
+    f.attrs["injected_spin_uniform_isotropic"] = np.array(
+        [bool((s.spin_meta or {}).get("uniform_isotropic")) for s in set_list],
+        dtype=bool)
+    f.attrs["spin_basis_assumption_violations"] = json.dumps(violations)
+    f.attrs["spin_basis_assumption_violated"] = bool(
+        [v for v in violations if v.get("verified")])
+    f.attrs["spin_basis_assumption_unverified"] = bool(
+        [v for v in violations if not v.get("verified")])
 
 
 def _v1_refuse_unsupported(ln_factor, in_support, amax_pairs, what):
@@ -2420,8 +2445,9 @@ class SelectionSet:
         chieff_det = self._chieff[keep]
         m1src_det = self._m1src[keep]
         m2src_det = self._m2src[keep]
-        logp_chi, in_support, amax_pairs, amax_sources, amax_mode = (
-            _v1_chieff_swap([self], [keep], amax, strict=strict))
+        (logp_chi, in_support, amax_pairs, amax_sources, amax_mode,
+         swap_violations) = _v1_chieff_swap([self], [keep], amax,
+                                            strict=strict)
         # No -50 floor (GW-03): a detected injection with zero assumed draw
         # density is a contradiction, not a small number -- see
         # gwcat/export/selection_builder.py.  The v2 twin refuses identically.
@@ -2473,6 +2499,7 @@ class SelectionSet:
                 getattr(self, "_sky_position_available", True))
             f.attrs["chi_eff_swap_applied"] = True
             _write_chieff_amax_attrs(f, amax_pairs, amax_sources, amax_mode)
+            _write_spin_swap_validity_attrs(f, [self], swap_violations)
             # ── Spin-prior contract provenance (PR 3) ──────────────────────
             # Selection export always applies the chi_eff swap (Mode A); the
             # naming mirrors the PE export so downstream can cross-check the two.
@@ -2800,8 +2827,9 @@ class CombinedSelectionSet:
 
         # Apply 1-D chi_eff prior swap, per-campaign ceilings and support gate
         # shared with the v2 builder (GW-37).
-        logp_chi, in_support, amax_pairs, amax_sources, amax_mode = (
-            _v1_chieff_swap(contrib_sets, contrib_keeps, amax, strict=strict))
+        (logp_chi, in_support, amax_pairs, amax_sources, amax_mode,
+         swap_violations) = _v1_chieff_swap(contrib_sets, contrib_keeps, amax,
+                                            strict=strict)
         # No -50 floor (GW-03); see the sibling exporter above.
         _v1_refuse_unsupported(logp_chi, in_support, amax_pairs,
                                "to_combined_selection_file")
@@ -2885,6 +2913,7 @@ class CombinedSelectionSet:
                     f"campaign, not on finiteness, if that is not intended.")
             f.attrs["chi_eff_swap_applied"] = True
             _write_chieff_amax_attrs(f, amax_pairs, amax_sources, amax_mode)
+            _write_spin_swap_validity_attrs(f, self._sets, swap_violations)
             # ── Spin-prior contract provenance (PR 3) ──────────────────────
             f.attrs["spin_prior_mode"] = "include"
             f.attrs["chi_eff_prior_applied_to_pdraw"] = True

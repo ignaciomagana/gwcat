@@ -118,3 +118,50 @@ def test_v1_combined_export_records_the_draw_domains(tmp_path):
         rows = json.loads(f.attrs["injection_draw_domain_per_campaign"])
         assert [r["declared_source"] for r in rows] == ["file_attrs",
                                                         "undeclared"]
+
+
+# ======================================================================
+# medium-14: the v1 chi_eff-swap exporters record what strict=False let in
+# ======================================================================
+def _core_spin_swap_problems(attrs):
+    """darksirens-core's _require_valid_spin_swap, on the attrs alone."""
+    problems = []
+    if "injected_spin_uniform_isotropic" in attrs:
+        if not np.atleast_1d(attrs["injected_spin_uniform_isotropic"]).all():
+            problems.append("not uniform-isotropic")
+    v = attrs.get("spin_basis_assumption_violations", "")
+    if v and v not in ("[]", "{}"):
+        problems.append("violations")
+    return problems
+
+
+def test_v1_strict_false_records_the_swap_violation(tmp_path):
+    from test_selection_chieff_reference import write_o4_nonuniform
+    path = write_o4_nonuniform(tmp_path / "nonuni.hdf", n=200, seed=3)
+    out = tmp_path / "v1.h5"
+    with pytest.warns(UserWarning, match="did NOT draw spins that way"):
+        SelectionSet(path, strict_spin_checks="off").to_darksirens(
+            str(out), amax=1.0, strict=False)
+    with h5py.File(out, "r") as f:
+        attrs = dict(f.attrs)
+    assert list(attrs["injected_spin_uniform_isotropic"]) == [False]
+    viol = json.loads(attrs["spin_basis_assumption_violations"])
+    assert len(viol) == 1 and viol[0]["verified"] is True
+    assert bool(attrs["spin_basis_assumption_violated"]) is True
+    # core's only spin-swap guard now refuses the file.
+    assert _core_spin_swap_problems(attrs)
+
+
+def test_v1_valid_swap_records_a_clean_gate(tmp_path):
+    o3 = write_endo3_full(tmp_path / "o3.hdf", n=60, seed=8)
+    o4 = write_o4_full(tmp_path / "o4.hdf", n=60, seed=9)
+    out = tmp_path / "v1c.h5"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        CombinedSelectionSet([SelectionSet(o3), SelectionSet(o4)]).to_darksirens(
+            str(out))
+    with h5py.File(out, "r") as f:
+        attrs = dict(f.attrs)
+    assert list(attrs["injected_spin_uniform_isotropic"]) == [True, True]
+    assert attrs["spin_basis_assumption_violations"] == "[]"
+    assert not _core_spin_swap_problems(attrs)
