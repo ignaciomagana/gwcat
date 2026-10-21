@@ -396,3 +396,37 @@ def test_v1_allowed_out_of_support_zeros_are_recorded_and_validate(tmp_path):
     results = validate_export(str(out))
     # The recorded spin-support zeros are not a distance-prior failure.
     assert results["pe_p_pe_positive"] is True
+
+
+# ==========================================================================
+# compact_type and source_class together record their intersection
+# ==========================================================================
+def _classes(tmp_path):
+    rows = [_row("GW900001_000001", source_class="BBH"),
+            _row("GW900002_000002", source_class="NSBH",
+                 m2_src_med=1.5),
+            _row("GW900003_000003", source_class="BBH")]
+    return _store(tmp_path, rows, name="classes.h5")
+
+
+@pytest.mark.parametrize("sc,expect", [("cbc", "BBH"),
+                                       (["bbh", "nsbh"], "BBH")])
+def test_compact_type_survives_a_source_class_request(tmp_path, sc, expect):
+    view = GWCatalog(_classes(tmp_path)).select(compact_type="BBH")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        sub = view.select(source_class=sc)
+        out = tmp_path / "v2.h5"
+        sub.export(str(out), spin_basis="chieff", nsamp=8, seed=0,
+                   cosmology=_COSMO)
+    assert sorted(sub.event_names) == ["GW900001_000001", "GW900003_000003"]
+    assert sub.selection_spec.source_class_filter == expect
+    with h5py.File(out, "r") as f:
+        assert _attr(f, "source_class_filter") == expect
+
+
+def test_disjoint_compact_type_and_source_class_are_refused():
+    with pytest.raises(ValueError, match="share no class"):
+        SelectionSpec().refine(compact_type="BBH").refine(source_class="nsbh")
+    with pytest.raises(ValueError, match="share no class"):
+        SelectionSpec().refine(compact_type="BBH").refine(compact_type="NSBH")

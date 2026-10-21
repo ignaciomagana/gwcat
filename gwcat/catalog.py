@@ -74,6 +74,18 @@ def _intersect_range(a, b):
     return (max(float(a[0]), float(b[0])), min(float(a[1]), float(b[1])))
 
 
+def _compact_class_set(compact_type):
+    """The canonical classes every ``compact_type`` gate admits (each gate is
+    one class, and gates AND), or ``None`` when there is no gate."""
+    if not compact_type:
+        return None
+    out = None
+    for c in compact_type:
+        one = {normalize_source_class(c)}
+        out = one if out is None else (out & one)
+    return out
+
+
 def _round(x):
     """A float rounded to the digest's precision, or ``None``."""
     return None if x is None else round(float(x), 10)
@@ -190,6 +202,20 @@ class SelectionSpec:
         compact = self.compact_type
         if compact_type is not None and str(compact_type) not in compact:
             compact = compact + (str(compact_type),)
+        # compact_type and source_class restrict the same class, so the view
+        # holds their INTERSECTION (review 2026-10-20).  An empty one would
+        # serialise as "no restriction" over a file of zero events -- the same
+        # trap the source_class composition above refuses.
+        ct_set = _compact_class_set(compact)
+        if ct_set is not None and (
+                not ct_set or (requested and classes is not None
+                               and not (set(classes) & ct_set))):
+            raise ValueError(
+                f"compact_type gate(s) {list(compact)} and source_class "
+                f"{list(classes) if requested and classes else None} share no "
+                f"class, so the selection is empty. An empty class restriction "
+                f"serialises identically to 'no restriction'; refusing "
+                f"instead. Select the class you mean once.")
 
         # The FAR policy, the missing-FAR count and the two policy flags belong
         # to the call that actually applied a FAR cut; a later, FAR-less
@@ -269,13 +295,20 @@ class SelectionSpec:
         given (GW-37): both restrict the same posterior-median class column, so
         a file cut by one must not describe itself as unfiltered because the
         caller reached for the other spelling.
+
+        With both, it is their INTERSECTION (review 2026-10-20): it used to be
+        the source_class request alone, so ``compact_type="BBH"`` plus
+        ``source_class="cbc"`` wrote BBH events under an empty filter and the
+        unfiltered contract hash.
         """
+        ct_set = _compact_class_set(self.compact_type)
         if not self.source_class_requested or not self.source_class:
-            if self.compact_type:
+            if ct_set:
                 return format_source_class_filter(
-                    [normalize_source_class(c) for c in self.compact_type])
+                    [c for c in SOURCE_CLASSES if c in ct_set])
             return ""
-        return format_source_class_filter(list(self.source_class))
+        return format_source_class_filter(
+            [c for c in self.source_class if ct_set is None or c in ct_set])
 
     @property
     def event_list_filter(self) -> str:
