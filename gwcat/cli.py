@@ -160,6 +160,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_inspect.add_argument("--json", action="store_true",
                            help="Print machine-readable JSON instead of a "
                                 "human-readable table.")
+    from .export.pe_builder import SUPPORTED_SPIN_BASES as _pe_spaces
+    from .params import list_spaces as _list_spaces
+    p_inspect.add_argument("--parameter-space", "--spin-basis",
+                           dest="spin_basis",
+                           default=DEFAULT_PARAMETER_SPACE,
+                           choices=[s for s in _list_spaces()
+                                    if s in _pe_spaces],
+                           help=f"Report missing_required_parameters for a "
+                                f"PE export in this space (default: "
+                                f"{DEFAULT_PARAMETER_SPACE}, the space "
+                                f"'export pe' defaults to).")
 
     # -- export-darksirens ----------------------------------------------
     from .waveform_policy import WAVEFORM_POLICIES
@@ -558,7 +569,10 @@ def _cmd_inspect(args) -> int:
     from .validation_summary import summarize_catalog, _json_default
 
     cat = GWCatalog(args.store)
-    info = summarize_catalog(cat)
+    # Requirements of the space an export would use, not the chi_eff-only
+    # legacy list: a store without the component spins reported nothing
+    # missing, and the default `export pe` then failed on it.
+    info = summarize_catalog(cat, parameter_space=args.spin_basis)
     info["store_path"] = args.store
 
     if args.json:
@@ -572,7 +586,7 @@ def _cmd_inspect(args) -> int:
     print(f"stored_parameters ({len(info['stored_parameters'])}): "
           f"{', '.join(info['stored_parameters'])}")
     if info["missing_required_parameters"]:
-        print(f"missing_required_parameters: "
+        print(f"missing_required_parameters ({args.spin_basis}): "
               f"{info['missing_required_parameters']}")
     if info["missing_optional_parameters"]:
         print(f"missing_optional_parameters: "
@@ -884,8 +898,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if args.command == "inspect":
-        return _cmd_inspect(args)
     # A ValueError out of these commands is a *diagnosed refusal* -- an
     # unrecognised --source-class token, a partial cosmology override, a
     # zero-density injection -- whose message already says what to fix.  The
@@ -893,8 +905,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # (validate already did; the export commands surfaced raw tracebacks).
     # A SpinBasisError (a RuntimeError; BlockCampaignMismatch is one) is a
     # diagnosed refusal too -- e.g. the chieff basis on a joint-density file.
+    # So is a MissingParameterError (a KeyError: the store lacks a column the
+    # requested space needs), which escaped as a raw traceback.
     from .export.selection_builder import SpinBasisError
+    from .schema import MissingParameterError
     try:
+        if args.command == "inspect":
+            return _cmd_inspect(args)
         if args.command == "export-darksirens":
             return _cmd_export_darksirens(args)
         if args.command == "export":
@@ -905,6 +922,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return _cmd_validate(args)
     except (ValueError, SpinBasisError) as e:
         print(f"{PROG} {args.command}: error: {e}", file=sys.stderr)
+        return 1
+    except MissingParameterError as e:
+        print(f"{PROG} {args.command}: error: "
+              f"{e.args[0] if e.args else e}", file=sys.stderr)
         return 1
 
     parser.error(f"unknown command {args.command!r}")  # pragma: no cover
