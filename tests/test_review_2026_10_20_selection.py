@@ -661,3 +661,54 @@ def test_zero_per_spin_pdf_in_the_fallback_is_refused(tmp_path):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             SelectionSet(path)._load()
+
+
+# ======================================================================
+# low-35: a campaign made with a named astropy cosmology (with radiation)
+# ======================================================================
+def _endo3_at_cosmology_to(path, cosmo, zmax, n=500, seed=111):
+    write_endo3_full(path, n=n, seed=seed)
+    z = np.sort(np.random.default_rng(seed).uniform(0.01, zmax, n))
+    with h5py.File(path, "r+") as f:
+        g = f["injections"]
+        m1s, m2s = g["mass1_source"][:], g["mass2_source"][:]
+        for k, v in {"redshift": z,
+                     "distance": cosmo.luminosity_distance(z).value,
+                     "mass1": m1s * (1 + z), "mass2": m2s * (1 + z)}.items():
+            del g[k]
+            g.create_dataset(k, data=v)
+    return str(path)
+
+
+@pytest.mark.parametrize("zmax", [1.5, 1.9])
+def test_named_astropy_generation_cosmology_is_matched_and_used(tmp_path,
+                                                                zmax):
+    # zmax 1.9 (endo3's range): the radiation-free fit misses and the old
+    # loader fell back to a radiation-free "Planck15" Jacobian with a
+    # warning; zmax 1.5: the fit absorbs radiation just under its tolerance
+    # and was "detected" with shifted parameters.
+    from astropy.cosmology import Planck18
+    path = _endo3_at_cosmology_to(tmp_path / "o3p18.hdf", Planck18, zmax)
+    s = SelectionSet(path, strict_spin_checks="off")
+    with warnings.catch_warnings():
+        # The old loader fell back here, warning about a "Planck15" Jacobian.
+        warnings.simplefilter("error", UserWarning)
+        s._load()
+    assert s._cosmology_source == "detected"
+    assert s._cosmology_model == "astropy.cosmology.Planck18"
+    with h5py.File(path, "r") as f:
+        g = f["injections"]
+        p = (g["mass1_source_mass2_source_sampling_pdf"][:]
+             * g["redshift_sampling_pdf"][:])
+        z, m1det = g["redshift"][:], g["mass1"][:]
+    c = 299792.458
+    ddl = Planck18.comoving_distance(z).value + (1 + z) * c / (
+        Planck18.H0.value * Planck18.efunc(z))
+    np.testing.assert_allclose(s._pdraw, p * m1det / (1 + z) ** 2 / ddl,
+                               rtol=1e-10)
+    out = tmp_path / "sel.h5"
+    s.export(str(out), spin_basis="component")
+    with h5py.File(out, "r") as f:
+        model = f.attrs["cosmology_model_per_campaign"][0]
+    model = model.decode() if isinstance(model, bytes) else model
+    assert model == "astropy.cosmology.Planck18"

@@ -696,6 +696,56 @@ def detect_generation_cosmology(z, dL_mpc, n_sample: int = 4000,
     return best
 
 
+#: The astropy realisations :func:`detect_named_cosmology` tries, newest first.
+#: Every one is flat, and every one carries radiation (Tcmb0 > 0) -- which the
+#: radiation-free fit of :func:`detect_generation_cosmology` cannot reproduce
+#: to its tolerance (review 2026-10-20, low-35).
+NAMED_GENERATION_COSMOLOGIES = ("Planck18", "Planck15", "Planck13", "WMAP9",
+                                "WMAP7", "WMAP5")
+
+
+def detect_named_cosmology(z, dL_mpc, n_sample: int = 4000,
+                           rtol: float = COSMOLOGY_DETECT_RTOL):
+    """The named astropy cosmology a campaign's ``(z, dL)`` pairs were made with.
+
+    Returns ``(name, cosmology, max_rel_residual)`` for the first of
+    :data:`NAMED_GENERATION_COSMOLOGIES` that reproduces every sampled pair to
+    ``rtol``, else ``None``.  Tried before the radiation-free flat-LCDM fit of
+    :func:`detect_generation_cosmology`: a campaign generated with astropy's
+    ``Planck15``/``Planck18`` includes radiation, which that fit either misses
+    (it then fell back to a radiation-free Jacobian at Planck15's (H0, Om0),
+    a z-dependent ~1e-3 error in ddL/dz) or absorbs into shifted parameters.
+    """
+    import astropy.cosmology as _ac
+
+    z = np.asarray(z, dtype=float).ravel()
+    dL = np.asarray(dL_mpc, dtype=float).ravel()
+    good = np.isfinite(z) & np.isfinite(dL) & (z > 0) & (dL > 0)
+    if good.sum() < 16:
+        return None
+    z, dL = z[good], dL[good]
+    if z.size > n_sample:
+        step = int(np.ceil(z.size / n_sample))
+        z, dL = z[::step], dL[::step]
+    for name in NAMED_GENERATION_COSMOLOGIES:
+        cosmo = getattr(_ac, name)
+        if float(cosmo.Ok0) != 0.0:
+            continue
+        resid = float(np.max(np.abs(
+            cosmo.luminosity_distance(z).value / dL - 1.0)))
+        if resid <= rtol:
+            return name, cosmo, resid
+    return None
+
+
+def _ddL_dz_of(z, dL_mpc, cosmo):
+    """d(dL)/dz for a FLAT astropy cosmology object (radiation included)."""
+    c_kms = 299792.458
+    return (dL_mpc / (1 + z)
+            + (1 + z) * (c_kms / float(cosmo.H0.value))
+            / cosmo.efunc(np.asarray(z, dtype=float)))
+
+
 def _cosmo_or_nan(s, attr):
     """A recorded per-campaign cosmology value, or NaN when none applies.
 
@@ -1051,8 +1101,8 @@ def campaign_provenance_attrs(set_list, *, draw_domain=None,
     and which ``draw_domain`` policy the export applied; the FAR-column
     discovery record (medium-31); the detected generation cosmology, which
     an override does not erase (medium-33); each campaign's own observing
-    time, the T_k of ``pdraw_normalisation`` (low-5); and the spin-removal
-    ceiling check (low-13).
+    time, the T_k of ``pdraw_normalisation`` (low-5); the spin-removal
+    ceiling check (low-13); and the (z, dL) model of each Jacobian (low-35).
     """
     if draw_domain_mismatch is None:
         draw_domain_mismatch = draw_domain_mismatches(set_list)
@@ -1091,6 +1141,12 @@ def campaign_provenance_attrs(set_list, *, draw_domain=None,
         "cosmology_generation_Om0_per_campaign": np.array(
             [_cosmo_or_nan(s, "_cosmology_generation_Om0") for s in set_list],
             dtype=float),
+        # Which (z, dL) model each campaign's Jacobian used (low-35): a
+        # radiation-free flat LCDM at cosmology_H0/Om0_per_campaign, a named
+        # astropy realisation (radiation included), or the file's ddL/dz.
+        "cosmology_model_per_campaign": np.array(
+            [str(getattr(s, "_cosmology_model", None)) for s in set_list],
+            dtype=h5py.string_dtype()),
         # The ceiling the spin-removal step's assumed amax was checked
         # against (detected, or the largest drawn magnitude) and the constant
         # factor it implies; NaN where no removal branch ran (low-13).
@@ -1166,6 +1222,11 @@ class SelectionSet:
         # recorded even when an override is used instead (medium-33).
         self._cosmology_generation_H0 = None
         self._cosmology_generation_Om0 = None
+        # Which (z, dL) model the Jacobian used ("flat_lcdm_no_radiation",
+        # "astropy.cosmology.<name>" or "file_ddL_dz") and, for a named match,
+        # the astropy object itself (low-35).
+        self._cosmology_model = None
+        self._jacobian_cosmology = None
         # PR4 read-time spin checks: "warn" (default) records + emits a warning
         # on failure, "raise" raises, "off" records silently.  Normalised here
         # so an invalid value fails loudly at construction.
@@ -1272,15 +1333,17 @@ class SelectionSet:
         """
         if self._cosmology_override:
             self._record_cosmology("override", self.H0, self.Om0)
-            det = detect_generation_cosmology(z, dL)
-            if det is not None:
-                H0_g, Om0_g, _ = det
+            self._cosmology_model = "flat_lcdm_no_radiation"
+            gen = self._detect_generation(z, dL)
+            if gen is not None:
+                H0_g, Om0_g, _, _, cosmo_g = gen
                 self._cosmology_generation_H0 = float(H0_g)
                 self._cosmology_generation_Om0 = float(Om0_g)
                 if not (np.isclose(H0_g, self.H0, rtol=1e-5, atol=0.0)
                         and np.isclose(Om0_g, self.Om0, rtol=1e-5, atol=0.0)):
-                    ratio = (_ddL_dz(z, dL, H0_g, Om0_g)
-                             / _ddL_dz(z, dL, self.H0, self.Om0))
+                    ddL_g = (_ddL_dz(z, dL, H0_g, Om0_g) if cosmo_g is None
+                             else _ddL_dz_of(z, dL, cosmo_g))
+                    ratio = ddL_g / _ddL_dz(z, dL, self.H0, self.Om0)
                     warnings.warn(
                         f"{self.path}: the explicit cosmology (H0={self.H0}, "
                         f"Om0={self.Om0}) differs from the generation "
@@ -1295,23 +1358,65 @@ class SelectionSet:
                         f"with cosmology_generation_H0/Om0_per_campaign.")
             return self.H0, self.Om0
 
-        det = detect_generation_cosmology(z, dL)
-        if det is None:
+        gen = self._detect_generation(z, dL)
+        if gen is None:
             warnings.warn(
                 f"{self.path}: could not identify the campaign's generation "
-                f"cosmology from its (z, dL) pairs, and the file does not ship "
-                f"dluminosity_distance_dredshift; falling back to Planck15 "
-                f"({self.H0}, {self.Om0}) for the ddL/dz Jacobian. The draw "
-                f"density is approximate to whatever the true generation "
-                f"cosmology differs by.")
+                f"cosmology from its (z, dL) pairs (neither a radiation-free "
+                f"flat LCDM nor any of {list(NAMED_GENERATION_COSMOLOGIES)}), "
+                f"and the file does not ship dluminosity_distance_dredshift; "
+                f"falling back to a radiation-free flat LCDM at Planck15's "
+                f"(H0, Om0) = ({self.H0}, {self.Om0}) for the ddL/dz "
+                f"Jacobian. The draw density is approximate to whatever the "
+                f"true generation cosmology differs by.")
             self._record_cosmology("default", self.H0, self.Om0)
+            self._cosmology_model = "flat_lcdm_no_radiation"
             return self.H0, self.Om0
 
-        H0, Om0, resid = det
+        H0, Om0, resid, model, cosmo = gen
         self._record_cosmology("detected", H0, Om0, resid)
         self._cosmology_generation_H0 = float(H0)
         self._cosmology_generation_Om0 = float(Om0)
+        self._cosmology_model = model
+        self._jacobian_cosmology = cosmo
         return H0, Om0
+
+    def _detect_generation(self, z, dL):
+        """``(H0, Om0, residual, model, cosmology-or-None)`` that made the pairs.
+
+        A named astropy realisation first (:func:`detect_named_cosmology`,
+        low-35), whose object is returned so the Jacobian uses its own E(z),
+        radiation included; then the radiation-free flat-LCDM fit
+        (:func:`detect_generation_cosmology`).  Named first because an exact
+        named match is exact, while the two-parameter radiation-free fit can
+        absorb radiation to just under its tolerance at z <~ 1.5 (9.5e-6 on
+        Planck18 pairs) and would then be "detected" with shifted parameters.
+        endo3 sits >= 1.9e-3 from every named realisation, so it is still
+        identified by the fit, exactly as before.  ``None`` when neither
+        matches.
+        """
+        named = detect_named_cosmology(z, dL)
+        if named is not None:
+            name, cosmo, resid = named
+            return (float(cosmo.H0.value), float(cosmo.Om0), resid,
+                    f"astropy.cosmology.{name}", cosmo)
+        det = detect_generation_cosmology(z, dL)
+        if det is not None:
+            return det[0], det[1], det[2], "flat_lcdm_no_radiation", None
+        return None
+
+    def _jacobian_ddL_dz(self, z, dL):
+        """``ddL/dz`` for a file that does not ship it, from the resolved cosmology.
+
+        The radiation-free closed form :func:`_ddL_dz` at the resolved
+        (H0, Om0), unless the generation cosmology was matched to a named
+        astropy object, whose own ``E(z)`` (radiation included) is used.
+        """
+        H0_j, Om0_j = self._resolve_jacobian_cosmology(z, dL)
+        cosmo = getattr(self, "_jacobian_cosmology", None)
+        if cosmo is not None:
+            return _ddL_dz_of(z, dL, cosmo)
+        return _ddL_dz(z, dL, H0_j, Om0_j)
 
     def _load(self):
         if self._loaded:
@@ -1634,9 +1739,9 @@ class SelectionSet:
                     f"with a campaign that DOES honour the override is "
                     f"refused.")
             self._record_cosmology("file", None, None)
+            self._cosmology_model = "file_ddL_dz"
         else:
-            H0_j, Om0_j = self._resolve_jacobian_cosmology(z, dL)
-            ddL = _ddL_dz(z, dL, H0_j, Om0_j)
+            ddL = self._jacobian_ddL_dz(z, dL)
         pdraw = np.exp(ln_pdraw_no_spin) * m1det / (1 + z) ** 2 / ddL
 
         # Time normalisation and mixture/month weights.  The O4 examples keep
@@ -1920,8 +2025,7 @@ class SelectionSet:
         ln_pdraw_no_spin = np.log(p_mass * p_z)
 
         # Jacobian: (m1src, m2src, z) → (m1det, q, dL)
-        H0_j, Om0_j = self._resolve_jacobian_cosmology(z, dL)
-        ddL = _ddL_dz(z, dL, H0_j, Om0_j)
+        ddL = self._jacobian_ddL_dz(z, dL)
         pdraw = np.exp(ln_pdraw_no_spin) * m1det / (1 + z) ** 2 / ddL
 
         # Time normalisation
