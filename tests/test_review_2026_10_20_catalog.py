@@ -814,3 +814,20 @@ def test_v1_validator_flags_an_all_policy_file(tmp_path):
         warnings.simplefilter("ignore")
         cat.to_darksirens(str(one), nsamp=8, seed=0, cosmology=_COSMO)
     assert validate_export(str(one))["pe_one_row_per_event"] is True
+
+
+def test_snr_min_does_not_blame_a_sibling_set_without_an_snr(tmp_path):
+    """Event B's chosen Mixed set has an SNR; its XPHM set does not.  B is
+    kept and must not be named as dropped for a missing SNR."""
+    rows = _multiset_rows()
+    rows[4]["snr_med"] = np.nan             # B's XPHM sibling
+    cat = GWCatalog(_store(tmp_path, rows))
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        sub = cat.select(snr_min=8.0, waveform_policy="mixed-first")
+    assert list(sub.event_names) == ["GW900002_000002"]
+    snr_msgs = [str(r.message) for r in rec if "SNR is unknown" in str(r.message)]
+    assert len(snr_msgs) == 1
+    assert "GW900001_000001" in snr_msgs[0]
+    assert "GW900002_000002" not in snr_msgs[0]
+    assert sub.selection_spec.to_dict()["n_events_missing_snr"] == 1

@@ -972,6 +972,7 @@ class GWCatalog:
             m &= c
             m_evt &= c
         n_missing_snr = 0
+        snr_nan_rows = None
         if snr_min is not None:
             # The same rules as pastro_min / sky_area_max (review 2026-10-20).
             # snr_med is the median of network_optimal_snr, which no
@@ -994,16 +995,10 @@ class GWCatalog:
                     f"of network_optimal_snr, which many releases do not "
                     f"carry). A threshold crossed with an all-absent column is "
                     f"a configuration error, not a selection; drop snr_min.")
-            n_missing_snr = int(len(set(self.names[in_scope & nan_snr])))
-            if n_missing_snr:
-                warnings.warn(
-                    f"snr_min={snr_min} drops {n_missing_snr} event(s) whose "
-                    f"posterior-median SNR is unknown (snr_med NaN: the sample "
-                    f"set carries no network_optimal_snr) -- not because their "
-                    f"SNR is low: "
-                    f"{sorted(set(self.names[in_scope & nan_snr].tolist()))}. "
-                    f"No injection cut reproduces dropping events for missing "
-                    f"metadata; recorded as n_events_missing_snr.")
+            # Named after the waveform policy has chosen (below): on a store
+            # holding several sample sets per event, an event whose CHOSEN
+            # set has an SNR is not dropped for a sibling set that lacks one.
+            snr_nan_rows = in_scope & nan_snr
             c = np.where(nan_snr, False, snr >= snr_min)
             m &= c
             m_row &= c
@@ -1291,6 +1286,7 @@ class GWCatalog:
                     approximant=approximant, sample_set_map=sample_set_map,
                     nrsur_q_rule=nrsur_q_rule)
         kept = np.asarray(kept, dtype=int)
+        kept_chosen = kept.copy()
         chosen_ok = m_row[kept] if kept.size else np.zeros(0, dtype=bool)
         if not chosen_ok.all():
             lost = sorted({str(self.names[r]) for r in kept[~chosen_ok]})
@@ -1311,6 +1307,27 @@ class GWCatalog:
             kept_names = self.names[kept] if kept.size else self.names[:0]
             homogeneous = bool(homogeneous) or (
                 len(set(kept_names.tolist())) == kept.size)
+
+        if snr_nan_rows is not None and snr_nan_rows.any():
+            # Events the SNR cut dropped because the SNR of the set that
+            # decides them is unknown: the chosen set when the event reached
+            # the policy, any of its sets when none of them passed.
+            final = set(self.names[kept].tolist()) if kept.size else set()
+            chosen_nan = {str(self.names[r]) for r in kept_chosen
+                          if snr_nan_rows[r]}
+            missing = sorted(
+                str(n) for n in set(self.names[snr_nan_rows].tolist())
+                if n not in final
+                and (n not in pass_names or n in chosen_nan))
+            n_missing_snr = len(missing)
+            if missing:
+                warnings.warn(
+                    f"snr_min={snr_min} drops {n_missing_snr} event(s) whose "
+                    f"posterior-median SNR is unknown (snr_med NaN: the sample "
+                    f"set carries no network_optimal_snr) -- not because their "
+                    f"SNR is low: {missing}. No injection cut reproduces "
+                    f"dropping events for missing metadata; recorded as "
+                    f"n_events_missing_snr.")
 
         # ── The EFFECTIVE selection (GW-33) ───────────────────────────────────
         # Composed with the spec of the view this call was made on, because the
