@@ -799,6 +799,14 @@ class GWCatalog:
                 "campaign can reproduce.")
 
         m = np.ones(len(self.names), dtype=bool)
+        # The cuts on quantities stored PER SAMPLE SET (class, posterior-median
+        # SNR and masses, sky area), kept apart from the event-level ones
+        # (names, FAR, p_astro) so that they can be applied to the sample set
+        # the waveform policy chooses rather than to every row before it
+        # chooses (review 2026-10-20; see the policy resolution below).  `m`
+        # stays the AND of everything, for the in-scope bookkeeping.
+        m_row = np.ones(len(self.names), dtype=bool)
+        m_evt = np.ones(len(self.names), dtype=bool)
         # What this call actually applies, for the effective spec below: a
         # compact_type that allowed_names overrules is NOT a cut this view made.
         applied_compact_type = None
@@ -807,11 +815,15 @@ class GWCatalog:
             apply_compact_type = (allowed_names is None or
                                   not allowed_names_authoritative)
             if apply_compact_type:
-                m &= (self.meta["compact_type"] == compact_type)
+                c = (self.meta["compact_type"] == compact_type)
+                m &= c
+                m_row &= c
                 applied_compact_type = compact_type
         if source_class is not None:
             allowed_classes = resolve_filter_classes(source_class)
-            m &= np.isin(self.source_class, list(allowed_classes))
+            c = np.isin(self.source_class, list(allowed_classes))
+            m &= c
+            m_row &= c
         if pastro_min is not None:
             # Read the RESOLVED value, not one spelling of it: a store whose
             # event table used `p_astro` (the documented override key) holds a
@@ -839,7 +851,9 @@ class GWCatalog:
                     f"{sorted(self.names[in_scope & nan_pa].tolist())}. "
                     f"Populate p_astro via event_table at ingest to use this "
                     f"cut on them.")
-            m &= np.where(nan_pa, False, pa >= pastro_min)
+            c = np.where(nan_pa, False, pa >= pastro_min)
+            m &= c
+            m_evt &= c
         n_missing_snr = 0
         if snr_min is not None:
             # The same rules as pastro_min / sky_area_max (review 2026-10-20).
@@ -873,13 +887,19 @@ class GWCatalog:
                     f"{sorted(set(self.names[in_scope & nan_snr].tolist()))}. "
                     f"No injection cut reproduces dropping events for missing "
                     f"metadata; recorded as n_events_missing_snr.")
-            m &= np.where(nan_snr, False, snr >= snr_min)
+            c = np.where(nan_snr, False, snr >= snr_min)
+            m &= c
+            m_row &= c
         if m1_src_range is not None:
             lo, hi = m1_src_range
-            m &= (self.meta["m1_src_med"] >= lo) & (self.meta["m1_src_med"] <= hi)
+            c = (self.meta["m1_src_med"] >= lo) & (self.meta["m1_src_med"] <= hi)
+            m &= c
+            m_row &= c
         if m2_src_range is not None:
             lo, hi = m2_src_range
-            m &= (self.meta["m2_src_med"] >= lo) & (self.meta["m2_src_med"] <= hi)
+            c = (self.meta["m2_src_med"] >= lo) & (self.meta["m2_src_med"] <= hi)
+            m &= c
+            m_row &= c
         if sky_area_max is not None:
             # No presence guard (GW-37).  It used to skip the cut when the store
             # carried no sky_area_90 while `refine()` recorded the threshold
@@ -913,7 +933,9 @@ class GWCatalog:
                     f"sky_area_max={sky_area_max} drops {n_nan} event(s) with "
                     f"no sky_area_90: "
                     f"{sorted(self.names[in_scope & nan_sa].tolist())}.")
-            m &= np.where(nan_sa, False, sa <= sky_area_max)
+            c = np.where(nan_sa, False, sa <= sky_area_max)
+            m &= c
+            m_row &= c
         _whitelist = allowed_names if allowed_names is not None else names
         if _whitelist is not None:
             _whitelist_arr = np.asarray(_whitelist)
@@ -936,7 +958,9 @@ class GWCatalog:
                         f"allowed_names event(s); they {action}: "
                         f"{sorted(dropped.tolist())}"
                     )
-            m &= np.isin(self.names, _whitelist_arr)
+            c = np.isin(self.names, _whitelist_arr)
+            m &= c
+            m_evt &= c
             # Both spellings are the same filter -- membership in a fixed list
             # of names -- and normalise into the one whitelist the spec keeps.
             name_filters.append(
@@ -958,7 +982,9 @@ class GWCatalog:
                     f"event_list: {len(missing_ev)} name(s) not found in store "
                     f"and will be skipped: {sorted(missing_ev)}"
                 )
-            m &= np.isin(self.names, listed_arr)
+            c = np.isin(self.names, listed_arr)
+            m &= c
+            m_evt &= c
 
         # ── FAR handling with explicit missing-FAR policy ─────────────────
         far_policy = "none"
@@ -982,6 +1008,7 @@ class GWCatalog:
                         f"{sorted(self.names[missing_mask].tolist())}. "
                         f"Pass allow_missing_far=True to keep them instead.")
                 m &= below
+                m_evt &= below
                 far_policy = "require"
             elif allow_missing_far:
                 if n_missing_far > 0:
@@ -990,6 +1017,7 @@ class GWCatalog:
                         f"event(s) with missing FAR through the far_max cut: "
                         f"{sorted(self.names[missing_mask].tolist())}")
                 m &= (below | ~fa)
+                m_evt &= (below | ~fa)
                 far_policy = "allow_missing"
             else:
                 if n_missing_far > 0:
@@ -999,16 +1027,36 @@ class GWCatalog:
                         f"allow_missing_far=True to keep them or require_far=True "
                         f"to fail loudly: {sorted(self.names[missing_mask].tolist())}")
                 m &= below
+                m_evt &= below
                 far_policy = "drop_missing"
 
         # (The p_astro-absence warning used to live here, after the cut it was
         # meant to describe had already removed every NaN row from `m` -- so it
         # could never fire.  It is issued at the cut itself now.)
-        sel = np.nonzero(m & np.isin(np.arange(len(self.names)), self._sel))[0]
+        in_view = np.isin(np.arange(len(self.names)), self._sel)
 
         # ── Waveform / sample-set policy resolution (PR 6) ────────────────────
         # Collapse the metadata-selected rows to one sample set per event
         # (unless waveform_policy="all").  A no-op for single-sample-set stores.
+        #
+        # The policy chooses FIRST and the per-sample-set cuts then apply to the
+        # set it chose (review 2026-10-20).  They used to run before it, so on a
+        # store holding every sample set an event cut meant "keep the event if
+        # ANY of its sets passes" and the policy then picked whichever survived:
+        # snr_min=8 with mixed-first quietly switched 54 O3 events from
+        # C01:Mixed (no SNR recorded) to C01:IMRPhenomXPHM with its own priors,
+        # the reason claimed a fallback, the event-map route said the store did
+        # not hold C01:Mixed, and a one-row-per-event store dropped the same
+        # events under the same selection_spec_digest.  The candidates are every
+        # row of each event that has at least one row passing every cut, so an
+        # event no set of which passes never reaches the policy (and cannot make
+        # strict-approximant fail); an event whose CHOSEN set fails a cut is
+        # dropped -- a cut never substitutes a different waveform.
+        passing = m & in_view
+        pass_names = set(self.names[passing].tolist())
+        cand = m_evt & in_view
+        cand &= np.isin(self.names, list(pass_names))
+        sel = np.nonzero(cand)[0]
         from .waveform_policy import resolve_policy, resolve_event_map
         map_report = None
         if waveform_policy == "event-map":
@@ -1022,6 +1070,27 @@ class GWCatalog:
                 self.names, sel, self.meta, policy=waveform_policy,
                 approximant=approximant, sample_set_map=sample_set_map,
                 nrsur_q_rule=nrsur_q_rule)
+        kept = np.asarray(kept, dtype=int)
+        chosen_ok = m_row[kept] if kept.size else np.zeros(0, dtype=bool)
+        if not chosen_ok.all():
+            lost = sorted({str(self.names[r]) for r in kept[~chosen_ok]})
+            kept_names_ok = {str(self.names[r]) for r in kept[chosen_ok]}
+            lost = [n for n in lost if n not in kept_names_ok]
+            if lost and waveform_policy != "all":
+                warnings.warn(
+                    f"{len(lost)} event(s) dropped because the sample set "
+                    f"waveform_policy={waveform_policy!r} chose for them fails "
+                    f"a per-sample-set cut (source_class/compact_type/snr_min/"
+                    f"m1_src_range/m2_src_range/sky_area_max), although another "
+                    f"of their sample sets passes: {lost[:10]}"
+                    + ("" if len(lost) <= 10 else f" (+{len(lost) - 10} more)")
+                    + ". The cuts apply to the chosen sample set; a cut never "
+                      "switches an event to a different waveform.")
+            reasons = [r for r, ok in zip(reasons, chosen_ok) if ok]
+            kept = kept[chosen_ok]
+            kept_names = self.names[kept] if kept.size else self.names[:0]
+            homogeneous = bool(homogeneous) or (
+                len(set(kept_names.tolist())) == kept.size)
 
         # ── The EFFECTIVE selection (GW-33) ───────────────────────────────────
         # Composed with the spec of the view this call was made on, because the

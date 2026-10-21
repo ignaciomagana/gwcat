@@ -264,3 +264,61 @@ def test_v1_whitelist_pair_validates_with_the_warning(tmp_path):
     with pytest.warns(UserWarning, match="selected by NAME"):
         results = validate_export(pe, sel)
     assert results["xcheck_source_class_estimator"] is True
+
+
+# ==========================================================================
+# Per-sample-set cuts apply to the sample set the policy chose
+# ==========================================================================
+def _multiset_rows():
+    """Event A's Mixed set (preferred) and SEOBNR set carry no SNR, its XPHM
+    set does -- the shape of a GWTC-2.1/3 event ingested with every set."""
+    a, b = "GW900001_000001", "GW900002_000002"
+    mixed = dict(sample_set_name="C01:Mixed", approximant="Mixed",
+                 is_mixed=1.0, is_preferred=1.0, priority_rank=0.0)
+    return [
+        _row(a, snr_med=np.nan, **mixed),
+        _row(a, snr_med=np.nan, sample_set_name="C01:SEOBNRv4PHM",
+             approximant="SEOBNRv4PHM", is_preferred=0.0, priority_rank=2.0),
+        _row(a, snr_med=12.0, sample_set_name="C01:IMRPhenomXPHM",
+             approximant="IMRPhenomXPHM", is_preferred=0.0, priority_rank=1.0),
+        _row(b, snr_med=15.0, **mixed),
+        _row(b, snr_med=15.0, sample_set_name="C01:IMRPhenomXPHM",
+             approximant="IMRPhenomXPHM", is_preferred=0.0, priority_rank=1.0),
+    ]
+
+
+def test_a_cut_does_not_switch_an_event_to_another_waveform(tmp_path):
+    cat = GWCatalog(_store(tmp_path, _multiset_rows()))
+    with pytest.warns(UserWarning, match="chose for them"):
+        sub = cat.select(snr_min=8.0, waveform_policy="mixed-first")
+    assert list(sub.event_names) == ["GW900002_000002"]
+    assert [cat.meta["sample_set_name"][r] for r in sub._sel] == ["C01:Mixed"]
+    assert list(sub._selection_reasons) == ["mixed-first:is_mixed"]
+
+
+def test_the_multiset_and_one_row_stores_select_the_same_events(tmp_path):
+    rows = _multiset_rows()
+    one = [r for r in rows if r["sample_set_name"] == "C01:Mixed"]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        a = GWCatalog(_store(tmp_path, rows, name="all.h5")).select(
+            snr_min=8.0, waveform_policy="mixed-first")
+        b = GWCatalog(_store(tmp_path, one, name="one.h5")).select(
+            snr_min=8.0, waveform_policy="mixed-first")
+    assert list(a.event_names) == list(b.event_names)
+    assert a.selection_spec.digest() == b.selection_spec.digest()
+
+
+def test_policy_all_still_cuts_row_by_row(tmp_path):
+    """Unchanged: under "all" every passing row is kept, so the cut stays
+    row-wise."""
+    cat = GWCatalog(_store(tmp_path, _multiset_rows()))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        sub = cat.select(snr_min=8.0, waveform_policy="all")
+    got = sorted((str(cat.names[r]), str(cat.meta["sample_set_name"][r]))
+                 for r in sub._sel)
+    assert got == [("GW900001_000001", "C01:IMRPhenomXPHM"),
+                   ("GW900002_000002", "C01:IMRPhenomXPHM"),
+                   ("GW900002_000002", "C01:Mixed")]
+    assert sub._homogeneous_sample_sets is False
