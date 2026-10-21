@@ -17,6 +17,9 @@
   6. ``--event-list`` refuses names the store does not hold instead of
      dropping them with a Python warning; ``--allow-missing-events`` skips
      them and records them in the validation summary.
+  7. ``inspect`` reports the requirements of the space ``export pe`` would
+     use; a MissingParameterError is a clean CLI error; ``--parameter-space
+     chieff_chip`` and ``--pastro-min`` have the opt-in flags they need.
 
 Every test is offline: GWOSC and Zenodo are monkeypatched.
 """
@@ -430,4 +433,64 @@ def test_a_complete_event_list_exports_as_before(tmp_path):
     out = tmp_path / "gw.h5"
     assert main(["export-darksirens", store, "--out", str(out),
                  "--event-list", listed, "--allow-missing-far"] + _V1) == 0
+    assert out.exists()
+
+
+# ==========================================================================
+# 7. inspect requirements, MissingParameterError, and the opt-in flags
+# ==========================================================================
+def test_inspect_reports_what_the_default_export_needs(tmp_path, capsys):
+    """The default `export pe` space is component; inspect checked the
+    chi_eff-only list and reported nothing missing on a store without the
+    component spins."""
+    from gwcat.cli import main
+    from test_cli import MIXED_EVENTS, _build_mixed_store
+    store = _build_mixed_store(tmp_path, MIXED_EVENTS)
+    assert main(["inspect", store, "--json"]) == 0
+    info = json.loads(capsys.readouterr().out)
+    assert info["required_for_parameter_space"] == "component"
+    assert "a_1" in info["missing_required_parameters"]
+
+
+def test_a_missing_parameter_is_a_clean_cli_error(tmp_path, capsys):
+    from gwcat.cli import main
+    from test_cli import MIXED_EVENTS, _build_mixed_store
+    store = _build_mixed_store(tmp_path, MIXED_EVENTS)
+    rc = main(["export", "pe", store, "--out", str(tmp_path / "x.h5"),
+               "--nsamp", "8", "--no-summary"])
+    assert rc == 1
+    assert "a_1" in capsys.readouterr().err
+
+
+def _spin_store(tmp_path):
+    from test_export_v2_pe import _build_spin_store
+    store, _ = _build_spin_store(
+        tmp_path, [{"name": "GW910001_000001"}, {"name": "GW910002_000002"}])
+    return str(store)
+
+
+def test_chieff_chip_is_reachable_with_its_opt_in(tmp_path):
+    import h5py
+    from gwcat.cli import main
+    store = _spin_store(tmp_path)
+    base = ["export", "pe", store, "--nsamp", "8", "--no-summary",
+            "--parameter-space", "chieff_chip"]
+    # still refused by default ...
+    assert main(base + ["--out", str(tmp_path / "a.h5")]) == 1
+    # ... and buildable with the flag the Python API takes
+    out = tmp_path / "b.h5"
+    assert main(base + ["--out", str(out), "--allow-projection-basis"]) == 0
+    with h5py.File(out, "r") as f:
+        assert f.attrs["spin_basis"] == "chieff_chip"
+
+
+def test_pastro_min_is_reachable_with_its_opt_in(tmp_path):
+    from gwcat.cli import main
+    store = _spin_store(tmp_path)
+    base = ["export", "pe", store, "--nsamp", "8", "--no-summary",
+            "--parameter-space", "chieff", "--pastro-min", "0.5"]
+    assert main(base + ["--out", str(tmp_path / "a.h5")]) == 1
+    out = tmp_path / "b.h5"
+    assert main(base + ["--out", str(out),
+                        "--allow-unpaired-pastro-min"]) == 0
     assert out.exists()

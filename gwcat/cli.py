@@ -293,7 +293,22 @@ def build_parser() -> argparse.ArgumentParser:
     pe_far_group = p_pe.add_mutually_exclusive_group()
     pe_far_group.add_argument("--allow-missing-far", action="store_true")
     pe_far_group.add_argument("--require-far", action="store_true")
-    p_pe.add_argument("--pastro-min", type=float, default=None)
+    p_pe.add_argument("--pastro-min", type=float, default=None,
+                      help="Drop events with p_astro below this. Refused "
+                           "unless --allow-unpaired-pastro-min is also given: "
+                           "no injection campaign carries p_astro, so no "
+                           "selection export reproduces this cut. Cut on "
+                           "--far-max or select by --event-list instead.")
+    p_pe.add_argument("--allow-unpaired-pastro-min", action="store_true",
+                      help="Write the file despite --pastro-min. It is then "
+                           "NOT usable with a selection function.")
+    p_pe.add_argument("--allow-projection-basis", action="store_true",
+                      help="Required by --parameter-space chieff_chip, which "
+                           "is opt-in and not a shipped product: a projection "
+                           "of the spin vector, definable only against a "
+                           "uniform-magnitude isotropic injected draw. Use "
+                           "'component' unless you need the projected "
+                           "density.")
     p_pe.add_argument("--nsamp", type=_positive_int, default=4096)
     p_pe.add_argument("--seed", type=int, default=0)
     p_pe.add_argument("--z-max", type=float, default=None)
@@ -776,6 +791,8 @@ def _cmd_export_pe(args) -> int:
         amax=args.amax,
         amax_fallback=args.amax_fallback,
         drop_spin_above_ceiling=args.drop_spin_above_ceiling,
+        allow_unpaired_pastro_min=args.allow_unpaired_pastro_min,
+        allow_projection_basis=args.allow_projection_basis,
         sample_set_map=args.sample_set_map,
         nrsur_q_rule=args.nrsur_q_rule,
         nrsur_q_rule_substitute=args.nrsur_q_rule_substitute,
