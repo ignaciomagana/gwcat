@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import csv
 import math
+import warnings
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Tuple, Union
 
@@ -86,12 +87,24 @@ _SOURCE_MANIFEST = "manifest"
 _SOURCE_USER_OVERRIDE = "user_override"
 
 
+#: Strings that spell "not a number".  A YAML ``nan`` is the STRING "nan"
+#: (only ``.nan`` is a float), so it must read as absent exactly like the CSV
+#: cell ``nan``, which is coerced to a float NaN (review 2026-10-20).
+_NAN_STRINGS = frozenset({"nan", ".nan", "+nan", "-nan"})
+
+
 def _is_present(value: Any) -> bool:
-    """True if ``value`` is a real, known value (not None/NaN/empty string)."""
+    """True if ``value`` is a real, known value (not None/NaN/empty string).
+
+    A NaN spelled as a string counts as absent: a YAML override saying
+    ``p_astro: nan`` used to ERASE the online value (the string won the
+    precedence and then resolved to NaN), while the same cell in a CSV
+    override kept it.
+    """
     if value is None:
         return False
     if isinstance(value, str):
-        return value != ""
+        return value.strip() != "" and value.strip().lower() not in _NAN_STRINGS
     if isinstance(value, float) and math.isnan(value):
         return False
     return True
@@ -181,16 +194,21 @@ def load_user_overrides(path: Union[str, Path]) -> Dict[str, Dict[str, Any]]:
         of records each carrying an ``event_name`` (or ``name``) key plus the
         override fields, e.g.::
 
-            GW150914:
+            GW150914_095045:
               far: 1.0e-8
               p_astro: 0.999
-            GW190425:
+            GW190425_081805:
               source_class: BNS
 
         or::
 
-            - event_name: GW150914
+            - event_name: GW150914_095045
               far: 1.0e-8
+
+        Keys are matched EXACTLY against the ingested event names, which are
+        the full ``GWyymmdd_hhmmss`` names of the PE files: a short name such
+        as ``GW150914`` matches nothing (:func:`metadata_diagnostics` warns,
+        naming the full name when one event matches the prefix).
 
     CSV (``.csv``)
         One header column must be ``event_name``; every other column is an
@@ -296,6 +314,8 @@ def metadata_diagnostics(
     manifest_is_nested = any(isinstance(v, Mapping) for v in manifest_defaults.values())
 
     fields = tuple(fields)
+    event_names = list(event_names)
+    _check_user_overrides(event_names, user_overrides, fields)
     diagnostics: Dict[str, Dict[str, Dict[str, Any]]] = {}
     for name in event_names:
         online_ev = online_table.get(name, {}) or {}
@@ -328,6 +348,43 @@ def metadata_diagnostics(
                 per_field[field] = {"value": None, "source": _SOURCES_ABSENT}
         diagnostics[name] = per_field
     return diagnostics
+
+
+def _check_user_overrides(event_names, user_overrides, fields) -> None:
+    """Refuse an unknown source class and report override keys that match no
+    event (review 2026-10-20).
+
+    A user override is an explicit request: a class typo (``BHBH``) used to
+    become ``Unknown`` silently at ingest, and an override keyed by a short
+    name (``GW150914``, the example this module used to document) applied to
+    nothing with no warning.
+    """
+    from .source_class import _CLASS_ALIASES, _compact_key
+    known = set(event_names)
+    unmatched = sorted(str(k) for k in user_overrides if k not in known)
+    if unmatched:
+        hints = []
+        for k in unmatched:
+            full = [n for n in event_names if str(n).startswith(f"{k}_")]
+            if len(full) == 1:
+                hints.append(f"{k} -> {full[0]}")
+        warnings.warn(
+            f"user overrides: {len(unmatched)} key(s) match no event being "
+            f"assembled and are NOT applied: {unmatched[:10]}"
+            + (f" (+{len(unmatched) - 10} more)" if len(unmatched) > 10 else "")
+            + (f". Keys are full event names; did you mean "
+               f"{', '.join(hints[:10])}?" if hints else "."))
+    if "source_class" in fields:
+        bad = []
+        for name, rec in user_overrides.items():
+            v = (rec or {}).get("source_class")
+            if _is_present(v) and _compact_key(v) not in _CLASS_ALIASES:
+                bad.append(f"{name}: {v!r}")
+        if bad:
+            raise ValueError(
+                f"user overrides: unrecognised source_class value(s) "
+                f"{bad[:10]}; an unrecognised class would be stored as "
+                f"'Unknown'. Use BBH, NSBH, BNS, MassGap or Unknown.")
 
 
 def assemble_event_metadata(

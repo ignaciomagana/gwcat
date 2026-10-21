@@ -723,3 +723,38 @@ def test_cache_and_store_discovery_helpers(tmp_path):
                                           store_path=store,
                                           prefer_gwosc=False)
     assert "GW250101_010101" in names and "GW230529_181500" not in names
+
+
+# ==========================================================================
+# User metadata overrides say when they apply nothing
+# ==========================================================================
+def test_overrides_keyed_by_a_short_name_warn_with_the_full_name():
+    from gwcat.event_metadata import assemble_event_metadata
+    names = ["GW150914_095045", "GW190425_081805"]
+    with pytest.warns(UserWarning, match="GW150914 -> GW150914_095045"):
+        table, _ = assemble_event_metadata(
+            names, online_table={},
+            user_overrides={"GW150914": {"far": 1e-8}})
+    assert "far" not in table["GW150914_095045"]
+
+
+def test_a_yaml_nan_override_does_not_erase_the_online_value(tmp_path):
+    from gwcat.event_metadata import (assemble_event_metadata,
+                                      load_user_overrides, resolve_pastro)
+    online = {"GW150914_095045": {"far": 1e-7, "pastro": 0.97}}
+    for fname, text in (("o.yaml", "GW150914_095045:\n  p_astro: nan\n"),
+                        ("o.csv", "event_name,p_astro\nGW150914_095045,nan\n")):
+        p = tmp_path / fname
+        p.write_text(text)
+        table, _ = assemble_event_metadata(
+            ["GW150914_095045"], online_table=online,
+            user_overrides=load_user_overrides(p))
+        assert resolve_pastro(table["GW150914_095045"]) == 0.97, fname
+
+
+def test_an_unknown_class_in_an_override_is_refused():
+    from gwcat.event_metadata import assemble_event_metadata
+    with pytest.raises(ValueError, match="BHBH"):
+        assemble_event_metadata(
+            ["GW190425_081805"], online_table={},
+            user_overrides={"GW190425_081805": {"source_class": "BHBH"}})
