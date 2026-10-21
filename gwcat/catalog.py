@@ -30,6 +30,12 @@ from .source_class import (normalize_source_class, resolve_filter_classes,
                            PE_MEDIAN_CUT_WARNING)
 
 
+#: The attr a PE export carries when it was written with event cuts on point
+#: estimates that no injection campaign reproduces (see
+#: :attr:`SelectionSpec.point_estimate_cuts`).  Absent when there are none.
+POINT_ESTIMATE_CUTS_ATTR = "point_estimate_cuts"
+
+
 class UnpairableSelectionCut(ValueError):
     """An event cut for which the paired injection campaign has no equivalent.
 
@@ -124,6 +130,10 @@ class SelectionSpec:
     require_far: bool = False
     waveform_policy: str = "preferred"
     approximant: Optional[str] = None
+    #: Whether the caller declared that the point-estimate cuts below may be
+    #: written although no injection campaign reproduces them (see
+    #: :meth:`check_pairable`).  Sticky across a chain of views.
+    point_estimate_cuts_allowed: bool = False
 
     # ---- composition ----------------------------------------------------
     def refine(self, *, compact_type=None, source_class=None, far_max=None,
@@ -131,7 +141,8 @@ class SelectionSpec:
                m1_src_range=None, m2_src_range=None, name_filters=(),
                allowed_names_authoritative=True, far_policy="none",
                n_missing_far=0, allow_missing_far=False, require_far=False,
-               waveform_policy="preferred", approximant=None):
+               waveform_policy="preferred", approximant=None,
+               allow_point_estimate_cuts=False):
         """This spec intersected with one further ``select()`` call.
 
         ``name_filters`` is a sequence of ``(label, names)`` pairs -- one per
@@ -204,9 +215,29 @@ class SelectionSpec:
             require_far=req_far,
             waveform_policy=str(waveform_policy),
             approximant=None if approximant is None else str(approximant),
+            point_estimate_cuts_allowed=bool(
+                self.point_estimate_cuts_allowed or allow_point_estimate_cuts),
         )
 
     # ---- derived views --------------------------------------------------
+    @property
+    def point_estimate_cuts(self) -> tuple:
+        """The cuts on per-event POINT ESTIMATES no injection set reproduces.
+
+        ``m1_src_range`` / ``m2_src_range`` cut on the posterior-median
+        source-frame masses and ``sky_area_max`` on the 90% sky area of the
+        posterior.  An injection has no posterior, so no injection-side cut
+        reproduces either: the injections' true masses scatter across a
+        median-mass boundary differently from the events', and an injection has
+        no sky area at all.  Exported against an uncut selection function, the
+        pair describes two different selections (Essick & Fishbach).  These
+        are the cuts :meth:`check_pairable` refuses unless declared.
+        """
+        return tuple(k for k, v in (("m1_src_range", self.m1_src_range),
+                                    ("m2_src_range", self.m2_src_range),
+                                    ("sky_area_max", self.sky_area_max))
+                     if v is not None)
+
     @property
     def is_filtered(self) -> bool:
         """Whether ANY event cut is in effect (policies alone do not count)."""
@@ -269,10 +300,19 @@ class SelectionSpec:
         every guard GW-12/GW-33 built -- the file recorded
         ``cut_estimator="none"`` and paired clean against an all-class
         selection function.
+
+        ``m1_src_range`` / ``m2_src_range`` count for the same reason (review
+        2026-10-20): they cut on the same posterior-median source-frame masses
+        the class column is computed from, so ``m2_src_range=(3, inf)`` is the
+        BBH class cut under a third spelling, and it used to be recorded as
+        ``"none"`` (or ``"name_whitelist"`` next to a list).
         """
+        median_mass_cut = (self.m1_src_range is not None
+                           or self.m2_src_range is not None)
         return pe_cut_estimator(
             (self.source_class if self.source_class_requested
-             else (self.compact_type or None)),
+             else (self.compact_type or
+                   (("median_mass_range",) if median_mass_cut else None))),
             self.allowed_names if self.name_filters else None)
 
     # ---- serialisation --------------------------------------------------
@@ -282,8 +322,12 @@ class SelectionSpec:
         The whitelist itself is summarised by count + digest rather than
         written out: the events actually exported are already listed in
         ``event_names``, and a 259-name list in an HDF5 attr helps nobody.
+
+        Keys added by the 2026-10-20 review are written only when they carry
+        something (a cut that is in effect), so the record of a selection that
+        uses none of them is unchanged.
         """
-        return {
+        out = {
             "compact_type": list(self.compact_type),
             "source_class": (list(self.source_class)
                              if self.source_class_requested else None),
@@ -310,6 +354,12 @@ class SelectionSpec:
                             else str(self.approximant)),
             "cut_estimator": self.cut_estimator,
         }
+        pe_cuts = self.point_estimate_cuts
+        if pe_cuts:
+            out["point_estimate_cuts"] = list(pe_cuts)
+            out["point_estimate_cuts_allowed"] = bool(
+                self.point_estimate_cuts_allowed)
+        return out
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), sort_keys=True,
@@ -332,7 +382,7 @@ class SelectionSpec:
         def _cut(x):
             return float("nan") if x is None else float(x)
 
-        return {
+        out = {
             "selection_spec": self.to_json(),
             "selection_spec_digest": self.digest(),
             "selection_filtered": bool(self.is_filtered),
@@ -356,19 +406,57 @@ class SelectionSpec:
             "approximant": "" if self.approximant is None else str(
                 self.approximant),
         }
+        pe_cuts = self.point_estimate_cuts
+        if pe_cuts:
+            # Written only when such a cut is in effect: the paired-file
+            # validator refuses a file that carries it.
+            out[POINT_ESTIMATE_CUTS_ATTR] = ",".join(pe_cuts)
+        return out
 
     # ---- pairing ---------------------------------------------------------
-    def check_pairable(self, *, allow_unpaired_pastro_min: bool = False):
+    def check_pairable(self, *, allow_unpaired_pastro_min: bool = False,
+                       allow_unpaired_point_estimate_cuts=None):
         """Refuse the cuts no injection campaign can reproduce.
 
-        ``pastro_min`` is the one that exists today.  Every selection export
-        records ``p_astro_available=False``, because the campaigns carry no
+        ``pastro_min``: every selection export records
+        ``p_astro_available=False``, because the campaigns carry no
         per-injection p_astro at all: there is no injection-side threshold that
         reproduces an event-side p_astro cut, so beta would describe a
         different selection than the one that produced the event list -- the
         Essick & Fishbach failure, and invisible in the files until the cut
         started being recorded.
+
+        ``m1_src_range`` / ``m2_src_range`` / ``sky_area_max`` (review
+        2026-10-20): cuts on per-event point estimates (see
+        :attr:`point_estimate_cuts`).  They used to pass every guard -- the
+        contract records them but neither hashes nor compares them -- so a
+        file cut to ``m1_src_range=(20, 70)`` paired cleanly with an uncut
+        selection.  Refused unless ``allow_unpaired_point_estimate_cuts`` is
+        true here or was declared on the view
+        (``select(..., allow_unpaired_point_estimate_cuts=True)``); a file
+        written anyway records them in ``point_estimate_cuts`` and the v1
+        paired validator refuses it.
         """
+        if allow_unpaired_point_estimate_cuts is None:
+            allow_unpaired_point_estimate_cuts = self.point_estimate_cuts_allowed
+        pe_cuts = self.point_estimate_cuts
+        if pe_cuts and not allow_unpaired_point_estimate_cuts:
+            raise UnpairableSelectionCut(
+                f"{', '.join(pe_cuts)} cut(s) on per-event POINT ESTIMATES "
+                f"(posterior-median source-frame masses, the posterior's 90% "
+                f"sky area) were applied to the events, but no injection "
+                f"campaign reproduces them: an injection has true masses, not "
+                f"a posterior median that scatters across the boundary, and no "
+                f"sky area at all. The exported beta would describe a "
+                f"different selection than the event list it is paired with "
+                f"(Essick & Fishbach), and nothing in the pairing contract "
+                f"would show it.\n"
+                f"\n"
+                f"Model the mass range in the population instead of cutting on "
+                f"it, or pass allow_unpaired_point_estimate_cuts=True to "
+                f"select() (or to to_darksirens) to write the file anyway -- it "
+                f"then records point_estimate_cuts and is NOT usable with a "
+                f"selection function.")
         if self.pastro_min is None or allow_unpaired_pastro_min:
             return
         raise UnpairableSelectionCut(
@@ -611,7 +699,8 @@ class GWCatalog:
                event_list=None, allow_missing_far=False, require_far=False,
                waveform_policy="preferred", approximant=None,
                sample_set_map=None, nrsur_q_rule=None,
-               nrsur_q_rule_substitute=False):
+               nrsur_q_rule_substitute=False,
+               allow_unpaired_point_estimate_cuts=False):
         """Return a filtered view of the catalog (no sample copy).
 
         Source-class / event-list / FAR options (PR 2)
@@ -637,6 +726,13 @@ class GWCatalog:
             them; a store where NO candidate event has either raises, because a
             threshold crossed with an all-absent column is a configuration
             error, not a selection (GW-14).
+        m1_src_range, m2_src_range, sky_area_max
+            Cuts on per-event point estimates (posterior-median source-frame
+            masses, the 90% sky area).  Cutting a view is always legal, but no
+            injection campaign reproduces these, so the exporters refuse a view
+            that carries one (:meth:`SelectionSpec.check_pairable`) unless
+            ``allow_unpaired_point_estimate_cuts=True`` declares it here; the
+            declaration is recorded and survives chained views.
 
         Waveform / sample-set policy (PR 6)
         -----------------------------------
@@ -903,7 +999,8 @@ class GWCatalog:
             allowed_names_authoritative=allowed_names_authoritative,
             far_policy=far_policy, n_missing_far=n_missing_far,
             allow_missing_far=allow_missing_far, require_far=require_far,
-            waveform_policy=waveform_policy, approximant=approximant)
+            waveform_policy=waveform_policy, approximant=approximant,
+            allow_point_estimate_cuts=allow_unpaired_point_estimate_cuts)
 
         result = GWCatalog(self.path, _sel=kept)
         result._selection_spec = spec
@@ -1134,7 +1231,8 @@ class GWCatalog:
                       write_summary: bool = False,
                       summary_context: Optional[dict] = None,
                       allow_zero_p_pe: bool = False,
-                      allow_unpaired_pastro_min: bool = False):
+                      allow_unpaired_pastro_min: bool = False,
+                      allow_unpaired_point_estimate_cuts: bool = False):
         """Write an HDF5 consumable by darksirens.gw.utils.load_gw_samples.
 
         p_pe convention (spin-prior contract)
@@ -1262,6 +1360,12 @@ class GWCatalog:
             records ``p_astro_available=False``), so no injection-side cut
             reproduces it and the pair is not usable; see
             :meth:`SelectionSpec.check_pairable`.
+        allow_unpaired_point_estimate_cuts : bool, default False
+            Write the file even though the exported view carries a cut on
+            per-event point estimates (``m1_src_range`` / ``m2_src_range`` /
+            ``sky_area_max``), which no injection campaign reproduces.  The
+            file then records ``point_estimate_cuts`` and the paired
+            validator refuses it; see :meth:`SelectionSpec.check_pairable`.
 
         Provenance (GW-33)
         ------------------
@@ -1286,7 +1390,9 @@ class GWCatalog:
                           allow_missing_far=allow_missing_far,
                           require_far=require_far,
                           waveform_policy=waveform_policy,
-                          approximant=approximant)
+                          approximant=approximant,
+                          allow_unpaired_point_estimate_cuts=(
+                              allow_unpaired_point_estimate_cuts))
         # The EFFECTIVE selection: this call's filters composed with those the
         # exported view already carried (GW-33).  Everything this exporter
         # records about the selection comes from here, and the cut no injection
@@ -1945,6 +2051,29 @@ class GWCatalog:
 V1_PE_REQUIRED = ("ra", "dec", "m1det", "m2det", "chieff", "dL", "p_pe",
                   "redshift", "m1src", "m2src")
 
+def _recorded_point_estimate_cuts(attrs) -> list:
+    """The point-estimate cuts a PE file records (see
+    :attr:`SelectionSpec.point_estimate_cuts`), from its
+    ``point_estimate_cuts`` attr or, for a file written before that attr, from
+    the ``selection_spec`` JSON it carries.  ``[]`` when there are none."""
+    raw = attrs.get(POINT_ESTIMATE_CUTS_ATTR)
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode()
+    cuts = [c for c in str(raw or "").split(",") if c.strip()]
+    spec_raw = attrs.get("selection_spec")
+    if isinstance(spec_raw, (bytes, bytearray)):
+        spec_raw = spec_raw.decode()
+    try:
+        spec = json.loads(spec_raw) if spec_raw else {}
+    except (TypeError, ValueError):
+        spec = {}
+    for k in ("m1_src_range", "m2_src_range", "sky_area_max"):
+        if isinstance(spec, dict) and spec.get(k) is not None \
+                and k not in cuts:
+            cuts.append(k)
+    return cuts
+
+
 #: Datasets the ``gwcat-selection-1.0`` schema MANDATES (what
 #: ``SelectionSet``/``CombinedSelectionSet.to_darksirens`` write).
 V1_SELECTION_REQUIRED = ("m1det", "m2det", "dL", "chieff", "ra", "dec",
@@ -2259,6 +2388,22 @@ def validate_export(gw_path: str, selection_path: str = None, strict: bool = Fal
             from .export.validate import _xcheck_detection_cut
             _xcheck_detection_cut(_fail, results, dict(fg.attrs),
                                   dict(fs.attrs))
+
+            # (e) Cuts on per-event point estimates (review 2026-10-20).  A
+            # file cut on posterior-median masses or on sky area describes an
+            # event list no injection set reproduces; the exporters refuse to
+            # write one unless told to, and a file written anyway must not
+            # pass as a valid pair.  Read from the recorded spec as well as
+            # the attr, so a file written before the attr existed is caught.
+            pe_cuts = _recorded_point_estimate_cuts(fg.attrs)
+            if pe_cuts:
+                _fail("xcheck_point_estimate_cuts",
+                      f"the PE file was cut on per-event point estimates "
+                      f"({', '.join(pe_cuts)}), which no injection campaign "
+                      f"reproduces, so this selection file cannot describe "
+                      f"its event list. Re-export the PE file without them "
+                      f"and model the range in the population instead.")
+            results["xcheck_point_estimate_cuts"] = True
 
     n_pass = sum(results.values())
     n_total = len(results)
