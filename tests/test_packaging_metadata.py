@@ -131,3 +131,50 @@ def test_the_declared_license_ships_with_its_text():
     # header claiming to be one.
     assert "Permission is hereby granted, free of charge" in text
     assert 'THE SOFTWARE IS PROVIDED "AS IS"' in text
+
+
+# ==========================================================================
+# Review 2026-10-20: every module-scope import of `import gwcat` is declared
+# ==========================================================================
+#: Import name -> distribution name, where they differ.
+_DIST_OF = {"yaml": "pyyaml"}
+
+
+@needs_source_tree
+def test_import_gwcat_needs_only_declared_dependencies():
+    """scipy was a hard import of ``import gwcat`` (gwcat/chi_eff_exact.py)
+    but not a declared dependency, so a plain ``pip install .`` could not
+    import gwcat.  Every third-party package imported at MODULE scope by a
+    module that ``import gwcat`` loads must be in [project].dependencies."""
+    import subprocess
+    import sys
+
+    out = subprocess.run(
+        [sys.executable, "-c",
+         "import sys, gwcat; print('\\n'.join(sorted("
+         "m.__file__ for n, m in sys.modules.items() if n == 'gwcat' or "
+         "n.startswith('gwcat.'))))"],
+        capture_output=True, text=True, check=True, cwd=str(REPO_ROOT))
+    files = [Path(x) for x in out.stdout.split() if x.endswith(".py")]
+    assert files, "import gwcat loaded no gwcat modules?"
+    stdlib = set(getattr(sys, "stdlib_module_names", ())) | {"__future__"}
+    third = set()
+    for f in files:
+        for node in ast.parse(f.read_text()).body:     # module scope only
+            if isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and not node.level:
+                names = [node.module]
+            else:
+                continue
+            third |= {n.split(".")[0] for n in names} - stdlib - {"gwcat"}
+    if not getattr(sys, "stdlib_module_names", None):  # py < 3.10
+        third -= {"typing", "dataclasses", "contextlib", "contextvars"}
+    declared = {re.split(r"[<>=!~\[ ;]", d, maxsplit=1)[0].lower()
+                for d in _pyproject()["project"]["dependencies"]}
+    missing = sorted(n for n in third
+                     if _DIST_OF.get(n, n).lower() not in declared)
+    assert not missing, (
+        f"`import gwcat` imports {missing} at module scope, but "
+        f"pyproject.toml does not declare them: a plain `pip install .` "
+        f"would fail to import gwcat.")

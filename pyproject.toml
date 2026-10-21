@@ -32,6 +32,9 @@ dependencies = [
     "h5py>=3.6",
     "astropy>=5.0",
     "pyyaml>=5.1",
+    # The exact chi_eff prior (gwcat/chi_eff_exact.py) imports
+    # scipy.special.spence at module scope, reached from `import gwcat`.
+    "scipy>=1.8",
 ]
 
 [project.optional-dependencies]
