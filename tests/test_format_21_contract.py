@@ -11,7 +11,9 @@ The contract hash exists to turn a growing list of per-field pairing checks into
 one comparison -- and, more importantly, to make a DISAGREEMENT detectable on a
 pair of files that each validate perfectly on their own.
 """
+import functools
 import json
+import os
 
 import numpy as np
 import h5py
@@ -173,16 +175,34 @@ def test_amax_is_deliberately_not_in_the_contract():
 # --------------------------------------------------------------------------
 # 2. The 2.1 writers, against the real re-ingested store
 # --------------------------------------------------------------------------
-STORE = "working/gw16/gwcat_store_all_gwtc_v13.h5"
+#: The GW-16 re-ingested store.  The default is relative to a working/ folder
+#: that git ignores, so in a fresh clone these tests skip; set
+#: GWCAT_CONTRACT_STORE to a store path to run them.  Setting it (or
+#: GWCAT_REAL_DATA=1) REQUESTS them, and a requested store that does not exist
+#: fails rather than skipping silently.
+STORE = os.environ.get("GWCAT_CONTRACT_STORE",
+                       "working/gw16/gwcat_store_all_gwtc_v13.h5")
+_STORE_REQUESTED = ("GWCAT_CONTRACT_STORE" in os.environ
+                    or os.environ.get("GWCAT_REAL_DATA") == "1")
 
 
 def _have_store():
-    import os
     return os.path.exists(STORE)
 
 
-needs_store = pytest.mark.skipif(not _have_store(),
-                                 reason="requires the GW-16 re-ingested store")
+def needs_store(fn):
+    """Run ``fn`` on the real store; skip without one, FAIL if requested."""
+    @functools.wraps(fn)
+    def _wrapped(*args, **kwargs):
+        if not _have_store():
+            if _STORE_REQUESTED:
+                pytest.fail(f"the contract store was requested "
+                            f"(GWCAT_CONTRACT_STORE / GWCAT_REAL_DATA=1) but "
+                            f"{STORE!r} does not exist")
+            pytest.skip("requires the GW-16 re-ingested store; set "
+                        "GWCAT_CONTRACT_STORE to its path")
+        return fn(*args, **kwargs)
+    return _wrapped
 
 
 def _export(tmp_path, fmt, basis, name):

@@ -23,6 +23,7 @@ call, so a v2 file can never be handed to the v1 contract (or the reverse).
 """
 from __future__ import annotations
 
+import json
 import warnings
 
 import numpy as np
@@ -166,12 +167,22 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
         store's provenance) and ``False`` are both valid;
       * physical ranges when spin columns are present: ``a1``/``a2`` in
         ``[0, max(spin_amax)*1.001]``, ``|cost{1,2}| <= 1``, ``chip`` in
-        ``[0, max(spin_amax)*1.001]``, ``chieff`` in ``[-1, 1]``.
+        ``[0, max(spin_amax)*1.001]``, ``chieff`` in ``[-1, 1]``;
+      * masses, ``dL`` and ``redshift`` finite and positive, ``m2 <= m1``,
+        ``q`` in ``(0, 1]`` (both files);
+      * one block per event: ``event_names`` unique and ``nobs`` long, and
+        ``homogeneous_sample_sets`` not False;
+      * a zero ``p_pe`` fails only at an in-support sample; out-of-support
+        samples (``in_support=0``) must be recorded and exactly zero.
 
     Selection file (``gwcat-selection-2.0``):
       * ``format_version == "gwcat-selection-2.0"`` and ``spin_basis`` valid;
       * ``pdraw`` finite and positive, ``pdraw`` length ``== n_detected``,
-        ``ndraw > n_detected``;
+        ``ndraw > n_detected``, ``ndraw == sum(campaign_ndraws)``,
+        ``T_obs_yr`` finite and positive;
+      * ``chieff_reference``: the sentinel ``pdraw`` rows are exactly the rows
+        with ``a1`` or ``a2`` above ``spin_reference_amax``, counted in
+        ``spin_reference_excluded_rows``, and the sentinel is negligible;
       * the per-campaign injected-spin provenance attrs
         (``injected_spin_format`` / ``injected_spin_amax_detected`` /
         ``injected_spin_uniform_isotropic``) are present;
@@ -192,9 +203,12 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
       * ``component`` basis: PE ``component_spin_prior_applied_to_p_pe`` must be
         ``True`` and the selection ``pdraw_state`` must equal the component
         constant.
-      * Cosmology: the selection cosmology must match the PE cosmology (reusing
-        the v1 tolerances ``|dH0| >= 1.0`` / ``|dOm0| >= 0.05``; per-event PE
-        cosmologies are each compared against the single selection cosmology).
+      * Cosmology: each campaign's recorded cosmology
+        (``cosmology_*_per_campaign``; the scalar only on an older file) must
+        match the PE cosmology (the v1 tolerances ``|dH0| >= 1.0`` /
+        ``|dOm0| >= 0.05``, per event when the PE cosmology varies); an equal
+        ``z_max`` must be the same truncation in ``dL``.
+      * A cumulative mixture must detect something in every PE event's run.
       * Source class: the PE and selection ``source_class_filter`` must resolve
         to the same canonical class set, and -- when both sides really do carry
         a class filter -- their ``source_class_cut_estimator`` must agree.  A
@@ -278,7 +292,7 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
     # ── PE file (internal) ──────────────────────────────────────────────────
     print(f"Validating gwcat-2.0 PE export: {pe_path}")
     pe_attrs, pe_present, pe_cols = _read_export(
-        pe_path, _PE_LEGACY + _PE_COMPONENT_EXTRA)
+        pe_path, _PE_LEGACY + _PE_COMPONENT_EXTRA + ["in_support", "q"])
 
     _validator_generation(_fail, pe_attrs.get("format_version"), "pe")
     _check("pe_format_version",
@@ -307,6 +321,30 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
             _check(f"pe_{ds}_length", pe_cols[ds].shape[0] == expected,
                    f"{pe_cols[ds].shape[0]} != nobs*nsamp = {expected}")
 
+    # One event, one block (review 2026-10-20).  waveform_policy='all' writes
+    # an event once per sample set (homogeneous_sample_sets=False), and the
+    # event-list digest de-duplicates by design, so such a file matched the
+    # whitelist it was cut from while a consumer multiplied that event's
+    # likelihood once per copy.
+    if pe_attrs.get("event_names") is not None:
+        _names = [_impl_str(x) for x in np.atleast_1d(pe_attrs["event_names"])]
+        _check("pe_event_names_length", len(_names) == nobs,
+               f"{len(_names)} event_names but nobs={nobs}")
+        _seen, _dup = set(), set()
+        for _n in _names:
+            (_dup if _n in _seen else _seen).add(_n)
+        _check("pe_event_names_unique", not _dup,
+               f"{len(_dup)} event(s) appear more than once in event_names "
+               f"(e.g. {sorted(_dup)[:5]}); a consumer counts each copy as a "
+               f"separate detection. Export one sample set per event "
+               f"(waveform_policy other than 'all').")
+    if pe_attrs.get("homogeneous_sample_sets") is not None:
+        _check("pe_homogeneous_sample_sets",
+               bool(pe_attrs["homogeneous_sample_sets"]),
+               "homogeneous_sample_sets=False: the file holds more than one "
+               "sample set for some event (waveform_policy='all'), which is "
+               "not a population-analysis input.")
+
     # p_pe finite & STRICTLY positive.  An exact zero used to be documented as
     # legal ("distance-prior tails"), but that state only ever arose from the
     # truncated distance prior GW-01 removed, and darksirens turns a zero weight
@@ -315,14 +353,47 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
     if "p_pe" in pe_cols and pe_cols["p_pe"].size:
         p = pe_cols["p_pe"]
         _check("pe_p_pe_finite", np.all(np.isfinite(p)))
-        n_zero = int(np.sum(p == 0.0))
+        # Samples outside the spin prior's support carry a RECORDED zero when
+        # the builder was told allow_out_of_support (in_support=0, counted in
+        # n_samples_out_of_support).  Only an in-support zero is the truncated
+        # distance prior; failing the recorded ones blamed the distance prior
+        # for a state the builder wrote on purpose (review 2026-10-20).
+        ins = pe_cols.get("in_support")
+        has_ins = ins is not None
+        if has_ins:
+            _check("pe_in_support_length", ins.shape == p.shape,
+                   f"{ins.shape[0]} in_support rows != {p.shape[0]} p_pe rows")
+        ins = (np.asarray(ins).astype(bool)
+               if has_ins and ins.shape == p.shape
+               else np.ones(p.shape, dtype=bool))
+        n_zero = int(np.sum((p == 0.0) & ins))
         n_neg = int(np.sum(p < 0.0))
         _check("pe_p_pe_positive", n_zero == 0 and n_neg == 0,
-               f"{n_zero} zero ({100 * n_zero / p.size:.2f}%) and {n_neg} "
-               f"negative of {p.size} samples; min={np.nanmin(p):.3e}. A zero "
-               f"p_pe means the store's p_dL_pe was truncated at the recorded "
+               f"{n_zero} zero ({100 * n_zero / p.size:.2f}%) at in-support "
+               f"samples and {n_neg} negative of {p.size} samples; "
+               f"min={np.nanmin(p):.3e}. A zero p_pe at an in-support sample "
+               f"means the store's p_dL_pe was truncated at the recorded "
                f"distance-prior bounds -- re-ingest so the distance prior is "
                f"evaluated over the full sample range.")
+        n_out = int(np.sum(~ins))
+        if n_out:
+            n_rec = pe_attrs.get("n_samples_out_of_support")
+            _check("pe_out_of_support_recorded",
+                   bool(pe_attrs.get("out_of_support_allowed", False))
+                   and n_rec is not None and int(n_rec) == n_out,
+                   f"{n_out} samples have in_support=0, but the file records "
+                   f"out_of_support_allowed="
+                   f"{pe_attrs.get('out_of_support_allowed')!r} and "
+                   f"n_samples_out_of_support={n_rec!r}")
+            _check("pe_out_of_support_p_pe_zero", np.all(p[~ins] == 0.0),
+                   f"{int(np.sum(p[~ins] != 0.0))} out-of-support samples "
+                   f"carry a non-zero p_pe; outside the spin prior's support "
+                   f"the density is zero")
+            print(f"  NOTE: {n_out} of {p.size} samples "
+                  f"({100 * n_out / p.size:.3f}%) are outside the spin prior's "
+                  f"support and carry a recorded zero p_pe "
+                  f"(allow_out_of_support); the consumer drops them but "
+                  f"counts them in each event's n.")
     else:
         # The `else` the frozen v1 validator and the v2 SELECTION block both
         # have, and only this one lacked (GW-37).  With nobs=0 every length
@@ -351,6 +422,7 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
                           pe_attrs.get("chi_eff_amax_2_per_event", []),
                           pe_attrs.get("chi_eff_amax", []))
     _range_checks(_check, pe_cols, pe_amax, prefix="pe")
+    _mass_distance_checks(_check, pe_cols, prefix="pe")
     _sky_checks(_check, pe_cols, prefix="pe")
     _fit_columns_present(_check, pe_attrs, pe_present, prefix="pe")
 
@@ -362,7 +434,7 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
     if selection_path is not None:
         print(f"Validating gwcat-2.0 selection export: {selection_path}")
         sel_attrs, sel_present, sel_cols = _read_export(
-            selection_path, _SEL_LEGACY + _SPIN_COLUMNS)
+            selection_path, _SEL_LEGACY + _SPIN_COLUMNS + ["q"])
 
         _validator_generation(_fail, sel_attrs.get("format_version"),
                               "selection")
@@ -378,6 +450,24 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
         n_det = int(sel_attrs.get("n_detected", 0))
         _check("sel_ndraw_gt_ndet", ndraw > n_det,
                f"ndraw={ndraw} <= n_detected={n_det}")
+        # ndraw is the sum of the campaigns' draws, and T_obs is a positive
+        # time (review 2026-10-20): a hand-edited ndraw passed as long as it
+        # exceeded n_detected, and beta scales as 1/ndraw.
+        if "campaign_ndraws" in sel_attrs:
+            _cn = np.atleast_1d(np.asarray(sel_attrs["campaign_ndraws"],
+                                           dtype=np.int64))
+            _check("sel_ndraw_is_sum_of_campaign_ndraws",
+                   int(_cn.sum()) == ndraw,
+                   f"ndraw={ndraw} but sum(campaign_ndraws)={int(_cn.sum())} "
+                   f"({_cn.tolist()})")
+        _T = sel_attrs.get("T_obs_yr")
+        try:
+            _T = float(_T)
+        except (TypeError, ValueError):
+            _T = float("nan")
+        _check("sel_T_obs_yr_positive", np.isfinite(_T) and _T > 0.0,
+               f"T_obs_yr={sel_attrs.get('T_obs_yr')!r} is not a positive "
+               f"finite observing time")
 
         # Required datasets, and every column tied to n_detected (GW-37).  This
         # block had NEITHER -- the PE half above has both, and so does the
@@ -432,6 +522,14 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
                        f"min={pd.min():.3e}")
             else:
                 _check("sel_pdraw_nonempty", False, "pdraw is empty")
+
+        # The reference basis's zero-weight rows must be exactly the rows
+        # outside the reference support, and their sentinel must really weigh
+        # nothing.  a1/a2 were required above for this purpose but never
+        # compared, so a sentinel on in-support rows (beta biased low) or a
+        # finite weight on out-of-reference rows (biased high) passed.
+        if sel_basis == "chieff_reference":
+            _reference_sentinel_checks(_check, sel_attrs, sel_cols)
 
         # Every name a 2.1 file declares in its OWN fit_columns must exist as a
         # dataset (GW-37).  A generic check beats extending two more hardcoded
@@ -531,13 +629,19 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
         else:
             sel_amax = 1.0
         _range_checks(_check, sel_cols, sel_amax, prefix="sel")
+        _mass_distance_checks(_check, sel_cols, prefix="sel")
         # A campaign that genuinely drew no sky position exempts its NaN rows,
         # but only if the file SAYS so -- the flag exists to be read (GW-20).
         _sky_avail = sel_attrs.get("sky_position_available")
-        _sky_all = (None if _sky_avail is None
-                    else bool(np.all(np.asarray(_sky_avail, dtype=bool))))
+        _sky_flags = (None if _sky_avail is None else
+                      np.atleast_1d(np.asarray(_sky_avail, dtype=bool)))
+        _sky_all = None if _sky_flags is None else bool(np.all(_sky_flags))
         _sky_checks(_check, sel_cols, prefix="sel",
                     sky_available=_sky_all)
+        if _sky_flags is not None and _sky_flags.any() and not _sky_flags.all():
+            # One skyless campaign used to exempt NaN sky rows in EVERY
+            # campaign of the file.
+            _sky_rows_follow_campaigns(_check, sel_cols, _sky_flags)
 
         # ── Cross-file contract checks (ALWAYS raise on mismatch) ────────────
         # (a) spin_basis must match -- name BOTH sides.
@@ -602,6 +706,28 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
                        f"a campaign records chi_eff_amax_source='detected' but "
                        f"its chi_eff_amax_per_campaign {used.tolist()} is not "
                        f"its injected_spin_amax_detected {det.tolist()}")
+                # A caller-forced ceiling (--amax) REPLACES the campaign's own
+                # in the swap; where the campaign's ceiling is known and
+                # differs, pdraw is the wrong density, chi_eff-dependently
+                # (review 2026-10-20: 0.99 forced on endo3's 0.998 is 0.7% off
+                # in the bulk and 29% above chi_eff 0.9).
+                forced = [(k, used[k].tolist(), det[k].tolist())
+                          for k, s_ in enumerate(sel_src)
+                          if s_ == "caller" and np.all(np.isfinite(det[k]))
+                          and not np.allclose(used[k], det[k], rtol=1e-9,
+                                              atol=1e-12)]
+                if forced:
+                    msg = (f"chieff: {len(forced)} campaign(s) swapped at a "
+                           f"caller-forced ceiling that is not the campaign's "
+                           f"own detected one (campaign, used, detected): "
+                           f"{forced}. The swap replaces the injected spin "
+                           f"density with the marginal at the ceiling it is "
+                           f"given, so pdraw is off chi_eff-dependently; "
+                           f"export without --amax.")
+                    if strict:
+                        _fail("xcheck_chieff_sel_amax_caller_matches_detected",
+                              msg)
+                    warnings.warn(msg)
             for side, srcs in (("PE", [str(x) for x in np.atleast_1d(
                     pe_attrs.get("chi_eff_amax_source_per_event", []))]),
                     ("selection", sel_src)):
@@ -613,17 +739,51 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
                         f"the chi_eff density divided out there rests on a "
                         f"fabricated amax. It is recorded, not verified.")
 
+            # The swap's violation record (GW-06): a campaign whose draw was
+            # MEASURED not uniform-isotropic, or ships a joint spin density
+            # the builder refuses by default, reached the file only through
+            # the builder's strict=False opt-out, and its pdraw is the wrong
+            # density.  The flags were written and never read.
+            try:
+                _viol = json.loads(str(sel_attrs.get(
+                    "spin_basis_assumption_violations", "[]")) or "[]")
+            except ValueError:
+                _viol = []
+            _refused = [v for v in _viol if isinstance(v, dict)
+                        and (v.get("verified") or v.get("reason"))]
+            if (bool(sel_attrs.get("spin_basis_assumption_violated", False))
+                    or _refused):
+                _fail("xcheck_chieff_spin_basis_assumption",
+                      f"the selection file records that the chi_eff swap was "
+                      f"applied to campaign(s) whose spin draw is not (or "
+                      f"cannot be shown to be) uniform-magnitude isotropic: "
+                      f"{[v.get('path') for v in _refused] or _viol}. It was "
+                      f"exported with strict=False; its pdraw is the wrong "
+                      f"density by a chi_eff-dependent factor. Use "
+                      f"spin_basis='chieff_reference' or 'component'.")
+            if bool(sel_attrs.get("spin_basis_assumption_unverified", False)):
+                warnings.warn(
+                    "chieff: the selection file records campaign(s) with no "
+                    "injected spin draw densities, so the uniform-isotropic "
+                    "assumption behind the chi_eff swap was not checked "
+                    "(spin_basis_assumption_unverified=True).")
+            results["xcheck_chieff_spin_basis_assumption"] = True
+
             pe_u = sorted({round(float(x), 6) for x in pe_amax_arr.ravel()
                            if np.isfinite(x)})
             sel_u = sorted({round(float(x), 6) for x in sel_amax_arr.ravel()
                             if np.isfinite(x)})
+            det_u = sorted({round(float(x), 6) for x in det.ravel()
+                            if np.isfinite(x)})
             print(f"  NOTE: chieff amax -- PE prior amax {pe_u} vs selection "
-                  f"injected amax {sel_u}. These are DIFFERENT quantities (the "
-                  f"PE sampling prior's ceiling vs the injected draw's) and are "
-                  f"NOT required to match.")
+                  f"injected (detected) amax {det_u or 'undetectable'}; the "
+                  f"selection's swap used {sel_u}. The PE and selection "
+                  f"ceilings are DIFFERENT quantities (the PE sampling prior's "
+                  f"ceiling vs the injected draw's) and are NOT required to "
+                  f"match.")
             if set(pe_u) != set(sel_u):
                 warnings.warn(
-                    f"chieff: PE prior amax {pe_u} != selection injected amax "
+                    f"chieff: PE prior amax {pe_u} != selection swap amax "
                     f"{sel_u}. This is expected and consistent -- each side "
                     f"divides out its own prior at its own amax (end-O3 injects "
                     f"a ~ U(0, 0.998) while the GWTC PE priors declare 0.99); "
@@ -674,43 +834,10 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
                     f"by forcing the two to match.")
             results["xcheck_chieff_chip_amax_recorded"] = True
 
-        # (c) Cosmology agreement (reuse the v1 tolerances / per-event logic).
-        sel_H0 = sel_attrs.get("cosmology_H0")
-        sel_Om = sel_attrs.get("cosmology_Om0")
-        if sel_H0 is not None and sel_Om is not None:
-            varies = bool(pe_attrs.get("cosmology_per_event_varies", False))
-            if varies:
-                pe_H0_arr = np.asarray(
-                    pe_attrs.get("cosmology_H0_per_event", []), dtype=float)
-                pe_Om_arr = np.asarray(
-                    pe_attrs.get("cosmology_Om0_per_event", []), dtype=float)
-                bad = ((np.abs(pe_H0_arr - float(sel_H0)) >= 1.0).any()
-                       or (np.abs(pe_Om_arr - float(sel_Om)) >= 0.05).any())
-                if bad:
-                    h0rng = ((pe_H0_arr.min(), pe_H0_arr.max())
-                             if pe_H0_arr.size else ("?", "?"))
-                    omrng = ((pe_Om_arr.min(), pe_Om_arr.max())
-                             if pe_Om_arr.size else ("?", "?"))
-                    _fail("xcheck_cosmology",
-                          f"PE export uses per-event cosmologies with H0 in "
-                          f"{h0rng} and Om0 in {omrng} that do not all match the "
-                          f"single selection cosmology (H0={sel_H0}, "
-                          f"Om0={sel_Om}). Re-export the selection under a "
-                          f"matching cosmology, or use a single-cosmology PE "
-                          f"export.")
-                results["xcheck_cosmology"] = True
-            else:
-                pe_H0 = pe_attrs.get("pe_cosmology_H0")
-                pe_Om = pe_attrs.get("pe_cosmology_Om0")
-                if pe_H0 is not None and abs(float(pe_H0) - float(sel_H0)) >= 1.0:
-                    _fail("xcheck_cosmology",
-                          f"PE cosmology H0={pe_H0} disagrees with selection "
-                          f"H0={sel_H0} (|Δ| >= 1.0).")
-                if pe_Om is not None and abs(float(pe_Om) - float(sel_Om)) >= 0.05:
-                    _fail("xcheck_cosmology",
-                          f"PE cosmology Om0={pe_Om} disagrees with selection "
-                          f"Om0={sel_Om} (|Δ| >= 0.05).")
-                results["xcheck_cosmology"] = True
+        # (c) Cosmology agreement (the v1 tolerances), against the cosmology
+        # each campaign's pdraw actually used -- not the selection's scalar,
+        # which is the constructor default (review 2026-10-20).
+        _xcheck_cosmology(_fail, results, pe_attrs, sel_attrs)
 
         # (d) Source-class compatibility.
         #
@@ -751,11 +878,19 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
         # (e) The detection cut: same statistic, same threshold.
         _xcheck_detection_cut(_fail, results, pe_attrs, sel_attrs)
 
+        # (e1) The same z_max is the same truncation only at the same distance.
+        _xcheck_z_max_distance(_fail, results, pe_attrs, sel_attrs)
+
         # (e2) Per-campaign selection cosmology (GW-09).
         _xcheck_campaign_cosmology(_check, results, sel_attrs)
 
         # (e2b) Mock-data provenance on the two sides.
         _xcheck_mock_data(results, pe_attrs, sel_attrs)
+
+        # (e2c) A cumulative mixture must detect something in every PE
+        # event's run.
+        if bool(sel_attrs.get("cumulative_mixture", False)):
+            _xcheck_mixture_event_runs(_fail, results, pe_attrs, sel_attrs)
 
         # (e3) The same chi_eff prior implementation on both sides (GW-40i).
         _xcheck_chi_eff_prior_impl(_fail, results, pe_attrs, sel_attrs,
@@ -919,6 +1054,145 @@ def _xcheck_mock_data(results, pe_attrs, sel_attrs):
     results["xcheck_mock_data"] = True
 
 
+#: Leap seconds GPS - UTC from each UTC date on (none since 2017-01-01).
+_GPS_LEAP_SECONDS = ((2012, 7, 1, 16), (2015, 7, 1, 17), (2017, 1, 1, 18))
+
+
+def _event_gps_span(name):
+    """The GPS time of an event NAME, as a ``(start, end)`` span, or ``None``.
+
+    ``GWyymmdd_hhmmss`` is a UTC time and gives a zero-width span; a bare
+    ``GWyymmdd`` gives its whole UTC day.  Anything else (synthetic names) is
+    ``None``: the files record no event times, so the name is the only clock.
+    """
+    import datetime as _dt
+    import re as _re
+
+    m = _re.fullmatch(r"GW(\d{2})(\d{2})(\d{2})(?:_(\d{2})(\d{2})(\d{2}))?",
+                      str(name).strip())
+    if m is None:
+        return None
+    y, mo, d = (int(x) for x in m.group(1, 2, 3))
+    try:
+        t0 = _dt.datetime(2000 + y, mo, d)
+        if m.group(4) is not None:
+            t0 = t0.replace(hour=int(m.group(4)), minute=int(m.group(5)),
+                            second=int(m.group(6)))
+    except ValueError:
+        return None
+
+    def _gps(t):
+        leap = 0
+        for yy, mm, dd, n in _GPS_LEAP_SECONDS:
+            if t >= _dt.datetime(yy, mm, dd):
+                leap = n
+        return (t - _dt.datetime(1980, 1, 6)).total_seconds() + leap
+
+    if m.group(4) is not None:
+        g = _gps(t0)
+        return g, g
+    return _gps(t0), _gps(t0 + _dt.timedelta(days=1)) - 1.0
+
+
+def _event_run(name):
+    """The observing run of an event name (official exposure windows), or
+    ``None`` when the name gives no time, or a time in no single window."""
+    from ..observing_runs import EXPOSURE_WINDOWS_GPS, RunWindowError, run_of_gps
+
+    span = _event_gps_span(name)
+    if span is None:
+        return None
+    try:
+        lo = run_of_gps(span[0], EXPOSURE_WINDOWS_GPS)
+        hi = run_of_gps(span[1], EXPOSURE_WINDOWS_GPS)
+    except RunWindowError:
+        return None
+    return lo if lo == hi else None
+
+
+def _xcheck_mixture_event_runs(_fail, results, pe_attrs, sel_attrs):
+    """Every PE event's run must have detectable rows in the mixture.
+
+    A cumulative-mixture selection records, per run, how many rows it wrote
+    (``n_detected_per_run``) and which detection rule applied
+    (``detection_rule_per_run``).  An acknowledged FAR-only export detects
+    nothing in O1/O2 (rule ``none(semianalytic_rows_excluded)``): it is correct
+    only for an event list with no O1/O2 events, and nothing compared the two.
+    Each PE event is placed in a run by the time in its name (official
+    exposure windows); an event in a run the mixture does not cover, or covers
+    with no detectable rows, enters the likelihood with no term for its run in
+    mu, which is refused.
+
+    With other campaigns in the product, an event outside the mixture's runs
+    may be covered by one of them (the files record no campaign time ranges),
+    so that case warns.  Names that give no time (synthetic events) warn.
+    """
+    names = pe_attrs.get("event_names")
+    runs = sel_attrs.get("run_labels")
+    if (names is None or runs is None
+            or sel_attrs.get("n_detected_per_run") is None
+            or sel_attrs.get("detection_rule_per_run") is None):
+        # The sel_mixture_has_* checks report a missing per-run record; a PE
+        # file without event_names has nothing to place.
+        results["xcheck_mixture_event_runs"] = True
+        return
+    runs = [_impl_str(r) for r in np.atleast_1d(runs)]
+    n_per = np.atleast_1d(np.asarray(
+        sel_attrs["n_detected_per_run"])).astype(int)
+    rules = [_impl_str(r) for r in np.atleast_1d(
+        sel_attrs["detection_rule_per_run"])]
+    if not (len(runs) == n_per.size == len(rules)):
+        # The alignment checks above have failed already.
+        results["xcheck_mixture_event_runs"] = True
+        return
+    n_camp = len(np.atleast_1d(
+        sel_attrs.get("campaign_kind_per_campaign", [""])))
+    detectable = {r: (int(n) > 0 and not rule.startswith("none"))
+                  for r, n, rule in zip(runs, n_per, rules)}
+    blind, outside, untimed = [], [], []
+    for n in (_impl_str(x) for x in np.atleast_1d(names)):
+        if _event_gps_span(n) is None:
+            untimed.append(n)
+            continue
+        r = _event_run(n)
+        if r is None or r not in detectable:
+            outside.append((n, r))
+        elif not detectable[r]:
+            blind.append((n, r))
+    if blind:
+        by_run = {}
+        for n, r in blind:
+            by_run.setdefault(r, []).append(n)
+        _fail("xcheck_mixture_event_runs",
+              f"{len(blind)} PE event(s) lie in run(s) where the cumulative-"
+              f"mixture selection detects nothing: "
+              + "; ".join(f"{r} [{len(v)}]: {v[:5]}"
+                          for r, v in sorted(by_run.items()))
+              + f" (n_detected_per_run={dict(zip(runs, n_per.tolist()))}, "
+                f"detection_rule_per_run={dict(zip(runs, rules))}). Those "
+                f"events enter the likelihood with no term for their run in "
+                f"mu. Drop them from the PE export (--event-list), or build "
+                f"the selection with --snr-threshold so the semianalytic rows "
+                f"are detected.")
+    if outside:
+        msg = (f"{len(outside)} PE event(s) lie outside every run of the "
+               f"cumulative mixture ({runs}): "
+               + ", ".join(f"{n} ({r or 'no official run window'})"
+                           for n, r in outside[:10])
+               + ". Their exposure is not in this mixture.")
+        if n_camp > 1:
+            warnings.warn(msg + " Another campaign of this product may cover "
+                                "them; the files cannot show which.")
+        else:
+            _fail("xcheck_mixture_event_runs", msg)
+    if untimed:
+        warnings.warn(
+            f"{len(untimed)} PE event name(s) carry no GPS time (e.g. "
+            f"{untimed[:3]}), so whether the cumulative mixture detects "
+            f"anything in their runs cannot be checked.")
+    results["xcheck_mixture_event_runs"] = True
+
+
 def _xcheck_source_class_estimator(_fail, results, pe_attrs, sel_attrs):
     """The two source-class cuts must act on the same quantity (GW-12).
 
@@ -973,10 +1247,13 @@ def _xcheck_detection_cut(_fail, results, pe_attrs, sel_attrs):
         real production configuration, not an error: the shipped BBH product
         selects events by *name whitelist* (``far_policy="none"``, no
         ``far_max``) while the injection set applies FAR < 1/yr.  Whether the
-        whitelist is equivalent to the injection cut is a claim about the data
-        -- for the shipped list it was checked directly, and 0 of 249
-        resolvable events violate FAR < 1/yr -- and no attr in either file can
-        establish it.  Refusing here would reject a pairing that is correct;
+        whitelist is equivalent to the injection cut is a claim about the data,
+        and no attr in either file can establish it.  For the shipped list only
+        one direction was checked: none of its 249 resolvable events has
+        FAR >= 1/yr.  The other direction -- every in-window candidate with
+        FAR < 1/yr is on the list -- was not, and does not hold as stated
+        (GW230630_070659, O4a, FAR 0.47/yr, has no released PE and is not on
+        it).  Refusing here would reject a pairing that may be correct;
         warning says the equivalence has to be established elsewhere.
       * **The PE side applied a FAR cut and kept events whose FAR was unknown**
         (``allow_missing_far``) -> FAIL.  That one *is* self-contradictory
@@ -1206,6 +1483,155 @@ def _xcheck_chi_eff_prior_impl(_fail, results, pe_attrs, sel_attrs, *,
                   f"chi_eff_prior_impl={sel_impl!r} (expected 'exact'). "
                   f"Re-export without --legacy-grid-priors.")
     results["xcheck_chi_eff_prior_impl"] = True
+
+
+def _pe_cosmologies(_fail, pe_attrs):
+    """The ``(H0, Om0)`` pairs the PE file's source-frame columns were computed
+    under: one per event when ``cosmology_per_event_varies``, else the file's
+    single cosmology (``[]`` when it records none).
+
+    A varying-cosmology file without per-event arrays of length ``nobs`` is
+    refused: the cross-check used to run over empty arrays and pass.
+    """
+    nobs = int(pe_attrs.get("nobs", 0))
+    if bool(pe_attrs.get("cosmology_per_event_varies", False)):
+        H = np.asarray(pe_attrs.get("cosmology_H0_per_event", []),
+                       dtype=float).ravel()
+        O = np.asarray(pe_attrs.get("cosmology_Om0_per_event", []),
+                       dtype=float).ravel()
+        if not (H.size == O.size == nobs and nobs > 0
+                and np.all(np.isfinite(H)) and np.all(np.isfinite(O))):
+            _fail("xcheck_cosmology",
+                  f"PE cosmology_per_event_varies=True but "
+                  f"cosmology_H0_per_event / cosmology_Om0_per_event hold "
+                  f"{H.size} / {O.size} entries (finite: "
+                  f"{int(np.isfinite(H).sum())} / {int(np.isfinite(O).sum())}) "
+                  f"for nobs={nobs}, so the cosmology of the source-frame "
+                  f"columns cannot be compared with the selection's.")
+        return list(zip(H.tolist(), O.tolist()))
+    H0, Om0 = pe_attrs.get("pe_cosmology_H0"), pe_attrs.get("pe_cosmology_Om0")
+    if H0 is None and Om0 is None:
+        return []
+    return [(float("nan") if H0 is None else float(H0),
+             float("nan") if Om0 is None else float(Om0))]
+
+
+def _sel_cosmologies(sel_attrs):
+    """``(pairs, n_without, source)``: the cosmologies the selection's pdraw
+    used, one per campaign that used one; how many campaigns used none (an
+    ``events``-format campaign reads its own ddL/dz); and where the answer came
+    from (``"per_campaign"``, or ``"scalar"`` on a file written before the
+    per-campaign record, whose scalar is all there is)."""
+    src = sel_attrs.get("cosmology_source_per_campaign")
+    H = np.atleast_1d(np.asarray(
+        sel_attrs.get("cosmology_H0_per_campaign", []), dtype=float)).ravel()
+    O = np.atleast_1d(np.asarray(
+        sel_attrs.get("cosmology_Om0_per_campaign", []), dtype=float)).ravel()
+    if src is not None and len(np.atleast_1d(src)) == H.size == O.size:
+        ok = np.isfinite(H) & np.isfinite(O)
+        return (list(zip(H[ok].tolist(), O[ok].tolist())),
+                int(np.sum(~ok)), "per_campaign")
+    H0, Om0 = sel_attrs.get("cosmology_H0"), sel_attrs.get("cosmology_Om0")
+    if H0 is None or Om0 is None:
+        return [], 0, "scalar"
+    return [(float(H0), float(Om0))], 0, "scalar"
+
+
+def _xcheck_cosmology(_fail, results, pe_attrs, sel_attrs):
+    """The PE cosmology against the cosmology each selection campaign used.
+
+    The tolerances are the v1 ones (``|dH0| >= 1.0`` or ``|dOm0| >= 0.05``
+    fails).  The selection side is ``cosmology_*_per_campaign`` -- the
+    cosmology that entered each campaign's pdraw, NaN for a campaign that used
+    none -- not the scalar ``cosmology_H0``/``Om0``, which is the constructor
+    default and the cosmology of no campaign (review 2026-10-20); the scalar is
+    used only for a file written before the per-campaign record.
+    """
+    pe_cos = _pe_cosmologies(_fail, pe_attrs)
+    sel_cos, _, sel_src = _sel_cosmologies(sel_attrs)
+    bad = [(ph, po, sh, so) for ph, po in pe_cos for sh, so in sel_cos
+           if (np.isfinite(ph) and abs(ph - sh) >= 1.0)
+           or (np.isfinite(po) and abs(po - so) >= 0.05)]
+    if bad:
+        pe_h = sorted({round(b[0], 6) for b in bad})
+        pe_o = sorted({round(b[1], 6) for b in bad})
+        sel_u = sorted({(round(b[2], 6), round(b[3], 6)) for b in bad})
+        where = ("per-campaign cosmology (cosmology_H0/Om0_per_campaign)"
+                 if sel_src == "per_campaign"
+                 else "scalar cosmology_H0/Om0 (a file without the "
+                      "per-campaign record)")
+        _fail("xcheck_cosmology",
+              f"PE cosmology H0 {pe_h[:5]} / Om0 {pe_o[:5]} disagrees with the "
+              f"selection's {where} (H0, Om0) = {sel_u} (|dH0| >= 1.0 or "
+              f"|dOm0| >= 0.05). A campaign's cosmology is the one its "
+              f"injections were generated under, so re-exporting the selection "
+              f"under another cosmology is not a fix; export the PE file under "
+              f"a cosmology within tolerance, or check that the pair is the "
+              f"intended one.")
+    results["xcheck_cosmology"] = True
+
+
+#: Relative agreement required of the two sides' z_max truncation distances.
+_ZMAX_DL_RTOL = 1e-6
+
+
+def _xcheck_z_max_distance(_fail, results, pe_attrs, sel_attrs):
+    """Equal ``z_max`` must be an equal truncation in distance.
+
+    The PE export drops samples with ``z(dL; event cosmology) > z_max``, and
+    the selection drops injections with injected ``z > z_max``, i.e. with
+    ``dL > dL(z_max; campaign cosmology)``.  Compared as numbers, z_max = 1
+    matched while the O3 events were truncated at dL = 6798.0 Mpc and the
+    injections at 6785.9 Mpc.  So when both sides state the same z_max, every
+    cosmology defining it -- each PE event's and each campaign's -- must give
+    the same luminosity distance at z_max (relative ``_ZMAX_DL_RTOL``).  A
+    campaign that records no cosmology (an ``events``-format file with its own
+    redshifts) warns: its distance edge is not in the files.
+    """
+    def _f(x):
+        try:
+            return float(np.asarray(x).ravel()[0])
+        except (TypeError, ValueError, IndexError):
+            return float("nan")
+
+    pe_z, sel_z = _f(pe_attrs.get("z_max")), _f(sel_attrs.get("z_max"))
+    if not (np.isfinite(pe_z) and np.isfinite(sel_z)
+            and np.isclose(pe_z, sel_z, rtol=1e-12, atol=0.0)):
+        # Unequal or unstated truncations are judged by _xcheck_detection_cut.
+        results["xcheck_z_max_distance"] = True
+        return
+    from ..cosmology import make_cosmology
+
+    pe_cos = _pe_cosmologies(_fail, pe_attrs)
+    sel_cos, n_without, sel_src = _sel_cosmologies(sel_attrs)
+    if sel_src == "scalar":
+        # The scalar is no campaign's cosmology; nothing to compare it with.
+        sel_cos, n_without = [], max(1, int(sel_attrs.get("n_campaigns", 1)))
+    edges = []
+    for side, pairs in (("PE", pe_cos), ("selection", sel_cos)):
+        for h, o in sorted({(round(h, 8), round(o, 8)) for h, o in pairs
+                            if np.isfinite(h) and np.isfinite(o)}):
+            d = float(make_cosmology(h, o).luminosity_distance(pe_z).value)
+            edges.append((side, h, o, d))
+    if edges:
+        ds = np.array([e[3] for e in edges])
+        if ds.max() - ds.min() > _ZMAX_DL_RTOL * ds.max():
+            _fail("xcheck_z_max_distance",
+                  f"both sides state z_max={pe_z}, but it is not one "
+                  f"truncation: "
+                  + "; ".join(f"{side} (H0={h}, Om0={o}) cuts at dL = "
+                              f"{d:.1f} Mpc" for side, h, o, d in edges)
+                  + ". The PE side converts each sample's dL to z under the "
+                    "event's cosmology and the selection cuts the injected z "
+                    "of a campaign generated under its own, so the two "
+                    "integrate over different distance ranges. Export both "
+                    "under the cosmology of the injections, or drop z_max.")
+    if n_without:
+        warnings.warn(
+            f"z_max={pe_z}: {n_without} selection campaign(s) record no "
+            f"cosmology, so the distance at which their injections are "
+            f"truncated cannot be compared with the PE side's.")
+    results["xcheck_z_max_distance"] = True
 
 
 def _xcheck_campaign_cosmology(_check, results, sel_attrs):
@@ -1479,6 +1905,64 @@ def _xcheck_reference_pair(_check, _fail, results, pe_attrs, sel_attrs,
             f"spin_reference_coverage_per_campaign.")
 
 
+#: How much larger than every in-support pdraw the out-of-reference sentinel
+#: must be: its inverse weight is then at least this factor below any real
+#: row's, i.e. zero to every precision a selection integral is computed at.
+_SENTINEL_MIN_RATIO = 1e100
+
+
+def _reference_sentinel_checks(_check, attrs, cols):
+    """The ``chieff_reference`` sentinel rows against ``a1``/``a2``.
+
+    The builder writes ``spin_reference_excluded_pdraw`` (default 1e300) at
+    exactly the rows with ``a1 > a_ref`` or ``a2 > a_ref`` (or no magnitude),
+    and counts them in ``spin_reference_excluded_rows``.  Checked here: the two
+    row sets are identical, the count matches, and the sentinel is so large
+    that its inverse weight is negligible against every in-support row.
+    """
+    if not all(k in cols for k in ("pdraw", "a1", "a2")):
+        return  # the sel_has_* checks above have already failed
+    pd = np.asarray(cols["pdraw"], dtype=float)
+    a1 = np.asarray(cols["a1"], dtype=float)
+    a2 = np.asarray(cols["a2"], dtype=float)
+    if not (pd.shape == a1.shape == a2.shape):
+        return  # the length checks above have already failed
+    names = ("spin_reference_amax", "spin_reference_excluded_pdraw",
+             "spin_reference_excluded_rows")
+    missing = [k for k in names if attrs.get(k) is None]
+    if not _check("sel_reference_sentinel_recorded", not missing,
+                  f"spin_basis='chieff_reference' but attr(s) {missing} are "
+                  f"missing, so which rows carry the zero-weight sentinel "
+                  f"cannot be checked"):
+        return
+    a_ref = float(attrs["spin_reference_amax"])
+    sentinel = float(attrs["spin_reference_excluded_pdraw"])
+    n_rec = int(attrs["spin_reference_excluded_rows"])
+    outside = ~((a1 <= a_ref) & (a2 <= a_ref))
+    is_sent = pd == sentinel
+    n_in_sent = int(np.sum(is_sent & ~outside))
+    n_out_real = int(np.sum(outside & ~is_sent))
+    _check("sel_reference_sentinel_rows", n_in_sent == 0 and n_out_real == 0,
+           f"{n_in_sent} row(s) with a1, a2 <= a_ref={a_ref} carry the "
+           f"out-of-reference sentinel pdraw={sentinel:.3e} (their weight is "
+           f"zeroed: beta biased low), and {n_out_real} row(s) with a1 or a2 "
+           f"> a_ref carry a real pdraw (the reference prior is zero there: "
+           f"beta biased high)")
+    _check("sel_reference_excluded_rows_count", int(np.sum(is_sent)) == n_rec,
+           f"{int(np.sum(is_sent))} rows carry the sentinel but "
+           f"spin_reference_excluded_rows={n_rec}")
+    real = pd[~is_sent]
+    if outside.any() and real.size and np.all(np.isfinite(real)):
+        top = float(np.max(real))
+        _check("sel_reference_sentinel_negligible",
+               np.isfinite(sentinel) and sentinel >= _SENTINEL_MIN_RATIO * top,
+               f"spin_reference_excluded_pdraw={sentinel:.3e} is not far above "
+               f"the largest in-support pdraw {top:.3e} (required: at least "
+               f"{_SENTINEL_MIN_RATIO:.0e} times larger), so the "
+               f"out-of-reference rows the attrs call zero-weight carry a "
+               f"real weight")
+
+
 def _fit_columns_present(_check, attrs, present, prefix):
     """Every coordinate a file DECLARES must exist as a dataset in it (GW-37).
 
@@ -1547,6 +2031,80 @@ def _sky_checks(_check, cols, prefix, sky_available=None):
                f"{name} outside [{lo:.6g}, {hi_:.6g}] radians "
                f"(min={f_.min():.6g}, max={f_.max():.6g}) -- degrees, "
                f"colatitude or a sign convention?")
+
+
+def _sky_rows_follow_campaigns(_check, cols, flags):
+    """NaN-sky rows must be the rows of the campaigns that drew no sky.
+
+    Rows are written campaign by campaign, in campaign order, so with
+    ``sky_position_available`` per campaign the NaN rows must form whole
+    blocks in the places the flags allow -- a skyless campaign's rows are all
+    NaN and a sky campaign's all finite.  The files do not record each
+    campaign's written row count, so this checks the ORDER of the NaN and
+    finite runs against the flags (a campaign with no rows may be skipped),
+    which catches NaN rows inside a sky campaign unless they touch a skyless
+    campaign's block; and it requires ra and dec to be NaN on the same rows.
+    """
+    if "ra" not in cols or "dec" not in cols:
+        return
+    ra = np.asarray(cols["ra"], dtype=float)
+    dec = np.asarray(cols["dec"], dtype=float)
+    if ra.shape != dec.shape or not ra.size:
+        return
+    nan_ra, nan_dec = ~np.isfinite(ra), ~np.isfinite(dec)
+    _check("sel_sky_nan_rows_paired", np.array_equal(nan_ra, nan_dec),
+           f"{int(np.sum(nan_ra != nan_dec))} rows have exactly one of ra/dec "
+           f"non-finite; a campaign without a sky has neither")
+    row_nan = nan_ra | nan_dec
+    starts = np.concatenate(([0], np.flatnonzero(row_nan[1:] != row_nan[:-1])
+                             + 1))
+    runs = row_nan[starts]                 # True = a NaN run
+    skyless = ~np.asarray(flags, dtype=bool)
+    ptr, ok = 0, True
+    for v in runs:
+        while ptr < skyless.size and bool(skyless[ptr]) != bool(v):
+            ptr += 1
+        if ptr == skyless.size:
+            ok = False
+            break
+        ptr += 1
+    _check("sel_sky_nan_rows_follow_campaigns", ok,
+           f"the NaN-sky rows form {int(runs.sum())} block(s) and the finite "
+           f"rows {int((~runs).sum())}, in an order the per-campaign "
+           f"sky_position_available={flags.tolist()} cannot produce: some "
+           f"NaN sky rows lie inside a campaign that drew a sky, and would "
+           f"reach hp.ang2pix as NaN")
+
+
+def _mass_distance_checks(_check, cols, prefix):
+    """Masses, distance and redshift: finite, positive and ordered.
+
+    The validator's only finiteness checks were on ``p_pe``/``pdraw`` and the
+    sky (August review, export-sel 4; review 2026-10-20), so a file with NaN or
+    negative ``dL``, NaN masses, ``m2 > m1`` or a negative redshift passed.
+    Every mass and ``dL`` must be finite and > 0, ``redshift`` finite and > 0,
+    ``m2 <= m1`` in both frames, and ``q`` (when written) in ``(0, 1]``.
+    """
+    for name in ("m1det", "m2det", "m1src", "m2src", "dL", "redshift"):
+        if name in cols and cols[name].size:
+            v = np.asarray(cols[name], dtype=float)
+            bad = ~(np.isfinite(v) & (v > 0.0))
+            _check(f"{prefix}_{name}_finite_positive", not bad.any(),
+                   f"{int(bad.sum())} of {v.size} {name} values are "
+                   f"non-finite or <= 0")
+    for m1, m2 in (("m1det", "m2det"), ("m1src", "m2src")):
+        if m1 in cols and m2 in cols and cols[m1].shape == cols[m2].shape:
+            a = np.asarray(cols[m1], dtype=float)
+            b = np.asarray(cols[m2], dtype=float)
+            n_bad = int(np.sum(b > a * (1.0 + _TOL)))
+            _check(f"{prefix}_{m2}_le_{m1}", n_bad == 0,
+                   f"{n_bad} rows have {m2} > {m1}; the mass density is in "
+                   f"(m1, q = m2/m1 <= 1)")
+    if "q" in cols and cols["q"].size:
+        q = np.asarray(cols["q"], dtype=float)
+        bad = ~(np.isfinite(q) & (q > 0.0) & (q <= 1.0 + _TOL))
+        _check(f"{prefix}_q_range", not bad.any(),
+               f"{int(bad.sum())} of {q.size} q values are outside (0, 1]")
 
 
 def _range_checks(_check, cols, amax, prefix):

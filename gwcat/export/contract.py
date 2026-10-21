@@ -1,11 +1,20 @@
 """The pairing contract and its hash (GW-22, design PR-G).
 
 A PE export and a selection export are only meaningfully paired if they agree
-about *what was fitted and under what assumptions*.  Today that agreement is
-checked field by field in the validator, which means every new field is a new
-check somebody has to remember to add.  A ``contract_hash`` makes the agreement
-one comparison, and -- more importantly -- makes a DISAGREEMENT detectable on a
-file that looks entirely healthy.
+about *what was fitted and under what assumptions*.  That agreement is checked
+field by field in the validator, which means every new field is a new check
+somebody has to remember to add.  A ``contract_hash`` turns the subset of the
+agreement that is an exact equality (:data:`PAIRING_FIELDS`) into one
+comparison, and makes a DISAGREEMENT in that subset detectable on a file that
+looks entirely healthy.
+
+It is NOT the whole pairing check.  Equal hashes say nothing about the fields
+it leaves out on purpose -- the detection cut, the cosmology, the PE and
+selection spin ceilings, the chi_eff prior implementation (``chi_eff_prior_impl``)
+and ``mock_data``; see "Why the rest are recorded but NOT hashed" below.  Those
+are compared by :func:`gwcat.export.validate.validate_export_v2`, so a consumer
+that only compares hashes (darksirens-core's pairing gate does) must also run
+the validator, or accept that those fields are unchecked.
 
 The contract, and the subset that is hashed
 -------------------------------------------
@@ -24,6 +33,22 @@ pairing to mean anything.
   must be the same convention on both sides or it does not cancel.
 * canonical ``source_class`` -- a filtered PE file paired with an unfiltered
   selection file is a silent bias.
+* ``source_class_cut_estimator`` / ``source_class_mass_threshold`` -- WHICH
+  quantity the class cut was applied to, and at what mass, on a side that
+  carries a class filter (``None`` on a side that does not).  The classes alone
+  hashed equal for a PE file cut on posterior-median masses and a selection
+  file cut on injected truth -- the pair ``validate`` refuses (GW-12) -- so a
+  consumer that compares only the hash accepted it.  The raw estimator is not
+  hashed on an unfiltered side, because a name-whitelisted PE file
+  (``name_whitelist``) and an unfiltered selection file (``none``) are a
+  correct pair that states different estimators.
+* ``z_max`` -- the redshift truncation.  The validator fails a pair whose two
+  stated truncations differ, and an equal digest used to hide one.
+
+These last three were added to the digest after 2.1 shipped, so they enter it
+only when SET (:data:`_PAIRING_FIELDS_WHEN_SET`): a contract that states none of
+them -- no class filter, no truncation -- hashes exactly as it did before, and a
+2.1 file written earlier still pairs with one written now.
 
 The effective event selection (GW-33)
 -------------------------------------
@@ -35,7 +60,9 @@ contract therefore also carries every OTHER effective cut
 (:data:`SELECTION_CONTRACT_FIELDS`), plus two deterministic digests: one over the
 name whitelist that was requested and one over the event list actually written.
 They are recorded and diffed rather than hashed -- an injection campaign has no
-event list to digest, so an equality hash over them could never match.
+event list to digest, so an equality hash over them could never match.  The
+exceptions are ``z_max`` and the two class-cut fields, which both sides state
+the same way on a correct pair and which enter the hash when set (above).
 
 Why the rest are recorded but NOT hashed
 ----------------------------------------
@@ -59,7 +86,12 @@ the digest differ on every correct pair, which is how a check stops being read.
 The PE and selection ``amax`` are in neither: they legitimately DIFFER, because
 the PE side removes the posterior's own spin prior (ceiling ~0.99) while the
 selection side swaps the injected draw (endo3 injects 0.998).  That stays a
-warn-not-fail cross-check.
+warn-not-fail cross-check.  (For the chieff/chieff_reference pair, where the
+two ceilings must be EQUAL, the validator requires it.)
+
+``chi_eff_prior_impl`` is in neither: it is a file attr, not a contract field,
+and the validator fails a pair whose two sides record different
+implementations.
 
 ``mock_data`` is in neither, deliberately.  The contract declares the density
 and the cuts a pair must share; whether the samples are synthetic is data
@@ -73,6 +105,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 
 #: The effective-event-selection fields (GW-33), read off a product's
 #: ``selection_spec`` provenance by :func:`selection_contract_fields`.  Every
@@ -93,6 +126,11 @@ SELECTION_CONTRACT_FIELDS = (
     "allowed_names_digest",
     "event_list_digest",
     "selection_spec_digest",
+    # The class cut's ESTIMATOR and mass threshold, on a side that carries a
+    # class filter (both sides write them, so they are read off the attrs
+    # rather than the PE-only selection_spec).  See the module docstring.
+    "source_class_cut_estimator",
+    "source_class_mass_threshold",
 )
 
 #: Fields, in a fixed order, that constitute the full declared contract.
@@ -124,6 +162,18 @@ PAIRING_FIELDS = (
     "spin_density_exact",
     "sky_prior_in_density",
     "source_class",
+    "source_class_cut_estimator",
+    "source_class_mass_threshold",
+    "z_max",
+)
+
+#: The :data:`PAIRING_FIELDS` added after format 2.1 shipped.  Each enters the
+#: digest only when it is set (not ``None``), so a contract that states none of
+#: them hashes exactly as it did before they existed.
+_PAIRING_FIELDS_WHEN_SET = (
+    "source_class_cut_estimator",
+    "source_class_mass_threshold",
+    "z_max",
 )
 
 #: Length of the hex digest.  16 hex chars = 64 bits: ample for detecting an
@@ -169,6 +219,10 @@ def event_list_digest(names) -> str:
     what lets a contract state its event selection without carrying (and
     round-tripping) the whole list.
 
+    Because it digests a set, it cannot show that a file holds an event more
+    than once: a file that writes one event twice has the digest of the list
+    that names it once.  The validator checks ``event_names`` for duplicates.
+
     ``None`` -- "no list recorded" -- returns ``""``, which is distinct from the
     digest of the empty list.
     """
@@ -198,6 +252,24 @@ def selection_contract_fields(attrs) -> dict:
             v = v.decode()
         s = str(v).strip()
         return s or None
+
+    # The class cut, from the attrs both sides write (GW-12): which quantity
+    # it was applied to, and at what mass.  Only on a side that HAS a class
+    # filter -- an unfiltered side states None, so a name-whitelisted PE file
+    # and an unfiltered selection file (estimators 'name_whitelist' / 'none')
+    # still agree.  A filtered side that does not record its estimator states
+    # "unrecorded", which matches no real estimator.
+    if _text(attrs.get("source_class_filter")):
+        from ..source_class import CUT_ESTIMATOR_ATTR
+        out["source_class_cut_estimator"] = (
+            _text(attrs.get(CUT_ESTIMATOR_ATTR)) or "unrecorded")
+        thr = attrs.get("nsbh_mass_threshold")
+        try:
+            thr = None if thr is None else float(thr)
+        except (TypeError, ValueError):
+            thr = None
+        out["source_class_mass_threshold"] = (
+            thr if thr is not None and math.isfinite(thr) else None)
 
     raw = _text(attrs.get("selection_spec"))
     try:
@@ -242,9 +314,13 @@ def contract_hash(contract: dict) -> str:
 
     Deliberately not over every field: the digest exists to be compared between
     a PE file and its selection file, so a field the two sides legitimately
-    state differently would make it mismatch on every correct pair.
+    state differently would make it mismatch on every correct pair.  The fields
+    in :data:`_PAIRING_FIELDS_WHEN_SET` enter only when set, so the digest of a
+    contract that states none of them is the one format 2.1 always wrote.
     """
-    payload = json.dumps({k: contract.get(k) for k in PAIRING_FIELDS},
+    payload = json.dumps({k: contract.get(k) for k in PAIRING_FIELDS
+                          if k not in _PAIRING_FIELDS_WHEN_SET
+                          or contract.get(k) is not None},
                          sort_keys=True, separators=(",", ":"))
     return stable_digest(payload)
 
