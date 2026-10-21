@@ -24,6 +24,7 @@ Two properties every writer here holds (GW-30):
 """
 from __future__ import annotations
 
+import warnings
 from typing import Optional
 
 import h5py
@@ -163,6 +164,36 @@ def _write_pe(product, out_path, format_version, *, with_contract=False,
     return str(out_path)
 
 
+def _warn_if_core_cannot_load(product):
+    """Say at write time that darksirens-core will refuse this selection file.
+
+    Review 2026-10-20, Medium 13.  The cumulative mixtures ship no sky position
+    for their semianalytic O1/O2 rows, so every route out of them reaches core
+    without one: ``sky_marginal=True`` drops ra/dec (core's selection contract
+    requires both datasets), and the default writes NaN ra/dec that core
+    refuses through ``sky_position_available``.  No wrong number reaches core --
+    the refusal is loud -- but it comes at load time, after an export and a
+    ``gwcat validate --strict`` that both passed.  A sky-marginal file can serve
+    only a sky-independent (spectral-siren) fit in a consumer that accepts one;
+    a galaxy-catalogue selection integral needs every injection's sky position.
+    Making such a file loadable needs a sky-marginal contract agreed with core.
+    """
+    sky = np.asarray(product.attrs.get("sky_position_available", True),
+                     dtype=bool).ravel()
+    marginal = bool(product.attrs.get("sky_marginalized", False))
+    if not marginal and sky.all():
+        return
+    why = ("sky_marginalized=True: no ra/dec columns" if marginal else
+           f"sky_position_available per campaign = {sky.tolist()}: NaN ra/dec "
+           f"rows")
+    warnings.warn(
+        f"this selection product has no sky position for every injection "
+        f"({why}). darksirens-core requires finite ra/dec on every injection "
+        f"and will refuse to load it; no gwcat format makes it loadable there "
+        f"today. It can serve only a sky-independent fit in a consumer that "
+        f"accepts a sky-marginal selection.")
+
+
 def _write_selection(product, out_path, format_version, *, with_contract=False,
                      write_summary=False, summary_context=None):
     """Serialize a selection product at ``format_version`` (2.0 or 2.1)."""
@@ -181,6 +212,7 @@ def _write_selection(product, out_path, format_version, *, with_contract=False,
             "ra/dec columns) cannot be written as gwcat-selection-2.1: the 2.1 "
             "contract's fit_columns include ra/dec. Write it with the default "
             "'gwcat2' (2.0) format.")
+    _warn_if_core_cannot_load(product)
     extra_attrs = _contract_attrs(product, "selection") if with_contract else {}
 
     with atomic_output_path(out_path) as tmp_path:
