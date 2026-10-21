@@ -538,8 +538,11 @@ def refresh_bbh_list(m2_min: float = 3.0) -> list:
     list back is the one output that must never happen (GW-15).
 
     Since GW-15 the live query is restricted to the LVK GWTC catalogs, so it
-    returns the LVK-only sample (~244 names) rather than the 286 that
-    third-party catalogs inflated it to.
+    returns the LVK-only sample rather than the 286 names that third-party
+    catalogs inflated it to.  Since the 2026-10-20 review it reads every event
+    version (no ``lastver``), so the LVK versions of the O3a events whose latest
+    GWOSC version is a third-party one count again: about 272 names are
+    expected (the 2026-09-24 cumulative table), not the ~244 measured before.
 
     Example::
 

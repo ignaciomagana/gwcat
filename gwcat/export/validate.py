@@ -7,9 +7,16 @@ style exactly:
   * a ``{check_name: passed_bool}`` dict is returned;
   * internal-consistency checks respect ``strict`` (raise on the first failure
     when ``strict=True``, otherwise print ``FAIL: ...`` and record ``False``);
-  * cross-file *contract* checks ALWAYS raise ``ValueError`` on mismatch,
+  * cross-file *contract* checks raise ``ValueError`` on mismatch, mostly
     independent of ``strict`` -- a file that *looks* valid while carrying the
     wrong spin basis / cosmology / source class is exactly what must be stopped.
+    A few only warn (and record ``False``) unless ``strict=True``: a chi_eff
+    prior implementation recorded on one side only, a PE file too old to check
+    the ``chieff_reference`` spin-prior contract, a ``chieff`` PE file keeping
+    rows above the reference ceiling, a caller-forced spin ceiling that differs
+    from the detected one.  Some only ever warn: a redshift truncation or a
+    detection cut stated on one side only.  Pass ``strict=True`` whenever the
+    pair gates an analysis, and read the warnings.
 
 It validates ``format_version="gwcat-pe-2.0"`` PE exports (built by
 :func:`gwcat.export.pe_builder.build_pe_product`) and, optionally, a paired
@@ -190,8 +197,9 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
         absent means real data);
       * physical ranges as above when spin columns are present.
 
-    Cross-file contract checks (ALWAYS raise on mismatch)
-    -----------------------------------------------------
+    Cross-file contract checks (raise on mismatch; see the module docstring
+    for the few that only warn without ``strict``)
+    -----------------------------------------------------------------------
       * PE ``spin_basis`` must equal selection ``spin_basis`` (the error names
         both) -- with the single exception of a ``chieff`` PE file paired with a
         ``chieff_reference`` selection file, which are the two halves of one
@@ -254,8 +262,9 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
     selection_path : str or path-like, optional
         Path to a paired ``gwcat-selection-2.0`` selection export.
     strict : bool, default False
-        Raise on the first internal-consistency failure.  Cross-file contract
-        checks always raise on mismatch regardless of this flag.
+        Raise on the first internal-consistency failure, and on the few
+        cross-file checks that otherwise only warn (module docstring).  Most
+        cross-file contract checks raise on mismatch regardless of this flag.
     spin_prior_allow_list : optional
         The events a ``chieff`` / ``chieff_reference`` pair may carry although
         their spin prior is NOT the label's own analytic one (GW-40d; see
@@ -975,8 +984,9 @@ def validate_export_any(pe_path, selection_path=None, strict=False, *,
     selection_path : str or path-like, optional
         Paired selection export.  Must be the same generation as ``pe_path``.
     strict : bool, default False
-        Raise on the first internal-consistency failure.  Cross-file contract
-        checks always raise on mismatch regardless of this flag.
+        Raise on the first internal-consistency failure, and on the few
+        cross-file checks that otherwise only warn.  Most cross-file contract
+        checks raise on mismatch regardless of this flag.
     require_exact_priors : bool, default False
         See :func:`validate_export_v2`; a v1 pair is refused.
 
