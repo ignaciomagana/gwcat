@@ -29,6 +29,8 @@
      manifest; an alias is its release (one directory, fetched once); the CLI
      fills the store's record_id / file_checksum; the GWOSC event table also
      answers to the full names of the O1/O2 events.
+ 10. The BBH whitelist's cache-discovery and refresh helpers, which nothing
+     exercised.
 
 Every test is offline: GWOSC and Zenodo are monkeypatched.
 """
@@ -842,3 +844,53 @@ def test_the_event_table_answers_to_the_full_o1o2_names(monkeypatch):
     assert table["GW150914"]["far"] == pytest.approx(1e-7)   # still there
     # a full-name entry GWOSC publishes itself is never overwritten
     assert table["GW170104_101158"]["far"] == pytest.approx(3.0)
+
+
+# ==========================================================================
+# 10. The BBH whitelist's cache and refresh helpers
+# ==========================================================================
+def test_cached_gwtc5_names_are_discovered_from_local_file_names(tmp_path):
+    from gwcat import bbh_allowed_names as ban
+    # (not tmp_path itself: its name, from this test's, contains "gwtc5")
+    tmp_path = tmp_path / "data"
+    (tmp_path / "GWTC-5" / "sub").mkdir(parents=True)
+    (tmp_path / "GWTC-5" / "IGWN-GWTC5p0-GW240101_000001-combined.hdf5"
+     ).write_bytes(b"")
+    (tmp_path / "GWTC-5" / "sub" / "GW240102_000002.hdf5").write_bytes(b"")
+    (tmp_path / "GWTC-5" / "GW230529_181500.hdf5").write_bytes(b"")  # NSBH
+    (tmp_path / "GWTC-5" / fetch.FETCH_MANIFEST_NAME).write_text("{}")
+    (tmp_path / "my_o4b_copy").mkdir()          # a custom spelling
+    (tmp_path / "my_o4b_copy" / "GW240103_000003.hdf5").write_bytes(b"")
+    (tmp_path / "GWTC-3").mkdir()               # not GWTC-5: ignored
+    (tmp_path / "GWTC-3" / "GW200101_000004_cosmo.h5").write_bytes(b"")
+    assert ban._discover_cached_gwtc5_names(tmp_path) == {
+        "GW240101_000001", "GW240102_000002", "GW240103_000003"}
+    assert ban._discover_cached_gwtc5_names(tmp_path / "missing") == set()
+
+
+def test_gwtc5_names_are_read_from_a_store(tmp_path):
+    import h5py
+    from gwcat import bbh_allowed_names as ban
+    path = tmp_path / "store.h5"
+    with h5py.File(path, "w") as f:
+        f.create_dataset("index/event_names", data=[
+            b"GW240101_000001", b"GW200101_000004", b"GW230529_181500"])
+        f.create_dataset("meta/catalog", data=[b"GWTC-5", b"GWTC-3",
+                                               b"GWTC-5"])
+    assert ban._read_store_gwtc5_names(path) == {"GW240101_000001"}
+
+
+def test_refresh_returns_the_live_list_and_never_the_static_one(monkeypatch,
+                                                                 capsys):
+    from gwcat import bbh_allowed_names as ban
+    live = sorted(ban.BBH_ALL[:3] + ["GW230529_181500", "GW250101_000000"])
+    monkeypatch.setattr(fetch, "fetch_bbh_names_gwosc", lambda **kw: live)
+    names = ban.refresh_bbh_list()
+    assert names == sorted(set(live) - ban.NON_BBH_EXCLUSIONS)
+    assert "GW250101_000000" in capsys.readouterr().out
+
+    def _down(**kw):
+        raise OSError("no route to host")
+    monkeypatch.setattr(fetch, "fetch_bbh_names_gwosc", _down)
+    with pytest.raises(OSError):
+        ban.refresh_bbh_list()
