@@ -136,22 +136,32 @@ def _stamp_legacy_spin_attrs(f, product):
         distinguish "no chi_eff prior was applied" from "this file does not
         say", and only the first is a statement it can act on.
     """
-    if product.spin_basis == "chieff":
-        f.attrs["spin_prior_mode"] = "include"
-        f.attrs["chi_eff_prior_applied_to_p_pe"] = True
-        f.attrs["chi_eff_in_p_pe"] = True
-    else:
-        mode = {"component": "component_flat",
-                "chieff_chip": "chieff_chip_joint",
-                "nospin": "none"}.get(product.spin_basis, "unknown")
-        f.attrs["spin_prior_mode"] = mode
-        # The 1-D chi_eff prior specifically is NOT in p_pe for any of
-        # these: component carries a flat box, chieff_chip a JOINT
-        # (chi_eff, chi_p) density, nospin nothing at all.  So the legacy
-        # scalar flag is False in every case, and the basis-specific attrs
-        # written by the builder are what say what WAS applied.
-        f.attrs["chi_eff_prior_applied_to_p_pe"] = False
-        f.attrs["chi_eff_in_p_pe"] = False
+    for k, v in _legacy_spin_flags(product.spin_basis).items():
+        f.attrs[k] = v
+
+
+def _legacy_spin_flags(spin_basis):
+    """The gwcat-1.0 spin attrs :func:`_stamp_legacy_spin_attrs` writes.
+
+    One definition, so the PE summary can state the same values as the file
+    (review 2026-10-20, Low 42: a chieff_chip summary said
+    chi_eff_prior_applied_to_p_pe=True beside a file that says False).
+    """
+    if spin_basis == "chieff":
+        return {"spin_prior_mode": "include",
+                "chi_eff_prior_applied_to_p_pe": True,
+                "chi_eff_in_p_pe": True}
+    mode = {"component": "component_flat",
+            "chieff_chip": "chieff_chip_joint",
+            "nospin": "none"}.get(spin_basis, "unknown")
+    # The 1-D chi_eff prior specifically is NOT in p_pe for any of
+    # these: component carries a flat box, chieff_chip a JOINT
+    # (chi_eff, chi_p) density, nospin nothing at all.  So the legacy
+    # scalar flag is False in every case, and the basis-specific attrs
+    # written by the builder are what say what WAS applied.
+    return {"spin_prior_mode": mode,
+            "chi_eff_prior_applied_to_p_pe": False,
+            "chi_eff_in_p_pe": False}
 
 
 def _write_columns(f, columns, order, **create_kwargs):
@@ -212,6 +222,13 @@ def _write_summary(product, out_path, format_version, summary_context):
     # to be indistinguishable from a 2.0 one because it was generated while the
     # file still said 2.0.
     summary["format_version"] = format_version
+    if product.kind == "pe":
+        # The legacy spin flags as the FILE states them (Low 42), not the
+        # builder's chi_eff_included, which is True for chieff_chip's joint
+        # (chi_eff, chi_p) density.
+        flags = _legacy_spin_flags(product.spin_basis)
+        for k in ("spin_prior_mode", "chi_eff_prior_applied_to_p_pe"):
+            summary[k] = flags[k]
     if summary_context:
         summary.update(summary_context)
     write_validation_summary(out_path, summary)

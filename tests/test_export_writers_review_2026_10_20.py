@@ -253,6 +253,31 @@ def test_the_atomic_write_keeps_a_symlinked_destination(tmp_path):
 
 
 # ==========================================================================
+# Low 42. The chieff_chip summary says what the file says
+# ==========================================================================
+def test_the_chieff_chip_summary_matches_the_file_flag(tmp_path):
+    from test_export_v2_pe import _FULL_SPIN, _build_spin_store
+
+    store, _ = _build_spin_store(
+        tmp_path, [{"name": "GWn_000002", "provide": _FULL_SPIN}],
+        n_per_event=100)
+    out = tmp_path / "chip.h5"
+    GWCatalog(store).export(str(out), format="gwcat2",
+                            spin_basis="chieff_chip",
+                            allow_projection_basis=True, nsamp=32, seed=0,
+                            cosmology=(67.74, 0.3089), write_summary=True)
+    with h5py.File(out, "r") as f:
+        flag = bool(f.attrs["chi_eff_prior_applied_to_p_pe"])
+        mode = f.attrs["spin_prior_mode"]
+    with open(_summary_paths(out)[0]) as f:
+        summary = json.load(f)
+    assert flag is False
+    assert summary["chi_eff_prior_applied_to_p_pe"] is flag
+    assert summary["spin_prior_mode"] == (
+        mode.decode() if isinstance(mode, bytes) else mode)
+
+
+# ==========================================================================
 # Medium 13. A selection product core cannot load says so when written
 # ==========================================================================
 def _sky_marginal_product():
