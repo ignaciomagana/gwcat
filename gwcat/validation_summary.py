@@ -88,6 +88,13 @@ def gwcat_commit() -> str:
     code is worse than none.  Never raises; a non-git install returns
     ``"unknown"``.  Cached per process (attrs are stamped per export, and the
     answer cannot change mid-process for an already-imported package).
+
+    The commit is accepted only when the repository git finds IS gwcat's own
+    tree: its top level is the directory holding the package and this file is
+    tracked there.  ``git -C <pkg_dir>`` walks up to the nearest repository,
+    so a non-editable install into a git-ignored ``.venv`` inside some other
+    checkout used to be stamped with THAT repository's HEAD -- a clean-looking
+    and wrong gwcat commit.  Such an install now says ``"unknown"``.
     """
     global _GWCAT_COMMIT_CACHE
     if _GWCAT_COMMIT_CACHE is not None:
@@ -96,6 +103,20 @@ def gwcat_commit() -> str:
     import subprocess
     pkg_dir = os.path.dirname(os.path.abspath(__file__))
     try:
+        top = subprocess.run(
+            ["git", "-C", pkg_dir, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        tracked = subprocess.run(
+            ["git", "-C", pkg_dir, "ls-files", "--error-unmatch", "--",
+             os.path.basename(os.path.abspath(__file__))],
+            capture_output=True, text=True, timeout=10,
+        ).returncode == 0
+        if (not top or not tracked
+                or os.path.realpath(top)
+                != os.path.realpath(os.path.dirname(pkg_dir))):
+            _GWCAT_COMMIT_CACHE = "unknown"
+            return _GWCAT_COMMIT_CACHE
         commit = subprocess.run(
             ["git", "-C", pkg_dir, "rev-parse", "HEAD"],
             capture_output=True, text=True, timeout=10,

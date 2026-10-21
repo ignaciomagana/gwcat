@@ -5,12 +5,16 @@
      superseded ~30 genuine LVK O3a events, which the LVK-catalog filter then
      dropped.  A cache written by the old query is not replayed.
   2. Cached GWOSC pages are checked before they are indexed.
+  3. ``writer_commit`` names gwcat's own commit or says "unknown": an install
+     inside another repository's checkout was stamped with that repository's
+     HEAD.
 
 Every test is offline: GWOSC and Zenodo are monkeypatched.
 """
 from __future__ import annotations
 
 import json
+import subprocess
 import warnings
 from urllib.parse import parse_qs, urlparse
 
@@ -189,3 +193,49 @@ def test_an_event_table_cache_without_pages_is_a_cache_miss(tmp_path, payload):
         cache_dir, fetch_cache.gwosc_cache_key("event_table_GWTC"), payload)
     with pytest.raises(fetch_cache.OfflineCacheMissError, match="pages"):
         fetch.fetch_event_table_gwosc(cache_dir=cache_dir, offline=True)
+
+
+# ==========================================================================
+# 3. writer_commit is gwcat's own commit, or "unknown"
+# ==========================================================================
+def _git(cwd, *args):
+    return subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "-C", str(cwd),
+         *args], check=True, capture_output=True, text=True).stdout.strip()
+
+
+def _fake_module_file(monkeypatch, path):
+    import gwcat.validation_summary as vs
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("# stand-in\n")
+    monkeypatch.setattr(vs, "__file__", str(path))
+    monkeypatch.setattr(vs, "_GWCAT_COMMIT_CACHE", None)
+    return vs
+
+
+def test_an_install_inside_another_checkout_is_not_stamped_with_its_head(
+        tmp_path, monkeypatch):
+    host = tmp_path / "host"
+    host.mkdir()
+    _git(host, "init", "-q")
+    (host / ".gitignore").write_text(".venv/\n")
+    (host / "README").write_text("host\n")
+    _git(host, "add", ".")
+    _git(host, "commit", "-q", "-m", "host")
+    vs = _fake_module_file(
+        monkeypatch,
+        host / ".venv" / "lib" / "site-packages" / "gwcat" /
+        "validation_summary.py")
+    assert vs.gwcat_commit() == "unknown"
+
+
+def test_gwcats_own_checkout_is_stamped_with_its_commit(tmp_path,
+                                                        monkeypatch):
+    repo = tmp_path / "gwcat-src"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    vs = _fake_module_file(monkeypatch,
+                           repo / "gwcat" / "validation_summary.py")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "gwcat")
+    assert vs.gwcat_commit() == _git(repo, "rev-parse", "HEAD")
