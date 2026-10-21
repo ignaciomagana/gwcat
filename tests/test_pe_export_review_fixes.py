@@ -355,3 +355,27 @@ def test_the_file_records_enough_to_reproduce_its_draw(tmp_path):
         idx = rng.choice(n_kept[i], size=nsamp, replace=n_kept[i] < nsamp)
         np.testing.assert_array_equal(cols["m1det"][i * nsamp:(i + 1) * nsamp],
                                       raw[name]["mass_1"][idx])
+
+
+# ==========================================================================
+# A forced replace=True is recorded as a draw with replacement (review Low 64)
+# ==========================================================================
+def test_forced_replacement_is_recorded(tmp_path):
+    events = [{"name": "GWr_000001", "n": 300}, {"name": "GWr_000002", "n": 300}]
+    store, _ = _build_spin_store(tmp_path, events, name="rep.h5")
+    out = tmp_path / "pe.h5"
+    GWCatalog(store).export(str(out), format="gwcat2", spin_basis="chieff",
+                            nsamp=64, seed=0, cosmology=_COSMO, replace=True)
+    _cols, attrs = _read(out)
+    assert bool(attrs["resampled_with_replacement"]) is True
+    assert int(attrs["n_events_resampled_with_replacement"]) == 2
+    assert _names(attrs["events_resampled_with_replacement"]) \
+        == ["GWr_000001", "GWr_000002"]
+
+    # The default draw of the same store uses no replacement and says so.
+    out2 = tmp_path / "pe_auto.h5"
+    GWCatalog(store).export(str(out2), format="gwcat2", spin_basis="chieff",
+                            nsamp=64, seed=0, cosmology=_COSMO)
+    _cols, a2 = _read(out2)
+    assert bool(a2["resampled_with_replacement"]) is False
+    assert len(a2["events_resampled_with_replacement"]) == 0

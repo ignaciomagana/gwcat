@@ -860,7 +860,10 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             drawn_rows.append(idx_orig)
             # The pool the draw chose from, after every cut (review Low 2).
             n_kept_pool.append(int(n_kept))
-            if rep and n_kept < nsamp:
+            # Every draw WITH replacement, not only an undersampled one: a
+            # forced replace=True bootstraps an event that has enough samples
+            # too (review Low 64), and its rows repeat just the same.
+            if rep:
                 upsampled_events.append(str(sub.event_names[e]))
 
             # The draw is settled: NOW read, and read only the rows it kept.
@@ -1540,8 +1543,13 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         "homogeneous_sample_sets": homogeneous,
         "n_unique_samples_per_event": np.asarray(n_unique_per_event,
                                                  dtype=np.int64),
+        # Any event drawn WITH replacement (rows may repeat): under the
+        # default replace="auto" exactly the undersampled ones, under a
+        # forced replace=True every event (review Low 64).
         "resampled_with_replacement": bool(upsampled_events),
         "n_events_resampled_with_replacement": int(len(upsampled_events)),
+        "events_resampled_with_replacement": np.array(upsampled_events,
+                                                      dtype=_str),
         # ── How the rows were drawn (review Low 2) ───────────────────────────
         # A seed-1 rebuild used to carry the same provenance as the seed-0
         # file; the seed lived only in the build script.
