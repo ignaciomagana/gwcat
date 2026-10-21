@@ -479,3 +479,15 @@ def test_unknown_convention_is_refused():
                                 np.array([1000.0]), [dict(_bounds(QXP), Z=1.0,
                                                           p_dL=lambda d: d)],
                                 convention="inverse_evidence")
+
+
+# --------------------------------------------------------------------------
+# Review 2026-10-20: the normalisation against an independent reference
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize("qmin", [QXP, QNR])
+def test_uic_normalisation_against_independent_quadrature(qmin):
+    """Both q floors, to 1e-8: the old 5e-3 brute-force check let a 1% shift
+    of an integration limit through."""
+    Z = uic_normalisation(**_bounds(qmin))
+    ref = _area_reference(MC[0], MC[1], qmin, 1.0, 1.0, 1000.0, 0.0, np.inf)
+    assert Z == pytest.approx(ref, rel=1e-8)
