@@ -44,6 +44,61 @@ chieff_reference --spin-reference-amax 0.99 --far-threshold 1.0`).
     evaluated with the legacy release-reweight table, which the production
     store was ingested with.
 
+  So the README quick start, the README Python recipe and
+  `examples/bbh_workflow.md`, which end in `validate --strict`, fail on the
+  production store as written (exit 1; `ValueError` in Python, strict or not).
+  With `--drop-spin-above-ceiling` on the PE export and the self-derived
+  allow-list, neither approved (options 2 and 9), a rebuild passes `--strict`
+  with 120 of 120 checks (checked at this branch's head for the 259- and the
+  249-event lists).
+- **After a re-ingest.** The rebuild above reused the 8263ae9 store. A PE
+  export from a store re-ingested with this branch, as some choices under
+  options 1 to 3 below would need, also changes four provenance attributes:
+  `prior_source_label_dL_per_event`, `prior_source_label_mass_per_event` and
+  `prior_source_label_spin_per_event` for 28 of the 259 events (27 C00:Mixed
+  events now name the constituent `IMRPhenomXPHM-SpinTaylor` where they named
+  `IMRPhenomXO4a`, and GW231123_135430 names `NRSur7dq4` where it named
+  `IMRPhenomTPHM`), and `spin_amax_config_per_constituent_per_event` for 29
+  events. Every dataset is unchanged (12 of 12, measured on a store
+  re-ingested with the ingest package at 54d9ed8). darksirens-core reads none
+  of these attributes.
+
+### Refusals an operator will meet
+
+Inputs that used to be accepted and are now refused, with their reach on the
+production data:
+- **Cosmology tokens at ingest.** An analytic distance prior that names an
+  unknown cosmology, or a named cosmology with radiation (astropy `Planck15`),
+  raises `UnrecognisedCosmologyError`. An unknown token used to warn and fall
+  back to the catalog default, and astropy `Planck15` was reduced to a flat
+  (H0, Om0) without radiation. The error is not caught per row, so one such
+  file aborts the whole `build_store` / `gwcat ingest` batch; there is no
+  per-row skip or opt-out. No row of the production store trips it: its
+  analytic-declared rows name `Planck15_LAL` (190) or an explicit `LambdaCDM`
+  with a finite H0 (2), and the other 90 take their cosmology from the release
+  table.
+- **`z_max` pairs from the production store.** The new cross-file check that an
+  equal `z_max` is the same truncation in distance (relative tolerance
+  `_ZMAX_DL_RTOL = 1e-6`) fails, strict or not, for any pair exported from
+  this store with the same `--z-max` on both sides whose events span its two
+  fiducial PE cosmologies, as the 259-event list does: astropy Planck15 on the
+  rows reweighted with the legacy release table (90 store rows, 69 of the 259
+  events), LAL Planck15 on the rest. Their dL(z_max) differ by about 0.2%
+  (0.18% at z_max = 1), while the cosmology cross-check accepts both
+  (|dH0| < 1). The error text gives the remedy: export both sides
+  under the cosmology of the injections, or drop `z_max`. The production
+  recipe sets no `z_max`.
+- **`far_threshold=inf`** (CLI `--far-threshold inf`) on a gwcat-2.x selection
+  export used to mean no FAR cut, every found injection. It is now refused
+  with the other non-finite thresholds.
+- **A superseded release file beside the current one.** `gwcat fetch` leaves a
+  superseded file (for example an `IGWN-...-v1` beside the current `-v2`) in
+  place and lists it in `superseded_files` of `gwcat_fetch_manifest.json`.
+  `gwcat ingest --glob` over such a directory now raises
+  `DuplicateSampleSetError` at the first repeated (event, sample set) instead
+  of ingesting both. Move the superseded file out of the glob, or ingest the
+  re-release separately and `merge_store(..., on_duplicate_key='refresh')`.
+
 ### Ingest (`gwcat/ingest.py`)
 
 Store numbers change only in `sky_area_90` and `observing_run`, plus one
@@ -261,7 +316,19 @@ Under default options no dataset changes.
   each only when set; a file with no class filter and no truncation keeps its
   previous `contract_hash`. The `contract` JSON gains these three keys.
 - Tests: set `GWCAT_CONTRACT_STORE` to run the 11 store-backed 2.1 contract
-  tests. A requested store that is missing fails instead of skipping.
+  tests. A requested store that is missing fails instead of skipping. Run once
+  against the production store (`store_gwtc_fresh_8263ae9_exact.h5`, read
+  only) on 2026-10-21: all 24 tests of `tests/test_format_21_contract.py`
+  pass, the 11 store-backed ones included. Those tests check the contract's
+  structure, not hash values, so 2.1 exports from that store (3 events in the
+  `component` and `chieff` spaces, and the endo3 campaign alone) were also
+  compared between 3ba1dbf and this branch. The hash moves only through the
+  two declared fields, `advisory_columns` and `sky_prior_in_density`, and the
+  `component` PE and selection hashes are equal to each other in both
+  versions. Unhashed contract fields that change: `dL_prior_kind` (now set,
+  `UniformSourceFrame`), the PE `selection_spec_digest`, and the selection's
+  scalar cosmology (a lone endo3 campaign now states its detected generation
+  cosmology, LAL Planck15, where it stated astropy Planck15).
 
 ### Fetch, CLI and summaries (`fetch.py`, `cli.py`, `population_samples.py`)
 
@@ -352,6 +419,11 @@ one attribute and the PE file eight.
   cuts, merge keys, mock pairs, the 1.0 formats, the 2.1 hash, the
   `chieff_reference` basis, the nocosmo distance prior, `o3_default_cosmo`, the
   mass Jacobian, the sky area, the new ingest guards and selection provenance.
+- Correction: an earlier note on this branch (commit 7b12505) said the
+  end-to-end recipe validates with `strict=True`. As written it does not on the
+  production store: the recipe, the quick start and `examples/bbh_workflow.md`
+  now say that their `validate --strict` step exits 1 until options 2 and 9
+  are decided, and show the variant that passes, marked as not approved.
 - Examples: the O3 + O4ab workflows use the gwcat-2.0 commands that run, with no
   `--H0`/`--Om0`, and the fake-data tutorial now passes `validate --strict`.
 - Validator docstrings say which cross-file checks only warn without `strict`.
@@ -462,6 +534,23 @@ Every default below is unchanged.
 - Core: read the per-event spin ceilings of v1 files (or refuse a NaN or
   asymmetric `chi_eff_amax`), apply the bootstrap variance correction, and read
   `homogeneous_sample_sets`.
+- Core, consequences of this branch (core tickets, not gwcat changes):
+  - v1 selection files now carry `injected_spin_uniform_isotropic` and
+    `spin_basis_assumption_violations`, which core's chi_eff-basis loader
+    enforces (it refuses any False flag or a non-empty violations list). The v1
+    gate records a spin-less legacy campaign as unverified (False) even when it
+    passes, so a v1 export of such a campaign that core loaded before this
+    branch is now refused by core (core's `allow_invalid_spin_swap` overrides).
+    Option 12 covers the 2.0 twin.
+  - The multi-campaign selection's scalar `cosmology_H0` / `cosmology_Om0` are
+    NaN, the production selection's included. Core's `warn_pair_cosmology`
+    returns early only on None, and a comparison with NaN is never true, so its
+    PE/selection cosmology warning is now silent for every multi-campaign
+    product. `gwcat validate` still compares each campaign (the production pair
+    passes). Core should read `cosmology_*_per_campaign`.
+  - Core reads neither the selection file's `mock_data` flag (only the PE
+    file's) nor the PE file's unique-sample count
+    (`n_unique_samples_per_event`).
 - The 2.0 builder writing `n_samples_available_per_event`; an event-map flag
   (or its removal) for `export-darksirens`; filling `snr_med` from the
   matched-filter SNR (it changes store values).
