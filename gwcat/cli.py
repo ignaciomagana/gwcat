@@ -362,9 +362,20 @@ def build_parser() -> argparse.ArgumentParser:
                              "cumulative mixtures ship no sky position at "
                              "all. gwcat2 (2.0) format only.")
     p_xsel.add_argument("--H0", type=float, default=None,
-                        help="Reference cosmology (default: Planck15) applied "
-                             "to every injection file.")
-    p_xsel.add_argument("--Om0", type=float, default=None)
+                        help="Override the cosmology of the ddL/dz Jacobian. "
+                             "Omit it (default) and each campaign uses its "
+                             "own: a file that ships "
+                             "dluminosity_distance_dredshift (every O4-era "
+                             "events file) reads it and no cosmology enters "
+                             "its pdraw; any other uses its generation "
+                             "cosmology detected from its (z, dL) pairs, and "
+                             "Planck15 only if that fails. An override reaches "
+                             "only the second kind, so one that would reach "
+                             "only some campaigns of a combined export (O3 + "
+                             "O4) is refused: omit it there.")
+    p_xsel.add_argument("--Om0", type=float, default=None,
+                        help="Matter density of the --H0 override (same "
+                             "rules).")
     p_xsel.add_argument("--no-summary", action="store_true",
                         help="Skip writing validation_summary.json/.md "
                              "next to --out.")
@@ -389,8 +400,13 @@ def build_parser() -> argparse.ArgumentParser:
     # -- selection -------------------------------------------------------
     p_sel = sub.add_parser(
         "selection",
-        help="Build a darksirens selection-function export from one or more "
-             "injection files (SelectionSet / CombinedSelectionSet).")
+        help="Build a v1 (gwcat-selection-1.0, chi_eff only) selection export "
+             "from one or more injection files (SelectionSet / "
+             "CombinedSelectionSet.to_darksirens). It replaces each "
+             "campaign's spin draw with the isotropic chi_eff prior and "
+             "refuses a campaign that did not draw spins that way, such as "
+             "O4ab; for O3 + O4ab use `export selection --parameter-space "
+             "chieff_reference --spin-reference-amax 0.99` without --H0.")
     p_sel.add_argument("--injections", nargs="+", required=True, metavar="FILE",
                        help="One or more LVK injection HDF5 files. More than "
                             "one is combined via CombinedSelectionSet.")
@@ -408,9 +424,17 @@ def build_parser() -> argparse.ArgumentParser:
                        help="bbh / nsbh / bns / massgap / cbc, or a canonical "
                             "class name.")
     p_sel.add_argument("--H0", type=float, default=None,
-                       help="Reference cosmology (default: Planck15) applied "
-                            "to every --injections file.")
-    p_sel.add_argument("--Om0", type=float, default=None)
+                       help="Override the cosmology of the ddL/dz Jacobian. "
+                            "Omit it (default) and each campaign uses its "
+                            "own: the shipped dluminosity_distance_dredshift "
+                            "of an O4-era events file, else the generation "
+                            "cosmology detected from its (z, dL) pairs "
+                            "(Planck15 only if that fails). An override that "
+                            "would reach only some of several --injections "
+                            "files is refused.")
+    p_sel.add_argument("--Om0", type=float, default=None,
+                       help="Matter density of the --H0 override (same "
+                            "rules).")
     p_sel.add_argument("--no-summary", action="store_true",
                        help="Skip writing validation_summary.json/.md next "
                             "to --out.")
@@ -428,8 +452,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_val.add_argument("selection_path", nargs="?", default=None,
                        metavar="SELECTION.h5")
     p_val.add_argument("--strict", action="store_true",
-                       help="Raise on the first internal-consistency failure "
-                            "(cross-file contract checks always raise).")
+                       help="Raise on the first internal-consistency failure. "
+                            "Most cross-file contract checks fail with or "
+                            "without it, but some only warn unless it is "
+                            "given (a chi_eff-prior implementation recorded "
+                            "on one side only, e.g. a pre-exact-prior PE file "
+                            "with an exact selection; a PE file too old to "
+                            "check the chieff_reference spin-prior contract) "
+                            "and one only ever warns (a redshift truncation "
+                            "stated on one side only). Use it whenever the "
+                            "pair gates an analysis, and read the warnings.")
     p_val.add_argument("--spin-prior-allow-list", default=None, metavar="FILE",
                        help="Events a chieff/chieff_reference pair may carry "
                             "whose spin prior is not their label's own "
