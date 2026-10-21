@@ -376,3 +376,46 @@ def test_constraint_only_mass_keys_still_borrow_and_the_real_pair_verifies():
     assert mp.source_kind == "sibling_inherited"
     nr = ing.resolve_mass_prior(NR, analyses, priors)
     assert nr.kind == "uniform_detector_frame" and nr.q_min == 0.16666667
+
+
+# ==========================================================================
+# medium-24: duplicate (event, sample set) rows in one build
+# ==========================================================================
+def _one_label_file(seed, label=C1X):
+    rng = np.random.default_rng(seed)
+    sd = {label: _samples(rng, 80, amax=0.9)}
+    return _Data(sd), sd, {"analytic": {label: _analytic()}}
+
+
+def test_two_releases_of_one_event_are_refused_not_silently_kept(
+        tmp_path, monkeypatch):
+    files = {"IGWN-GWTC2p1-v1-GW950101_000001_PEDataRelease_mixed_cosmo.h5":
+             _one_label_file(1),
+             "IGWN-GWTC2p1-v2-GW950101_000001_PEDataRelease_mixed_cosmo.h5":
+             _one_label_file(2)}
+    with pytest.raises(ing.DuplicateSampleSetError, match="twice"):
+        _ingest(tmp_path, monkeypatch, files)
+
+
+def test_two_preferred_rows_for_one_event_warn(tmp_path, monkeypatch):
+    files = {"IGWN-GWTC2p1-v1-GW950101_000001_PEDataRelease_mixed_cosmo.h5":
+             _one_label_file(1, label=C1X),
+             "IGWN-GWTC3p0-v1-GW950101_000001_PEDataRelease_mixed_cosmo.h5":
+             _one_label_file(2, label=C1S)}
+    with pytest.warns(UserWarning, match="more than one preferred"):
+        store = _ingest(tmp_path, monkeypatch, files)
+    with h5py.File(store, "r") as f:
+        assert len(f["index/event_names"]) == 2
+
+
+def test_cli_ingests_a_file_matched_by_two_globs_once(tmp_path, monkeypatch):
+    for b in ("GW950101_000001_a.h5", "GW950102_000002_b.h5"):
+        (tmp_path / b).write_bytes(b"")
+    seen = {}
+    monkeypatch.setattr(ing, "build_store",
+                        lambda paths, out, **kw: seen.setdefault("p", paths))
+    ing._cli(["--glob", str(tmp_path / "*.h5"), "--glob",
+              str(tmp_path / "GW950101*.h5"), "--no-event-table",
+              "--out", str(tmp_path / "s.h5")], _deprecated=False)
+    assert [os.path.basename(p) for p in seen["p"]] == [
+        "GW950101_000001_a.h5", "GW950102_000002_b.h5"]

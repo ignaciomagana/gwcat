@@ -745,6 +745,35 @@ class MixedPriorMismatchError(ValueError):
     """A combined set's constituents declare different analytic priors."""
 
 
+class DuplicateSampleSetError(ValueError):
+    """One (event, sample set) would occupy two rows of a store."""
+
+
+def _warn_multiple_preferred(names, is_preferred, where):
+    """Warn when an event carries more than one ``is_preferred`` row.
+
+    The ``preferred`` and ``mixed-first`` waveform policies then break the
+    tie by store order, so which samples are exported is not a choice anyone
+    made (review 2026-10-20, medium-24 / medium-25).
+    """
+    if is_preferred is None:
+        return
+    count = {}
+    for n, f in zip(names, is_preferred):
+        try:
+            pref = float(f) > 0.5
+        except (TypeError, ValueError):
+            pref = False
+        if pref:
+            count[n] = count.get(n, 0) + 1
+    many = sorted(n for n, c in count.items() if c > 1)
+    if many:
+        warnings.warn(
+            f"{where}: {len(many)} event(s) carry more than one preferred "
+            f"sample set ({many[:10]}); the 'preferred' and 'mixed-first' "
+            f"waveform policies would pick between them by store order.")
+
+
 # --------------------------------------------------------------------------
 # Distance-prior resolution
 # --------------------------------------------------------------------------
@@ -2253,6 +2282,11 @@ def build_store(paths, out_path, params=None, extra_params=None,
     records = []   # per row: (name, n_samples, {param: array}) -- union schema
     offsets = [0]
     names, meta = [], {k: [] for k in META_FLOAT_FIELDS + META_STR_FIELDS}
+    # Row identity is (event, sample set): a second row with the same key is
+    # refused, and two FILES for one event are reported (review 2026-10-20,
+    # medium-24).  Before, a directory holding IGWN-GWTC2p1-v1 and -v2 of one
+    # event stored both and the export silently kept whichever sorted first.
+    row_source, event_files = {}, {}
 
     for path in paths:
         catalog = detect_catalog(path)
@@ -2278,7 +2312,17 @@ def build_store(paths, out_path, params=None, extra_params=None,
         # priors/analytic group records (GW-02).
         flavour = detect_release_flavour(path)
 
+        event_files.setdefault(name, []).append(os.path.basename(path))
         for analysis in labels:
+            if (name, analysis) in row_source:
+                raise DuplicateSampleSetError(
+                    f"{name} [{analysis}] would be ingested twice: from "
+                    f"{row_source[(name, analysis)]} and "
+                    f"{os.path.basename(path)}. A store row is one (event, "
+                    f"sample set); pass each release file once (for a "
+                    f"re-release, merge_store(..., on_duplicate_key="
+                    f"'refresh') replaces the old row).")
+            row_source[(name, analysis)] = os.path.basename(path)
             s = samples_dict[analysis]
 
             n = len(np.asarray(s["luminosity_distance"]))
@@ -2639,6 +2683,14 @@ def build_store(paths, out_path, params=None, extra_params=None,
                 src = f"constituent_mixture[{joined}]"
             print(f"[{catalog}] {name}: {n} samp, sample_set={analysis}, "
                   f"prior={src}")
+
+    multi = {n: fs for n, fs in event_files.items() if len(fs) > 1}
+    if multi:
+        warnings.warn(
+            f"{len(multi)} event(s) come from more than one file: "
+            f"{dict(list(multi.items())[:5])}. Their rows are kept as "
+            f"separate sample sets; check that this is intended.")
+    _warn_multiple_preferred(names, meta.get("is_preferred"), "build_store")
 
     # Assemble the UNION of parameters across events, NaN-filling event slices
     # where a parameter is absent, and build the per-event availability mask.
@@ -3521,9 +3573,15 @@ def _cli(
     if a.inspect:
         inspect(a.inspect)
         return
-    paths = []
+    paths, seen = [], set()
     for g in a.glob:
-        paths += sorted(glob.glob(g))
+        # Overlapping globs used to pass one file twice (review 2026-10-20,
+        # medium-24); each file is ingested once, in first-match order.
+        for p in sorted(glob.glob(g)):
+            key = os.path.realpath(p)
+            if key not in seen:
+                seen.add(key)
+                paths.append(p)
     if not paths:
         ap.error("no files matched; pass --glob or --inspect")
     event_table = {} if a.no_event_table else None
