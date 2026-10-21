@@ -982,3 +982,34 @@ def test_input_identity_is_recorded_and_a_byte_copy_is_refused(tmp_path):
     with pytest.raises(OverlappingCampaignError, match="byte-identical"):
         build_selection_product([SelectionSet(p), SelectionSet(copy)],
                                 spin_basis="component")
+
+
+@pytest.mark.parametrize("basis", ["chieff", "chieff_chip"])
+def test_per_campaign_spin_attrs_keep_empty_campaigns(tmp_path, basis):
+    """A campaign with no detections was left out of the *_per_campaign spin
+    attrs, so they no longer lined up with campaign_ndraws and every other
+    per-campaign array (and the validator's matching check skipped on the
+    shape mismatch)."""
+    from gwcat.export import build_selection_product
+
+    o4a = write_o4_full(tmp_path / "a.hdf", n=30, amax=(0.9, 0.9), seed=16)
+    o4b = write_o4_full(tmp_path / "b.hdf", n=30, amax=(0.8, 0.8), seed=17,
+                        detected=False)
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        a = build_selection_product([SelectionSet(o4a), SelectionSet(o4b)],
+                                    spin_basis=basis).attrs
+    assert any("no detected injections" in str(w.message) for w in rec)
+    if basis == "chieff":
+        pairs = np.asarray(a["chi_eff_amax_per_campaign"])
+        assert pairs.shape == (2, 2)
+        np.testing.assert_allclose(pairs[0], [0.9, 0.9], rtol=1e-9)
+        assert np.isnan(pairs[1]).all()
+        assert [x.decode() if isinstance(x, bytes) else x for x in
+                a["chi_eff_amax_source_per_campaign"]] == ["detected",
+                                                           "no_detections"]
+    else:
+        amax = np.asarray(a["chi_eff_chi_p_amax_detected_per_campaign"])
+        assert amax.shape == (2,)
+        assert amax[0] == pytest.approx(0.9, rel=1e-9) and np.isnan(amax[1])
+    assert float(a["chi_eff_amax"]) == pytest.approx(0.9, rel=1e-9)

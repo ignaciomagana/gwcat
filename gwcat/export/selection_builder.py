@@ -1270,9 +1270,10 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     n_after_total = 0
     far_columns_union = []
     campaign_info = []
-    chieff_chip_amax = []        # per (non-empty) campaign detected amax used
-    # Per (non-empty) campaign chi_eff ceilings actually used, and how each was
-    # resolved ("detected" / "caller" / "fallback").
+    chieff_chip_amax = []        # per campaign detected amax used (NaN: empty)
+    # Per campaign chi_eff ceilings actually used, and how each was resolved
+    # ("detected" / "caller" / "fallback"; "no_detections" with NaN for a
+    # campaign that contributed no rows).
     chieff_amax_pairs, chieff_amax_sources = [], []
 
     mixture_attrs = None
@@ -1295,6 +1296,14 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                 f"FAR < {far_threshold}"
                 + ("" if source_class is None
                    else f" in source class {source_class!r}"))
+            # Keep the *_per_campaign spin attrs aligned with the campaign
+            # order (review fix): an empty campaign used no ceiling, which is
+            # NaN with its reason, not a missing row that shifts the others.
+            if spin_basis == "chieff":
+                chieff_amax_pairs.append((float("nan"), float("nan")))
+                chieff_amax_sources.append("no_detections")
+            elif spin_basis == "chieff_chip":
+                chieff_chip_amax.append(float("nan"))
             continue
 
         frac = ndraw_per[k] / ndraw_total
@@ -1594,7 +1603,8 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             chieff_amax_sources, dtype=_str)
         attrs["chi_eff_amax_mode"] = ("fixed" if forced_amax is not None
                                       else "per_campaign")
-        attrs["chi_eff_amax"] = (float(pairs.max()) if pairs.size
+        attrs["chi_eff_amax"] = (float(np.nanmax(pairs))
+                                 if np.isfinite(pairs).any()
                                  else float(amax_fallback))
         # GW-06: empty unless strict=False let a non-uniform-isotropic campaign
         # through, in which case the file says so about itself.
@@ -1676,8 +1686,9 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         # The support bound of the joint prior in force, i.e. the largest
         # detected ceiling -- not the caller's argument, which this basis has
         # never used for anything.
-        attrs["chi_eff_amax"] = (float(np.max(chieff_chip_amax))
-                                 if chieff_chip_amax else float(amax_fallback))
+        attrs["chi_eff_amax"] = (
+            float(np.nanmax(chieff_chip_amax))
+            if np.isfinite(chieff_chip_amax).any() else float(amax_fallback))
 
     # ── GW-39: campaign kind, detection policy, sky, per-run bookkeeping ────
     attrs["cumulative_mixture"] = bool(any(is_mixture))
