@@ -860,12 +860,20 @@ def _write_chieff_amax_attrs(f, amax_pairs, amax_sources, mode):
 
     ``chi_eff_amax`` stays scalar for backward compatibility when every
     campaign resolved to the same ceiling, and is NaN otherwise so a reader
-    cannot mistake one campaign's ceiling for the file's.
+    cannot mistake one campaign's ceiling for the file's.  The per-campaign
+    arrays have one entry per campaign of the export, in campaign order; a
+    campaign that contributed no rows has NaN ceilings and the source
+    ``"no_detections"`` (review 2026-10-20, low-15: they used to skip it, so
+    a reader zipping them with the other per-campaign arrays by index gave a
+    ceiling to the wrong campaign) and does not enter the scalar.
     """
     a1s = [a1 for a1, _ in amax_pairs]
     a2s = [a2 for _, a2 in amax_pairs]
-    uniform = len(set(a1s)) == 1 and len(set(a2s)) == 1
-    f.attrs["chi_eff_amax"] = float(a1s[0]) if uniform else float("nan")
+    used = [(a1, a2) for a1, a2 in amax_pairs
+            if np.isfinite(a1) and np.isfinite(a2)]
+    uniform = (len({a1 for a1, _ in used}) == 1
+               and len({a2 for _, a2 in used}) == 1)
+    f.attrs["chi_eff_amax"] = float(used[0][0]) if uniform else float("nan")
     f.attrs["chi_eff_amax_1_per_campaign"] = np.asarray(a1s, dtype=float)
     f.attrs["chi_eff_amax_2_per_campaign"] = np.asarray(a2s, dtype=float)
     f.attrs["chi_eff_amax_source_per_campaign"] = [str(s) for s in amax_sources]
@@ -2981,7 +2989,7 @@ class CombinedSelectionSet:
         # The campaigns that actually CONTRIBUTED rows, in concatenation order
         # (empty ones are skipped below).  The chi_eff swap resolves its ceiling
         # per campaign, so it needs the same list in the same order (GW-37).
-        contrib_sets, contrib_keeps = [], []
+        contrib_sets, contrib_keeps, contrib_index = [], [], []
 
         for k, s in enumerate(self._sets):
             det = s.detected_mask(far_threshold)
@@ -3018,6 +3026,7 @@ class CombinedSelectionSet:
             cols["pdraw"].append(pdraw_k)
             contrib_sets.append(s)
             contrib_keeps.append(keep)
+            contrib_index.append(k)
             n_det_total += n_det_k
             campaign_info.append(
                 f"{s.path}: N={ndraw_per[k]}, T={s._T_yr:.2f}yr, "
@@ -3120,7 +3129,13 @@ class CombinedSelectionSet:
                     f"silently drop the NaN campaigns' injections; cut on "
                     f"campaign, not on finiteness, if that is not intended.")
             f.attrs["chi_eff_swap_applied"] = True
-            _write_chieff_amax_attrs(f, amax_pairs, amax_sources, amax_mode)
+            # One entry per campaign, aligned with every other per-campaign
+            # attr; a campaign without detections gets NaN (low-15).
+            pairs_all = [(float("nan"), float("nan"))] * len(self._sets)
+            sources_all = ["no_detections"] * len(self._sets)
+            for i, k in enumerate(contrib_index):
+                pairs_all[k], sources_all[k] = amax_pairs[i], amax_sources[i]
+            _write_chieff_amax_attrs(f, pairs_all, sources_all, amax_mode)
             _write_spin_swap_validity_attrs(f, self._sets, swap_violations)
             # ── Spin-prior contract provenance (PR 3) ──────────────────────
             f.attrs["spin_prior_mode"] = "include"

@@ -619,3 +619,26 @@ def test_removal_ceiling_check_is_silent_below_the_assumed_ceiling(tmp_path):
         warnings.simplefilter("error", UserWarning)
         s._load()
     assert s._removal_amax_factor is None
+
+
+# ======================================================================
+# low-15: v1 combined per-campaign ceilings align with the campaigns
+# ======================================================================
+def test_v1_combined_ceilings_have_one_entry_per_campaign(tmp_path):
+    none = write_o4_full(tmp_path / "none.hdf", n=30, seed=91, detected=False)
+    o3 = write_endo3_full(tmp_path / "o3.hdf", n=30, seed=92)
+    out = tmp_path / "v1.h5"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        CombinedSelectionSet([SelectionSet(none), SelectionSet(o3)]
+                             ).to_darksirens(str(out))
+    with h5py.File(out, "r") as f:
+        a1 = np.asarray(f.attrs["chi_eff_amax_1_per_campaign"])
+        src = list(f.attrs["chi_eff_amax_source_per_campaign"])
+        n_cosmo = len(f.attrs["cosmology_source_per_campaign"])
+        scalar = float(f.attrs["chi_eff_amax"])
+    assert a1.shape == (2,) == (n_cosmo,)
+    assert np.isnan(a1[0]) and np.isclose(a1[1], 0.998)
+    src = [x.decode() if isinstance(x, bytes) else x for x in src]
+    assert src == ["no_detections", "detected"]
+    assert np.isclose(scalar, 0.998)
