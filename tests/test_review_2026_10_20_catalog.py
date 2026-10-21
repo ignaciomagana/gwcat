@@ -617,3 +617,46 @@ def test_event_list_with_a_byte_order_mark(tmp_path):
     assert load_event_list(str(p)) == ["GW900001_000001", "GW900003_000003"]
     sub = GWCatalog(_three(tmp_path)).select(event_list=str(p))
     assert sorted(sub.event_names) == ["GW900001_000001", "GW900003_000003"]
+
+
+# ==========================================================================
+# The non-BBH exclusion list names GW190425 by its real timestamp
+# ==========================================================================
+def test_the_bns_gw190425_is_excluded_by_its_real_name():
+    """The list named GW190425_232155, a timestamp no release has; the
+    event's name in the GWTC-2.1 PE release is GW190425_081805."""
+    from gwcat import bbh_allowed_names as ban
+    assert "GW190425_081805" in ban.NON_BBH_EXCLUSIONS
+    assert "GW190425_232155" not in ban.NON_BBH_EXCLUSIONS
+    assert "GW190425_081805" not in ban._unique_sorted_bbh_names(
+        ["GW190425_081805", "GW150914_095045"])
+
+
+@pytest.mark.skipif(
+    __import__("os").environ.get("GWCAT_REAL_DATA") != "1",
+    reason="set GWCAT_REAL_DATA=1 and GWCAT_PE_ROOT to check the exclusions "
+           "against the released PE file names")
+def test_every_exclusion_resolves_against_the_released_pe_names():
+    """Where the list excludes an event by its short name (GWyymmdd) AND by a
+    full name, the full name must be the one the release uses on that day:
+    a timestamp that does not exist excludes nothing.  (Two events can share
+    a date -- GW190426_152155 and GW190426_190642 -- so a full name without a
+    short-form sibling is not checked.)"""
+    import os
+    import re
+    from gwcat import bbh_allowed_names as ban
+    root = os.environ.get("GWCAT_PE_ROOT")
+    if not root or not os.path.isdir(root):
+        pytest.fail("GWCAT_REAL_DATA=1 but $GWCAT_PE_ROOT is not a directory")
+    released = set()
+    for _dir, _sub, files in os.walk(root):
+        for fn in files:
+            released.update(re.findall(r"GW\d{6}_\d{6}", fn))
+    by_date = {}
+    for n in released:
+        by_date.setdefault(n[:8], set()).add(n)
+    short = {n for n in ban.NON_BBH_EXCLUSIONS if re.fullmatch(r"GW\d{6}", n)}
+    bad = [n for n in ban.NON_BBH_EXCLUSIONS
+           if re.fullmatch(r"GW\d{6}_\d{6}", n) and n[:8] in short
+           and n[:8] in by_date and n not in by_date[n[:8]]]
+    assert not bad, (bad, {n[:8]: sorted(by_date[n[:8]]) for n in bad})

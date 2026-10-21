@@ -36,7 +36,7 @@ GWTC-5.0 context (arxiv:2605.27225, submitted 26 May 2026)
 - 104 O4b events, the full official Event_list/GWTC5_BBH.txt
 - Combined O1–O4b: 259 BBH events with PE measurements
 - Explicit non-BBH exclusions include BNS/NSBH events such as
-  GW190425_232155, GW200105_162426, GW200115_042309,
+  GW190425_081805, GW200105_162426, GW200115_042309,
   GW230518_125908, and GW230529_181500, plus the GW190814_211039
   lower-mass-gap system (excluded from the BBH population sample)
 """
