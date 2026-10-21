@@ -439,6 +439,18 @@ def _spin_variant_token(variant: str) -> str:
     return ""
 
 
+def _is_combined_base(base: str) -> bool:
+    """Whether an analysis BASE names a combined ("Mixed") sample set.
+
+    ``"Mixed"`` and its extended spellings: 29 GWTC-4.1 files ship
+    ``C00:Mixed+XO4a`` beside ``C00:Mixed`` (with the same rows and the same
+    meta_data/combined record).  Testing ``base == "Mixed"`` exactly kept it
+    as a single-waveform label, and so as a CONSTITUENT candidate of
+    ``C00:Mixed`` (review 2026-10-20, high-13 and low-73).
+    """
+    return str(base).startswith("Mixed")
+
+
 def find_mixed_analyses(analyses, prefix: str):
     """Every combined ("Mixed") set for ``prefix``, best spin variant first.
 
@@ -2038,9 +2050,13 @@ def _constituent_mixture_prior(catalog, analysis, analyses, samples_dict,
                                       truncated_dL_density, uic_normalisation)
     pfx, _base, variant = _label_parts(analysis)
     want = _spin_variant_token(variant)
+    # Every combined set is excluded, not only the base "Mixed": C00:Mixed+XO4a
+    # carries the C00:Mixed rows, so keeping it as a candidate made every row
+    # ambiguous and aborted the ingest on all 29 GWTC-4.1 files that ship it
+    # (review 2026-10-20, high-13).
     cands = {a: samples_dict[a] for a in analyses
              if a != analysis and _label_parts(a)[0] == pfx
-             and _label_parts(a)[1] != "Mixed"
+             and not _is_combined_base(_label_parts(a)[1])
              and _spin_variant_token(_label_parts(a)[2]) == want}
     labels, counts = match_constituent_rows(samples_dict[analysis], cands)
 

@@ -80,8 +80,9 @@ class _Data:
 
 
 def _samples(rng, n, amax=0.9, gps=1372000000.0):
-    m1 = rng.uniform(30.0, 60.0, n)
-    q = rng.uniform(0.2, 1.0, n)
+    # inside every constituent's chirp-mass and mass-ratio support
+    m1 = rng.uniform(30.0, 50.0, n)
+    q = rng.uniform(0.5, 1.0, n)
     return {"mass_1": m1, "mass_2": q * m1,
             "luminosity_distance": rng.uniform(500.0, 2000.0, n),
             "ra": rng.uniform(0.0, 2 * np.pi, n),
@@ -305,3 +306,36 @@ def test_same_variant_siblings_with_different_ceilings_are_refused():
         sp = ing.resolve_spin_prior_full("C01:Mixed", analyses, priors, None,
                                          None, allow_variant_mismatch=True)
     assert "candidates_disagree" in sp.source
+
+
+# ==========================================================================
+# high-13: --constituent-mixture-prior on files that ship C00:Mixed+XO4a
+# ==========================================================================
+XO, MXO = "C00:IMRPhenomXO4a", "C00:Mixed+XO4a"
+O4_NAME_XO4A = (
+    "IGWN-GWTC4p1-18965dda8_5-GW950601_224134-combined_PEDataRelease.hdf5")
+
+
+def _gw230601_like(seed=2, n=120):
+    """The real GW230601_224134 layout: C00:Mixed+XO4a has exactly the
+    C00:Mixed rows and the same meta_data/combined record; C00:IMRPhenomXO4a
+    contributes no row to either."""
+    data, sd, priors = _gw230702_like(seed=seed, n=n)
+    rng = np.random.default_rng(seed + 100)
+    sd = {XO: _samples(rng, n), XP: sd[XP], MX: sd[MX],
+          MXO: {k: v.copy() for k, v in sd[MX].items()}, NR: sd[NR],
+          SE: sd[SE]}
+    priors["analytic"][XO] = _analytic()
+    rec = {"meta_data": {"combined": f"{XP}, {SE}, {NR}"}}
+    return _Data(sd, extra={MX: rec, MXO: rec}), sd, priors
+
+
+def test_constituent_mixture_builds_on_a_file_with_mixed_plus_xo4a(
+        tmp_path, monkeypatch):
+    cfg = ing.IngestConfig(constituent_mixture_prior=True, **_CFG)
+    store = _ingest(tmp_path, monkeypatch, {O4_NAME_XO4A: _gw230601_like()},
+                    cfg=cfg)
+    assert _meta(store, "analysis_used") == MX
+    assert _meta(store, "mass_prior_kind") == "constituent_mixture"
+    assert _meta(store, "constituent_mixture_labels") == f"{XP}+{NR}+{SE}"
+    assert _meta(store, "constituent_mixture_counts") == "60,60,60"
