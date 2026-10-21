@@ -331,9 +331,11 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     count reads ``a_1``/``a_2`` but calls no rng): ``n_above_spin_ceiling_raw``
     over the raw label, and ``n_exported_above_spin_ceiling_per_event`` over
     the exported rows -- the rows a ``chieff_reference`` selection weights at
-    zero when the cut is off (a chieff export warns about them).  ``-1`` marks
-    an event that cannot be counted (no spin ceiling, or no ``a_1``/``a_2``
-    samples), and ``spin_ceiling_counted`` says whether every event was.
+    zero when the cut is off (a chieff export warns about them).  Both count
+    against the DECLARED ceiling (the one the cut uses), before any component
+    ``samples_bound`` widening.  ``-1`` marks an event that cannot be counted
+    (no spin ceiling, or no ``a_1``/``a_2`` samples), and
+    ``spin_ceiling_counted`` says whether every event was.
 
     Per-prior provenance (GW-40c)
     -----------------------------
@@ -1712,9 +1714,9 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         # no a_1/a_2 samples).
         "n_above_spin_ceiling_raw_per_event": np.asarray(
             n_above_spin_ceiling_raw, dtype=np.int64),
-        # Exported ROWS (repeats included) above the ceiling: 0 under the
-        # cut; without it, the rows a chieff_reference selection weights at
-        # zero.  -1 where not counted.
+        # Exported ROWS (repeats included) above the DECLARED ceiling (before
+        # any samples_bound widening): 0 under the cut; without it, the rows
+        # a chieff_reference selection weights at zero.  -1 where not counted.
         "n_exported_above_spin_ceiling_per_event": np.asarray(
             n_exported_above_spin_ceiling, dtype=np.int64),
         "spin_ceiling_counted": bool(
