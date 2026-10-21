@@ -2820,6 +2820,39 @@ def validate_export(gw_path: str, selection_path: str = None, strict: bool = Fal
                f"a consumer counts every block as an independent detection. "
                f"Re-export with a policy that keeps one sample set per event.")
 
+        # One spin ceiling in "exclude" mode.  The consumer applies the
+        # chi_eff prior at the single chi_eff_amax for both spins, so the file
+        # is only usable when that scalar is finite and is every event's
+        # ceiling on both spins.  The writer writes NaN (and warns) when the
+        # events' ceilings differ or are asymmetric, and a consumer reading
+        # the NaN masks every sample (ln Z = -inf); a file written before
+        # that fix states amax_1 for a (0.99, 0.05) event (review 2026-10-20).
+        spin_mode = f.attrs.get("spin_prior_mode")
+        spin_mode = (spin_mode.decode()
+                     if isinstance(spin_mode, (bytes, bytearray))
+                     else spin_mode)
+        if spin_mode == "exclude":
+            try:
+                amax = float(f.attrs.get("chi_eff_amax", np.nan))
+            except (TypeError, ValueError):
+                amax = float("nan")
+            per_event = [np.asarray(f.attrs[k], dtype=float).ravel()
+                         for k in ("chi_eff_amax_1_per_event",
+                                   "chi_eff_amax_2_per_event")
+                         if k in f.attrs]
+            ok = np.isfinite(amax) and all(np.all(a == amax)
+                                           for a in per_event)
+            _check("pe_exclude_one_spin_ceiling", ok,
+                   f"spin_prior_mode='exclude' with chi_eff_amax={amax!r}, "
+                   f"but the per-event ceilings are "
+                   + ", ".join(f"[{a.min():g}, {a.max():g}]" if a.size
+                               else "[]" for a in per_event)
+                   + " (amax_1, amax_2). A consumer that applies the chi_eff "
+                     "prior from the one scalar evaluates a wrong prior, or "
+                     "none at all when it is NaN. Re-export with "
+                     "spin_prior_mode='include', or read the per-event "
+                     "arrays in the consumer.")
+
         if "m1src" in f and "m1det" in f:
             _check("pe_m1src_le_m1det",
                    np.all(np.array(f["m1src"]) <= np.array(f["m1det"]) + 1e-10))

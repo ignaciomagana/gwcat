@@ -401,6 +401,29 @@ def test_v1_symmetric_ceiling_is_still_written(tmp_path):
         spin_prior_mode="exclude")
     with h5py.File(out, "r") as f:
         assert float(f.attrs["chi_eff_amax"]) == 0.99
+    assert validate_export(str(out))["pe_exclude_one_spin_ceiling"] is True
+
+
+@pytest.mark.parametrize("ceilings", [
+    [(0.99, 0.05), (0.99, 0.05)],           # asymmetric (0.99 at 3ba1dbf)
+    [(0.99, 0.99), (0.4, 0.4)]])            # mixed (NaN at both commits)
+def test_v1_validator_flags_an_exclude_file_without_one_ceiling(tmp_path,
+                                                                ceilings):
+    """Core's v1 loader reads only chi_eff_amax: NaN masks every sample, a
+    finite amax_1 for a (0.99, 0.05) event is a wrong prior.  The file was
+    written and passed validate_export."""
+    rows = [_row(f"GW90000{i}_00000{i}", spin_amax_1=a1, spin_amax_2=a2,
+                 chi_eff=np.linspace(-0.03, 0.03, 40))
+            for i, (a1, a2) in enumerate(ceilings, start=1)]
+    out = tmp_path / "exc_bad.h5"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        GWCatalog(_store(tmp_path, rows)).to_darksirens(
+            str(out), nsamp=8, seed=0, cosmology=_COSMO,
+            spin_prior_mode="exclude")
+    assert validate_export(str(out))["pe_exclude_one_spin_ceiling"] is False
+    with pytest.raises(AssertionError, match="pe_exclude_one_spin_ceiling"):
+        validate_export(str(out), strict=True)
 
 
 # ==========================================================================
