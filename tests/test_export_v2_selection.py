@@ -1031,3 +1031,22 @@ def test_out_of_reference_sentinel_must_be_negligible(tmp_path, sentinel):
     # The default is accepted.
     build_selection_product(SelectionSet(path), spin_basis="chieff_reference",
                             spin_reference_amax=0.99)
+
+
+def test_a_forced_amax_that_contradicts_the_detected_ceiling_warns(tmp_path):
+    """A numeric amax silently overrode each campaign's detected ceiling on the
+    chieff basis; the legacy mode stays, but it is no longer silent."""
+    from gwcat.export import build_selection_product
+
+    path = write_o4_full(tmp_path / "o4.hdf", n=30, amax=(0.9, 0.9), seed=19)
+    with pytest.warns(UserWarning, match="differs from the campaign's own"):
+        build_selection_product(SelectionSet(path), spin_basis="chieff",
+                                amax=0.99)
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        a = build_selection_product(SelectionSet(path), spin_basis="chieff",
+                                    amax=0.9).attrs
+    assert not any("differs from the campaign's own" in str(w.message)
+                   for w in rec)
+    assert [x.decode() if isinstance(x, bytes) else x
+            for x in a["chi_eff_amax_source_per_campaign"]] == ["caller"]

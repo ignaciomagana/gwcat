@@ -554,11 +554,27 @@ def _campaign_chieff_amax(s, forced_amax, amax_fallback):
     and no ceiling is knowable) -- which warns, because a fabricated ceiling in a
     density that depends on it is exactly what GW-31 was about.
     """
-    if forced_amax is not None:
-        return "caller", float(forced_amax), float(forced_amax)
     detected = (s.spin_meta or {}).get("amax_detected")
-    if (detected is not None
-            and all(a is not None and np.isfinite(a) for a in detected[:2])):
+    has_det = (detected is not None
+               and all(a is not None and np.isfinite(a) for a in detected[:2]))
+    if forced_amax is not None:
+        # The forced ceiling is a documented legacy mode, but it silently
+        # overrode a ceiling the campaign's own draw states (review fix):
+        # endo3 forced to 0.99 instead of its 0.998 puts pdraw off by 0.7% in
+        # the bulk and ~29% above chi_eff 0.9.
+        if has_det and not all(
+                np.isclose(float(forced_amax), float(a), rtol=1e-9, atol=1e-12)
+                for a in detected[:2]):
+            warnings.warn(
+                f"{s.path}: amax={float(forced_amax)} forces the chi_eff swap's "
+                f"ceiling, and it differs from the campaign's own detected "
+                f"injected ceiling {tuple(float(a) for a in detected[:2])}. "
+                f"The swap replaces that draw's spin density, so the exported "
+                f"pdraw is off by a chi_eff-DEPENDENT factor that does not "
+                f"cancel; recorded as chi_eff_amax_source_per_campaign="
+                f"'caller'. Use amax='auto' for the detected ceiling.")
+        return "caller", float(forced_amax), float(forced_amax)
+    if has_det:
         return "detected", float(detected[0]), float(detected[1])
     warnings.warn(
         f"{s.path}: spin_basis='chieff' needs the ceiling of the injected spin "
