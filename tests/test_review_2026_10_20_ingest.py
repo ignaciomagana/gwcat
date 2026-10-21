@@ -711,3 +711,30 @@ def test_merge_store_into_a_mock_store_stays_mock_without_warning(
     with warnings.catch_warnings():
         warnings.filterwarnings("error", message=".*mock-data store with")
         assert _merge_new(tmp_path, monkeypatch, existing_mock=True) is True
+
+
+# ==========================================================================
+# low-10: a C00:Mixed row's priors are searched in its constituents first
+# ==========================================================================
+def test_mixed_row_borrows_from_a_constituent_not_from_xo4a(tmp_path,
+                                                             monkeypatch):
+    """GW230601-like: C00:IMRPhenomXO4a sorts first but is not a constituent."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        store = _ingest(tmp_path, monkeypatch,
+                        {O4_NAME_XO4A: _gw230601_like()})
+    assert _meta(store, "analysis_used") == MX
+    for p in ("dL", "mass", "spin"):
+        assert _meta(store, f"prior_source_label_{p}") == XP
+    cfgs = json.loads(_meta(store, "spin_amax_config_per_constituent"))
+    assert sorted(cfgs) == sorted([XP, NR, SE])
+
+
+def test_sibling_search_order_puts_constituents_then_same_variant_first():
+    order = ing._sibling_search_order(
+        "C00:Mixed:HighSpin",
+        ["C00:IMRPhenomNSBH", "C00:IMRPhenomXPHM:LowSpin", "C00:Mixed:HighSpin",
+         "C00:SEOBNRv5PHM:HighSpin", "C00:IMRPhenomXPHM:HighSpin"],
+        constituents=["C00:IMRPhenomXPHM:HighSpin"])
+    assert order == ["C00:IMRPhenomXPHM:HighSpin", "C00:SEOBNRv5PHM:HighSpin",
+                     "C00:IMRPhenomNSBH", "C00:IMRPhenomXPHM:LowSpin"]

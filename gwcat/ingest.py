@@ -769,6 +769,24 @@ def compare_constituent_priors(analysis, constituents, priors):
     return f"differ:{','.join(differ)}" if differ else "agree"
 
 
+def _sibling_search_order(analysis, analyses, constituents=()):
+    """The siblings to borrow a prior from, best first (review 2026-10-20,
+    low-10).
+
+    A combined set's own constituents (as its ``meta_data/combined`` record
+    names them) come first, then siblings sharing the ingested label's spin
+    variant token, then the rest, each group in file order.  The plain file
+    order made 27 production C00:Mixed rows record C00:IMRPhenomXO4a -- not a
+    constituent -- as the source of their distance, mass and spin priors
+    (equal to the constituents' in every key, so no number moved).
+    """
+    want = _spin_variant_token(_label_parts(analysis)[2])
+    first = [c for c in constituents if c != analysis and c in analyses]
+    rest = [a for a in analyses if a != analysis and a not in first]
+    same = [a for a in rest if _spin_variant_token(_label_parts(a)[2]) == want]
+    return first + same + [a for a in rest if a not in same]
+
+
 class MixedPriorMismatchError(ValueError):
     """A combined set's constituents declare different analytic priors."""
 
@@ -1075,7 +1093,7 @@ def _dL_prior_from_config(data, analysis, analyses):
 
 def resolve_dL_prior(catalog, analysis, analyses, priors, dL_samples,
                      cfg: IngestConfig, flavour: str = "native",
-                     release_table=None, data=None):
+                     release_table=None, data=None, constituents=()):
     """Resolve the effective distance prior for one ingested analysis.
 
     Strategy for the bounds is unchanged: read analytic from the chosen
@@ -1099,6 +1117,9 @@ def resolve_dL_prior(catalog, analysis, analyses, priors, dL_samples,
     :class:`~gwcat.release_cosmology.ReleaseReweightCosmologyError`.  Any other
     row whose prior declares no cosmology takes the per-CATALOG default.
 
+    ``constituents`` (a combined set's ``meta_data/combined`` labels) are
+    searched first, then same-variant siblings (:func:`_sibling_search_order`).
+
     Returns a :class:`ResolvedDLPrior`.
     """
     if flavour not in RELEASE_FLAVOURS:
@@ -1117,7 +1138,8 @@ def resolve_dL_prior(catalog, analysis, analyses, priors, dL_samples,
     src = f"analytic[{analysis}]"
     src_label = analysis if parsed is not None else ""
     if parsed is None:
-        for an in analyses:  # sibling search (handles O4 Mixed w/o priors)
+        # sibling search (handles O4 Mixed w/o priors), constituents first
+        for an in _sibling_search_order(analysis, analyses, constituents):
             parsed = _try(an)
             if parsed is not None:
                 src = f"analytic[{an}]"
@@ -1340,7 +1362,8 @@ class ResolvedMassPrior:
     m2_max: Optional[float] = None
 
 
-def resolve_mass_prior(analysis, analyses, priors, *, siblings=True):
+def resolve_mass_prior(analysis, analyses, priors, *, siblings=True,
+                       constituents=()):
     """Parse the analytic mass prior for one ingested analysis.
 
     Searches the chosen analysis then its siblings, exactly as the distance and
@@ -1384,7 +1407,8 @@ def resolve_mass_prior(analysis, analyses, priors, *, siblings=True):
 
     found, src_an = _find(analysis), analysis
     if found is None and siblings:
-        for an in analyses:
+        # constituents first, then same-variant siblings (low-10)
+        for an in _sibling_search_order(analysis, analyses, constituents):
             found = _find(an)
             if found is not None:
                 src_an = an
@@ -1560,12 +1584,15 @@ def _spin_amax_from_config(data, analysis, analyses=(),
     return a1, a2, [an for an, _v in use], len(vals) == 1
 
 
-def constituent_spin_amax_config(data, analysis, analyses):
+def constituent_spin_amax_config(data, analysis, analyses, constituents=()):
     """JSON ``{sibling: [a1_max, a2_max] | null}`` for a ``Mixed`` label.
 
-    Every same-prefix, non-Mixed sibling of ``analysis`` is listed, with the
-    ceilings its ``config_file/engine/a_spin{1,2}-max`` declares, or ``null``
-    when its config declares none.  ``""`` for a label that is not a combined
+    The constituents its ``meta_data/combined`` record names are listed when
+    given (review 2026-10-20, low-10: the sibling list also took
+    C00:IMRPhenomXO4a and C00:Mixed+XO4a for constituents of C00:Mixed), else
+    every same-prefix, non-Mixed sibling of ``analysis``, with the ceilings
+    its ``config_file/engine/a_spin{1,2}-max`` declares, or ``null`` when its
+    config declares none.  ``""`` for a label that is not a combined
     ``Mixed`` set, or when ``data`` carries no config at all.
     """
     import json as _json
@@ -1576,7 +1603,7 @@ def constituent_spin_amax_config(data, analysis, analyses):
     if not isinstance(cfg_all, dict):
         return ""
     out = {}
-    for an in analyses:
+    for an in (list(constituents) or analyses):
         p2, b2, _v2 = _label_parts(an)
         if an == analysis or p2 != prefix or b2 == "Mixed":
             continue
@@ -1666,7 +1693,8 @@ def resolve_spin_prior(analysis, analyses, priors, a1_samples, a2_samples,
 
 def resolve_spin_prior_full(analysis, analyses, priors, a1_samples,
                             a2_samples, fallback_amax=0.99,
-                            allow_variant_mismatch=False, data=None):
+                            allow_variant_mismatch=False, data=None,
+                            constituents=()):
     """Resolve the spin-magnitude prior AND its provenance (GW-40b).
 
     ``data`` (the pesummary read object) enables the LALInference config path:
@@ -1690,7 +1718,9 @@ def resolve_spin_prior_full(analysis, analyses, priors, a1_samples,
     are recorded in ``source``.  When nothing analytic is found anywhere, fall
     back to ``amax = fallback_amax`` with ``kind = "assumed_default"``.
     Same-variant siblings that declare different ceilings are refused
-    (:class:`SpinPriorMismatchError`) unless ``allow_variant_mismatch``.
+    (:class:`SpinPriorMismatchError`) unless ``allow_variant_mismatch``;
+    ``constituents`` (a combined set's ``meta_data/combined`` labels) are
+    searched first and, when given, are the candidates that must agree.
 
     Regardless of how the bounds were obtained, ``max(|a_i samples|)`` is checked
     against ``amax_i * (1 + 1e-3)``; a violation warns and is noted in
@@ -1740,9 +1770,14 @@ def resolve_spin_prior_full(analysis, analyses, priors, a1_samples,
         # GW230529_181500, whose C00:IMRPhenomNSBH analytic group has
         # chi_1/chi_2 and no a_1/a_2.)
         want = _spin_variant_token(_label_parts(analysis)[2])
-        cands = [a for a in analyses if _find(a) is not None]
+        # Constituents first (low-10): a combined set's prior is its
+        # constituents', whatever else the file carries.
+        order = _sibling_search_order(analysis, analyses, constituents)
+        cands = [a for a in order if _find(a) is not None]
         same = [a for a in cands if _spin_variant_token(_label_parts(a)[2]) == want]
         other = [a for a in cands if a not in same]
+        # When the constituents are known, it is THEY that must agree.
+        same = [a for a in same if a in constituents] or same
 
         # Siblings that would all be acceptable must AGREE on the ceilings:
         # otherwise which one is borrowed -- and so the ceiling -- follows
@@ -1845,7 +1880,9 @@ def resolve_spin_prior_full(analysis, analyses, priors, a1_samples,
         source = "default(no_analytic_prior)"
         src_label, src_kind = "", "assumed_default"
         declared = (_spin_amax_from_config(
-                        data, analysis, analyses,
+                        data, analysis,
+                        _sibling_search_order(analysis, analyses,
+                                              constituents),
                         allow_variant_mismatch=allow_variant_mismatch)
                     if data is not None else None)
         if declared is not None:
@@ -2127,8 +2164,10 @@ def inspect(path: str, cfg: Optional[IngestConfig] = None):
     s = samples_dict[analysis]
     dL = np.asarray(s["luminosity_distance"], float)
     flavour = detect_release_flavour(path)
+    constituents = combined_constituents(data, analysis, analyses)
     res = resolve_dL_prior(catalog, analysis, analyses, priors, dL, cfg,
-                           flavour=flavour, data=data)
+                           flavour=flavour, data=data,
+                           constituents=constituents)
     val = (validate_prior_against_samples(priors, [analysis] + analyses, res,
                                           impl=cfg.dL_prior_impl)
            if cfg.validate_prior else None)
@@ -2141,11 +2180,11 @@ def inspect(path: str, cfg: Optional[IngestConfig] = None):
     sp = resolve_spin_prior_full(
         analysis, analyses, priors, a1_samp, a2_samp,
         allow_variant_mismatch=cfg.spin_prior_allow_variant_mismatch,
-        data=data)
+        data=data, constituents=constituents)
     spin_amax_1, spin_amax_2, spin_kind, spin_src = (sp.amax_1, sp.amax_2,
                                                      sp.kind, sp.source)
-    mass_prior = resolve_mass_prior(analysis, analyses, priors)
-    constituents = combined_constituents(data, analysis, analyses)
+    mass_prior = resolve_mass_prior(analysis, analyses, priors,
+                                    constituents=constituents)
     mixed_priors = (compare_constituent_priors(analysis, constituents, priors)
                     if constituents or _label_parts(analysis)[1] == "Mixed"
                     else "")
@@ -2604,9 +2643,13 @@ def build_store(paths, out_path, params=None, extra_params=None,
             rec = {p: np.asarray(s[p], dtype=np.float64) for p in params if p in s}
 
             dL = np.asarray(s["luminosity_distance"], float)
+            # The constituents a combined set's record names (critical-1,
+            # low-10): searched first for every borrowed prior.
+            constituents = combined_constituents(data, analysis, analyses)
             res = resolve_dL_prior(catalog, analysis, analyses, priors, dL, cfg,
                                    flavour=flavour,
-                                   release_table=release_table, data=data)
+                                   release_table=release_table, data=data,
+                                   constituents=constituents)
             H0, Om0, dmin, dmax, src = (res.H0, res.Om0, res.dmin, res.dmax,
                                         res.source)
             ks_val = None
@@ -2734,7 +2777,7 @@ def build_store(paths, out_path, params=None, extra_params=None,
                 sp = resolve_spin_prior_full(
                     analysis, analyses, priors, a1_samp, a2_samp,
                     allow_variant_mismatch=cfg.spin_prior_allow_variant_mismatch,
-                    data=data)
+                    data=data, constituents=constituents)
             except SpinPriorMismatchError:
                 # A constituent-mixture row REPLACES the borrowed spin prior,
                 # and the mixture refuses disagreeing constituents itself.
@@ -2742,7 +2785,8 @@ def build_store(paths, out_path, params=None, extra_params=None,
                     raise
                 sp = resolve_spin_prior_full(
                     analysis, analyses, priors, a1_samp, a2_samp,
-                    allow_variant_mismatch=True, data=data)
+                    allow_variant_mismatch=True, data=data,
+                    constituents=constituents)
             spin_amax_1, spin_amax_2, spin_kind, spin_src = (
                 sp.amax_1, sp.amax_2, sp.kind, sp.source)
             if sp.samples_exceed_amax and cfg.spin_exceeds_amax == "raise":
@@ -2762,7 +2806,6 @@ def build_store(paths, out_path, params=None, extra_params=None,
                 rec["p_dL_pe"] = cmix["p_dL"]
                 rec["p_mass_dL_pe"] = cmix["p_mass_dL"]
             # ── Do a combined set's constituents agree? (critical-1) ────────
-            constituents = combined_constituents(data, analysis, analyses)
             mixed_priors = ""
             if constituents or _label_parts(analysis)[1] == "Mixed":
                 mixed_priors = compare_constituent_priors(
@@ -2839,7 +2882,8 @@ def build_store(paths, out_path, params=None, extra_params=None,
             # |dm2det/dq| = m1det Jacobian that is only valid for a prior
             # uniform in detector-frame component masses, so warn loudly when
             # the file declares something else instead of asserting it silently.
-            mp = resolve_mass_prior(analysis, analyses, priors)
+            mp = resolve_mass_prior(analysis, analyses, priors,
+                                    constituents=constituents)
             if mp.kind == "unrecognized":
                 warnings.warn(
                     f"{name} [{analysis}]: the analytic mass prior is not "
@@ -2854,7 +2898,8 @@ def build_store(paths, out_path, params=None, extra_params=None,
             meta["prior_source_label_spin"].append(sp.source_label)
             meta["prior_source_kind_spin"].append(sp.source_kind)
             meta["spin_amax_config_per_constituent"].append(
-                constituent_spin_amax_config(data, analysis, analyses))
+                constituent_spin_amax_config(data, analysis, analyses,
+                                             constituents))
             meta["mixed_constituent_labels"].append("+".join(constituents))
             meta["mixed_constituent_priors"].append(mixed_priors)
             meta["spin_sample_max_1"].append(float(sp.sample_max_1))
