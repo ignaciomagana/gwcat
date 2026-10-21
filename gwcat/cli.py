@@ -185,7 +185,14 @@ def build_parser() -> argparse.ArgumentParser:
                                "stored PE cosmology.")
     p_export.add_argument("--event-list", default=None, metavar="FILE",
                           help="Restrict to a user event-list file (one name "
-                               "per line, '#' comments allowed).")
+                               "per line, '#' comments allowed). Every name "
+                               "must be in the store, exactly as the store "
+                               "spells it; see --allow-missing-events.")
+    p_export.add_argument("--allow-missing-events", action="store_true",
+                          help="With --event-list: skip listed names the "
+                               "store does not hold (with a warning) instead "
+                               "of refusing; the skipped names are recorded "
+                               "in the validation summary.")
     p_export.add_argument("--far-max", type=float, default=None,
                           metavar="FAR_YR")
     far_group = p_export.add_mutually_exclusive_group()
@@ -263,7 +270,14 @@ def build_parser() -> argparse.ArgumentParser:
                            "stored PE cosmology.")
     p_pe.add_argument("--event-list", default=None, metavar="FILE",
                       help="Restrict to a user event-list file (one name "
-                           "per line, '#' comments allowed).")
+                           "per line, '#' comments allowed). Every name must "
+                           "be in the store, exactly as the store spells it; "
+                           "see --allow-missing-events.")
+    p_pe.add_argument("--allow-missing-events", action="store_true",
+                      help="With --event-list: skip listed names the store "
+                           "does not hold (with a warning) instead of "
+                           "refusing; the skipped names are recorded in the "
+                           "validation summary.")
     p_pe.add_argument("--far-max", type=float, default=None, metavar="FAR_YR")
     pe_far_group = p_pe.add_mutually_exclusive_group()
     pe_far_group.add_argument("--allow-missing-far", action="store_true")
@@ -590,6 +604,49 @@ def _parse_source_class(spec: Optional[str]):
     return [s.strip() for s in spec.split(",") if s.strip()]
 
 
+def _event_list_preflight(args, cat) -> Optional[dict]:
+    """Refuse an ``--event-list`` naming events the store does not hold.
+
+    ``GWCatalog.select`` only warns about such names and drops them, so a short
+    alias (``GW150914`` for ``GW150914_095045``) or a typo silently lost that
+    event: the export exited 0, recorded ``n_allowed_names`` one above ``nobs``,
+    and ``validate --strict`` passed it.  The CLI user asked for those events
+    by name, so a name that matches nothing is an error, with the store's
+    spelling suggested when the name is a historical date-only GWTC name.
+    ``--allow-missing-events`` restores the skip, and the skipped names go into
+    the validation summary.  Returns the summary fields to record (or None).
+    """
+    if args.event_list is None:
+        return None
+    from .population_samples import resolve_event_name_aliases
+    from .source_class import load_event_list
+
+    store_names = [str(n) for n in cat.names]
+    store_set = set(store_names)
+    missing = [n for n in load_event_list(args.event_list)
+               if n not in store_set]
+    if not missing:
+        return None
+    if getattr(args, "allow_missing_events", False):
+        return {"event_list_missing_names": missing,
+                "event_list_allow_missing_events": True}
+
+    rows = []
+    for name in missing:
+        try:
+            _resolved, alias = resolve_event_name_aliases([name], store_names)
+        except ValueError:
+            alias = {}
+        rows.append(f"{name!r} (the store has {alias[name]!r})"
+                    if name in alias else repr(name))
+    raise ValueError(
+        f"--event-list {args.event_list}: {len(missing)} listed name(s) are "
+        f"not in the store, and an export would silently drop them: "
+        f"{', '.join(rows)}. List each event exactly as the store spells it "
+        f"(`gwcat inspect` shows the names), or pass --allow-missing-events "
+        f"to skip them deliberately.")
+
+
 def _prior_impl_scope(args):
     """The chi_eff-prior implementation this command builds with (GW-40i).
 
@@ -611,8 +668,10 @@ def _cmd_export_darksirens_impl(args) -> int:
 
     cosmology = _parse_cosmology(args.cosmology)
     cat = GWCatalog(args.store)
+    summary_context = _event_list_preflight(args, cat)
     cat.to_darksirens(
         args.out,
+        summary_context=summary_context,
         source_class=_parse_source_class(args.source_class),
         spin_prior_mode=args.spin_prior_mode,
         waveform_policy=args.waveform_policy,
@@ -681,11 +740,13 @@ def _cmd_export_pe(args) -> int:
 
     cosmology = _parse_cosmology(args.cosmology)
     cat = GWCatalog(args.store)
+    summary_context = _event_list_preflight(args, cat)
     cat.export(
         args.out,
         format=args.format,
         spin_basis=args.spin_basis,
         write_summary=not args.no_summary,
+        summary_context=summary_context,
         source_class=_parse_source_class(args.source_class),
         waveform_policy=args.waveform_policy,
         approximant=args.approximant,

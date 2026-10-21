@@ -14,6 +14,9 @@
      --nsamp is refused at parse time.
   5. A date-only event name resolves only through the table of historical
      GWTC names, never to whichever same-day event the store holds.
+  6. ``--event-list`` refuses names the store does not hold instead of
+     dropping them with a Python warning; ``--allow-missing-events`` skips
+     them and records them in the validation summary.
 
 Every test is offline: GWOSC and Zenodo are monkeypatched.
 """
@@ -359,3 +362,72 @@ def test_the_historical_table_agrees_with_the_bundled_lists():
     # system are not members
     assert len(members) == 12
     assert "GW190814_211039" in NON_BBH_EXCLUSIONS
+
+
+# ==========================================================================
+# 6. --event-list names the store lacks are an error, not a silent drop
+# ==========================================================================
+def _store_and_list(tmp_path, listed):
+    from test_cli import MIXED_EVENTS, _build_mixed_store
+    events = [dict(MIXED_EVENTS[0], name="GW150914_095045"),
+              dict(MIXED_EVENTS[0], name="GW910002_000002")]
+    store = _build_mixed_store(tmp_path, events)
+    path = tmp_path / "events.txt"
+    path.write_text("\n".join(listed) + "\n")
+    return store, str(path)
+
+
+_V1 = ["--cosmology", "67.74,0.3089", "--nsamp", "8", "--no-summary"]
+
+
+def test_a_typo_in_the_event_list_fails_the_export(tmp_path, capsys):
+    from gwcat.cli import main
+    store, listed = _store_and_list(
+        tmp_path, ["GW150914_095045", "GW910002_00002"])
+    out = tmp_path / "gw.h5"
+    rc = main(["export-darksirens", store, "--out", str(out),
+               "--event-list", listed] + _V1)
+    assert rc == 1
+    assert "GW910002_00002" in capsys.readouterr().err
+    assert not out.exists()
+
+
+def test_a_short_alias_fails_and_names_the_stores_spelling(tmp_path, capsys):
+    """The README example passed date-only names, which select() dropped."""
+    from gwcat.cli import main
+    store, listed = _store_and_list(tmp_path, ["GW150914", "GW910002_000002"])
+    for cmd in (["export-darksirens"], ["export", "pe"]):
+        out = tmp_path / "gw.h5"
+        rc = main(cmd + [store, "--out", str(out), "--event-list", listed,
+                         "--nsamp", "8", "--no-summary"])
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "'GW150914' (the store has 'GW150914_095045')" in err
+        assert not out.exists()
+
+
+def test_allow_missing_events_skips_and_records_them(tmp_path):
+    from gwcat.cli import main
+    store, listed = _store_and_list(
+        tmp_path, ["GW150914_095045", "GW910002_000002", "GW999999_999999"])
+    out = tmp_path / "gw.h5"
+    with pytest.warns(UserWarning, match="not found in store"):
+        rc = main(["export-darksirens", store, "--out", str(out),
+                   "--event-list", listed, "--allow-missing-events",
+                   "--cosmology", "67.74,0.3089", "--nsamp", "8",
+                   "--allow-missing-far"])
+    assert rc == 0
+    summary = json.loads(
+        open(str(out) + ".validation_summary.json").read())
+    assert summary["event_list_missing_names"] == ["GW999999_999999"]
+    assert summary["event_list_allow_missing_events"] is True
+
+
+def test_a_complete_event_list_exports_as_before(tmp_path):
+    from gwcat.cli import main
+    store, listed = _store_and_list(
+        tmp_path, ["GW150914_095045", "GW910002_000002"])
+    out = tmp_path / "gw.h5"
+    assert main(["export-darksirens", store, "--out", str(out),
+                 "--event-list", listed, "--allow-missing-far"] + _V1) == 0
+    assert out.exists()
