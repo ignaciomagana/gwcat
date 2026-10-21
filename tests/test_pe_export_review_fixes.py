@@ -467,3 +467,37 @@ def test_chieff_chip_refuses_an_nsbh_style_pair_of_ceilings(tmp_path):
                             nsamp=32, seed=0, cosmology=_COSMO)
     _cols, attrs = _read(out)
     np.testing.assert_array_equal(attrs["spin_amax_2_per_event"], [0.99, 0.05])
+
+
+# ==========================================================================
+# chieff_chip records why the component columns were omitted
+# (August export-pe 6)
+# ==========================================================================
+def test_chieff_chip_records_the_events_that_drop_the_component_columns(
+        tmp_path):
+    """One event with a stored chi_p but no components satisfied chieff_chip
+    and silently switched a1/a2/cost1/cost2 off for every event."""
+    events = [{"name": "GWx_000001", "provide": _FULL_SPIN},
+              {"name": "GWx_000002", "provide": {"chi_p"}}]
+    store, _ = _build_spin_store(tmp_path, events, name="nocomp.h5")
+    out = tmp_path / "cc.h5"
+    with pytest.warns(UserWarning, match=r"omitted for EVERY.*GWx_000002"):
+        GWCatalog(store).export(str(out), format="gwcat2",
+                                spin_basis="chieff_chip",
+                                allow_projection_basis=True, nsamp=32, seed=0,
+                                cosmology=_COSMO)
+    cols, attrs = _read(out)
+    assert "a1" not in cols and "chip" in cols
+    assert bool(attrs["component_columns_emitted"]) is False
+    assert _names(attrs["component_columns_missing_events"]) == ["GWx_000002"]
+
+    # A component export states that it wrote them.
+    out2 = tmp_path / "comp.h5"
+    full = [{"name": "GWx_000003", "provide": _FULL_SPIN}]
+    store2, _ = _build_spin_store(tmp_path, full, name="comp_ok.h5")
+    GWCatalog(store2).export(str(out2), format="gwcat2",
+                             spin_basis="component", nsamp=32, seed=0,
+                             cosmology=_COSMO)
+    _cols, a2 = _read(out2)
+    assert bool(a2["component_columns_emitted"]) is True
+    assert len(a2["component_columns_missing_events"]) == 0

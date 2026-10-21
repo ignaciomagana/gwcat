@@ -770,6 +770,15 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                        and _group_available_all(sub, "a_2")
                        and _group_available_all(sub, "cos_tilt_1", "tilt_1")
                        and _group_available_all(sub, "cos_tilt_2", "tilt_2"))
+        # WHICH selected events lack a component column, and so switch the
+        # a1/a2/cost1/cost2 columns off for EVERY event (August export-pe 6):
+        # recorded and warned about, so a re-export over a slightly different
+        # event list cannot silently change the file's column set.
+        component_missing_events = [
+            str(sub.event_names[e]) for e in range(sub.n_events)
+            if not (avail_a1[e] and avail_a2[e]
+                    and (avail_cos1[e] or avail_tilt1[e])
+                    and (avail_cos2[e] or avail_tilt2[e]))]
 
         a1_list, a2_list, cost1_list, cost2_list, chip_list = [], [], [], [], []
         chip_src_list = []
@@ -1246,6 +1255,16 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                 f"(spin_amax_config_per_constituent_per_event) one widened box "
                 f"is an approximation. A projection basis keeps its declared "
                 f"ceiling and is refused by the support gate instead.")
+        if not emit_extras:
+            warnings.warn(
+                f"spin_basis={spin_basis!r}: {len(component_missing_events)} "
+                f"selected event(s) lack a_1, a_2 or a tilt, so the raw "
+                f"component columns a1/a2/cost1/cost2 are omitted for EVERY "
+                f"event (the output must stay rectangular): "
+                f"{component_missing_events[:10]}"
+                + ("" if len(component_missing_events) <= 10
+                   else f", ... (+{len(component_missing_events) - 10} more)")
+                + ". Recorded as component_columns_emitted=False.")
         if chip_no_ingredient_events:
             warnings.warn(
                 f"chi_p_definition='schmidt_recomputed': "
@@ -1276,6 +1295,11 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             "spin_amax_source_2_per_event": np.array(amax_src2_list, dtype=_str),
             "spin_amax_inflation_per_event": np.asarray(amax_infl_list,
                                                         dtype=float),
+            # August export-pe 6: whether a1/a2/cost1/cost2 were written, and
+            # the selected events that switched them off when they were not.
+            "component_columns_emitted": bool(emit_extras),
+            "component_columns_missing_events": np.array(
+                component_missing_events, dtype=_str),
         }
         if spin_basis == "component":
             spin_attrs["component_spin_prior_applied_to_p_pe"] = True
