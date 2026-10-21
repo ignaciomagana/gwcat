@@ -163,6 +163,7 @@ coverage check per run as well as per campaign.
 from __future__ import annotations
 
 import json
+import os
 import warnings
 
 import numpy as np
@@ -230,7 +231,9 @@ class OverlappingCampaignError(ValueError):
     A cumulative mixture already contains every run's exposure in its
     ``total_generated``/``total_analysis_time`` and per-row weights; adding a
     campaign that overlaps it in time (endo3 for O3, rpo4ab for O4) counts that
-    exposure twice and double-counts its detections in the Essick sum.
+    exposure twice and double-counts its detections in the Essick sum.  The
+    same holds for any two campaigns over the same time, including one file
+    passed twice (see :func:`_refuse_overlapping_campaigns`).
     """
 
 #: Extra per-injection spin columns (emitted when available for every campaign).
@@ -298,17 +301,32 @@ def _detect_keep(s, far_threshold, source_class, snr_threshold, z_max=None,
 
 
 def _refuse_overlapping_campaigns(set_list):
-    """Refuse a cumulative mixture combined with a campaign that overlaps it.
+    """Refuse campaigns that cover the same time in one selection product.
 
-    A mixture's normalisation (``total_generated``, ``total_analysis_time``) and
-    its per-row weights already hold every run it spans; a second campaign over
-    any of that time -- endo3 for O3, rpo4ab for O4 -- would count the shared
-    exposure twice.  The overlap is judged on GPS ranges (the rows' own times,
-    else the campaign's ``gps_start``/``gps_end`` attrs); a campaign whose
-    range is unknown is refused too, because an overlap cannot be ruled out.
+    Each campaign's ``pdraw`` is scaled by ``N_k/N_total`` and its exposure
+    enters ``T_obs``, so ``mu = sum_k T_k xi_k``: two campaigns over the same
+    time EACH add that time's ``T xi``, and the shared exposure (and its
+    detected injections) is counted twice.
+
+    * A cumulative mixture's normalisation (``total_generated``,
+      ``total_analysis_time``) and per-row weights already hold every run it
+      spans; a second campaign over any of that time -- endo3 for O3, rpo4ab
+      for O4 -- is refused, and so is one whose range is unknown, because an
+      overlap cannot be ruled out.
+    * Any other pair (review fix) is refused when it is the same injection
+      file twice, or when both GPS ranges are known and intersect (an
+      O4a-only set plus rpo4ab, two campaigns over one run).  A pair whose
+      overlap cannot be judged (no row times, no ``gps_start``/``gps_end``)
+      warns: the legacy spin-less campaigns carry no times at all, and the
+      per-campaign GPS record (``campaign_gps_range_source_per_campaign =
+      'unknown'``) says so in the file.
+
+    The overlap is judged on GPS ranges: the rows' own times, else the
+    campaign's ``gps_start``/``gps_end`` attrs.
     """
     if len(set_list) < 2:
         return
+    _refuse_overlapping_single_campaigns(set_list)
     mixtures = [s for s in set_list
                 if s.campaign_kind == CAMPAIGN_CUMULATIVE_MIXTURE]
     for m in mixtures:
@@ -336,6 +354,53 @@ def _refuse_overlapping_campaigns(set_list):
                     f"injections) in the selection integral. Export the "
                     f"mixture alone; to use another campaign for one run, "
                     f"build that run from its own campaign instead.")
+
+
+def _refuse_overlapping_single_campaigns(set_list):
+    """The pairwise half of :func:`_refuse_overlapping_campaigns`.
+
+    Pairs involving a cumulative mixture are left to the mixture rule there,
+    which is stricter (an unknown range is refused, not warned about).
+    """
+    unknown = []
+    for i, a in enumerate(set_list):
+        for b in set_list[i + 1:]:
+            if CAMPAIGN_CUMULATIVE_MIXTURE in (a.campaign_kind,
+                                               b.campaign_kind):
+                continue
+            pa, pb = os.fspath(a.path), os.fspath(b.path)
+            if os.path.realpath(pa) == os.path.realpath(pb):
+                raise OverlappingCampaignError(
+                    f"the same injection file appears twice in one selection "
+                    f"product: {pa!r} and {pb!r}. Each copy adds its draws "
+                    f"to ndraw, its exposure to T_obs and its detected "
+                    f"injections to the sum, so the campaign's exposure is "
+                    f"counted twice. Pass each campaign once.")
+            ra, rb = a.gps_range, b.gps_range
+            if ra is None or rb is None:
+                unknown.append((pa, pb))
+                continue
+            if ra[0] <= rb[1] and rb[0] <= ra[1]:
+                raise OverlappingCampaignError(
+                    f"{pa} (GPS [{ra[0]:.0f}, {ra[1]:.0f}]) and {pb} (GPS "
+                    f"[{rb[0]:.0f}, {rb[1]:.0f}]) cover overlapping time. The "
+                    f"builder combines campaigns by their Essick fractions "
+                    f"N_k/N_total, which is right only for campaigns over "
+                    f"DISJOINT time: each campaign adds its own exposure, so "
+                    f"the shared stretch is counted twice in the selection "
+                    f"integral (and its detected injections twice in the "
+                    f"sum). Two campaigns over the same time are one mixture "
+                    f"density, which needs every campaign's draw density on "
+                    f"every injection and is not what this builder writes; "
+                    f"export one campaign per stretch of time.")
+    if unknown:
+        warnings.warn(
+            "cannot rule out a time overlap between campaign(s) "
+            + "; ".join(f"{a} and {b}" for a, b in unknown)
+            + ": at least one carries no row times and no gps_start/gps_end "
+              "attrs. Campaigns over the same time double-count its exposure "
+              "in the selection integral; the file records "
+              "campaign_gps_range_source_per_campaign='unknown' for them.")
 
 
 def _mixture_run_attrs(s, keep, detect, far_threshold, snr_threshold,

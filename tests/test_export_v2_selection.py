@@ -697,3 +697,44 @@ def test_time_coverage_unknown_is_nan_not_absent(tmp_path):
     assert (src.decode() if isinstance(src, bytes) else src) == "unknown"
     assert json.loads(prod.attrs["campaign_runs_per_campaign"]) == [[]]
     assert json.loads(prod.attrs["observing_runs_covered"]) == []
+
+
+def test_the_same_campaign_twice_is_refused(tmp_path):
+    """build_selection_product([endo3, endo3]) used to double n_det, ndraw and
+    mu without a word -- the overlap refusal compared GPS ranges against
+    cumulative mixtures only."""
+    from gwcat.export import build_selection_product
+    from gwcat.export.selection_builder import OverlappingCampaignError
+
+    p = write_endo3_full(tmp_path / "endo3.hdf", n=30, seed=4)
+    with pytest.raises(OverlappingCampaignError, match="appears twice"):
+        build_selection_product([SelectionSet(p), SelectionSet(p)],
+                                spin_basis="component")
+
+
+def test_two_campaigns_over_one_run_are_refused(tmp_path):
+    from gwcat.export import build_selection_product
+    from gwcat.export.selection_builder import OverlappingCampaignError
+    from gwcat.observing_runs import EXPOSURE_WINDOWS_GPS
+
+    lo, hi = EXPOSURE_WINDOWS_GPS["O4a"]
+    p1 = _o4_with_times(tmp_path / "o4a_only.hdf", 30, lo, lo + 1e6, 5)
+    p2 = _o4_with_times(tmp_path / "o4ab.hdf", 30, lo + 5e5, hi, 6)
+    with pytest.raises(OverlappingCampaignError, match="overlapping time"):
+        build_selection_product([SelectionSet(p1), SelectionSet(p2)],
+                                spin_basis="component")
+    # Disjoint time combines as before.
+    p3 = _o4_with_times(tmp_path / "later.hdf", 30, lo + 2e6, hi, 7)
+    prod = build_selection_product([SelectionSet(p1), SelectionSet(p3)],
+                                   spin_basis="component")
+    assert int(prod.attrs["n_campaigns"]) == 2
+
+
+def test_an_unjudgeable_overlap_warns(tmp_path):
+    from gwcat.export import build_selection_product
+
+    o3 = write_endo3_full(tmp_path / "endo3.hdf", n=20, seed=8)
+    o4 = write_o4_full(tmp_path / "o4.hdf", n=20, seed=9)
+    with pytest.warns(UserWarning, match="cannot rule out a time overlap"):
+        build_selection_product([SelectionSet(o3), SelectionSet(o4)],
+                                spin_basis="component")
