@@ -147,10 +147,12 @@ SPIN_CHIEFF_REFERENCE = ParameterBlock(
     # divides by the reference in the denominator, so it assumes nothing
     # about the parent's magnitudes and tilts -- it only needs the parent to
     # COVER the reference support, which is a coverage check on the injected
-    # magnitudes (enforced in the builder).  The one assumption it shares with
-    # spin.component_polar is the azimuths: the 4-D component density it
-    # starts from divides them out as uniform (review 2026-10-20).
-    requires_campaign=CampaignRequirement(uniform_azimuth=True),
+    # magnitudes (enforced in the builder).  What it shares with
+    # spin.component_polar is the 4-D component density it starts from, and
+    # so that density's one assumption on a JOINT-density campaign (uniform
+    # azimuths; see spin.component_polar), which is recorded per campaign
+    # rather than required (review 2026-10-20).
+    requires_campaign=CampaignRequirement(),
     store_required=("a_1", "a_2", "chi_eff"),
     store_alternatives=(("cos_tilt_1", "tilt_1"), ("cos_tilt_2", "tilt_2")),
     store_params_fetched=("a_1", "a_2", "cos_tilt_1", "cos_tilt_2",
@@ -191,12 +193,15 @@ SPIN_COMPONENT_POLAR = ParameterBlock(
     map_kind="bijective",
     exact_draw_density=True,
     prior_is_per_event_constant=True,
-    # A bijection of the 4-D (a, cos tilt) vector, so exact for any campaign
-    # whose spin AZIMUTHS are uniform: a joint-density campaign's 6-D density
-    # is reduced to 4-D by dividing the azimuths out as U[0, 2pi) each, which
-    # is a requirement on the campaign, now declared and evaluated (review
-    # 2026-10-20; every LVK campaign passes it).
-    requires_campaign=CampaignRequirement(uniform_azimuth=True),
+    # No campaign requirement, but one recorded assumption (review
+    # 2026-10-20).  A FACTORED campaign (o4_factored) gives the azimuth density
+    # as its own factor, so the 4-D (a, cos tilt) density is exact whatever
+    # that factor is.  A JOINT-density campaign (joint_cartesian, joint_polar,
+    # the O3 endo3 sampling_pdf) is reduced to 4-D by dividing each azimuth
+    # out as U[0, 2pi): one density evaluated at the drawn points cannot show
+    # an azimuth dependence, so this is assumed unless the file's per-spin
+    # cartesian pdfs check isotropic (endo3).  The selection product records
+    # which, per campaign: injected_spin_azimuths_per_campaign.
     # chi_eff is required even though it is ADVISORY here: the component export
     # still writes the legacy 10 columns, so the store must carry it. A
     # deliberate, documented simplification -- the alternative is making chi_eff
@@ -212,9 +217,11 @@ SPIN_COMPONENT_POLAR = ParameterBlock(
             "chieff": Range(-1.0, 1.0), "chip": Range(0.0, 1.0)},
     notes=("The default and the recommended space. Its injection density is "
            "read NUMERICALLY off the file, so it requires nothing of the "
-           "campaign's magnitudes or tilts and is exact for any campaign with "
-           "uniform azimuths (which a joint-density campaign's reduction to "
-           "4-D assumes, and which is checked). chieff/chip are emitted but "
+           "campaign's magnitudes or tilts. It is exact for a factored "
+           "campaign, whose azimuth density is its own factor; a joint-density "
+           "campaign's reduction to 4-D assumes uniform azimuths, which the "
+           "selection product records per campaign "
+           "(injected_spin_azimuths_per_campaign). chieff/chip are emitted but "
            "ADVISORY: pdraw carries no term for them, so fitting on them here "
            "would be wrong -- the hole sel_v2_component.h5 shipped with."),
 )

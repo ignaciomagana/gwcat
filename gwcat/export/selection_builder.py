@@ -985,10 +985,6 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                                      zip(set_list, is_mixture) if m)
             + ". Each already carries every run's exposure; export one.")
     _refuse_overlapping_campaigns(set_list)
-    # The block requirement no basis-specific check below enforces: uniform
-    # azimuths (review 2026-10-20: declared in the registry, never evaluated).
-    get_space(spin_basis).refuse_unmet_requirements(
-        [(str(s.path), s.spin_meta) for s in set_list])
     if acknowledge_semianalytic_excluded and snr_threshold is not None:
         raise ValueError(
             "acknowledge_semianalytic_excluded=True (--acknowledge-semianalytic-"
@@ -1324,6 +1320,11 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             dtype=bool),
         "injected_spin_checks": json.dumps(
             [_json_checks(s.spin_meta.get("checks", {})) for s in set_list]),
+        # How each campaign's 4-D component spin density treats the azimuths
+        # (review 2026-10-20): exact for a factored file, verified or ASSUMED
+        # uniform for a joint density.  Recorded, not required.
+        "injected_spin_azimuths_per_campaign": np.array(
+            [_injected_spin_azimuths(s) for s in set_list], dtype=_str),
         # False for campaigns whose rows carry no drawn sky position (the
         # semianalytic O1/O2 entries of the cumulative mixtures); their
         # exported ra/dec are NaN.
@@ -1600,3 +1601,39 @@ def _json_checks(checks):
         else:
             out[k] = float(v)
     return out
+
+
+#: The tolerance :func:`gwcat.selection_spin.check_factored_vs_joint` passes at.
+_FACTORED_VS_JOINT_RTOL = 1e-6
+
+
+def _injected_spin_azimuths(s):
+    """How campaign ``s``'s 4-D component spin density treats the azimuths.
+
+    * ``"factored"`` -- the file gives each azimuth's density as its own
+      factor (o4_factored), so the 4-D (a, cos tilt) density marginalises it
+      exactly, whatever that factor is.
+    * ``"checked_isotropic"`` -- a joint cartesian density (O3 endo3) divided
+      out as uniform in azimuth, where the file's per-spin cartesian pdfs
+      check isotropic on every row (a uniform direction, so a uniform
+      azimuth) and the joint pdf, when given, equals their product.
+    * ``"assumed_uniform"`` -- a joint density (joint_cartesian, joint_polar,
+      or an endo3 file whose isotropy check does not pass) reduced to 4-D by
+      dividing each azimuth out as U[0, 2 pi).  One density evaluated at the
+      drawn points cannot show an azimuth dependence, so this is not checked.
+    * ``"none"`` -- the campaign has no component spin density.
+    """
+    if getattr(s, "_ln_spin_component", None) is None:
+        return "none"
+    meta = s.spin_meta or {}
+    fmt = meta.get("spin_format")
+    if fmt == "o4_factored":
+        return "factored"
+    if fmt == "endo3_factored":
+        checks = meta.get("checks") or {}
+        uni = checks.get("max_spin_uniform")
+        dev = checks.get("factored_vs_joint_dev")
+        if (uni is not None and all(bool(x) for x in uni)
+                and (dev is None or float(dev) <= _FACTORED_VS_JOINT_RTOL)):
+            return "checked_isotropic"
+    return "assumed_uniform"

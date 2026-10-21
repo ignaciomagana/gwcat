@@ -362,20 +362,64 @@ def _o4_with_azimuth(tmp_path, uniform):
     return path
 
 
-def test_component_selection_refuses_non_uniform_azimuths(tmp_path):
-    """spin.component_polar was declared 'exact for any campaign' while the
-    4-D density divides the azimuths out as uniform, which nothing checked."""
+def test_factored_campaign_azimuths_are_marginalised_not_refused(tmp_path):
+    """A factored campaign gives each azimuth density as its own factor, so
+    the 4-D component density is exact whatever that factor is: a normalised
+    NON-uniform azimuth density must leave pdraw unchanged, and the product
+    records how the azimuths were treated."""
     from gwcat.export import build_selection_product
-    from gwcat.params.registry import CampaignRequirementError
     from gwcat.selection import SelectionSet
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        build_selection_product(SelectionSet(_o4_with_azimuth(tmp_path, True)),
-                                spin_basis="component")
-        with pytest.raises(CampaignRequirementError, match="azimuths"):
-            build_selection_product(
-                SelectionSet(_o4_with_azimuth(tmp_path, False)),
-                spin_basis="component")
+        uni = build_selection_product(
+            SelectionSet(_o4_with_azimuth(tmp_path, True)),
+            spin_basis="component")
+        non = build_selection_product(
+            SelectionSet(_o4_with_azimuth(tmp_path, False)),
+            spin_basis="component")
+    np.testing.assert_array_equal(non.columns["pdraw"], uni.columns["pdraw"])
+    assert _strs(non.attrs["injected_spin_azimuths_per_campaign"]) == [
+        "factored"]
+
+
+def test_joint_density_campaigns_record_the_azimuth_assumption(tmp_path):
+    """The review case: joint_polar, joint_cartesian and the O3 cartesian
+    format reduce a joint density to 4-D by dividing the azimuths out as
+    uniform, which nothing checked or recorded.  The O3 format's per-spin
+    isotropy check verifies it; a joint density cannot, so it is recorded as
+    an assumption."""
+    from gwcat.export import build_selection_product
+    from gwcat.selection import SelectionSet
+    from test_selection_spin import write_endo3_full, write_mixture
+    cases = {"assumed_uniform": [write_mixture(tmp_path / "p.hdf", "polar"),
+                                 write_mixture(tmp_path / "c.hdf",
+                                               "cartesian")],
+             "checked_isotropic": [write_endo3_full(tmp_path / "e.hdf", 200)]}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for want, paths in cases.items():
+            for path in paths:
+                for basis, kw in (("component", {}),
+                                  ("chieff_reference",
+                                   {"spin_reference_amax": 0.99})):
+                    prod = build_selection_product(SelectionSet(str(path)),
+                                                   spin_basis=basis, **kw)
+                    assert _strs(prod.attrs[
+                        "injected_spin_azimuths_per_campaign"]) == [want], (
+                        path, basis)
+
+
+def test_only_a_block_that_keeps_the_azimuths_needs_them_uniform():
+    """A failed azimuth check contradicts the 6-D block, which keeps the
+    azimuths at an assumed uniform density; the 4-D component block
+    marginalises a factored azimuth density exactly and requires nothing."""
+    from gwcat.params import get_space
+    meta = {"uniform_isotropic": True, "amax_detected": (0.9, 0.7),
+            "checks": {"azimuth_uniform": (False, True)}}
+    assert get_space("component_6d").unmet_requirements(meta) == {
+        "spin.component_6d": ("uniform_azimuth",)}
+    assert get_space("component").unmet_requirements(meta) == {}
+    assert get_space("chieff_reference").unmet_requirements(meta) == {}
 
 
 def test_21_selection_with_no_sky_in_any_row_is_refused(tmp_path):
