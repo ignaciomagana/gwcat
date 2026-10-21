@@ -434,9 +434,16 @@ def test_chieff_chip_ppe_joint_prior(tmp_path):
     store, _ = _build_spin_store(tmp_path, events)
     cat = GWCatalog(store)
     out = tmp_path / "chieffchip.h5"
+    # The mismatched event is refused by default (August export-pe 3): the
+    # joint prior has one amax and would be evaluated at amax_1.
+    with pytest.raises(ValueError, match="GWc4_000002"):
+        cat.export(str(out), format="gwcat2", spin_basis="chieff_chip",
+                   allow_projection_basis=True, nsamp=32, seed=0,
+                   cosmology=(67.74, 0.3089))
     with pytest.warns(UserWarning, match="spin_amax_1 != spin_amax_2"):
         cat.export(str(out), format="gwcat2", spin_basis="chieff_chip", allow_projection_basis=True,
-                   nsamp=32, seed=0, cosmology=(67.74, 0.3089))
+                   nsamp=32, seed=0, cosmology=(67.74, 0.3089),
+                   allow_chieff_chip_amax_mismatch=True)
 
     cols, attrs = _read(out)
     assert bool(attrs["chi_eff_chi_p_prior_applied_to_p_pe"]) is True

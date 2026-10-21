@@ -255,7 +255,8 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                      allow_projection_basis=False,
                      drop_spin_above_ceiling=False,
                      sample_set_map=None, nrsur_q_rule=None,
-                     nrsur_q_rule_substitute=False, mock_data=None):
+                     nrsur_q_rule_substitute=False, mock_data=None,
+                     allow_chieff_chip_amax_mismatch=False):
     """Build a PE :class:`ExportProduct` from a :class:`~gwcat.catalog.GWCatalog`.
 
     For ``spin_basis="chieff"`` this reproduces the legacy
@@ -273,6 +274,11 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     stores).  Pass a number to force one ceiling on every event; that is what the
     chieff basis used to do unconditionally, which stamped the caller's default
     0.99 on events whose sampling prior said something else (GW-31).
+
+    The ``chieff_chip`` joint prior admits a single ceiling, so an event with
+    ``amax_1 != amax_2`` is REFUSED (it used to be evaluated at ``amax_1`` with
+    a warning); ``allow_chieff_chip_amax_mismatch=True`` restores that, still
+    recorded in ``spin_amax_mismatch_events``.
 
     The assembled ``p_pe`` must be finite and strictly positive (GW-01); a zero
     weight means the store's ``p_dL_pe`` was written by a pre-GW-01 ingest that
@@ -1172,6 +1178,26 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             }
         elif emit_extras:  # nobs == 0
             extras = {k: np.array([]) for k in ("a1", "a2", "cost1", "cost2")}
+
+        # ── chieff_chip with two ceilings (August export-pe 3) ──────────────
+        # The joint (chi_eff, chi_p) prior admits ONE amax and is evaluated at
+        # amax_1, so an event whose prior gives the secondary a different
+        # ceiling (an NSBH's a_2 <= 0.05) gets a density of the wrong shape and
+        # support, by a factor no per-event normalisation removes.  Refused
+        # unless asked for; the component basis takes both ceilings exactly.
+        if (spin_basis == "chieff_chip" and mismatch_events
+                and not allow_chieff_chip_amax_mismatch):
+            raise ValueError(
+                f"spin_basis='chieff_chip': {len(mismatch_events)} event(s) "
+                f"have spin_amax_1 != spin_amax_2, but the joint (chi_eff, "
+                f"chi_p) prior admits a single amax and would evaluate them "
+                f"at amax_1, which is not their prior: {mismatch_events[:10]}"
+                + ("" if len(mismatch_events) <= 10
+                   else f", ... (+{len(mismatch_events) - 10} more)")
+                + ". Use spin_basis='component' (exact for any pair of "
+                  "ceilings), exclude the events, or pass "
+                  "allow_chieff_chip_amax_mismatch=True to export them at "
+                  "amax_1 anyway.")
 
         if spin_basis == "component":
             columns = _apply_component_basis(data, amax1_ps, amax2_ps,

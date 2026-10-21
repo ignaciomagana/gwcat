@@ -442,3 +442,28 @@ def test_a_pooled_allowance_does_not_cover_an_event_with_no_support(tmp_path):
                                 allow_zero_p_pe=True, **kw)
     _cols, attrs = _read(out)
     assert int(attrs["n_out_of_support_per_event"][3]) == 32
+
+
+# ==========================================================================
+# chieff_chip refuses an event whose two spins have different ceilings
+# (August export-pe 3 / spin-cosmo 2)
+# ==========================================================================
+def test_chieff_chip_refuses_an_nsbh_style_pair_of_ceilings(tmp_path):
+    """GW230529-like: a_1 <= 0.99, a_2 <= 0.05.  The joint prior has ONE
+    amax, so the event was evaluated at amax_1 = 0.99 for both spins (the
+    secondary's spin volume inflated ~20x), with only a warning."""
+    events = [{"name": "GWn_000001", "amax1": 0.99, "amax2": 0.99},
+              {"name": "GWn_000002", "amax1": 0.99, "amax2": 0.05}]
+    store, _ = _build_spin_store(tmp_path, events, name="nsbh.h5")
+    kw = dict(format="gwcat2", spin_basis="chieff_chip",
+              allow_projection_basis=True, nsamp=32, seed=0, cosmology=_COSMO)
+    with pytest.raises(ValueError, match=r"spin_amax_1 != spin_amax_2.*"
+                                         r"GWn_000002"):
+        GWCatalog(store).export(str(tmp_path / "x.h5"), **kw)
+    assert not (tmp_path / "x.h5").exists()
+    # The component basis takes both ceilings exactly.
+    out = tmp_path / "comp.h5"
+    GWCatalog(store).export(str(out), format="gwcat2", spin_basis="component",
+                            nsamp=32, seed=0, cosmology=_COSMO)
+    _cols, attrs = _read(out)
+    np.testing.assert_array_equal(attrs["spin_amax_2_per_event"], [0.99, 0.05])
