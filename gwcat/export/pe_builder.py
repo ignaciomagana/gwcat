@@ -1281,7 +1281,9 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
 
     # ── Exported-weight support contract (GW-01) ────────────────────────────
     from ..schema import check_p_pe_positive
-    check_p_pe_positive(
+    # With allow_zero_p_pe, the count of exact zeros written is recorded on
+    # the product (review 2026-10-20: the bypass left no trace).
+    n_zero_p_pe_allowed = check_p_pe_positive(
         columns["p_pe"], event_names=kept, nsamp=nsamp,
         allow_zero=allow_zero_p_pe, expected_zero=~in_support,
         context=f"gwcat-pe-2.0 export (spin_basis={spin_basis!r})",
@@ -1427,6 +1429,8 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         "n_samples_out_of_support": int(n_out),
         "frac_samples_out_of_support": float(frac_out),
         "n_out_of_support_per_event": n_out_per_event,
+        "allow_zero_p_pe": bool(allow_zero_p_pe),
+        "n_zero_p_pe_allowed": int(n_zero_p_pe_allowed),
         "prior_reweight_ess_per_event": ess_per_event,
         "max_out_of_support_frac": float(max_out_of_support_frac),
         "out_of_support_allowed": bool(allow_out_of_support),

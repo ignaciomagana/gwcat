@@ -276,6 +276,10 @@ SPACES: Dict[str, ParameterSpace] = {
 #: The three spaces that correspond to an existing ``spin_basis`` value.
 LEGACY_SPIN_BASES = ("chieff", "chieff_chip", "component")
 
+#: Spaces a builder refuses without an explicit opt-in flag (chieff_chip:
+#: ``allow_projection_basis``), so never offered as a remedy in an error.
+OPT_IN_SPACES = ("chieff_chip",)
+
 
 def get_space(name: str) -> ParameterSpace:
     if name not in SPACES:

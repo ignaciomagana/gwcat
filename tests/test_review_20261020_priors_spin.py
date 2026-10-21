@@ -482,3 +482,50 @@ def test_writer_refuses_an_undeclared_dataset(tmp_path):
     prod.columns["mystery"] = np.zeros_like(prod.columns["p_pe"])
     with pytest.raises(ValueError, match="mystery"):
         write_pe_gwcat2(prod, str(tmp_path / "x.h5"))
+
+
+# ==========================================================================
+# allow_zero_p_pe covers exact zeros only, and is recorded
+# ==========================================================================
+@pytest.mark.parametrize("bad", [np.nan, np.inf, -1.0])
+def test_allow_zero_does_not_write_nan_inf_or_negative(bad):
+    from gwcat.schema import ZeroWeightError, check_p_pe_positive
+    p = np.array([1.0, 0.0, bad, 2.0])
+    with pytest.raises(ZeroWeightError, match="exact zeros only"):
+        check_p_pe_positive(p, allow_zero=True)
+    with pytest.warns(UserWarning, match="writing it anyway"):
+        assert check_p_pe_positive(np.array([1.0, 0.0, 2.0]),
+                                   allow_zero=True) == 1
+
+
+def test_allowed_zero_p_pe_is_recorded_on_the_product(tmp_path):
+    store = _two_event_store(tmp_path)
+    with h5py.File(store, "r+") as f:
+        p = f["samples/p_dL_pe"][()]
+        p[:5] = 0.0
+        f["samples/p_dL_pe"][...] = p
+    attrs = _export(store, tmp_path / "pe.h5", nsamp=200,
+                    allow_zero_p_pe=True)
+    assert bool(attrs["allow_zero_p_pe"]) is True
+    assert int(attrs["n_zero_p_pe_allowed"]) == 5
+    clean = _export(_two_event_store(tmp_path, name="clean.h5"),
+                    tmp_path / "pe2.h5")
+    assert bool(clean["allow_zero_p_pe"]) is False
+    assert int(clean["n_zero_p_pe_allowed"]) == 0
+
+
+# ==========================================================================
+# The missing-parameter hint offers only spaces the builder can build
+# ==========================================================================
+def test_hint_omits_opt_in_spaces_and_unsatisfiable_alternatives():
+    from gwcat.schema import _supported_spaces_hint, spaces_supported_by
+    # a_1/a_2/chi_eff but neither cos_tilt_i nor tilt_i: the component and
+    # chieff_reference spaces' alternative groups cannot be met.
+    have = ["mass_1", "mass_2", "luminosity_distance", "p_dL_pe", "ra", "dec",
+            "chi_eff", "a_1", "a_2", "chi_p"]
+    ok = spaces_supported_by(have)
+    assert "component" not in ok and "chieff" in ok
+    full = have + ["cos_tilt_1", "cos_tilt_2"]
+    assert "component" in spaces_supported_by(full)
+    hint = _supported_spaces_hint(full)
+    assert "chieff_chip" not in hint and "component" in hint
