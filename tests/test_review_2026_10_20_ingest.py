@@ -876,3 +876,22 @@ def test_store_records_how_the_run_was_assigned(tmp_path, monkeypatch):
     store = _ingest(tmp_path, monkeypatch, {O3_NAME: _gw191109_like()})
     assert _meta(store, "observing_run") == "O3b"
     assert _meta(store, "observing_run_source") == "gps_exposure_windows"
+
+
+# ==========================================================================
+# low-71: the merged store's mock flag follows the rows that survive
+# ==========================================================================
+def test_merge_whose_mock_rows_are_all_skipped_is_real(tmp_path,
+                                                       monkeypatch):
+    real = _ingest(tmp_path, monkeypatch, {_E1: _one_label_file(1)},
+                   name="real.h5")
+    mock = _ingest(tmp_path, monkeypatch, {_E1: _one_label_file(1)},
+                   name="mock.h5", mock_data=True)
+    out = tmp_path / "m.h5"
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", message=".*mock-data store with")
+        with pytest.warns(UserWarning, match="skipped"):
+            ing.merge_stores(real, mock, str(out))
+    with h5py.File(out, "r") as f:
+        assert ing.read_store_mock_data(f) is False
+        assert len(f["index/event_names"]) == 1

@@ -3931,12 +3931,18 @@ def merge_stores(store_a, store_b, out_path, cfg: Optional[IngestConfig] = None,
     # because the merge producing its replacement failed.
     # A merge holding ANY synthetic row is synthetic: the flag is file-level,
     # and labelling a partly-mock store as real is the error it exists to stop.
-    a_mock, b_mock = bool(A.get("mock_data")), bool(B.get("mock_data"))
+    # Judged on the rows WRITTEN, after deduplication (review 2026-10-20,
+    # low-71): a mock store whose rows were all skipped contributes none, and
+    # a merge holding only real rows used to come out mock for good.
+    a_mock = bool(A.get("mock_data")) and A["n_events"] > 0
+    b_mock = bool(B.get("mock_data")) and B["n_events"] > 0
     mock_data = a_mock or b_mock
-    if a_mock != b_mock:
+    if (A["n_events"] and B["n_events"]
+            and bool(A.get("mock_data")) != bool(B.get("mock_data"))):
         warnings.warn(
             f"merging a mock-data store with a real-data store "
-            f"({store_a!r} mock_data={a_mock}, {store_b!r} mock_data={b_mock}); "
+            f"({store_a!r} mock_data={bool(A.get('mock_data'))}, {store_b!r} "
+            f"mock_data={bool(B.get('mock_data'))}); "
             f"the merged store is flagged mock_data=True, and so is every "
             f"export built from it.")
 
