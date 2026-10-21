@@ -485,3 +485,26 @@ def test_pe_median_snr_and_cut_does_not_pair_with_a_far_or_snr_mask(tmp_path):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             validate_export_v2(str(pe), str(sel))
+
+
+# ======================================================================
+# ndraw is the campaigns' sum; T_obs is a positive time
+# ======================================================================
+def test_hand_edited_ndraw_fails(tmp_path):
+    """ndraw was checked only as ndraw > n_detected; a hand edit to 12.8x the
+    campaigns' draws passed and scales beta by the same factor."""
+    pe = _pe_component(tmp_path, name="pe_nd.h5")
+    sel = _sel(tmp_path, name="sel_nd.h5")
+    with h5py.File(sel, "r+") as f:
+        f.attrs["ndraw"] = int(round(12.8 * int(f.attrs["ndraw"])))
+    res = validate_export_v2(str(pe), str(sel))
+    assert res["sel_ndraw_is_sum_of_campaign_ndraws"] is False
+
+
+def test_nonpositive_T_obs_fails(tmp_path):
+    pe = _pe_component(tmp_path, name="pe_T.h5")
+    sel = _sel(tmp_path, name="sel_T.h5")
+    with h5py.File(sel, "r+") as f:
+        f.attrs["T_obs_yr"] = float("nan")
+    res = validate_export_v2(str(pe), str(sel))
+    assert res["sel_T_obs_yr_positive"] is False

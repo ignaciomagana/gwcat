@@ -436,6 +436,24 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
         n_det = int(sel_attrs.get("n_detected", 0))
         _check("sel_ndraw_gt_ndet", ndraw > n_det,
                f"ndraw={ndraw} <= n_detected={n_det}")
+        # ndraw is the sum of the campaigns' draws, and T_obs is a positive
+        # time (review 2026-10-20): a hand-edited ndraw passed as long as it
+        # exceeded n_detected, and beta scales as 1/ndraw.
+        if "campaign_ndraws" in sel_attrs:
+            _cn = np.atleast_1d(np.asarray(sel_attrs["campaign_ndraws"],
+                                           dtype=np.int64))
+            _check("sel_ndraw_is_sum_of_campaign_ndraws",
+                   int(_cn.sum()) == ndraw,
+                   f"ndraw={ndraw} but sum(campaign_ndraws)={int(_cn.sum())} "
+                   f"({_cn.tolist()})")
+        _T = sel_attrs.get("T_obs_yr")
+        try:
+            _T = float(_T)
+        except (TypeError, ValueError):
+            _T = float("nan")
+        _check("sel_T_obs_yr_positive", np.isfinite(_T) and _T > 0.0,
+               f"T_obs_yr={sel_attrs.get('T_obs_yr')!r} is not a positive "
+               f"finite observing time")
 
         # Required datasets, and every column tied to n_detected (GW-37).  This
         # block had NEITHER -- the PE half above has both, and so does the
