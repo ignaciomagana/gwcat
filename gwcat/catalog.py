@@ -134,6 +134,9 @@ class SelectionSpec:
     #: written although no injection campaign reproduces them (see
     #: :meth:`check_pairable`).  Sticky across a chain of views.
     point_estimate_cuts_allowed: bool = False
+    #: Events the ``snr_min`` cut dropped because their posterior-median SNR
+    #: is unknown (NaN), counted by the call that applied the cut.
+    n_missing_snr: int = 0
 
     # ---- composition ----------------------------------------------------
     def refine(self, *, compact_type=None, source_class=None, far_max=None,
@@ -142,7 +145,7 @@ class SelectionSpec:
                allowed_names_authoritative=True, far_policy="none",
                n_missing_far=0, allow_missing_far=False, require_far=False,
                waveform_policy="preferred", approximant=None,
-               allow_point_estimate_cuts=False):
+               allow_point_estimate_cuts=False, n_missing_snr=0):
         """This spec intersected with one further ``select()`` call.
 
         ``name_filters`` is a sequence of ``(label, names)`` pairs -- one per
@@ -217,6 +220,9 @@ class SelectionSpec:
             approximant=None if approximant is None else str(approximant),
             point_estimate_cuts_allowed=bool(
                 self.point_estimate_cuts_allowed or allow_point_estimate_cuts),
+            # A later SNR cut sees only rows with a finite SNR, so the counts
+            # of chained calls add up to the events the cuts dropped for it.
+            n_missing_snr=int(self.n_missing_snr) + int(n_missing_snr),
         )
 
     # ---- derived views --------------------------------------------------
@@ -354,6 +360,8 @@ class SelectionSpec:
                             else str(self.approximant)),
             "cut_estimator": self.cut_estimator,
         }
+        if self.snr_min is not None:
+            out["n_events_missing_snr"] = int(self.n_missing_snr)
         pe_cuts = self.point_estimate_cuts
         if pe_cuts:
             out["point_estimate_cuts"] = list(pe_cuts)
@@ -831,9 +839,40 @@ class GWCatalog:
                     f"Populate p_astro via event_table at ingest to use this "
                     f"cut on them.")
             m &= np.where(nan_pa, False, pa >= pastro_min)
+        n_missing_snr = 0
         if snr_min is not None:
-            m &= np.where(np.isnan(self.meta["snr_med"]), False,
-                          self.meta["snr_med"] >= snr_min)
+            # The same rules as pastro_min / sky_area_max (review 2026-10-20).
+            # snr_med is the median of network_optimal_snr, which no
+            # GWTC-2.1/3 C01:Mixed set carries, so 57 of the 259 production BBH
+            # events (GW150914 among them) are NaN -- and the cut dropped them
+            # without a word, even at snr_min=0.
+            if "snr_med" not in self.meta:
+                raise ValueError(
+                    f"select(snr_min={snr_min}) needs the 'snr_med' meta "
+                    f"column and this store has none (columns: "
+                    f"{sorted(self.meta)}).")
+            snr = np.asarray(self.meta["snr_med"], dtype=float)
+            in_scope = m & np.isin(np.arange(len(self.names)), self._sel)
+            nan_snr = np.isnan(snr)
+            if in_scope.any() and nan_snr[in_scope].all():
+                raise ValueError(
+                    f"select(snr_min={snr_min}) would exclude all "
+                    f"{int(in_scope.sum())} candidate event(s) because "
+                    f"'snr_med' is NaN for every one of them (it is the median "
+                    f"of network_optimal_snr, which many releases do not "
+                    f"carry). A threshold crossed with an all-absent column is "
+                    f"a configuration error, not a selection; drop snr_min.")
+            n_missing_snr = int(len(set(self.names[in_scope & nan_snr])))
+            if n_missing_snr:
+                warnings.warn(
+                    f"snr_min={snr_min} drops {n_missing_snr} event(s) whose "
+                    f"posterior-median SNR is unknown (snr_med NaN: the sample "
+                    f"set carries no network_optimal_snr) -- not because their "
+                    f"SNR is low: "
+                    f"{sorted(set(self.names[in_scope & nan_snr].tolist()))}. "
+                    f"No injection cut reproduces dropping events for missing "
+                    f"metadata; recorded as n_events_missing_snr.")
+            m &= np.where(nan_snr, False, snr >= snr_min)
         if m1_src_range is not None:
             lo, hi = m1_src_range
             m &= (self.meta["m1_src_med"] >= lo) & (self.meta["m1_src_med"] <= hi)
@@ -1000,7 +1039,8 @@ class GWCatalog:
             far_policy=far_policy, n_missing_far=n_missing_far,
             allow_missing_far=allow_missing_far, require_far=require_far,
             waveform_policy=waveform_policy, approximant=approximant,
-            allow_point_estimate_cuts=allow_unpaired_point_estimate_cuts)
+            allow_point_estimate_cuts=allow_unpaired_point_estimate_cuts,
+            n_missing_snr=n_missing_snr)
 
         result = GWCatalog(self.path, _sel=kept)
         result._selection_spec = spec

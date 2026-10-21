@@ -151,3 +151,34 @@ def test_the_unfiltered_spec_record_is_unchanged():
     d = spec.to_dict()
     assert "point_estimate_cuts" not in d
     assert "point_estimate_cuts" not in spec.to_attrs()
+
+
+# ==========================================================================
+# snr_min says which events it dropped for a missing SNR
+# ==========================================================================
+def test_snr_min_names_the_events_it_drops_for_a_missing_snr(tmp_path):
+    """57 of the 259 production BBH events have no network_optimal_snr, so
+    select(snr_min=0.0) dropped them -- GW150914 among them -- silently."""
+    rows = [_row("GW150914_095045", snr_med=np.nan),
+            _row("GW900002_000002", snr_med=9.0),
+            _row("GW900003_000003", snr_med=30.0)]
+    cat = GWCatalog(_store(tmp_path, rows))
+    with pytest.warns(UserWarning, match="GW150914_095045"):
+        sub = cat.select(snr_min=0.0)
+    assert sorted(sub.event_names) == ["GW900002_000002", "GW900003_000003"]
+    spec = sub.selection_spec.to_dict()
+    assert spec["n_events_missing_snr"] == 1
+
+
+def test_snr_min_on_an_all_nan_column_is_a_configuration_error(tmp_path):
+    rows = [_row("GW900001_000001", snr_med=np.nan),
+            _row("GW900002_000002", snr_med=np.nan)]
+    with pytest.raises(ValueError, match="snr_med"):
+        GWCatalog(_store(tmp_path, rows)).select(snr_min=8.0)
+
+
+def test_snr_min_on_a_store_without_the_column_is_refused(tmp_path):
+    rows = [_row("GW900001_000001")]
+    cat = GWCatalog(_store(tmp_path, rows, drop_meta=("snr_med",)))
+    with pytest.raises(ValueError, match="'snr_med' meta column"):
+        cat.select(snr_min=8.0)
