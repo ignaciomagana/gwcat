@@ -184,6 +184,41 @@ def test_snr_min_on_a_store_without_the_column_is_refused(tmp_path):
         cat.select(snr_min=8.0)
 
 
+def _snr_scope_rows():
+    """A and B carry no SNR, C does; B fails another cut of the same call."""
+    return [_row("GW900001_000001", snr_med=np.nan),
+            _row("GW900002_000002", snr_med=np.nan, far=5.0, m1_src_med=90.0),
+            _row("GW900003_000003", snr_med=30.0)]
+
+
+@pytest.mark.parametrize("other", [
+    {"event_list": ["GW900001_000001", "GW900003_000003"]},
+    {"allowed_names": ["GW900001_000001", "GW900003_000003"]},
+    {"far_max": 1.0},
+    {"m1_src_range": (20.0, 70.0)}])
+def test_snr_min_names_only_the_events_no_other_cut_removed(tmp_path, other):
+    """The population list plus snr_min on the production store named and
+    counted 73 events, 16 of them not in the list; the right count is 57."""
+    cat = GWCatalog(_store(tmp_path, _snr_scope_rows()))
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        sub = cat.select(snr_min=0.0, **other)
+    assert list(sub.event_names) == ["GW900003_000003"]
+    snr_msgs = [str(r.message) for r in rec if "SNR is unknown" in str(r.message)]
+    assert len(snr_msgs) == 1
+    assert "GW900001_000001" in snr_msgs[0]
+    assert "GW900002_000002" not in snr_msgs[0]
+    assert sub.selection_spec.to_dict()["n_events_missing_snr"] == 1
+
+
+def test_snr_min_refuses_a_name_list_of_events_without_an_snr(tmp_path):
+    """Unlisted events carrying an SNR do not make the cut a selection."""
+    cat = GWCatalog(_store(tmp_path, _snr_scope_rows()))
+    with pytest.raises(ValueError, match="NaN for every one of them"):
+        cat.select(snr_min=0.0,
+                   event_list=["GW900001_000001", "GW900002_000002"])
+
+
 # ==========================================================================
 # The v1 exporter records its z_max truncation, and the v1 pair refuses it
 # ==========================================================================

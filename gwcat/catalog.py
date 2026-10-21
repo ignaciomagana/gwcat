@@ -903,6 +903,9 @@ class GWCatalog:
         # stays the AND of everything, for the in-scope bookkeeping.
         m_row = np.ones(len(self.names), dtype=bool)
         m_evt = np.ones(len(self.names), dtype=bool)
+        # The per-sample-set cuts other than snr_min, so that the missing-SNR
+        # accounting below counts only rows every OTHER cut keeps.
+        m_row_nosnr = np.ones(len(self.names), dtype=bool)
         # What this call actually applies, for the effective spec below: a
         # compact_type that allowed_names overrules is NOT a cut this view made.
         applied_compact_type = None
@@ -935,12 +938,14 @@ class GWCatalog:
                 c = (ct_column == compact_type)
                 m &= c
                 m_row &= c
+                m_row_nosnr &= c
                 applied_compact_type = compact_type
         if source_class is not None:
             allowed_classes = resolve_filter_classes(source_class)
             c = np.isin(self.source_class, list(allowed_classes))
             m &= c
             m_row &= c
+            m_row_nosnr &= c
         if pastro_min is not None:
             # Read the RESOLVED value, not one spelling of it: a store whose
             # event table used `p_astro` (the documented override key) holds a
@@ -985,20 +990,16 @@ class GWCatalog:
                     f"column and this store has none (columns: "
                     f"{sorted(self.meta)}).")
             snr = np.asarray(self.meta["snr_med"], dtype=float)
-            in_scope = m & np.isin(np.arange(len(self.names)), self._sel)
             nan_snr = np.isnan(snr)
-            if in_scope.any() and nan_snr[in_scope].all():
-                raise ValueError(
-                    f"select(snr_min={snr_min}) would exclude all "
-                    f"{int(in_scope.sum())} candidate event(s) because "
-                    f"'snr_med' is NaN for every one of them (it is the median "
-                    f"of network_optimal_snr, which many releases do not "
-                    f"carry). A threshold crossed with an all-absent column is "
-                    f"a configuration error, not a selection; drop snr_min.")
-            # Named after the waveform policy has chosen (below): on a store
-            # holding several sample sets per event, an event whose CHOSEN
-            # set has an SNR is not dropped for a sibling set that lacks one.
-            snr_nan_rows = in_scope & nan_snr
+            # The all-NaN refusal and the names are decided once EVERY other
+            # cut has run (below): the name-list and FAR cuts come after this
+            # one, and counting here blamed events an event_list, allowed_names
+            # or far_max in the same call removed anyway -- 73 named instead of
+            # 57 for the population list on the production store.  They are
+            # also named after the waveform policy has chosen: on a store
+            # holding several sample sets per event, an event whose CHOSEN set
+            # has an SNR is not dropped for a sibling set that lacks one.
+            snr_nan_rows = nan_snr
             c = np.where(nan_snr, False, snr >= snr_min)
             m &= c
             m_row &= c
@@ -1007,11 +1008,13 @@ class GWCatalog:
             c = (self.meta["m1_src_med"] >= lo) & (self.meta["m1_src_med"] <= hi)
             m &= c
             m_row &= c
+            m_row_nosnr &= c
         if m2_src_range is not None:
             lo, hi = m2_src_range
             c = (self.meta["m2_src_med"] >= lo) & (self.meta["m2_src_med"] <= hi)
             m &= c
             m_row &= c
+            m_row_nosnr &= c
         if sky_area_max is not None:
             # No presence guard (GW-37).  It used to skip the cut when the store
             # carried no sky_area_90 while `refine()` recorded the threshold
@@ -1048,6 +1051,7 @@ class GWCatalog:
             c = np.where(nan_sa, False, sa <= sky_area_max)
             m &= c
             m_row &= c
+            m_row_nosnr &= c
         _whitelist = allowed_names if allowed_names is not None else names
         if _whitelist is not None:
             _whitelist_arr = np.asarray(_whitelist)
@@ -1171,6 +1175,20 @@ class GWCatalog:
         # meant to describe had already removed every NaN row from `m` -- so it
         # could never fire.  It is issued at the cut itself now.)
         in_view = np.isin(np.arange(len(self.names)), self._sel)
+
+        if snr_nan_rows is not None:
+            # The rows snr_min decides: in the view and kept by every other
+            # cut, event-level (names, FAR, p_astro) and per-sample-set alike.
+            snr_scope = m_evt & m_row_nosnr & in_view
+            if snr_scope.any() and snr_nan_rows[snr_scope].all():
+                raise ValueError(
+                    f"select(snr_min={snr_min}) would exclude all "
+                    f"{int(snr_scope.sum())} candidate event(s) because "
+                    f"'snr_med' is NaN for every one of them (it is the median "
+                    f"of network_optimal_snr, which many releases do not "
+                    f"carry). A threshold crossed with an all-absent column is "
+                    f"a configuration error, not a selection; drop snr_min.")
+            snr_nan_rows = snr_nan_rows & snr_scope
 
         # ── Waveform / sample-set policy resolution (PR 6) ────────────────────
         # Collapse the metadata-selected rows to one sample set per event
