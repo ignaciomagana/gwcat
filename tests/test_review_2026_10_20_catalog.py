@@ -605,3 +605,15 @@ def test_v1_event_map_without_a_map_names_a_route_that_works(tmp_path):
         GWCatalog(store).to_darksirens(str(tmp_path / "x.h5"), nsamp=8,
                                        seed=0, cosmology=_COSMO,
                                        waveform_policy="event-map")
+
+
+# ==========================================================================
+# An event list saved with a byte-order mark keeps its first event
+# ==========================================================================
+def test_event_list_with_a_byte_order_mark(tmp_path):
+    from gwcat.source_class import load_event_list
+    p = tmp_path / "bom.txt"
+    p.write_bytes(b"\xef\xbb\xbfGW900001_000001\nGW900003_000003\n")
+    assert load_event_list(str(p)) == ["GW900001_000001", "GW900003_000003"]
+    sub = GWCatalog(_three(tmp_path)).select(event_list=str(p))
+    assert sorted(sub.event_names) == ["GW900001_000001", "GW900003_000003"]

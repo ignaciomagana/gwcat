@@ -81,7 +81,8 @@ def _read_event_list_file(fname: str) -> list[str]:
     if not path.exists():
         path = Path(__file__).parent.joinpath(*_EVENT_LIST_DIRNAME, fname)
     names: list[str] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    # utf-8-sig: a byte-order mark must not become part of the first name.
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
         line = line.split("#", 1)[0].strip()
         if line:
             names.append(line)

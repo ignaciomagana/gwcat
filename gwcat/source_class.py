@@ -534,7 +534,10 @@ def load_event_list(source: Union[str, Path, Sequence[str]]) -> list:
         if not path.exists():
             raise FileNotFoundError(f"event list file not found: {source}")
         raw = []
-        for line in path.read_text(encoding="utf-8").splitlines():
+        # utf-8-sig, not utf-8 (review 2026-10-20): a list saved by a
+        # spreadsheet starts with a byte-order mark, which utf-8 keeps as part
+        # of the first name -- so the first event silently matched nothing.
+        for line in path.read_text(encoding="utf-8-sig").splitlines():
             line = line.split("#", 1)[0].strip()
             if line:
                 raw.append(line)
