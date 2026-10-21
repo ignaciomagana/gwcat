@@ -208,6 +208,27 @@ def test_a_failed_summary_write_leaves_the_previous_summary_whole(
 
 
 # ==========================================================================
+# Low 4. The run environment that sets the last bits
+# ==========================================================================
+@pytest.mark.parametrize("kind", ["pe", "selection"])
+def test_the_file_records_its_run_environment(tmp_path, kind):
+    out = tmp_path / f"{kind}.h5"
+    product = (build_pe_product(GWCatalog(_store(tmp_path)),
+                                spin_basis="chieff", nsamp=8, seed=0)
+               if kind == "pe" else _selection_product())
+    get_exporter("gwcat2", kind=kind)(product, str(out))
+    with h5py.File(out, "r") as f:
+        env = json.loads(str(f.attrs["writer_environment"]))
+    assert env["numpy"] == np.__version__
+    assert env["h5py"] == h5py.__version__
+    assert env["hdf5"] == h5py.version.hdf5_version
+    for key in ("python", "machine", "scipy", "astropy",
+                "numpy_cpu_baseline", "numpy_cpu_dispatch_active"):
+        assert key in env
+    assert isinstance(env["numpy_cpu_dispatch_active"], list)
+
+
+# ==========================================================================
 # Medium 13. A selection product core cannot load says so when written
 # ==========================================================================
 def _sky_marginal_product():

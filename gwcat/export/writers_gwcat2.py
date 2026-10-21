@@ -74,6 +74,51 @@ def _stamp_attrs(f, product, format_version):
     from ..validation_summary import gwcat_commit, package_version
     f.attrs["writer_commit"] = gwcat_commit()
     f.attrs["writer_version"] = package_version()
+    f.attrs["writer_environment"] = _writer_environment()
+
+
+def _writer_environment():
+    """The run environment that sets an export's last bits, as a JSON string.
+
+    Review 2026-10-20, Low 4: a Haswell rebuild of the production PE file
+    differs from the AVX-512 build in about 378k p_pe values at the 1e-17
+    level, so a bitwise rebuild check cannot tell environment from code unless
+    the file says which environment wrote it: the library versions, numpy's
+    BLAS, its compiled-in SIMD baseline and the dispatch targets this CPU runs.
+    Never raises; a field that cannot be read is "unknown".
+    """
+    import json as _json
+    import platform
+    import sys
+
+    env = {"python": sys.version.split()[0], "machine": platform.machine(),
+           "numpy": np.__version__, "h5py": h5py.__version__,
+           "hdf5": h5py.version.hdf5_version}
+    for mod in ("scipy", "astropy"):
+        try:
+            env[mod] = str(__import__(mod).__version__)
+        except Exception:
+            env[mod] = "unknown"
+    try:
+        try:
+            from numpy._core import _multiarray_umath as _mu
+        except ImportError:                      # numpy < 2
+            from numpy.core import _multiarray_umath as _mu
+        feats = _mu.__cpu_features__
+        env["numpy_cpu_baseline"] = list(_mu.__cpu_baseline__)
+        env["numpy_cpu_dispatch_active"] = [
+            t for t in _mu.__cpu_dispatch__ if feats.get(t)]
+    except Exception:
+        env["numpy_cpu_baseline"] = "unknown"
+        env["numpy_cpu_dispatch_active"] = "unknown"
+    try:
+        blas = np.show_config(mode="dicts")["Build Dependencies"]["blas"]
+        env["numpy_blas"] = " ".join(
+            str(blas.get(k, "")) for k in ("name", "version",
+                                           "openblas configuration")).strip()
+    except Exception:
+        env["numpy_blas"] = "unknown"
+    return _json.dumps(env, sort_keys=True)
 
 
 def _stamp_legacy_spin_attrs(f, product):
