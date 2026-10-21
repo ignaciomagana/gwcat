@@ -1218,6 +1218,25 @@ def _parse_gwosc_event_table_page(data: dict, table: dict) -> None:
         table[clean] = {"far": far, "pastro": pastro}
 
 
+def _add_historical_name_aliases(table: dict) -> dict:
+    """Index each date-only GWOSC entry under its full GWTC name too.
+
+    GWOSC keys the O1/O2 events by their GWTC-1 names (``GW150914``), while
+    every store row carries the timestamped name of its GWTC-2.1 release file
+    (``GW150914_095045``), so those ten rows never matched the table and read
+    ``metadata_source='pe_file_only'``: a FAR or p_astro GWOSC published for
+    them would have been dropped without a word.  The mapping is the fixed
+    table of historical names
+    (:data:`gwcat.population_samples.HISTORICAL_DATE_ONLY_NAMES`), and an entry
+    GWOSC publishes under the full name itself is never overwritten.
+    """
+    from .population_samples import HISTORICAL_DATE_ONLY_NAMES
+    for short, full in HISTORICAL_DATE_ONLY_NAMES.items():
+        if short in table and full not in table:
+            table[full] = dict(table[short])
+    return table
+
+
 def fetch_event_table_gwosc(
     catalog_tag: str = "GWTC",
     timeout: int = 30,
@@ -1230,6 +1249,8 @@ def fetch_event_table_gwosc(
     genuinely absent from some public GWOSC entries; missing values come back
     as NaN (never fabricated), which is what lets
     ``gwcat.ingest.build_store`` record ``far_available=False`` explicitly.
+    An O1/O2 event GWOSC lists under its date-only name is also indexed under
+    its full name (see :func:`_add_historical_name_aliases`).
 
     catalog_tag : "GWTC" (cumulative), "GWTC-2.1-confident", etc.
     cache_dir / offline : see :mod:`gwcat.fetch_cache`.  ``None``/unset (the
@@ -1249,7 +1270,7 @@ def fetch_event_table_gwosc(
         table: dict = {}
         for page in _cached_pages(cached, cache_dir, key):
             _parse_gwosc_event_table_page(page, table)
-        return table
+        return _add_historical_name_aliases(table)
 
     base = f"https://gwosc.org/eventapi/json/{catalog_tag}/"
     table = {}
@@ -1268,7 +1289,7 @@ def fetch_event_table_gwosc(
         fetch_cache.write_metadata_cache(
             cache_dir, key, {"catalog_tag": catalog_tag, "pages": pages})
 
-    return table
+    return _add_historical_name_aliases(table)
 
 
 # ---------------------------------------------------------------------------
