@@ -275,3 +275,79 @@ def test_event_names_must_match_nobs(tmp_path):
         f.attrs["event_names"] = np.array(names[:1], dtype=h5py.string_dtype())
     res = validate_export_v2(str(pe))
     assert res["pe_event_names_length"] is False
+
+
+# ======================================================================
+# Cosmology: the per-campaign record, no vacuous pass, z_max in distance
+# ======================================================================
+def _set_campaign_cosmology(sel, H0, Om0, scalar=(67.74, 0.3075)):
+    """Make the selection file look like the production one: a scalar that is
+    the constructor default, and one campaign that used (H0, Om0)."""
+    with h5py.File(sel, "r+") as f:
+        f.attrs["cosmology_H0"], f.attrs["cosmology_Om0"] = scalar
+        f.attrs["cosmology_source_per_campaign"] = np.array(
+            ["detected"], dtype=h5py.string_dtype())
+        f.attrs["cosmology_H0_per_campaign"] = np.array([H0])
+        f.attrs["cosmology_Om0_per_campaign"] = np.array([Om0])
+
+
+def _set_pe_cosmology(pe, H0, Om0):
+    with h5py.File(pe, "r+") as f:
+        f.attrs["cosmology_per_event_varies"] = False
+        f.attrs["pe_cosmology_H0"], f.attrs["pe_cosmology_Om0"] = H0, Om0
+
+
+def test_cosmology_is_compared_with_the_campaign_not_the_scalar(tmp_path):
+    """A PE export within 1 of the campaign's generation H0 was refused
+    because it is more than 1 from the scalar, which no campaign used."""
+    pe = _pe_component(tmp_path, name="pe_cos.h5")
+    sel = _sel(tmp_path, name="sel_cos.h5")
+    _set_campaign_cosmology(sel, 67.9, 0.3065)
+    _set_pe_cosmology(pe, 68.8, 0.3065)
+    res = validate_export_v2(str(pe), str(sel))
+    assert res["xcheck_cosmology"] is True
+    # ...and a PE cosmology really far from the campaign's still fails, with
+    # no advice to re-export the selection under another cosmology.
+    _set_pe_cosmology(pe, 70.0, 0.3065)
+    with pytest.raises(ValueError, match="xcheck_cosmology") as ei:
+        validate_export_v2(str(pe), str(sel))
+    assert "per-campaign" in str(ei.value)
+    assert "Re-export the selection" not in str(ei.value)
+
+
+def test_varying_pe_cosmology_without_per_event_arrays_fails(tmp_path):
+    """With cosmology_per_event_varies=True and no per-event arrays the check
+    ran over empty arrays and passed."""
+    pe = _pe_component(tmp_path, name="pe_var.h5")
+    sel = _sel(tmp_path, name="sel_var.h5")
+    _set_campaign_cosmology(sel, 50.0, 0.3)
+    with h5py.File(pe, "r+") as f:
+        f.attrs["cosmology_per_event_varies"] = True
+        for k in ("cosmology_H0_per_event", "cosmology_Om0_per_event"):
+            if k in f.attrs:
+                del f.attrs[k]
+    with pytest.raises(ValueError, match="cosmology_per_event_varies"):
+        validate_export_v2(str(pe), str(sel))
+
+
+def _set_z_max(path, z):
+    with h5py.File(path, "r+") as f:
+        f.attrs["z_max"] = float(z)
+
+
+def test_equal_z_max_under_different_cosmologies_fails(tmp_path):
+    """z_max = 1 on both sides truncated the PE samples at dL = 6798.0 Mpc
+    and the injections at 6785.9 Mpc, and was reported as matched."""
+    pe = _pe_component(tmp_path, name="pe_z.h5")
+    sel = _sel(tmp_path, name="sel_z.h5")
+    _set_pe_cosmology(pe, 67.74, 0.3075)
+    _set_campaign_cosmology(sel, 67.9, 0.3065)
+    for p in (pe, sel):
+        _set_z_max(p, 1.0)
+    with pytest.raises(ValueError, match="xcheck_z_max_distance") as ei:
+        validate_export_v2(str(pe), str(sel))
+    assert "6798.0" in str(ei.value) and "6785.9" in str(ei.value)
+    # One cosmology on both sides: one truncation, and it passes.
+    _set_pe_cosmology(pe, 67.9, 0.3065)
+    res = validate_export_v2(str(pe), str(sel))
+    assert res["xcheck_z_max_distance"] is True

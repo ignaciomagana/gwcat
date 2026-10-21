@@ -706,43 +706,10 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
                     f"by forcing the two to match.")
             results["xcheck_chieff_chip_amax_recorded"] = True
 
-        # (c) Cosmology agreement (reuse the v1 tolerances / per-event logic).
-        sel_H0 = sel_attrs.get("cosmology_H0")
-        sel_Om = sel_attrs.get("cosmology_Om0")
-        if sel_H0 is not None and sel_Om is not None:
-            varies = bool(pe_attrs.get("cosmology_per_event_varies", False))
-            if varies:
-                pe_H0_arr = np.asarray(
-                    pe_attrs.get("cosmology_H0_per_event", []), dtype=float)
-                pe_Om_arr = np.asarray(
-                    pe_attrs.get("cosmology_Om0_per_event", []), dtype=float)
-                bad = ((np.abs(pe_H0_arr - float(sel_H0)) >= 1.0).any()
-                       or (np.abs(pe_Om_arr - float(sel_Om)) >= 0.05).any())
-                if bad:
-                    h0rng = ((pe_H0_arr.min(), pe_H0_arr.max())
-                             if pe_H0_arr.size else ("?", "?"))
-                    omrng = ((pe_Om_arr.min(), pe_Om_arr.max())
-                             if pe_Om_arr.size else ("?", "?"))
-                    _fail("xcheck_cosmology",
-                          f"PE export uses per-event cosmologies with H0 in "
-                          f"{h0rng} and Om0 in {omrng} that do not all match the "
-                          f"single selection cosmology (H0={sel_H0}, "
-                          f"Om0={sel_Om}). Re-export the selection under a "
-                          f"matching cosmology, or use a single-cosmology PE "
-                          f"export.")
-                results["xcheck_cosmology"] = True
-            else:
-                pe_H0 = pe_attrs.get("pe_cosmology_H0")
-                pe_Om = pe_attrs.get("pe_cosmology_Om0")
-                if pe_H0 is not None and abs(float(pe_H0) - float(sel_H0)) >= 1.0:
-                    _fail("xcheck_cosmology",
-                          f"PE cosmology H0={pe_H0} disagrees with selection "
-                          f"H0={sel_H0} (|Δ| >= 1.0).")
-                if pe_Om is not None and abs(float(pe_Om) - float(sel_Om)) >= 0.05:
-                    _fail("xcheck_cosmology",
-                          f"PE cosmology Om0={pe_Om} disagrees with selection "
-                          f"Om0={sel_Om} (|Δ| >= 0.05).")
-                results["xcheck_cosmology"] = True
+        # (c) Cosmology agreement (the v1 tolerances), against the cosmology
+        # each campaign's pdraw actually used -- not the selection's scalar,
+        # which is the constructor default (review 2026-10-20).
+        _xcheck_cosmology(_fail, results, pe_attrs, sel_attrs)
 
         # (d) Source-class compatibility.
         #
@@ -782,6 +749,9 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
 
         # (e) The detection cut: same statistic, same threshold.
         _xcheck_detection_cut(_fail, results, pe_attrs, sel_attrs)
+
+        # (e1) The same z_max is the same truncation only at the same distance.
+        _xcheck_z_max_distance(_fail, results, pe_attrs, sel_attrs)
 
         # (e2) Per-campaign selection cosmology (GW-09).
         _xcheck_campaign_cosmology(_check, results, sel_attrs)
@@ -1364,6 +1334,155 @@ def _xcheck_chi_eff_prior_impl(_fail, results, pe_attrs, sel_attrs, *,
                   f"chi_eff_prior_impl={sel_impl!r} (expected 'exact'). "
                   f"Re-export without --legacy-grid-priors.")
     results["xcheck_chi_eff_prior_impl"] = True
+
+
+def _pe_cosmologies(_fail, pe_attrs):
+    """The ``(H0, Om0)`` pairs the PE file's source-frame columns were computed
+    under: one per event when ``cosmology_per_event_varies``, else the file's
+    single cosmology (``[]`` when it records none).
+
+    A varying-cosmology file without per-event arrays of length ``nobs`` is
+    refused: the cross-check used to run over empty arrays and pass.
+    """
+    nobs = int(pe_attrs.get("nobs", 0))
+    if bool(pe_attrs.get("cosmology_per_event_varies", False)):
+        H = np.asarray(pe_attrs.get("cosmology_H0_per_event", []),
+                       dtype=float).ravel()
+        O = np.asarray(pe_attrs.get("cosmology_Om0_per_event", []),
+                       dtype=float).ravel()
+        if not (H.size == O.size == nobs and nobs > 0
+                and np.all(np.isfinite(H)) and np.all(np.isfinite(O))):
+            _fail("xcheck_cosmology",
+                  f"PE cosmology_per_event_varies=True but "
+                  f"cosmology_H0_per_event / cosmology_Om0_per_event hold "
+                  f"{H.size} / {O.size} entries (finite: "
+                  f"{int(np.isfinite(H).sum())} / {int(np.isfinite(O).sum())}) "
+                  f"for nobs={nobs}, so the cosmology of the source-frame "
+                  f"columns cannot be compared with the selection's.")
+        return list(zip(H.tolist(), O.tolist()))
+    H0, Om0 = pe_attrs.get("pe_cosmology_H0"), pe_attrs.get("pe_cosmology_Om0")
+    if H0 is None and Om0 is None:
+        return []
+    return [(float("nan") if H0 is None else float(H0),
+             float("nan") if Om0 is None else float(Om0))]
+
+
+def _sel_cosmologies(sel_attrs):
+    """``(pairs, n_without, source)``: the cosmologies the selection's pdraw
+    used, one per campaign that used one; how many campaigns used none (an
+    ``events``-format campaign reads its own ddL/dz); and where the answer came
+    from (``"per_campaign"``, or ``"scalar"`` on a file written before the
+    per-campaign record, whose scalar is all there is)."""
+    src = sel_attrs.get("cosmology_source_per_campaign")
+    H = np.atleast_1d(np.asarray(
+        sel_attrs.get("cosmology_H0_per_campaign", []), dtype=float)).ravel()
+    O = np.atleast_1d(np.asarray(
+        sel_attrs.get("cosmology_Om0_per_campaign", []), dtype=float)).ravel()
+    if src is not None and len(np.atleast_1d(src)) == H.size == O.size:
+        ok = np.isfinite(H) & np.isfinite(O)
+        return (list(zip(H[ok].tolist(), O[ok].tolist())),
+                int(np.sum(~ok)), "per_campaign")
+    H0, Om0 = sel_attrs.get("cosmology_H0"), sel_attrs.get("cosmology_Om0")
+    if H0 is None or Om0 is None:
+        return [], 0, "scalar"
+    return [(float(H0), float(Om0))], 0, "scalar"
+
+
+def _xcheck_cosmology(_fail, results, pe_attrs, sel_attrs):
+    """The PE cosmology against the cosmology each selection campaign used.
+
+    The tolerances are the v1 ones (``|dH0| >= 1.0`` or ``|dOm0| >= 0.05``
+    fails).  The selection side is ``cosmology_*_per_campaign`` -- the
+    cosmology that entered each campaign's pdraw, NaN for a campaign that used
+    none -- not the scalar ``cosmology_H0``/``Om0``, which is the constructor
+    default and the cosmology of no campaign (review 2026-10-20); the scalar is
+    used only for a file written before the per-campaign record.
+    """
+    pe_cos = _pe_cosmologies(_fail, pe_attrs)
+    sel_cos, _, sel_src = _sel_cosmologies(sel_attrs)
+    bad = [(ph, po, sh, so) for ph, po in pe_cos for sh, so in sel_cos
+           if (np.isfinite(ph) and abs(ph - sh) >= 1.0)
+           or (np.isfinite(po) and abs(po - so) >= 0.05)]
+    if bad:
+        pe_h = sorted({round(b[0], 6) for b in bad})
+        pe_o = sorted({round(b[1], 6) for b in bad})
+        sel_u = sorted({(round(b[2], 6), round(b[3], 6)) for b in bad})
+        where = ("per-campaign cosmology (cosmology_H0/Om0_per_campaign)"
+                 if sel_src == "per_campaign"
+                 else "scalar cosmology_H0/Om0 (a file without the "
+                      "per-campaign record)")
+        _fail("xcheck_cosmology",
+              f"PE cosmology H0 {pe_h[:5]} / Om0 {pe_o[:5]} disagrees with the "
+              f"selection's {where} (H0, Om0) = {sel_u} (|dH0| >= 1.0 or "
+              f"|dOm0| >= 0.05). A campaign's cosmology is the one its "
+              f"injections were generated under, so re-exporting the selection "
+              f"under another cosmology is not a fix; export the PE file under "
+              f"a cosmology within tolerance, or check that the pair is the "
+              f"intended one.")
+    results["xcheck_cosmology"] = True
+
+
+#: Relative agreement required of the two sides' z_max truncation distances.
+_ZMAX_DL_RTOL = 1e-6
+
+
+def _xcheck_z_max_distance(_fail, results, pe_attrs, sel_attrs):
+    """Equal ``z_max`` must be an equal truncation in distance.
+
+    The PE export drops samples with ``z(dL; event cosmology) > z_max``, and
+    the selection drops injections with injected ``z > z_max``, i.e. with
+    ``dL > dL(z_max; campaign cosmology)``.  Compared as numbers, z_max = 1
+    matched while the O3 events were truncated at dL = 6798.0 Mpc and the
+    injections at 6785.9 Mpc.  So when both sides state the same z_max, every
+    cosmology defining it -- each PE event's and each campaign's -- must give
+    the same luminosity distance at z_max (relative ``_ZMAX_DL_RTOL``).  A
+    campaign that records no cosmology (an ``events``-format file with its own
+    redshifts) warns: its distance edge is not in the files.
+    """
+    def _f(x):
+        try:
+            return float(np.asarray(x).ravel()[0])
+        except (TypeError, ValueError, IndexError):
+            return float("nan")
+
+    pe_z, sel_z = _f(pe_attrs.get("z_max")), _f(sel_attrs.get("z_max"))
+    if not (np.isfinite(pe_z) and np.isfinite(sel_z)
+            and np.isclose(pe_z, sel_z, rtol=1e-12, atol=0.0)):
+        # Unequal or unstated truncations are judged by _xcheck_detection_cut.
+        results["xcheck_z_max_distance"] = True
+        return
+    from ..cosmology import make_cosmology
+
+    pe_cos = _pe_cosmologies(_fail, pe_attrs)
+    sel_cos, n_without, sel_src = _sel_cosmologies(sel_attrs)
+    if sel_src == "scalar":
+        # The scalar is no campaign's cosmology; nothing to compare it with.
+        sel_cos, n_without = [], max(1, int(sel_attrs.get("n_campaigns", 1)))
+    edges = []
+    for side, pairs in (("PE", pe_cos), ("selection", sel_cos)):
+        for h, o in sorted({(round(h, 8), round(o, 8)) for h, o in pairs
+                            if np.isfinite(h) and np.isfinite(o)}):
+            d = float(make_cosmology(h, o).luminosity_distance(pe_z).value)
+            edges.append((side, h, o, d))
+    if edges:
+        ds = np.array([e[3] for e in edges])
+        if ds.max() - ds.min() > _ZMAX_DL_RTOL * ds.max():
+            _fail("xcheck_z_max_distance",
+                  f"both sides state z_max={pe_z}, but it is not one "
+                  f"truncation: "
+                  + "; ".join(f"{side} (H0={h}, Om0={o}) cuts at dL = "
+                              f"{d:.1f} Mpc" for side, h, o, d in edges)
+                  + ". The PE side converts each sample's dL to z under the "
+                    "event's cosmology and the selection cuts the injected z "
+                    "of a campaign generated under its own, so the two "
+                    "integrate over different distance ranges. Export both "
+                    "under the cosmology of the injections, or drop z_max.")
+    if n_without:
+        warnings.warn(
+            f"z_max={pe_z}: {n_without} selection campaign(s) record no "
+            f"cosmology, so the distance at which their injections are "
+            f"truncated cannot be compared with the PE side's.")
+    results["xcheck_z_max_distance"] = True
 
 
 def _xcheck_campaign_cosmology(_check, results, sel_attrs):
