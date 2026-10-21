@@ -229,6 +229,30 @@ def test_the_file_records_its_run_environment(tmp_path, kind):
 
 
 # ==========================================================================
+# Low 19. A per-file symlink is written through, not replaced
+# ==========================================================================
+def test_the_atomic_write_keeps_a_symlinked_destination(tmp_path):
+    from gwcat.export.atomic import atomic_output_path
+
+    real_dir, link_dir = tmp_path / "data", tmp_path / "links"
+    real_dir.mkdir()
+    link_dir.mkdir()
+    target = real_dir / "product.h5"
+    target.write_bytes(b"old")
+    link = link_dir / "product.h5"
+    link.symlink_to(target)
+
+    with atomic_output_path(link) as tmp:
+        with open(tmp, "wb") as f:
+            f.write(b"new")
+
+    assert link.is_symlink(), "the link was replaced by a regular file"
+    assert target.read_bytes() == b"new", "the link target was left stale"
+    for d in (real_dir, link_dir):
+        assert [p.name for p in d.iterdir() if "gwcat-tmp" in p.name] == []
+
+
+# ==========================================================================
 # Medium 13. A selection product core cannot load says so when written
 # ==========================================================================
 def _sky_marginal_product():
