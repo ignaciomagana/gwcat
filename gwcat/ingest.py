@@ -3106,9 +3106,15 @@ def build_store(paths, out_path, params=None, extra_params=None,
     # Written event slice by event slice into preallocated columns: the union is
     # never concatenated in memory, so the ingest peak is the records alone
     # rather than the records plus a second copy of the whole catalog (GW-24).
+    provenance = _store_build_provenance(
+        "build_store", cfg=cfg, meta=meta,
+        inputs={"files": [os.path.basename(p) for p in paths],
+                "sample_sets": (sample_sets if isinstance(sample_sets, str)
+                                else list(sample_sets))})
     union_params = _write_store_from_records(out_path, records,
                                              candidate_params, offsets, names,
-                                             meta, cfg, mock_data=mock_data)
+                                             meta, cfg, mock_data=mock_data,
+                                             provenance=provenance)
     print(f"\nWrote {out_path}: {len(names)} events, "
           f"{offsets[-1]} total samples, params={union_params}")
 
@@ -3349,6 +3355,43 @@ SCHEMA_VERSION_PRIOR_PROVENANCE = "1.4"
 STORE_MOCK_DATA_ATTR = "mock_data"
 
 
+#: File-level store attrs recording the BUILD (review 2026-10-20, low-31):
+#: which gwcat wrote the store and with which IngestConfig, the
+#: release-reweight table(s) its rows used, and its inputs.  Per-row columns
+#: already record most number-changing choices; nothing recorded the build.
+#: Written by :func:`build_store` and :func:`merge_stores` only.
+STORE_PROVENANCE_ATTRS = ("gwcat_writer_version", "gwcat_writer_commit",
+                          "store_writer", "ingest_config_json",
+                          "release_reweight_table_sha256",
+                          "store_inputs_json")
+
+
+def _store_build_provenance(kind, cfg=None, meta=None, inputs=None):
+    """The :data:`STORE_PROVENANCE_ATTRS` values for one store write."""
+    import dataclasses
+    from .validation_summary import gwcat_commit, package_version
+    prov = {"gwcat_writer_version": str(package_version()),
+            "gwcat_writer_commit": str(gwcat_commit()),
+            "store_writer": str(kind)}
+    if cfg is not None:
+        prov["ingest_config_json"] = json.dumps(
+            dataclasses.asdict(cfg), sort_keys=True, default=str)
+    if meta is not None:
+        prov["release_reweight_table_sha256"] = json.dumps(sorted(
+            {str(x) for x in meta.get("dL_prior_cosmology_table_sha256", [])
+             if x}))
+    if inputs is not None:
+        prov["store_inputs_json"] = json.dumps(inputs, sort_keys=True,
+                                               default=str)
+    return prov
+
+
+def read_store_provenance(f) -> dict:
+    """The :data:`STORE_PROVENANCE_ATTRS` an open store carries ({} if none)."""
+    return {k: _decode(f.attrs[k]) for k in STORE_PROVENANCE_ATTRS
+            if k in f.attrs}
+
+
 def read_store_mock_data(f) -> bool:
     """Whether an open store (or any ``h5py`` object with ``attrs``) is mock."""
     return bool(f.attrs.get(STORE_MOCK_DATA_ATTR, False))
@@ -3387,11 +3430,14 @@ def _store_schema_version(meta):
     return SCHEMA_VERSION
 
 
-def _write_store_attrs(f, stored_params, names, meta, mock_data=False):
+def _write_store_attrs(f, stored_params, names, meta, mock_data=False,
+                       provenance=None):
     """Write the file-level attributes (schema, column names, row count).
 
     ``mock_data`` adds :data:`STORE_MOCK_DATA_ATTR` -- only when True, so a
     real-data store's attrs are exactly what they were before the flag existed.
+    ``provenance`` (:func:`_store_build_provenance`) adds the build record;
+    None writes none.
     """
     f.attrs["schema_version"] = _store_schema_version(meta)
     f.attrs.create("param_names",
@@ -3399,6 +3445,8 @@ def _write_store_attrs(f, stored_params, names, meta, mock_data=False):
     f.attrs["n_events"] = len(names)
     if mock_data:
         f.attrs[STORE_MOCK_DATA_ATTR] = True
+    for k, v in (provenance or {}).items():
+        f.attrs[k] = v
 
 
 def _write_store_index(f, offsets, names, avail, meta, cfg):
@@ -3451,7 +3499,8 @@ def _create_sample_column(g, p, n, cfg):
 
 
 def _write_store_from_records(out_path, records, candidate_params, offsets,
-                              names, meta, cfg, mock_data=False):
+                              names, meta, cfg, mock_data=False,
+                              provenance=None):
     """Write a store straight from per-event arrays, one event slice at a time.
 
     The concatenating path (:func:`_assemble_union` + :func:`_write_store`)
@@ -3469,7 +3518,8 @@ def _write_store_from_records(out_path, records, candidate_params, offsets,
     union_params, avail = _union_params_and_avail(records, candidate_params)
     total = int(offsets[-1]) if len(offsets) else 0
     with h5py.File(out_path, "w") as f:
-        _write_store_attrs(f, union_params, names, meta, mock_data)
+        _write_store_attrs(f, union_params, names, meta, mock_data,
+                           provenance)
         g = f.create_group("samples")
         for p in union_params:
             ds = _create_sample_column(g, p, total, cfg)
@@ -3605,7 +3655,7 @@ def _copy_column(src_ds, dst_ds, runs):
 
 
 def _write_store_streaming(out_path, stored_params, sources, offsets, names,
-                           avail, meta, cfg, mock_data=False):
+                           avail, meta, cfg, mock_data=False, provenance=None):
     """Write a store whose sample columns are COPIED from existing stores.
 
     ``sources`` is a list of ``(store metadata dict, destination start offset)``
@@ -3618,7 +3668,8 @@ def _write_store_streaming(out_path, stored_params, sources, offsets, names,
     """
     total = int(offsets[-1]) if len(offsets) else 0
     with h5py.File(out_path, "w") as f:
-        _write_store_attrs(f, stored_params, names, meta, mock_data)
+        _write_store_attrs(f, stored_params, names, meta, mock_data,
+                           provenance)
         g = f.create_group("samples")
         dsets = {p: _create_sample_column(g, p, total, cfg)
                  for p in stored_params}
@@ -3825,11 +3876,19 @@ def merge_stores(store_a, store_b, out_path, cfg: Optional[IngestConfig] = None,
             f"the merged store is flagged mock_data=True, and so is every "
             f"export built from it.")
 
+    inputs = []
+    for path_in in (store_a, store_b):
+        with h5py.File(path_in, "r") as fin:
+            inputs.append(dict(read_store_provenance(fin),
+                               path=os.path.basename(str(path_in))))
+    provenance = _store_build_provenance(
+        "merge_stores", cfg=cfg, meta=merged_meta,
+        inputs={"stores": inputs, "on_duplicate_key": on_duplicate_key})
     write_path = f"{out_path}.gwcat-merge-tmp"
     try:
         _write_store_streaming(write_path, union_params, [(A, 0), (B, a_total)],
                                offsets, names, avail, merged_meta, cfg,
-                               mock_data=mock_data)
+                               mock_data=mock_data, provenance=provenance)
     except BaseException:
         if os.path.exists(write_path):
             os.remove(write_path)

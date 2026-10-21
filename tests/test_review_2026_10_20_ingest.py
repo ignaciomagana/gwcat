@@ -801,3 +801,34 @@ def test_defaulted_cosmology_warning_does_not_overclaim_the_ks(tmp_path,
         store = _ingest(tmp_path, monkeypatch,
                         {_O4_PL: _odd_cosmology_file()})
     assert _meta(store, "dL_prior_cosmology_source") == "catalog_default"
+
+
+# ==========================================================================
+# low-31: the store records the build that wrote it
+# ==========================================================================
+def test_build_store_records_writer_and_config(tmp_path, monkeypatch):
+    store = _ingest(tmp_path, monkeypatch, {_E1: _one_label_file(1)})
+    with h5py.File(store, "r") as f:
+        prov = ing.read_store_provenance(f)
+    assert prov["store_writer"] == "build_store"
+    assert prov["gwcat_writer_commit"] and prov["gwcat_writer_version"]
+    conf = json.loads(prov["ingest_config_json"])
+    assert conf["dL_prior_impl"] == "astropy"
+    assert conf["validate_prior"] is False
+    assert json.loads(prov["store_inputs_json"])["files"] == [_E1]
+    assert len(json.loads(prov["release_reweight_table_sha256"])) == 1
+
+
+def test_merge_stores_records_its_inputs(tmp_path, monkeypatch):
+    a = _ingest(tmp_path, monkeypatch, {_E1: _one_label_file(1)},
+                name="a.h5")
+    b = _ingest(tmp_path, monkeypatch, {_E2: _one_label_file(2)},
+                name="b.h5")
+    out = tmp_path / "m.h5"
+    ing.merge_stores(a, b, str(out))
+    with h5py.File(out, "r") as f:
+        prov = ing.read_store_provenance(f)
+    assert prov["store_writer"] == "merge_stores"
+    ins = json.loads(prov["store_inputs_json"])["stores"]
+    assert [i["path"] for i in ins] == ["a.h5", "b.h5"]
+    assert all(i["store_writer"] == "build_store" for i in ins)
