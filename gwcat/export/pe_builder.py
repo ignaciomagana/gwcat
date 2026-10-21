@@ -615,6 +615,9 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     #: Selected events with EVERY sample above z_max, which therefore are not
     #: exported, and the samples each had (review Medium 39).
     dropped_by_z_max, n_cut_dropped_by_z_max = [], []
+    #: The luminosity distance z_max is, under each kept event's own PE
+    #: cosmology: the distance the cut really is on this side (review Low 18).
+    z_max_dL = []
     kept_H0, kept_Om0 = [], []
     kept_ss_name, kept_ss_approx, kept_ss_reason = [], [], []
     # Resampling provenance (GW-13), aligned with ``kept``.
@@ -915,6 +918,9 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             kept.append(sub.event_names[e])
             kept_mass_kind.append(mass_kind_e)
             n_cut_by_z_max.append(n_cut_e)
+            z_max_dL.append(
+                float("nan") if z_max is None else
+                float(cosmo_e.luminosity_distance(float(z_max)).to_value("Mpc")))
             n_dropped_spin.append(n_drop_e)
             n_above_spin_ceiling_raw.append(n_raw_e)
             n_exported_above_spin_ceiling.append(
@@ -1502,6 +1508,12 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         # Selected events the cut removed ENTIRELY (every sample above
         # z_max), with their sample counts (review Medium 39).
         "events_dropped_by_z_max": np.array(dropped_by_z_max, dtype=_str),
+        # The same z_max is a different distance cut per event (each in its
+        # own PE cosmology) and on the injection side (at injected z): the
+        # distance, in Mpc, it is here, per kept event (review Low 18).  NaN
+        # when unused.
+        "z_max_dL_per_event": np.asarray(z_max_dL, dtype=float),
+        "z_max_cut_coordinate": "redshift_under_each_event_pe_cosmology",
         "n_samples_cut_by_z_max_dropped_events": np.asarray(
             n_cut_dropped_by_z_max, dtype=np.int64),
         # spin basis (new in v2)

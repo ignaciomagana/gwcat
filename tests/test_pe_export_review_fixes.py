@@ -379,3 +379,34 @@ def test_forced_replacement_is_recorded(tmp_path):
     _cols, a2 = _read(out2)
     assert bool(a2["resampled_with_replacement"]) is False
     assert len(a2["events_resampled_with_replacement"]) == 0
+
+
+# ==========================================================================
+# z_max is recorded as the distance it is under each event's cosmology
+# (review Low 18)
+# ==========================================================================
+def test_z_max_is_recorded_as_a_distance_per_event(tmp_path):
+    from astropy.cosmology import FlatLambdaCDM
+
+    store = _store_cosmologies(tmp_path, [67.74, 67.90],
+                               [0.3075, 0.3065], name="zdl.h5")
+    out = tmp_path / "pe.h5"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        GWCatalog(store).export(str(out), format="gwcat2",
+                                spin_basis="chieff", nsamp=32, seed=0,
+                                z_max=1.0)
+    _cols, attrs = _read(out)
+    want = [FlatLambdaCDM(H0=h, Om0=o).luminosity_distance(1.0).to_value("Mpc")
+            for h, o in ((67.74, 0.3075), (67.90, 0.3065))]
+    np.testing.assert_allclose(attrs["z_max_dL_per_event"], want, rtol=1e-12)
+    assert want[0] != want[1]
+    coord = attrs["z_max_cut_coordinate"]
+    assert "redshift" in (coord.decode() if isinstance(coord, bytes)
+                          else coord)
+
+    out2 = tmp_path / "pe_noz.h5"
+    GWCatalog(store).export(str(out2), format="gwcat2", spin_basis="chieff",
+                            nsamp=32, seed=0)
+    _cols, a2 = _read(out2)
+    assert np.all(np.isnan(np.asarray(a2["z_max_dL_per_event"], float)))
