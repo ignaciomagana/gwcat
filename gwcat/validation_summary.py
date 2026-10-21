@@ -171,6 +171,31 @@ def _json_default(o: Any):
     return str(o)
 
 
+def _json_safe(o: Any) -> Any:
+    """``o`` with every non-finite float (at any depth) replaced by ``None``.
+
+    :func:`_json_default` is only consulted for objects ``json`` cannot encode
+    itself, and a Python ``float`` -- or a numpy array it turns into a list of
+    them -- is not one, so a NaN reached the file as a bare ``NaN`` token,
+    which strict JSON parsers reject.  The production selection summary
+    carried such tokens.  Sanitising first and dumping with
+    ``allow_nan=False`` makes the output valid JSON by construction.
+    """
+    if isinstance(o, dict):
+        return {k: _json_safe(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_json_safe(v) for v in o]
+    if isinstance(o, (set, frozenset)):
+        return [_json_safe(v) for v in sorted(o)]
+    if isinstance(o, np.ndarray):
+        return _json_safe(o.tolist())
+    if isinstance(o, np.generic):
+        return _json_safe(o.item())
+    if isinstance(o, float) and not np.isfinite(o):
+        return None
+    return o
+
+
 # ---------------------------------------------------------------------------
 # Generic store/catalog diagnostics
 # ---------------------------------------------------------------------------
@@ -504,7 +529,8 @@ def write_validation_summary(
 
     json_path = out_path + ".validation_summary.json"
     with open(json_path, "w") as f:
-        json.dump(summary, f, indent=2, default=_json_default)
+        json.dump(_json_safe(summary), f, indent=2, default=_json_default,
+                  allow_nan=False)
         f.write("\n")
 
     md_path = None

@@ -20,6 +20,7 @@
   7. ``inspect`` reports the requirements of the space ``export pe`` would
      use; a MissingParameterError is a clean CLI error; ``--parameter-space
      chieff_chip`` and ``--pastro-min`` have the opt-in flags they need.
+  8. validation_summary.json is strict JSON: a NaN at any depth is null.
 
 Every test is offline: GWOSC and Zenodo are monkeypatched.
 """
@@ -494,3 +495,33 @@ def test_pastro_min_is_reachable_with_its_opt_in(tmp_path):
     assert main(base + ["--out", str(out),
                         "--allow-unpaired-pastro-min"]) == 0
     assert out.exists()
+
+
+# ==========================================================================
+# 8. The validation summary is strict JSON
+# ==========================================================================
+def _strict_load(text):
+    def _refuse(token):
+        raise ValueError(f"non-JSON token {token}")
+    return json.loads(text, parse_constant=_refuse)
+
+
+def test_validation_summary_json_has_no_nan_tokens(tmp_path):
+    import numpy as np
+    from gwcat.validation_summary import write_validation_summary
+    out = tmp_path / "sel.h5"
+    json_path, _ = write_validation_summary(out, {
+        "kind": "selection_export",
+        "H0": float("nan"),
+        "detected_frac": np.float64("inf"),
+        "per_campaign": [1.0, float("nan")],
+        "arr": np.array([0.5, np.nan]),
+        "nested": {"x": (float("-inf"), 2)},
+        "count": np.int64(3),
+    }, write_md=False)
+    data = _strict_load(open(json_path).read())
+    assert data["H0"] is None and data["detected_frac"] is None
+    assert data["per_campaign"] == [1.0, None]
+    assert data["arr"] == [0.5, None]
+    assert data["nested"] == {"x": [None, 2]}
+    assert data["count"] == 3

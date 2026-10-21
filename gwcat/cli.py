@@ -581,7 +581,8 @@ def _selection_cosmology_kwargs(args) -> dict:
 
 def _cmd_inspect(args) -> int:
     from .catalog import GWCatalog
-    from .validation_summary import summarize_catalog, _json_default
+    from .validation_summary import (summarize_catalog, _json_default,
+                                     _json_safe)
 
     cat = GWCatalog(args.store)
     # Requirements of the space an export would use, not the chi_eff-only
@@ -591,7 +592,8 @@ def _cmd_inspect(args) -> int:
     info["store_path"] = args.store
 
     if args.json:
-        print(json.dumps(info, indent=2, default=_json_default))
+        print(json.dumps(_json_safe(info), indent=2, default=_json_default,
+                         allow_nan=False))
         return 0
 
     cat.summary()
