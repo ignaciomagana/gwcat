@@ -660,3 +660,66 @@ def test_every_exclusion_resolves_against_the_released_pe_names():
            if re.fullmatch(r"GW\d{6}_\d{6}", n) and n[:8] in short
            and n[:8] in by_date and n not in by_date[n[:8]]]
     assert not bad, (bad, {n[:8]: sorted(by_date[n[:8]]) for n in bad})
+
+
+# ==========================================================================
+# refresh_bbh_list places names by run window; the BBH-list helpers
+# ==========================================================================
+def test_refresh_places_january_2024_events_in_o4a(monkeypatch, capsys):
+    """A GW24x/GW25x prefix put the three January-2024 O4a events into the
+    O4b block, and the output asked for a paste into a Python literal that
+    no longer exists."""
+    from gwcat import bbh_allowed_names as ban
+    from gwcat import fetch
+    live = sorted(set(ban.BBH_ALL) | {"GW240110_000000", "GW240601_000000"})
+    monkeypatch.setattr(fetch, "fetch_bbh_names_gwosc", lambda **kw: live)
+    out = ban.refresh_bbh_list()
+    text = capsys.readouterr().out
+    assert out == live
+    o4a = text.split("bbh_o4a.txt")[1].split("# gwcat")[0]
+    o4b = text.split("bbh_o4b.txt")[1]
+    assert "GW240110_000000" in o4a and "GW240110_000000" not in o4b
+    assert "GW240601_000000" in o4b
+    # Only the names a file lacks are listed, and January-2024 bundled names
+    # are not offered to the O4b file.
+    assert "GW240109_050431" not in o4b
+    assert "Paste this into BBH_O4B" not in text
+
+
+def test_every_bundled_name_lies_in_its_files_run():
+    from gwcat import bbh_allowed_names as ban
+    for fname, names in (("bbh_o1o2.txt", ban.BBH_O1O2),
+                         ("bbh_o3a.txt", ban.BBH_O3A),
+                         ("bbh_o3b.txt", ban.BBH_O3B),
+                         ("bbh_o4a.txt", ban.BBH_O4A),
+                         ("bbh_o4b.txt", ban.BBH_O4B)):
+        for n in names:
+            assert ban._RUN_LIST_FILE[ban._run_of_event_name(n)] == fname, n
+
+
+def test_cache_and_store_discovery_helpers(tmp_path):
+    """The cache scan and the store reader behind get_bbh_allowed_names had
+    no test at all."""
+    from gwcat import bbh_allowed_names as ban
+    d = tmp_path / "GWTC" / "GWTC-5"
+    d.mkdir(parents=True)
+    (d / "IGWN-GWTC5p0-x-GW250101_010101-combined_PEDataRelease.hdf5").write_text("")
+    (d / "IGWN-GWTC5p0-x-GW230529_181500-combined_PEDataRelease.hdf5").write_text("")
+    (d / "README.txt").write_text("")
+    assert ban._discover_cached_gwtc5_names(tmp_path / "GWTC") == {
+        "GW250101_010101"}
+
+    store = tmp_path / "s.h5"
+    with h5py.File(store, "w") as f:
+        f.create_dataset("index/event_names", data=np.array(
+            ["GW250101_010101", "GW190521_030229", "GW230529_181500"],
+            dtype=h5py.string_dtype()))
+        f.create_dataset("meta/catalog", data=np.array(
+            ["GWTC-5.0", "GWTC-2.1", "GWTC-5.0"], dtype=h5py.string_dtype()))
+    assert ban._read_store_gwtc5_names(store) == {"GW250101_010101"}
+    # Offline: no live query, the curated list plus the store's GWTC-5 names.
+    with pytest.warns(UserWarning, match="final BBH count"):
+        names = ban.get_bbh_allowed_names(data_dir=tmp_path / "GWTC",
+                                          store_path=store,
+                                          prefer_gwosc=False)
+    assert "GW250101_010101" in names and "GW230529_181500" not in names
