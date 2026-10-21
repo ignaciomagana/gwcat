@@ -24,6 +24,8 @@ Two properties every writer here holds (GW-30):
 """
 from __future__ import annotations
 
+import hashlib
+import os
 import warnings
 from typing import Optional
 
@@ -119,16 +121,48 @@ def _write_columns(f, columns, order, **create_kwargs):
             f.create_dataset(k, data=arr, **create_kwargs)
 
 
+#: The sidecars :func:`gwcat.validation_summary.write_validation_summary` writes
+#: next to an export.
+_SUMMARY_SUFFIXES = (".validation_summary.json", ".validation_summary.md")
+
+
+def _remove_stale_summary(out_path):
+    """Remove a previous export's summary before the new file is published.
+
+    Review 2026-10-20, Medium 53: a summary is written only when asked for (the
+    Python default is not to), and nothing removed an old one, so a re-export
+    to the same path -- from Python, or with ``--no-summary`` -- sat beside a
+    summary listing the previous product's events and nsamp under the same
+    output_path.  Called before the publishing rename, so at no moment does the
+    new file sit beside the old summary; no summary is better than a wrong one.
+    """
+    for suffix in _SUMMARY_SUFFIXES:
+        p = os.fspath(out_path) + suffix
+        if os.path.lexists(p):
+            os.remove(p)
+
+
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def _write_summary(product, out_path, format_version, summary_context):
     """Write the validation summary next to the FINISHED file at ``out_path``.
 
     Called only after the atomic rename, so everything that reads the file back
     (:func:`gwcat.validation_summary.v2_export_summary_additions`) sees the file
-    the consumer will see -- final version, final attrs.
+    the consumer will see -- final version, final attrs.  The summary carries
+    the sha256 of that file, so a summary can be checked against the file
+    beside it rather than trusted by its name.
     """
     from ..validation_summary import write_validation_summary
     summary = dict(product.summary)
     summary["output_path"] = str(out_path)
+    summary["output_sha256"] = _sha256(out_path)
     # The version the summary actually describes.  A 2.1 export's summary used
     # to be indistinguishable from a 2.0 one because it was generated while the
     # file still said 2.0.
@@ -157,6 +191,7 @@ def _write_pe(product, out_path, format_version, *, with_contract=False,
             # Datasets (gzip, like the legacy exporter).
             _write_columns(f, product.columns, _PE_DATASETS,
                            compression="gzip", shuffle=False)
+        _remove_stale_summary(out_path)
 
     if write_summary:
         _write_summary(product, out_path, format_version, summary_context)
@@ -223,6 +258,7 @@ def _write_selection(product, out_path, format_version, *, with_contract=False,
             # Datasets (gzip, like the legacy selection exporter).
             _write_columns(f, product.columns, _SELECTION_DATASETS,
                            compression="gzip")
+        _remove_stale_summary(out_path)
 
     if write_summary:
         _write_summary(product, out_path, format_version, summary_context)

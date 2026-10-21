@@ -481,14 +481,21 @@ def write_validation_summary(
         # Additive only: caller-supplied fields win over the reconstructed ones.
         summary = {**additions, **summary}
 
+    # Atomic, like the file it describes (review 2026-10-20, Medium 53): opened
+    # 'w' in place, a failure mid-write left a truncated summary where a
+    # complete one had been.
+    from .export.atomic import atomic_output_path
+
     json_path = out_path + ".validation_summary.json"
-    with open(json_path, "w") as f:
-        json.dump(summary, f, indent=2, default=_json_default)
-        f.write("\n")
+    with atomic_output_path(json_path) as tmp:
+        with open(tmp, "w") as f:
+            json.dump(summary, f, indent=2, default=_json_default)
+            f.write("\n")
 
     md_path = None
     if write_md:
         md_path = out_path + ".validation_summary.md"
-        with open(md_path, "w") as f:
-            f.write(render_markdown(summary))
+        with atomic_output_path(md_path) as tmp:
+            with open(tmp, "w") as f:
+                f.write(render_markdown(summary))
     return json_path, md_path

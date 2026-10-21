@@ -152,6 +152,62 @@ def test_a_store_without_the_class_states_nothing(tmp_path):
 
 
 # ==========================================================================
+# Medium 53. A summary always describes the file beside it
+# ==========================================================================
+@pytest.mark.parametrize("kind", ["pe", "selection"])
+def test_a_reexport_without_a_summary_removes_the_stale_one(tmp_path, kind):
+    out = tmp_path / f"{kind}.h5"
+    if kind == "pe":
+        first = build_pe_product(GWCatalog(_store(tmp_path)),
+                                 spin_basis="chieff", nsamp=8, seed=0)
+        second = build_pe_product(GWCatalog(_store(tmp_path, name="b.h5")),
+                                  spin_basis="chieff", nsamp=4, seed=1)
+    else:
+        first, second = _selection_product(5), _selection_product(3)
+    get_exporter("gwcat2", kind=kind)(first, str(out), write_summary=True)
+    assert all(os.path.exists(p) for p in _summary_paths(out))
+    get_exporter("gwcat2", kind=kind)(second, str(out))   # library default
+    assert not any(os.path.exists(p) for p in _summary_paths(out)), \
+        "the new file sits beside a summary of the previous export"
+
+
+@pytest.mark.parametrize("kind", ["pe", "selection"])
+def test_the_summary_carries_the_digest_of_its_file(tmp_path, kind):
+    out = tmp_path / f"{kind}.h5"
+    product = (build_pe_product(GWCatalog(_store(tmp_path)),
+                                spin_basis="chieff", nsamp=8, seed=0)
+               if kind == "pe" else _selection_product())
+    get_exporter("gwcat2", kind=kind)(product, str(out), write_summary=True)
+    with open(_summary_paths(out)[0]) as f:
+        summary = json.load(f)
+    with open(out, "rb") as f:
+        assert summary["output_sha256"] == hashlib.sha256(f.read()).hexdigest()
+
+
+def test_a_failed_summary_write_leaves_the_previous_summary_whole(
+        tmp_path, monkeypatch):
+    """The summary was opened 'w' in place: a failure mid-write left a
+    truncated JSON where a complete one had been."""
+    import gwcat.validation_summary as vs
+
+    out = tmp_path / "x.h5"
+    out.write_bytes(b"not an export")
+    vs.write_validation_summary(str(out), {"kind": "test", "n": 1})
+    json_path = _summary_paths(out)[0]
+    before = open(json_path).read()
+
+    def _boom(obj, fp, **kw):
+        fp.write('{"kind": "te')
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(vs.json, "dump", _boom)
+    with pytest.raises(RuntimeError, match="disk full"):
+        vs.write_validation_summary(str(out), {"kind": "test", "n": 2})
+    assert open(json_path).read() == before
+    assert [p.name for p in tmp_path.iterdir() if "gwcat-tmp" in p.name] == []
+
+
+# ==========================================================================
 # Medium 13. A selection product core cannot load says so when written
 # ==========================================================================
 def _sky_marginal_product():
