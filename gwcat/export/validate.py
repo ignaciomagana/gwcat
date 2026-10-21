@@ -278,7 +278,7 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
     # ── PE file (internal) ──────────────────────────────────────────────────
     print(f"Validating gwcat-2.0 PE export: {pe_path}")
     pe_attrs, pe_present, pe_cols = _read_export(
-        pe_path, _PE_LEGACY + _PE_COMPONENT_EXTRA)
+        pe_path, _PE_LEGACY + _PE_COMPONENT_EXTRA + ["in_support"])
 
     _validator_generation(_fail, pe_attrs.get("format_version"), "pe")
     _check("pe_format_version",
@@ -339,14 +339,47 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
     if "p_pe" in pe_cols and pe_cols["p_pe"].size:
         p = pe_cols["p_pe"]
         _check("pe_p_pe_finite", np.all(np.isfinite(p)))
-        n_zero = int(np.sum(p == 0.0))
+        # Samples outside the spin prior's support carry a RECORDED zero when
+        # the builder was told allow_out_of_support (in_support=0, counted in
+        # n_samples_out_of_support).  Only an in-support zero is the truncated
+        # distance prior; failing the recorded ones blamed the distance prior
+        # for a state the builder wrote on purpose (review 2026-10-20).
+        ins = pe_cols.get("in_support")
+        has_ins = ins is not None
+        if has_ins:
+            _check("pe_in_support_length", ins.shape == p.shape,
+                   f"{ins.shape[0]} in_support rows != {p.shape[0]} p_pe rows")
+        ins = (np.asarray(ins).astype(bool)
+               if has_ins and ins.shape == p.shape
+               else np.ones(p.shape, dtype=bool))
+        n_zero = int(np.sum((p == 0.0) & ins))
         n_neg = int(np.sum(p < 0.0))
         _check("pe_p_pe_positive", n_zero == 0 and n_neg == 0,
-               f"{n_zero} zero ({100 * n_zero / p.size:.2f}%) and {n_neg} "
-               f"negative of {p.size} samples; min={np.nanmin(p):.3e}. A zero "
-               f"p_pe means the store's p_dL_pe was truncated at the recorded "
+               f"{n_zero} zero ({100 * n_zero / p.size:.2f}%) at in-support "
+               f"samples and {n_neg} negative of {p.size} samples; "
+               f"min={np.nanmin(p):.3e}. A zero p_pe at an in-support sample "
+               f"means the store's p_dL_pe was truncated at the recorded "
                f"distance-prior bounds -- re-ingest so the distance prior is "
                f"evaluated over the full sample range.")
+        n_out = int(np.sum(~ins))
+        if n_out:
+            n_rec = pe_attrs.get("n_samples_out_of_support")
+            _check("pe_out_of_support_recorded",
+                   bool(pe_attrs.get("out_of_support_allowed", False))
+                   and n_rec is not None and int(n_rec) == n_out,
+                   f"{n_out} samples have in_support=0, but the file records "
+                   f"out_of_support_allowed="
+                   f"{pe_attrs.get('out_of_support_allowed')!r} and "
+                   f"n_samples_out_of_support={n_rec!r}")
+            _check("pe_out_of_support_p_pe_zero", np.all(p[~ins] == 0.0),
+                   f"{int(np.sum(p[~ins] != 0.0))} out-of-support samples "
+                   f"carry a non-zero p_pe; outside the spin prior's support "
+                   f"the density is zero")
+            print(f"  NOTE: {n_out} of {p.size} samples "
+                  f"({100 * n_out / p.size:.3f}%) are outside the spin prior's "
+                  f"support and carry a recorded zero p_pe "
+                  f"(allow_out_of_support); the consumer drops them but "
+                  f"counts them in each event's n.")
     else:
         # The `else` the frozen v1 validator and the v2 SELECTION block both
         # have, and only this one lacked (GW-37).  With nobs=0 every length

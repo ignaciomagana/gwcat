@@ -351,3 +351,49 @@ def test_equal_z_max_under_different_cosmologies_fails(tmp_path):
     _set_pe_cosmology(pe, 67.9, 0.3065)
     res = validate_export_v2(str(pe), str(sel))
     assert res["xcheck_z_max_distance"] is True
+
+
+# ======================================================================
+# Recorded out-of-support zeros are not a truncated distance prior
+# ======================================================================
+def _pe_out_of_support(tmp_path):
+    events = [{"name": "GWv0_000001"}, {"name": "GWv0_000002"}]
+    store, _ = _build_spin_store(tmp_path, events, name="store_oos.h5")
+    out = tmp_path / "pe_oos.h5"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        GWCatalog(store).export(str(out), format="gwcat2", spin_basis="chieff",
+                                nsamp=64, seed=0, cosmology=_COSMO, amax=0.2,
+                                allow_out_of_support=True)
+    return out
+
+
+def test_allow_out_of_support_export_validates(tmp_path):
+    """A chieff export at amax 0.2 with allow_out_of_support=True writes
+    recorded zeros, and `gwcat validate` failed it with the distance-prior
+    diagnosis, so no product built this way could ever validate."""
+    pe = _pe_out_of_support(tmp_path)
+    a = _attrs(pe)
+    assert int(a["n_samples_out_of_support"]) > 0
+    res = validate_export_v2(str(pe), strict=True)
+    assert res["pe_p_pe_positive"] is True
+    assert res["pe_out_of_support_recorded"] is True
+    assert res["pe_out_of_support_p_pe_zero"] is True
+
+
+def test_in_support_zero_still_fails(tmp_path):
+    pe = _pe_out_of_support(tmp_path)
+    with h5py.File(pe, "r+") as f:
+        p, ins = f["p_pe"][()], f["in_support"][()].astype(bool)
+        p[int(np.flatnonzero(ins)[0])] = 0.0
+        f["p_pe"][...] = p
+    res = validate_export_v2(str(pe))
+    assert res["pe_p_pe_positive"] is False
+
+
+def test_unrecorded_out_of_support_rows_fail(tmp_path):
+    pe = _pe_out_of_support(tmp_path)
+    with h5py.File(pe, "r+") as f:
+        f.attrs["n_samples_out_of_support"] = 0
+    res = validate_export_v2(str(pe))
+    assert res["pe_out_of_support_recorded"] is False
