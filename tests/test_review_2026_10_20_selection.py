@@ -296,3 +296,92 @@ def test_detectors_keep_a_genuine_uniform_ceiling():
     amax, ok = sspin.detect_max_spin_cart(
         1.0 / (4 * np.pi * a ** 2 * 1.2), a * 1.2 / 0.998)
     assert (amax, ok) == (None, False)
+
+
+# ======================================================================
+# medium-31 / low-36: FAR-column discovery
+# ======================================================================
+def _events_far_file(path, far_cols, searches=None, compound=True):
+    """A minimal events-format file with the given FAR columns (dict)."""
+    n = len(next(iter(far_cols.values())))
+    base = {"mass1_source": np.full(n, 30.0), "mass2_source": np.full(n, 20.0),
+            "z": np.full(n, 0.1), "mass1_detector": np.full(n, 33.0),
+            "mass2_detector": np.full(n, 22.0),
+            "luminosity_distance": np.full(n, 450.0),
+            "dluminosity_distance_dredshift": np.full(n, 4500.0),
+            "right_ascension": np.full(n, 1.0), "declination": np.full(n, 0.5),
+            "spin1z": np.full(n, 0.2), "spin2z": np.full(n, -0.1),
+            "chi_eff": np.full(n, 0.08), "weights": np.full(n, 2.0),
+            "lnpdraw_mass1_source": np.full(n, -1.0),
+            "lnpdraw_mass2_source_GIVEN_mass1_source": np.full(n, -2.0),
+            "lnpdraw_z": np.full(n, -3.0)}
+    for k in ("spin1x", "spin1y", "spin2x", "spin2y"):
+        base[k] = np.zeros(n)
+    cols = dict(base, **far_cols)
+    with h5py.File(path, "w") as f:
+        f.attrs["total_analysis_time"] = 365.25 * 24 * 3600
+        f.attrs["total_generated"] = 100
+        if searches is not None:
+            f.attrs["searches"] = np.array(searches, dtype=h5py.string_dtype())
+        if compound:
+            dt = np.dtype([(k, np.asarray(v).dtype) for k, v in cols.items()])
+            rec = np.zeros(n, dtype=dt)
+            for k, v in cols.items():
+                rec[k] = v
+            f.create_dataset("events", data=rec)
+        else:
+            g = f.create_group("events")
+            for k, v in cols.items():
+                g.create_dataset(k, data=v)
+    return str(path)
+
+
+def test_declared_search_without_a_column_is_not_dropped_silently(tmp_path):
+    # Row 1 is found ONLY by MBTA, whose column is spelled 'mbta-bbh_far'.
+    path = _events_far_file(tmp_path / "far.hdf", {
+        "pycbc_far": np.array([0.5, 5.0, 5.0]),
+        "mbta-bbh_far": np.array([5.0, 0.2, 5.0])},
+        searches=["pycbc", "mbta"])
+    s = SelectionSet(path, strict_spin_checks="off")
+    with pytest.warns(UserWarning, match=r"declares search\(es\) \['mbta'\]"):
+        s._load()
+    assert s._far_columns == ["pycbc_far"]
+    out = tmp_path / "sel.h5"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        s.export(str(out), spin_basis="chieff", amax=0.99, strict=False)
+    with h5py.File(out, "r") as f:
+        disc = json.loads(f.attrs["significance_far_discovery_per_campaign"])
+    assert disc[0]["unmatched_searches"] == ["mbta"]
+    assert disc[0]["unclaimed_columns"] == ["mbta-bbh_far"]
+    assert disc[0]["declared"] == ["pycbc", "mbta"]
+
+
+def test_unreadable_far_column_is_raised_not_skipped(tmp_path):
+    path = _events_far_file(tmp_path / "bad.hdf", {
+        "pycbc_far": np.array([0.5, 5.0, 5.0]),
+        "gstlal_far": np.array([b"x", b"0.1", b"y"])},
+        searches=["pycbc", "gstlal"], compound=False)
+    # h5py raises OSError (no conversion path) for this column; the old
+    # loader caught it and thresholded on pycbc alone.
+    with pytest.raises((ValueError, OSError)):
+        SelectionSet(path, strict_spin_checks="off")._load()
+
+
+def test_fallback_far_scan_order_does_not_depend_on_the_hash_seed(tmp_path):
+    import os
+    import subprocess
+    import sys
+    names = ["zz_far", "far_b", "mm_far", "far_a", "cc_far", "far_q"]
+    path = _events_far_file(tmp_path / "scan.hdf",
+                            {k: np.array([0.5, 5.0]) for k in names})
+    code = ("import sys, h5py; from gwcat.selection import _events_far_columns;"
+            "f = h5py.File(sys.argv[1], 'r');"
+            "print(','.join(_events_far_columns(f['events'], f)))")
+    seen = set()
+    for seed in ("0", "1", "2", "3"):
+        env = dict(os.environ, PYTHONHASHSEED=seed)
+        out = subprocess.run([sys.executable, "-c", code, path], env=env,
+                             capture_output=True, text=True, check=True)
+        seen.add(out.stdout.strip())
+    assert seen == {",".join(names)}          # file order, every seed

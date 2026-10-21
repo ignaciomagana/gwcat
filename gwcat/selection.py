@@ -315,26 +315,93 @@ def _search_names(f):
     return [str(raw)]
 
 
-def _events_far_columns(table, f):
-    """The FAR columns the events loader will threshold on, in its own order.
+def _h5_field_list(table):
+    """Column names of ``table`` in FILE order.
+
+    :func:`_h5_field_names` returns a set, whose iteration order changes with
+    ``PYTHONHASHSEED``; anything that iterates the columns to choose or order
+    them uses this instead (review 2026-10-20, low-36).
+    """
+    if isinstance(table, _PlannedFields):
+        return list(table._dset.dtype.names)
+    if isinstance(table, h5py.Dataset) and table.dtype.names is not None:
+        return list(table.dtype.names)
+    return list(table.keys())
+
+
+def _looks_like_far(key):
+    """Whether an ``events`` column name looks like a search FAR."""
+    return isinstance(key, str) and (key.endswith("_far")
+                                     or key.startswith("far_"))
+
+
+def _events_far_discovery(table, f):
+    """Which FAR columns the events loader thresholds on, and what it left out.
 
     One declared search contributes one column (``<search>_far`` or
-    ``far_<search>``); a file that declares none falls back to every column that
-    looks like a FAR.  Shared with :func:`_events_field_plan` so the plan asks
-    for exactly the columns the read will use.
+    ``far_<search>``); a file that declares none (or none that matches) falls
+    back to every column that looks like a FAR, in file order.  Returns a dict
+    with the ``declared`` searches, the ``columns`` used (in this order), the
+    ``unmatched_searches`` that are declared but have no column under either
+    spelling, the ``unclaimed_columns`` that look like a FAR and are not used,
+    and the ``source`` of the choice.  The last two used to be dropped without
+    a word (review 2026-10-20, medium-31): a file declaring ``mbta`` whose
+    column is ``mbta-bbh_far`` lost its MBTA-only detections, mu low and the
+    rate high, with no message.
     """
     have = _h5_field_names(table)
-    columns = []
-    for s in _search_names(f):
+    declared = _search_names(f)
+    columns, unmatched = [], []
+    for s in declared:
         for col in (s + "_far", "far_" + s):
             if col in have:
                 columns.append(col)
                 break
+        else:
+            unmatched.append(s)
+    source = "declared_searches"
     if not columns:
-        columns = [key for key in have
-                   if isinstance(key, str)
-                   and (key.endswith("_far") or key.startswith("far_"))]
-    return columns
+        columns = [key for key in _h5_field_list(table)
+                   if _looks_like_far(key)]
+        source = "fallback_scan"
+    unclaimed = [key for key in _h5_field_list(table)
+                 if _looks_like_far(key) and key not in columns]
+    return {"declared": list(declared), "columns": list(columns),
+            "unmatched_searches": unmatched, "unclaimed_columns": unclaimed,
+            "source": source}
+
+
+def _report_far_discovery(path, disc):
+    """Warn when FAR discovery dropped a declared search or an unused column."""
+    unmatched, unclaimed = disc["unmatched_searches"], disc["unclaimed_columns"]
+    if not (unmatched or unclaimed):
+        return
+    parts = []
+    if unmatched:
+        parts.append(
+            f"it declares search(es) {unmatched} with no FAR column spelled "
+            f"'<search>_far' or 'far_<search>', so detections made only by "
+            f"them are NOT in the detection mask (mu biased low, the inferred "
+            f"rate high)")
+    if unclaimed:
+        parts.append(
+            f"FAR-looking column(s) {unclaimed} belong to no search it "
+            f"declares and are not thresholded")
+    warnings.warn(
+        f"{path}: " + "; ".join(parts) + f". Thresholding on "
+        f"{disc['columns']} ({disc['source']}). If a declared search's column "
+        f"is spelled otherwise, rename it or declare the name it uses. "
+        f"Recorded in significance_far_discovery_per_campaign.")
+
+
+def _events_far_columns(table, f):
+    """The FAR columns the events loader will threshold on, in its own order.
+
+    The ``columns`` of :func:`_events_far_discovery`; shared with
+    :func:`_events_field_plan` so the plan asks for exactly the columns the
+    read will use.
+    """
+    return _events_far_discovery(table, f)["columns"]
 
 
 def _events_field_plan(table, f):
@@ -947,11 +1014,12 @@ def campaign_provenance_attrs(set_list, *, draw_domain=None,
                               draw_domain_mismatch=None):
     """Per-campaign provenance attrs shared by every selection exporter.
 
-    Records only: nothing here changes a number in the product.  Starts with
-    the declared injection draw domain (review 2026-10-20, high-4): each
+    Records only: nothing here changes a number in the product.  The
+    declared injection draw domain (review 2026-10-20, high-4): each
     campaign's declared bounds (``None`` = undeclared), the extent its rows
     actually span, whether some campaign drew past another's declared bound,
-    and which ``draw_domain`` policy the export applied.
+    and which ``draw_domain`` policy the export applied; and the FAR-column
+    discovery record (medium-31).
     """
     if draw_domain_mismatch is None:
         draw_domain_mismatch = draw_domain_mismatches(set_list)
@@ -974,6 +1042,10 @@ def campaign_provenance_attrs(set_list, *, draw_domain=None,
             "not_applied" if draw_domain is None else str(draw_domain)),
         "injection_draw_domain_applied": json.dumps(
             draw_domain_applied if draw_domain_applied is not None else {}),
+        # How each campaign's FAR columns were chosen, and the declared
+        # searches / FAR-looking columns that were not used (medium-31).
+        "significance_far_discovery_per_campaign": json.dumps(
+            [getattr(s, "_far_discovery", None) or {} for s in set_list]),
     }
 
 
@@ -985,6 +1057,11 @@ def _ddL_dz(z, dL_mpc, H0, Om0):
     DC = dL_mpc / (1 + z)
     return DC + (1 + z) * dH / E
 
+
+#: The search FAR columns of the O3 ``injections`` format (endo3), in the order
+#: the loader stacks them.
+O3_FAR_COLUMNS = ("far_gstlal", "far_pycbc_bbh", "far_pycbc_hyperbank",
+                  "far_mbta", "far_cwb")
 
 #: The spin-magnitude ceiling the cartesian/polar spin-REMOVAL step assumes when
 #: subtracting the analytic injected spin prior.  It is NOT necessarily the amax a
@@ -1059,6 +1136,8 @@ class SelectionSet:
         # Names of the FAR/significance columns actually used for thresholding;
         # populated by _read_events / _read_injections (explicit provenance).
         self._far_columns = []
+        # How those columns were chosen and what was left out (medium-31).
+        self._far_discovery = None
         # GW-39: what kind of campaign this is, the per-row run label (a
         # cumulative mixture only; None otherwise), the per-row time and the
         # semianalytic SNR column (None when the file carries none), and the
@@ -1454,14 +1533,14 @@ class SelectionSet:
         # names (e.g. "pycbc_far", "cwb-bbh_far") and older names.  The
         # discovery is _events_far_columns, shared with the field plan so the
         # one-pass read asks for exactly these columns (GW-32).
-        fars_per_search = []
-        far_columns = []
-        for col in _events_far_columns(ev, f):
-            try:
-                fars_per_search.append(_h5_read_field(ev, col))
-                far_columns.append(col)
-            except Exception:
-                pass
+        # A column that cannot be read is a broken file, not a missing search:
+        # the read error is raised, not swallowed (review 2026-10-20,
+        # medium-31), and a dropped declared search or unused FAR column warns.
+        disc = _events_far_discovery(ev, f)
+        _report_far_discovery(self.path, disc)
+        self._far_discovery = disc
+        far_columns = list(disc["columns"])
+        fars_per_search = [_h5_read_field(ev, col) for col in far_columns]
         self._fars = np.column_stack(fars_per_search) if fars_per_search else None
         self._far_columns = far_columns
 
@@ -1761,20 +1840,28 @@ class SelectionSet:
         # FAR columns: O3 uses hardcoded names
         fars_per_search = []
         far_columns = []
-        for col in ["far_gstlal", "far_pycbc_bbh", "far_pycbc_hyperbank",
-                     "far_mbta", "far_cwb"]:
+        source = "o3_search_names"
+        for col in O3_FAR_COLUMNS:
             if col in inj:
                 fars_per_search.append(np.asarray(inj[col], float))
                 far_columns.append(col)
-        # Also scan for any other *far* columns we might have missed
+        # Also scan for any other *far* columns we might have missed.  A column
+        # that cannot be read is raised, not skipped (review 2026-10-20,
+        # medium-31).
+        far_like = [key for key in inj
+                    if isinstance(key, str) and key.startswith("far_")]
         if not fars_per_search:
-            for key in inj:
-                if isinstance(key, str) and key.startswith("far_"):
-                    try:
-                        fars_per_search.append(np.asarray(inj[key], float))
-                        far_columns.append(key)
-                    except Exception:
-                        pass
+            source = "fallback_scan"
+            for key in far_like:
+                fars_per_search.append(np.asarray(inj[key], float))
+                far_columns.append(key)
+        disc = {"declared": _search_names(f), "columns": list(far_columns),
+                "unmatched_searches": [],
+                "unclaimed_columns": [k for k in far_like
+                                      if k not in far_columns],
+                "source": source}
+        _report_far_discovery(self.path, disc)
+        self._far_discovery = disc
         self._fars = np.column_stack(fars_per_search) if fars_per_search else None
         self._far_columns = far_columns
 
