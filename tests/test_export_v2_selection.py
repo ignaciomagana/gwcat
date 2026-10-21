@@ -954,3 +954,31 @@ def test_endo3_jacobian_matches_astropy_on_a_cosmology_consistent_file(tmp_path)
     expected = (pdf * (2 * np.pi) ** 2 * a1 ** 2 * a2 ** 2
                 * m1det / (1 + z) ** 2 / ddL)
     np.testing.assert_allclose(prod.columns["pdraw"], expected, rtol=1e-7)
+
+
+def test_input_identity_is_recorded_and_a_byte_copy_is_refused(tmp_path):
+    """No injection name or hash reached the selection HDF5, so a re-clipped
+    file under the same name made a product indistinguishable from the
+    original; and a byte copy under another name combined like a new
+    campaign."""
+    import hashlib
+    import os
+    import shutil
+    from gwcat.export import build_selection_product
+    from gwcat.export.selection_builder import OverlappingCampaignError
+
+    p = write_o4_full(tmp_path / "o4.hdf", n=20, seed=15)
+    with open(p, "rb") as fh:
+        digest = hashlib.sha256(fh.read()).hexdigest()
+    a = build_selection_product(SelectionSet(p), spin_basis="component").attrs
+    dec = [x.decode() if isinstance(x, bytes) else x
+           for x in a["campaign_file_sha256"]]
+    assert dec == [digest]
+    assert [x.decode() if isinstance(x, bytes) else x
+            for x in a["campaign_files"]] == [os.fspath(p)]
+    assert list(a["campaign_file_size_bytes"]) == [os.path.getsize(p)]
+
+    copy = shutil.copy(p, tmp_path / "renamed.hdf")
+    with pytest.raises(OverlappingCampaignError, match="byte-identical"):
+        build_selection_product([SelectionSet(p), SelectionSet(copy)],
+                                spin_basis="component")

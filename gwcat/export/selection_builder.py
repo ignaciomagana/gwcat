@@ -168,6 +168,7 @@ coverage check per run as well as per campaign.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import warnings
@@ -1189,6 +1190,8 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                                      zip(set_list, is_mixture) if m)
             + ". Each already carries every run's exposure; export one.")
     _refuse_overlapping_campaigns(set_list)
+    campaign_files, campaign_sizes, campaign_sha256 = _campaign_identity(
+        set_list)
     if acknowledge_semianalytic_excluded and snr_threshold is not None:
         raise ValueError(
             "acknowledge_semianalytic_excluded=True (--acknowledge-semianalytic-"
@@ -1700,6 +1703,11 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     # a PE file holding events from uncovered time can be refused downstream.
     time_coverage = _time_coverage_attrs(set_list)
     attrs.update(time_coverage)
+    # Which injection files, byte for byte, this product was built from.
+    attrs["campaign_files"] = np.array(campaign_files, dtype=_str)
+    attrs["campaign_file_size_bytes"] = np.array(campaign_sizes,
+                                                 dtype=np.int64)
+    attrs["campaign_file_sha256"] = np.array(campaign_sha256, dtype=_str)
     if mixture_attrs is not None:
         attrs.update(mixture_attrs)
     if reference_coverage_runs is not None:
@@ -1773,6 +1781,8 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             time_coverage["observing_runs_covered"]),
         "T_obs_yr_per_campaign": time_coverage[
             "T_obs_yr_per_campaign"].tolist(),
+        "campaign_file_size_bytes": list(campaign_sizes),
+        "campaign_file_sha256": list(campaign_sha256),
     }
     if a_ref is not None:
         summary["spin_reference_amax"] = float(a_ref)
@@ -1814,6 +1824,39 @@ def _sky_availability(set_list):
             f"campaigns' injections; cut on campaign, not on finiteness, if "
             f"that is not intended.")
     return sky
+
+
+def _file_sha256(path, chunk=8 << 20):
+    """sha256 of a file, streamed (the O4ab campaign is ~3 GB)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(chunk), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _campaign_identity(set_list):
+    """``(paths, sizes, sha256s)`` of each campaign's injection file.
+
+    The product used to record no identity for its inputs, so a re-clipped
+    injection file under the same name gave a product that paired and
+    validated exactly like the original (review fix).  Two campaigns whose
+    files are byte-identical are one campaign passed twice, which double-counts
+    its exposure exactly as the same path twice does, and are refused.
+    """
+    paths = [os.fspath(s.path) for s in set_list]
+    sizes = [int(os.path.getsize(p)) for p in paths]
+    digests = [_file_sha256(p) for p in paths]
+    seen = {}
+    for p, d in zip(paths, digests):
+        if d in seen:
+            raise OverlappingCampaignError(
+                f"{seen[d]!r} and {p!r} are byte-identical injection files "
+                f"(sha256 {d}): the same campaign appears twice in one "
+                f"selection product, so its draws, exposure and detected "
+                f"injections would be counted twice. Pass each campaign once.")
+        seen[d] = p
+    return paths, sizes, digests
 
 
 def _time_coverage_attrs(set_list):
