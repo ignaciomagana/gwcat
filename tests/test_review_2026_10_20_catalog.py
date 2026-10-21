@@ -322,3 +322,19 @@ def test_policy_all_still_cuts_row_by_row(tmp_path):
                    ("GW900002_000002", "C01:IMRPhenomXPHM"),
                    ("GW900002_000002", "C01:Mixed")]
     assert sub._homogeneous_sample_sets is False
+
+
+# ==========================================================================
+# The inclusive FAR cut says so, and names events on the rounded threshold
+# ==========================================================================
+def test_far_cut_names_events_on_the_rounded_threshold(tmp_path):
+    rows = [_row("GW231002_143916", far=1.0), _row("GW900002_000002", far=0.96),
+            _row("GW900003_000003", far=1e-3)]
+    cat = GWCatalog(_store(tmp_path, rows))
+    with pytest.warns(UserWarning, match="GW231002_143916") as rec:
+        sub = cat.select(far_max=1.0)
+    assert not any("GW900002_000002" in str(r.message) for r in rec)
+    # The cut itself is unchanged: the event on the threshold is kept.
+    assert "GW231002_143916" in set(sub.event_names)
+    assert sub.selection_spec.to_dict()["far_cut_operator"] == "<="
+    assert sub.selection_spec.to_attrs()["far_cut_operator"] == "<="

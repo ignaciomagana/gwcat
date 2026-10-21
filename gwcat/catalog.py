@@ -36,6 +36,12 @@ from .source_class import (normalize_source_class, resolve_filter_classes,
 POINT_ESTIMATE_CUTS_ATTR = "point_estimate_cuts"
 
 
+#: How the PE-side ``far_max`` cut compares (``far <= far_max``).  Every
+#: injection detection mask is strict (``far < threshold``); recorded with the
+#: cut so a consumer can see the two differ at the threshold itself.
+FAR_CUT_OPERATOR = "<="
+
+
 class UnpairableSelectionCut(ValueError):
     """An event cut for which the paired injection campaign has no equivalent.
 
@@ -360,6 +366,8 @@ class SelectionSpec:
                             else str(self.approximant)),
             "cut_estimator": self.cut_estimator,
         }
+        if self.far_max is not None:
+            out["far_cut_operator"] = FAR_CUT_OPERATOR
         if self.snr_min is not None:
             out["n_events_missing_snr"] = int(self.n_missing_snr)
         pe_cuts = self.point_estimate_cuts
@@ -414,6 +422,8 @@ class SelectionSpec:
             "approximant": "" if self.approximant is None else str(
                 self.approximant),
         }
+        if self.far_max is not None:
+            out["far_cut_operator"] = FAR_CUT_OPERATOR
         pe_cuts = self.point_estimate_cuts
         if pe_cuts:
             # Written only when such a cut is in effect: the paired-file
@@ -1000,6 +1010,30 @@ class GWCatalog:
             n_missing_far = int(missing_mask.sum())
             below = np.zeros(len(self.names), dtype=bool)
             below[fa] = far[fa] <= far_max
+            # The PE cut is inclusive while every injection mask is strict
+            # (far < threshold), and the catalog FAR is GWOSC's value rounded to
+            # two significant figures, so real events sit exactly on round
+            # thresholds (0.25, 0.5; GW231002_143916 is published at 1.0).
+            # The operator is recorded (far_cut_operator) and the events whose
+            # published FAR equals far_max to that precision -- whose true FAR
+            # may lie on either side -- are named (review 2026-10-20).  The
+            # cut itself is unchanged.
+            at_thr = np.zeros(len(self.names), dtype=bool)
+            pos = fa & (far > 0) & np.isfinite(far)
+            unit = np.zeros(len(self.names))
+            unit[pos] = 10.0 ** (np.floor(np.log10(far[pos])) - 1)
+            at_thr[pos] = np.abs(far[pos] - far_max) <= 0.5 * unit[pos]
+            at_thr &= candidates
+            if at_thr.any():
+                warnings.warn(
+                    f"far_max={far_max}: {int(at_thr.sum())} event(s) have a "
+                    f"catalog FAR equal to the threshold at the two significant "
+                    f"figures GWOSC publishes, so their true FAR may lie on "
+                    f"either side of it: "
+                    f"{sorted(set(self.names[at_thr].tolist()))}. This cut "
+                    f"keeps them (far <= far_max) while every injection mask "
+                    f"is strict (far < threshold); recorded as "
+                    f"far_cut_operator='<='.")
             if require_far:
                 if n_missing_far > 0:
                     raise ValueError(
