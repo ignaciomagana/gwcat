@@ -552,3 +552,28 @@ def test_the_spec_digest_does_not_depend_on_the_whitelist_spelling(tmp_path):
     assert len(digests) == 1
     # A Path is recorded as the path it is, not as an in-memory sequence.
     assert views[3].selection_spec.name_filters == (f"event_list:{path}",)
+
+
+# ==========================================================================
+# The event-map identity is part of the selection spec
+# ==========================================================================
+def test_the_event_map_identity_enters_the_spec(tmp_path):
+    from gwcat.waveform_policy import SampleSetMap
+    cat = GWCatalog(_store(tmp_path, _multiset_rows()))
+    a = {"GW900001_000001": "C01:IMRPhenomXPHM", "GW900002_000002": "C01:Mixed"}
+    b = {"GW900001_000001": "C01:SEOBNRv4PHM", "GW900002_000002": "C01:Mixed"}
+    path = tmp_path / "map_a.json"
+    path.write_text(json.dumps(a, indent=2))
+    as_dict = cat.select(waveform_policy="event-map", sample_set_map=a)
+    as_file = cat.select(waveform_policy="event-map", sample_set_map=str(path))
+    in_code = cat.select(waveform_policy="event-map",
+                         sample_set_map=SampleSetMap(labels=dict(a)))
+    other = cat.select(waveform_policy="event-map", sample_set_map=b)
+    d = {v.selection_spec.digest() for v in (as_dict, as_file, in_code)}
+    assert len(d) == 1
+    assert other.selection_spec.digest() not in d
+    spec = as_dict.selection_spec.to_dict()
+    assert spec["sample_set_map_digest"]
+    assert spec["nrsur_q_rule"] is None
+    # A map built in code no longer records an empty identity.
+    assert in_code._sample_set_map_report["map_sha256"]

@@ -172,6 +172,12 @@ class SelectionSpec:
     #: Events the ``snr_min`` cut dropped because their posterior-median SNR
     #: is unknown (NaN), counted by the call that applied the cut.
     n_missing_snr: int = 0
+    #: ``waveform_policy="event-map"`` only: the content digest of the map
+    #: (:func:`sample_set_map_digest`) and the NRSur q-rule settings, so the
+    #: spec -- and its digest -- say WHICH map chose the sample sets.
+    sample_set_map_digest: Optional[str] = None
+    nrsur_q_rule: Optional[float] = None
+    nrsur_q_rule_substitute: bool = False
 
     # ---- composition ----------------------------------------------------
     def refine(self, *, compact_type=None, source_class=None, far_max=None,
@@ -180,7 +186,9 @@ class SelectionSpec:
                allowed_names_authoritative=True, far_policy="none",
                n_missing_far=0, allow_missing_far=False, require_far=False,
                waveform_policy="preferred", approximant=None,
-               allow_point_estimate_cuts=False, n_missing_snr=0):
+               allow_point_estimate_cuts=False, n_missing_snr=0,
+               sample_set_map_digest=None, nrsur_q_rule=None,
+               nrsur_q_rule_substitute=False):
         """This spec intersected with one further ``select()`` call.
 
         ``name_filters`` is a sequence of ``(label, names)`` pairs -- one per
@@ -272,6 +280,13 @@ class SelectionSpec:
             # A later SNR cut sees only rows with a finite SNR, so the counts
             # of chained calls add up to the events the cuts dropped for it.
             n_missing_snr=int(self.n_missing_snr) + int(n_missing_snr),
+            # The map identity follows the policy, which the caller passes as
+            # the view's effective one (inherited or new).
+            sample_set_map_digest=(None if sample_set_map_digest is None
+                                   else str(sample_set_map_digest)),
+            nrsur_q_rule=(None if nrsur_q_rule is None
+                          else float(nrsur_q_rule)),
+            nrsur_q_rule_substitute=bool(nrsur_q_rule_substitute),
         )
 
     # ---- derived views --------------------------------------------------
@@ -418,6 +433,12 @@ class SelectionSpec:
         }
         if self.far_max is not None:
             out["far_cut_operator"] = FAR_CUT_OPERATOR
+        if self.waveform_policy == "event-map":
+            # The map identity (review 2026-10-20): it was absent from the
+            # spec, so two exports chosen by different maps shared a digest.
+            out["sample_set_map_digest"] = self.sample_set_map_digest or ""
+            out["nrsur_q_rule"] = _round(self.nrsur_q_rule)
+            out["nrsur_q_rule_substitute"] = bool(self.nrsur_q_rule_substitute)
         if self.snr_min is not None:
             out["n_events_missing_snr"] = int(self.n_missing_snr)
         pe_cuts = self.point_estimate_cuts
@@ -1258,6 +1279,12 @@ class GWCatalog:
                     q_frac_fn=self._q_below_nrsur_floor_frac,
                     nrsur_q_rule=nrsur_q_rule,
                     nrsur_q_rule_substitute=nrsur_q_rule_substitute)
+                # A map built in code carries no file hash; record its content
+                # digest rather than an empty identity (review 2026-10-20).
+                map_report = dict(map_report)
+                map_report["map_content_sha256"] = map_digest
+                if not map_report.get("map_sha256"):
+                    map_report["map_sha256"] = map_digest
             else:
                 kept, reasons, homogeneous = resolve_policy(
                     self.names, sel, self.meta, policy=waveform_policy,
@@ -1303,7 +1330,11 @@ class GWCatalog:
             allow_missing_far=allow_missing_far, require_far=require_far,
             waveform_policy=eff_policy, approximant=eff_approximant,
             allow_point_estimate_cuts=allow_unpaired_point_estimate_cuts,
-            n_missing_snr=n_missing_snr)
+            n_missing_snr=n_missing_snr,
+            sample_set_map_digest=map_digest,
+            nrsur_q_rule=(map_report or {}).get("nrsur_q_rule"),
+            nrsur_q_rule_substitute=bool(
+                (map_report or {}).get("nrsur_q_rule_substitute", False)))
 
         result = GWCatalog(self.path, _sel=kept)
         result._selection_spec = spec
