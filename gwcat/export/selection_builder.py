@@ -681,7 +681,13 @@ def _check_reference_coverage(set_list, a_ref, *, strict):
     Two evidences, deliberately not conflated.  A campaign with a DETECTED
     (uniform-magnitude) ceiling proves the hole, so it raises under ``strict``.
     A campaign without one leaves only the largest magnitude actually drawn,
-    which is a sample maximum and not a support bound -- that warns.
+    which is a sample maximum and not a support bound.  That warns while the
+    shortfall ``(a_ref - max)/a_ref`` is one sampling noise could leave; once
+    it is wider than that at false-alarm :data:`_COVERAGE_FALSE_ALARM` (for a
+    draw whose density near ``a_ref`` is at least a tenth of the reference's)
+    it is a hole on the rows' own evidence and raises under ``strict`` too
+    (review fix: it used to warn even then -- an O4-sized campaign stopping at
+    0.95 against ``a_ref = 0.99`` exported, and core never reads the flag).
 
     Returns ``(covered_flags, evidence_per_campaign)``.
     """
@@ -692,6 +698,7 @@ def _check_reference_coverage(set_list, a_ref, *, strict):
         has_det = (detected is not None
                    and all(a is not None and np.isfinite(a)
                            for a in detected[:2]))
+        n_rows = 0
         if has_det:
             bound = float(min(detected[0], detected[1]))
             source = "detected"
@@ -699,23 +706,38 @@ def _check_reference_coverage(set_list, a_ref, *, strict):
             mags = [np.asarray(a, dtype=float) for a in (s._a1, s._a2)
                     if a is not None]
             bound = float(min(m.max() for m in mags)) if mags else float("nan")
+            n_rows = int(min(np.isfinite(m).sum() for m in mags)) if mags else 0
             source = "drawn_max"
         ok = bool(np.isfinite(bound) and bound >= a_ref)
         covered.append(ok)
         evidence.append({"path": str(s.path), "bound": bound,
                          "bound_source": source, "covers_a_ref": ok})
         if not ok:
-            (proven_bad if source == "detected" else unproven_bad).append(
-                evidence[-1])
+            if source == "detected":
+                proven_bad.append(evidence[-1])
+            elif ((a_ref - bound) / a_ref
+                  > -np.log(_COVERAGE_FALSE_ALARM)
+                  / (_COVERAGE_MIN_DENSITY_RATIO * max(n_rows, 1))):
+                # No draw in (bound, a_ref] over n_rows rows: improbable
+                # below the false-alarm level unless the region is undrawn.
+                evidence[-1]["n_rows"] = n_rows
+                proven_bad.append(evidence[-1])
+            else:
+                unproven_bad.append(evidence[-1])
 
     def _detail(rows):
-        return "; ".join(f"{r['path']} (magnitudes reach {r['bound']:.6g}, "
-                         f"from {r['bound_source']})" for r in rows)
+        return "; ".join(
+            f"{r['path']} (magnitudes reach {r['bound']:.6g}, from "
+            f"{r['bound_source']}"
+            + (f" over {r['n_rows']} rows" if "n_rows" in r else "") + ")"
+            for r in rows)
 
     if proven_bad:
         msg = (
             f"spin_reference_amax={a_ref} exceeds the injected spin magnitude "
-            f"ceiling of {len(proven_bad)} campaign(s): {_detail(proven_bad)}. "
+            f"ceiling of {len(proven_bad)} campaign(s) (detected, or a drawn "
+            f"maximum over too many rows to be sampling noise): "
+            f"{_detail(proven_bad)}. "
             f"The reference prior puts probability where those campaigns drew "
             f"no injections at all, so the reweighted selection integral is "
             f"missing that region entirely and alpha is biased LOW -- which "

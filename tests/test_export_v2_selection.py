@@ -856,3 +856,35 @@ def test_reference_tilt_hole_is_refused(tmp_path):
     assert ok["spin_reference_coverage_ok"] is True
     assert (np.asarray(ok["spin_reference_tilt_max_gap_per_campaign"])
             < ok["spin_reference_tilt_gap_tolerance_per_campaign"][0]).all()
+
+
+def test_a_sample_maximum_hole_is_refused_once_it_is_not_noise(tmp_path):
+    """A campaign with no detectable magnitude ceiling whose magnitudes stop
+    well below a_ref only warned, even under strict, and the file was written
+    with spin_reference_coverage_ok=False.  On enough rows the shortfall is a
+    hole, not noise, and strict now refuses it; a handful of rows still warns
+    (test_selection_chieff_reference pins that half)."""
+    from gwcat.export import build_selection_product
+    from gwcat.export.selection_builder import BlockCampaignMismatch
+
+    n = 20000          # shortfall 0.04 of a_ref; noise allows ~0.01 here
+    path = write_o4_full(tmp_path / "o4.hdf", n=n, amax=(0.95, 0.95), seed=41)
+    rng = np.random.default_rng(42)
+    with h5py.File(path, "r+") as f:
+        # Non-uniform magnitudes (no detectable ceiling) that stop at 0.95.
+        for k in ("1", "2"):
+            ev = f["events"]
+            ev[f"lnpdraw_spin{k}_magnitude"][:] = rng.normal(0.0, 0.3, n)
+    s = SelectionSet(path)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        assert s.spin_meta["amax_detected"] in (None, (None, None))
+        with pytest.raises(BlockCampaignMismatch, match="sampling noise"):
+            build_selection_product(SelectionSet(path),
+                                    spin_basis="chieff_reference",
+                                    spin_reference_amax=0.99)
+        prod = build_selection_product(SelectionSet(path),
+                                       spin_basis="chieff_reference",
+                                       spin_reference_amax=0.99, strict=False)
+    assert prod.attrs["spin_reference_coverage_ok"] is False
+    assert list(prod.attrs["spin_reference_coverage_per_campaign"]) == [False]
