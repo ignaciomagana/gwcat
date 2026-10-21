@@ -652,8 +652,8 @@ def resolve_event_map(event_names: Sequence, sel, meta: dict, sample_set_map,
               " to the map, or re-ingest with --sample-sets all.")
     if dup_sel or dup_store:
         raise SampleSetMapError(
-            f"waveform_policy='event-map': a label does not say which release "
-            f"to export when more than one row holds it."
+            "waveform_policy='event-map': a label does not say which release "
+            "to export when more than one row holds it."
             + (f" {len(dup_sel)} event(s) have more than one SELECTED row for "
                f"the label the map resolves: {dup_sel[:10]}." if dup_sel
                else "")

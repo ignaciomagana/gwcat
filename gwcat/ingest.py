@@ -58,7 +58,7 @@ import h5py
 from .cosmology import (make_cosmology, uniform_source_frame_prob,
                         dL_prior_prob, DL_PRIOR_KINDS, DL_PRIOR_NEEDS_ALPHA,
                         DL_PRIOR_NEEDS_COSMOLOGY,
-                        DistancePriorKindError, NAMED_COSMOLOGIES,
+                        DistancePriorKindError,
                         PLANCK15, O4_FALLBACK, UnrecognisedCosmologyError,
                         is_radiation_free_flat_lcdm, resolve_named_cosmology)
 from .source_class import (normalize_source_class, classify_by_mass,

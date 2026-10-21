@@ -1532,18 +1532,18 @@ def _pe_cosmologies(_fail, pe_attrs):
     if bool(pe_attrs.get("cosmology_per_event_varies", False)):
         H = np.asarray(pe_attrs.get("cosmology_H0_per_event", []),
                        dtype=float).ravel()
-        O = np.asarray(pe_attrs.get("cosmology_Om0_per_event", []),
-                       dtype=float).ravel()
-        if not (H.size == O.size == nobs and nobs > 0
-                and np.all(np.isfinite(H)) and np.all(np.isfinite(O))):
+        Om = np.asarray(pe_attrs.get("cosmology_Om0_per_event", []),
+                        dtype=float).ravel()
+        if not (H.size == Om.size == nobs and nobs > 0
+                and np.all(np.isfinite(H)) and np.all(np.isfinite(Om))):
             _fail("xcheck_cosmology",
                   f"PE cosmology_per_event_varies=True but "
                   f"cosmology_H0_per_event / cosmology_Om0_per_event hold "
-                  f"{H.size} / {O.size} entries (finite: "
-                  f"{int(np.isfinite(H).sum())} / {int(np.isfinite(O).sum())}) "
+                  f"{H.size} / {Om.size} entries (finite: "
+                  f"{int(np.isfinite(H).sum())} / {int(np.isfinite(Om).sum())}) "
                   f"for nobs={nobs}, so the cosmology of the source-frame "
                   f"columns cannot be compared with the selection's.")
-        return list(zip(H.tolist(), O.tolist()))
+        return list(zip(H.tolist(), Om.tolist()))
     H0, Om0 = pe_attrs.get("pe_cosmology_H0"), pe_attrs.get("pe_cosmology_Om0")
     if H0 is None and Om0 is None:
         return []
@@ -1560,11 +1560,11 @@ def _sel_cosmologies(sel_attrs):
     src = sel_attrs.get("cosmology_source_per_campaign")
     H = np.atleast_1d(np.asarray(
         sel_attrs.get("cosmology_H0_per_campaign", []), dtype=float)).ravel()
-    O = np.atleast_1d(np.asarray(
+    Om = np.atleast_1d(np.asarray(
         sel_attrs.get("cosmology_Om0_per_campaign", []), dtype=float)).ravel()
-    if src is not None and len(np.atleast_1d(src)) == H.size == O.size:
-        ok = np.isfinite(H) & np.isfinite(O)
-        return (list(zip(H[ok].tolist(), O[ok].tolist())),
+    if src is not None and len(np.atleast_1d(src)) == H.size == Om.size:
+        ok = np.isfinite(H) & np.isfinite(Om)
+        return (list(zip(H[ok].tolist(), Om[ok].tolist())),
                 int(np.sum(~ok)), "per_campaign")
     H0, Om0 = sel_attrs.get("cosmology_H0"), sel_attrs.get("cosmology_Om0")
     if H0 is None or Om0 is None:

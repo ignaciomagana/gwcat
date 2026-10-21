@@ -28,7 +28,6 @@ import pytest
 from gwcat.catalog import GWCatalog
 from gwcat.export import (export, build_pe_product, get_exporter,
                           register_exporter, list_formats, ExportProduct)
-from gwcat.schema import MissingParameterError
 
 
 # ==========================================================================
