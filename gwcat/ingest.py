@@ -3834,8 +3834,12 @@ def merge_stores(store_a, store_b, out_path, cfg: Optional[IngestConfig] = None,
         row.  ``"skip"`` drops it and warns (the historical behaviour, and the
         default).  ``"refresh"`` REPLACES the matching ``store_a`` row with
         ``store_b``'s -- how one sample set's samples or metadata are updated
-        without re-ingesting the whole catalog; the refreshed row moves to the
-        end of the store, which is positional only (rows are addressed by key).
+        without re-ingesting the whole catalog.  The refreshed row moves to the
+        END of the store, and row position is not only cosmetic: a seeded PE
+        export draws every event's samples from one random stream in store row
+        order, so a refresh re-draws every event after the old position under
+        the same seed, with every digest unchanged (review 2026-10-20,
+        low-63).  Re-export from a fresh build when draws must match.
         ``"keep"`` appends both, leaving two rows with the same key -- a store
         state the readers treat as duplicate and which is only ever what you
         want mid-pipeline.  ``None`` derives it from the legacy
@@ -3991,9 +3995,13 @@ def merge_store(existing_path: str, new_paths, out_path: str = None,
         ``(event_name, sample_set_name)`` already exists in ``existing_path``.
         ``"skip"`` (default) keeps the existing row; ``"refresh"`` replaces it
         with the newly ingested one -- the way to update one waveform's samples
-        without re-ingesting the catalog.  Note that a new SAMPLE SET for an
-        event already in the store is not a duplicate at all: it is added under
-        either setting (GW-14).
+        without re-ingesting the catalog.  The refreshed row moves to the end
+        of the store, which changes which samples a seeded export draws for
+        every later event (see :func:`merge_stores`).  Note that a new SAMPLE
+        SET for an event already in the store is not a duplicate at all: it is
+        added under either setting (GW-14) -- unless it is that event's
+        preferred row, which replaces or is skipped against the existing
+        preferred row (review 2026-10-20, medium-25).
     mock_data : bool or None
         Whether the NEW files are synthetic (:data:`STORE_MOCK_DATA_ATTR`).
         ``None`` (default) inherits the existing store's flag, so appending to
