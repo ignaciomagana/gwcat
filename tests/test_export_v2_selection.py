@@ -792,3 +792,67 @@ def test_scalar_cosmology_is_the_one_pdraw_used(tmp_path):
                                      spin_basis="component").attrs
     assert bool(ac["cosmology_mixed_across_campaigns"]) is True
     assert np.isnan(ac["cosmology_H0"]) and np.isnan(ac["cosmology_Om0"])
+
+
+def _o4_aligned_hemisphere(path, n, seed):
+    """O4 factored fixture with a ~ U(0, 0.9) and cos(tilt) ~ U(0, 1): the
+    magnitudes cover a_ref = 0.9, the orientations cover half the sphere."""
+    from gwcat.spin import chi_p_from_components
+
+    write_o4_full(path, n=n, amax=(0.9, 0.9), seed=seed)
+    rng = np.random.default_rng(seed + 77)
+    with h5py.File(path, "r+") as f:
+        ev = f["events"]
+        m1, m2 = ev["mass1_source"][:], ev["mass2_source"][:]
+        a1, a2 = ev["spin1_magnitude"][:], ev["spin2_magnitude"][:]
+        ph1, ph2 = ev["spin1_azimuthal_angle"][:], ev["spin2_azimuthal_angle"][:]
+        c1, c2 = rng.uniform(0.0, 1.0, n), rng.uniform(0.0, 1.0, n)
+        th1, th2 = np.arccos(c1), np.arccos(c2)
+        s1, s2 = np.sin(th1), np.sin(th2)
+        ev["spin1_polar_angle"][:] = th1
+        ev["spin2_polar_angle"][:] = th2
+        ev["lnpdraw_spin1_polar_angle"][:] = np.log(s1)    # p(θ) = sin θ
+        ev["lnpdraw_spin2_polar_angle"][:] = np.log(s2)
+        ev["spin1x"][:], ev["spin1y"][:] = a1 * s1 * np.cos(ph1), a1 * s1 * np.sin(ph1)
+        ev["spin2x"][:], ev["spin2y"][:] = a2 * s2 * np.cos(ph2), a2 * s2 * np.sin(ph2)
+        ev["spin1z"][:], ev["spin2z"][:] = a1 * c1, a2 * c2
+        ev["chi_eff"][:] = (m1 * a1 * c1 + m2 * a2 * c2) / (m1 + m2)
+        ev["chi_p"][:] = chi_p_from_components(a1, a2, c1, c2, m1, m2)
+    return str(path)
+
+
+def test_reference_tilt_hole_is_refused(tmp_path):
+    """The coverage check compared magnitudes only, so an aligned-hemisphere
+    campaign exported with spin_reference_coverage_ok=True and alpha biased
+    low (a detected fraction of 1/4 of the truth in the review's probe)."""
+    from gwcat.export import build_selection_product
+    from gwcat.export.selection_builder import BlockCampaignMismatch
+
+    hole = _o4_aligned_hemisphere(tmp_path / "hemi.hdf", 2000, 31)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")           # the loader's isotropy check
+        with pytest.raises(BlockCampaignMismatch, match="never drew"):
+            build_selection_product(SelectionSet(hole),
+                                    spin_basis="chieff_reference",
+                                    spin_reference_amax=0.9)
+        with pytest.warns(UserWarning, match="never drew"):
+            prod = build_selection_product(SelectionSet(hole),
+                                           spin_basis="chieff_reference",
+                                           spin_reference_amax=0.9,
+                                           strict=False)
+    a = prod.attrs
+    assert list(a["spin_reference_coverage_per_campaign"]) == [True]
+    assert list(a["spin_reference_tilt_coverage_per_campaign"]) == [False]
+    assert a["spin_reference_coverage_ok"] is False
+    gaps = np.asarray(a["spin_reference_tilt_max_gap_per_campaign"])
+    assert gaps.shape == (1, 2) and (gaps > 0.99).all()     # [-1, 0) undrawn
+
+    # Isotropic control, same size: covered, and nothing is refused.
+    iso = write_o4_full(tmp_path / "iso.hdf", n=2000, amax=(0.9, 0.9), seed=32)
+    ok = build_selection_product(SelectionSet(iso),
+                                 spin_basis="chieff_reference",
+                                 spin_reference_amax=0.9).attrs
+    assert list(ok["spin_reference_tilt_coverage_per_campaign"]) == [True]
+    assert ok["spin_reference_coverage_ok"] is True
+    assert (np.asarray(ok["spin_reference_tilt_max_gap_per_campaign"])
+            < ok["spin_reference_tilt_gap_tolerance_per_campaign"][0]).all()

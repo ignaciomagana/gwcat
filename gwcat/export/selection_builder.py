@@ -127,6 +127,12 @@ put in the missing region, and alpha comes out biased low.  With a detectable
 (uniform-magnitude) ceiling that is provable and raises under ``strict``; on a
 campaign with no detectable ceiling it falls back to the largest magnitude
 actually drawn and warns, because "not observed" is weaker than "not drawn".
+The same holds for orientations: the reference is isotropic, so a campaign
+that never drew part of ``cos(tilt) in [-1, 1]`` (an aligned-hemisphere draw)
+leaves a hole too, found from the widest gap between its drawn tilts
+(:func:`_check_reference_tilt_coverage`).  "Assumes nothing about how the
+campaign drew its spins" therefore means nothing about their DENSITY; their
+support must still cover the reference's.
 
 Columns (all bases): the legacy 10 (``m1det, m2det, dL, chieff, ra, dec, m1src,
 m2src, redshift, pdraw``) plus ``a1, a2, cost1, cost2, chip`` whenever every
@@ -732,6 +738,99 @@ def _check_reference_coverage(set_list, a_ref, *, strict):
     return covered, evidence
 
 
+#: False-alarm probability of the sample-based coverage-hole tests: a gap this
+#: unlikely under a draw that covers the reference is not sampling noise.
+_COVERAGE_FALSE_ALARM = 1e-9
+#: The smallest campaign draw density, as a fraction of the reference density,
+#: that the hole tests allow inside a covered region (a non-isotropic draw such
+#: as O4ab's varies by a factor ~2; this allows ten).
+_COVERAGE_MIN_DENSITY_RATIO = 0.1
+
+
+def _tilt_max_gap(cost):
+    """Widest interval of ``cos(tilt)`` in [-1, 1] holding no drawn value."""
+    c = np.asarray(cost, dtype=float)
+    c = np.sort(np.clip(c[np.isfinite(c)], -1.0, 1.0))
+    if not c.size:
+        return 2.0
+    return float(np.max(np.diff(np.concatenate(([-1.0], c, [1.0])))))
+
+
+def _tilt_gap_tolerance(n):
+    """Widest ``cos(tilt)`` gap that ``n`` covering draws leave by chance.
+
+    For ``n`` draws whose density is at least ``rho`` times the isotropic
+    reference's (1/2 on [-1, 1]) everywhere, P(some gap wider than ``w``) <=
+    ``(n + 1) exp(-n rho w / 2)``; this is the ``w`` at which that bound is
+    :data:`_COVERAGE_FALSE_ALARM`.  Above 2 (the whole range) for a handful of
+    draws, i.e. too few rows to show anything.
+    """
+    if n <= 0:
+        return float("inf")
+    return float(2.0 * (np.log(n + 1.0) - np.log(_COVERAGE_FALSE_ALARM))
+                 / (_COVERAGE_MIN_DENSITY_RATIO * n))
+
+
+def _check_reference_tilt_coverage(set_list, *, strict):
+    """Refuse/warn when a campaign's drawn tilts do not COVER the reference.
+
+    The reference is isotropic, so the reweighting needs draws over all of
+    ``cos(tilt) in [-1, 1]`` for both bodies, exactly as it needs magnitudes up
+    to ``a_ref`` (:func:`_check_reference_coverage`): an orientation range the
+    campaign never drew carries reference probability and no injections, and
+    alpha comes out biased LOW.  The magnitude check alone let an
+    aligned-hemisphere campaign (``cos(tilt) ~ U(0, 1)``) export with
+    ``coverage_ok=True`` and a detected fraction of a quarter of the truth
+    (review fix).
+
+    The evidence is the drawn values (every row of the campaign, detected or
+    not): the widest gap between them, including the gaps to -1 and +1,
+    against :func:`_tilt_gap_tolerance`.  A gap above the tolerance is a hole
+    at false-alarm probability :data:`_COVERAGE_FALSE_ALARM`, so it raises
+    under ``strict`` (warns otherwise); the production campaigns span the full
+    range with gaps far below it.
+
+    Returns ``(covered_flags, max_gap_per_campaign, tolerance_per_campaign)``.
+    """
+    covered, gaps, tols, bad = [], [], [], []
+    for s in set_list:
+        costs = [c for c in (s._cost1, s._cost2) if c is not None]
+        if len(costs) < 2:
+            # Unreachable for a reference basis (it needs the component spin
+            # draw, which carries both tilts); recorded as unchecked if not.
+            gaps.append((float("nan"), float("nan")))
+            tols.append(float("nan"))
+            covered.append(False)
+            bad.append(f"{s.path} (no drawn tilts to check)")
+            continue
+        n = int(min(np.isfinite(np.asarray(c, dtype=float)).sum()
+                    for c in costs))
+        g = tuple(_tilt_max_gap(c) for c in costs)
+        tol = _tilt_gap_tolerance(n)
+        ok = bool(max(g) <= tol)
+        gaps.append(g)
+        tols.append(tol)
+        covered.append(ok)
+        if not ok:
+            bad.append(f"{s.path} (widest undrawn cos(tilt) interval "
+                       f"{max(g):.4g} wide over {n} rows; sampling noise "
+                       f"leaves at most {tol:.3g})")
+    if bad:
+        msg = (
+            f"the isotropic reference spin prior puts probability on spin "
+            f"orientations that {len(bad)} campaign(s) never drew: "
+            + "; ".join(bad)
+            + ". The reweighting can only redistribute weight where a "
+              "campaign drew, so the selection integral is missing that "
+              "region and alpha is biased LOW. Use spin_basis='component', "
+              "which needs no reference. Pass strict=False to export anyway; "
+              "the file records spin_reference_tilt_coverage_per_campaign.")
+        if strict:
+            raise BlockCampaignMismatch(msg)
+        warnings.warn(msg)
+    return covered, gaps, tols
+
+
 def _campaign_reference_lnfactor(s, keep, a_ref):
     """``(ln p_iso(chieff|q,a_ref), in_reference_support)`` for one campaign.
 
@@ -1085,11 +1184,15 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
 
     #: Per-campaign reference-support coverage (reference bases only).
     reference_coverage, reference_coverage_evidence = [], []
+    #: Per-campaign tilt coverage of the isotropic reference (review fix).
+    tilt_coverage, tilt_gaps, tilt_tols = [], [], []
     #: The same check run by run on each mixture campaign (GW-39).
     reference_coverage_runs = None
     if a_ref is not None:
         reference_coverage, reference_coverage_evidence = (
             _check_reference_coverage(set_list, a_ref, strict=strict))
+        tilt_coverage, tilt_gaps, tilt_tols = (
+            _check_reference_tilt_coverage(set_list, strict=strict))
         for s, mix in zip(set_list, is_mixture):
             if mix:
                 reference_coverage_runs = _reference_coverage_per_run(s, a_ref)
@@ -1490,7 +1593,17 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         attrs["spin_reference_coverage_source_per_campaign"] = np.array(
             [e["bound_source"] for e in reference_coverage_evidence],
             dtype=_str)
-        attrs["spin_reference_coverage_ok"] = bool(all(reference_coverage))
+        # The orientation half of the coverage (review fix): the widest
+        # cos(tilt) interval each campaign never drew, per body, against the
+        # widest one sampling noise leaves at false-alarm 1e-9.
+        attrs["spin_reference_tilt_coverage_per_campaign"] = np.array(
+            tilt_coverage, dtype=bool)
+        attrs["spin_reference_tilt_max_gap_per_campaign"] = np.array(
+            tilt_gaps, dtype=float).reshape(-1, 2)
+        attrs["spin_reference_tilt_gap_tolerance_per_campaign"] = np.array(
+            tilt_tols, dtype=float)
+        attrs["spin_reference_coverage_ok"] = bool(
+            all(reference_coverage) and all(tilt_coverage))
     elif spin_basis == "component":
         attrs["spin_prior_mode"] = "component"
         # Stated False, not omitted: darksirens' loader REQUIRES this attr, so
@@ -1619,6 +1732,8 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         summary["spin_reference_excluded_rows"] = int(n_out_of_reference)
         summary["spin_reference_coverage_per_campaign"] = [
             bool(x) for x in reference_coverage]
+        summary["spin_reference_tilt_coverage_per_campaign"] = [
+            bool(x) for x in tilt_coverage]
 
     for info in campaign_info:
         print(f"  {info}")
