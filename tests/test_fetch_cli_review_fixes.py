@@ -12,6 +12,8 @@
      is not applied to every campaign), --strict no longer claims every
      cross-file check raises, and a NaN/out-of-range cosmology or a zero
      --nsamp is refused at parse time.
+  5. A date-only event name resolves only through the table of historical
+     GWTC names, never to whichever same-day event the store holds.
 
 Every test is offline: GWOSC and Zenodo are monkeypatched.
 """
@@ -318,3 +320,42 @@ def test_nsamp_zero_is_refused(sub, capsys):
                                    "--nsamp", "0"])
     assert ei.value.code == 2
     assert "must be >= 1" in capsys.readouterr().err
+
+
+# ==========================================================================
+# 5. Date-only names resolve through the historical table only
+# ==========================================================================
+def test_a_date_only_name_never_resolves_to_the_other_event_of_the_day():
+    """GW200208 is not a GWTC name; with only the non-member GW200208_222617
+    in the store it used to resolve to it."""
+    from gwcat.population_samples import resolve_event_name_aliases
+    with pytest.raises(ValueError, match="not a historical date-only"):
+        resolve_event_name_aliases(["GW200208"], ["GW200208_222617"])
+
+
+def test_a_store_listing_an_event_twice_is_not_ambiguous():
+    from gwcat.population_samples import resolve_event_name_aliases
+    resolved, aliases = resolve_event_name_aliases(
+        ["GW150914"], ["GW150914_095045", "GW150914_095045"])
+    assert resolved == ["GW150914_095045"]
+
+
+def test_gwtc2s_gw190521_is_the_030229_event():
+    from gwcat.population_samples import resolve_event_name_aliases
+    resolved, aliases = resolve_event_name_aliases(
+        ["GW190521", "GW190521_074359"],
+        ["GW190521_030229", "GW190521_074359"])
+    assert resolved == ["GW190521_030229", "GW190521_074359"]
+    assert aliases == {"GW190521": "GW190521_030229"}
+
+
+def test_the_historical_table_agrees_with_the_bundled_lists():
+    from gwcat.bbh_allowed_names import BBH_ALL, NON_BBH_EXCLUSIONS
+    from gwcat.population_samples import HISTORICAL_DATE_ONLY_NAMES
+    for short, full in HISTORICAL_DATE_ONLY_NAMES.items():
+        assert full.startswith(short + "_"), (short, full)
+    members = {f for f in HISTORICAL_DATE_ONLY_NAMES.values() if f in BBH_ALL}
+    # GWTC-1's ten BBH plus GW190412 and GW190521; the BNS and the mass-gap
+    # system are not members
+    assert len(members) == 12
+    assert "GW190814_211039" in NON_BBH_EXCLUSIONS
