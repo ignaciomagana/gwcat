@@ -156,10 +156,22 @@ def ln_p_spin_cart_component(spin_pdf_cart, a):
     marginalisation, θ→cosθ Jacobian cancels the volume ``sinθ``).  For the
     endo3 uniform-isotropic draw ``p_cart = 1/(4π a² max_spin)`` this collapses
     to ``1/(2·max_spin)``.
+
+    ``spin_pdf_cart`` must be finite and strictly positive: a zero is a
+    malformed row, and flooring it at 1e-300 (as this did until review
+    2026-10-20, low-17) fabricated a draw density ~1e-300 times too small.
     """
     spin_pdf_cart = np.asarray(spin_pdf_cart, dtype=float)
-    return np.log(np.maximum(spin_pdf_cart, _SIN_FLOOR)) \
-        + 2.0 * np.log(clip_a(a)) + LN_2PI
+    bad = ~np.isfinite(spin_pdf_cart) | (spin_pdf_cart <= 0.0)
+    if np.any(bad):
+        first = int(np.flatnonzero(np.atleast_1d(bad))[0])
+        raise ValueError(
+            f"per-spin cartesian sampling pdf is not finite and strictly "
+            f"positive: {int(np.sum(bad))} of {bad.size} entries (first at "
+            f"index {first}, value {np.atleast_1d(spin_pdf_cart)[first]!r}); "
+            f"a zero draw density is a malformed row, refused rather than "
+            f"floored.")
+    return np.log(spin_pdf_cart) + 2.0 * np.log(clip_a(a)) + LN_2PI
 
 
 # ----------------------------------------------------------------------
@@ -203,25 +215,71 @@ def ln_pdraw_no_spin_from_polar_joint(ln_pdraw_joint, cost1, cost2, amax=0.99):
 # ----------------------------------------------------------------------
 # Read-time checks + amax auto-detection
 # ----------------------------------------------------------------------
-def detect_uniform_amax_from_lnmag(lnp_mag, tol_std=1e-6):
+#: Relative slack on the TOP edge of a detected uniform magnitude support: no
+#: drawn magnitude may exceed the detected ceiling by more than this.  endo3
+#: stores float32 spin components, which round |s| by ~1e-7 relative.
+AMAX_EDGE_RTOL = 1e-5
+
+#: The BOTTOM edge: ``N`` magnitudes drawn from ``U(0, amax)`` have
+#: ``P(min a > x) = (1 - x/amax)^N``, so ``min a > LOW_EDGE_DRAWS * amax / N``
+#: happens with probability below ``exp(-LOW_EDGE_DRAWS) ~ 1e-13``.  A campaign
+#: whose smallest magnitude sits above that bound did not draw from 0.
+LOW_EDGE_DRAWS = 30.0
+
+
+def uniform_magnitude_support_ok(amax, a):
+    """Whether drawn magnitudes ``a`` are consistent with ``U(0, amax)``.
+
+    A constant magnitude density only says ``p(a) = 1/width`` on SOME interval;
+    the review of 2026-10-20 (medium-16) found both detectors reading
+    ``1/width`` as a ceiling for ``a ~ U(a_min, a_max)`` with ``a_min > 0``.
+    This requires the support to be the one the chi_eff swap and the coverage
+    check assume, ``[0, amax]``: ``0 < amax <= 1`` (a physical ceiling; a
+    larger "ceiling" is an artefact, medium-15), no drawn magnitude above
+    ``amax`` (within :data:`AMAX_EDGE_RTOL`), and the smallest one within
+    :data:`LOW_EDGE_DRAWS` ``* amax / N`` of zero.  ``a=None`` checks
+    ``amax`` alone.
+    """
+    if amax is None or not np.isfinite(amax):
+        return False
+    if not (0.0 < amax <= 1.0 + AMAX_EDGE_RTOL):
+        return False
+    if a is None:
+        return True
+    a = np.asarray(a, dtype=float).ravel()
+    a = a[np.isfinite(a)]
+    if not a.size:
+        return True
+    if float(a.max()) > amax * (1.0 + AMAX_EDGE_RTOL):
+        return False
+    return bool(float(a.min()) <= amax * min(1.0, LOW_EDGE_DRAWS / a.size))
+
+
+def detect_uniform_amax_from_lnmag(lnp_mag, tol_std=1e-6, a=None):
     """Detect a uniform magnitude draw and its ``amax`` from ``lnp_mag``.
 
     For ``a ~ U(0, amax)`` the magnitude density is ``p(a)=1/amax`` so
     ``lnp_mag = −ln amax`` is *constant*.  Returns ``(amax, is_uniform)`` where
-    ``is_uniform`` is ``std(lnp_mag) < tol_std``.
+    ``is_uniform`` is ``std(lnp_mag) < tol_std`` AND the drawn magnitudes ``a``
+    (when given) span ``[0, amax]`` (:func:`uniform_magnitude_support_ok`).
 
     ``amax`` is ``exp(−median(lnp_mag))`` **only when the draw is actually
-    uniform**, and ``None`` otherwise (GW-05).  Returning the expression
-    unconditionally produced a number that is not an amax at all for a
-    non-uniform draw: the O4ab campaign yields 0.7478 / 0.7397 by this formula
+    uniform from zero**, and ``None`` otherwise (GW-05).  Returning the
+    expression unconditionally produced a number that is not an amax at all for
+    a non-uniform draw: the O4ab campaign yields 0.7478 / 0.7397 by this formula
     while its spins reach 0.99999, because the median of a *varying* log-density
     is just a summary statistic of a mixture, not a ceiling.  That fabricated
     value was fed straight into the joint (chi_eff, chi_p) prior under
-    ``strict=False``, silently mis-specifying the support by ~25%.
+    ``strict=False``, silently mis-specifying the support by ~25%.  A CONSTANT
+    density on ``[a_min, a_max]`` with ``a_min > 0`` gives ``a_max - a_min``,
+    which is not a ceiling either (review 2026-10-20, medium-16), so the
+    support is checked too.
     """
     lnp_mag = np.asarray(lnp_mag, dtype=float)
     is_uniform = bool(np.std(lnp_mag) < tol_std)
     amax = float(np.exp(-np.median(lnp_mag))) if is_uniform else None
+    if is_uniform and not uniform_magnitude_support_ok(amax, a):
+        return None, False
     return amax, is_uniform
 
 
@@ -252,16 +310,31 @@ def detect_max_spin_cart(spin_pdf_cart, a, tol=1e-6):
 
     For ``p_cart = 1/(4π a² max_spin)`` the product ``c = p_cart·4π·a²`` is the
     constant ``1/max_spin``.  Returns ``(max_spin, is_uniform_isotropic)`` where
-    uniformity is judged by the *relative* spread of ``c``.
+    uniformity is judged by the *relative* spread of ``c`` and by the drawn
+    magnitudes ``a`` spanning ``[0, max_spin]``
+    (:func:`uniform_magnitude_support_ok`).
+
+    ``max_spin`` is ``None`` unless the draw is uniform from zero -- the twin of
+    the O4 detector's GW-05 fix, which this one never received (review
+    2026-10-20, medium-15): for a non-uniform draw ``1/median(c)`` is a summary
+    statistic of the magnitude density, not a ceiling (1.056 for 90% U(0, 0.95)
+    + 10% U(0.40, 0.42); 0.71 for p(a) = 2a), and it was stored as the
+    campaign's detected amax and counted as proof by the reference-coverage
+    check.  For a constant density on ``[a_min, a_max]``, ``a_min > 0``, it is
+    ``a_max - a_min`` (medium-16).
     """
     spin_pdf_cart = np.asarray(spin_pdf_cart, dtype=float)
-    a = clip_a(a)
-    c = spin_pdf_cart * 4.0 * np.pi * a ** 2
+    c = spin_pdf_cart * 4.0 * np.pi * clip_a(a) ** 2
     med = float(np.median(c))
     if med <= 0.0 or not np.isfinite(med):
-        return float("nan"), False
+        return None, False
     rel_spread = float(np.max(np.abs(c - med)) / med) if c.size else 0.0
-    return 1.0 / med, bool(rel_spread < tol)
+    if not rel_spread < tol:
+        return None, False
+    max_spin = 1.0 / med
+    if not uniform_magnitude_support_ok(max_spin, a):
+        return None, False
+    return max_spin, True
 
 
 def check_factored_vs_joint(sampling_pdf, p_mass, p_z,

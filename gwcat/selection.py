@@ -20,32 +20,51 @@ the multi-campaign VT estimator in Essick et al. (2023):
   ndraw = N_O3 + N_O4
   pdraw_i *= N_k / ndraw  for injection i from campaign k
 
-Spin-prior contract (Mode A, matching the PE export)
-----------------------------------------------------
-On load, the injection spin-draw distribution is removed from the draw PDF
-(step 3 above).  On export (``to_darksirens``), it is REPLACED by the 1-D
-isotropic chi_eff prior — the "chi_eff swap" — so the exported ``pdraw``
-already contains the 1-D chi_eff prior.  This is recorded as
-``chi_eff_swap_applied=True``, ``chi_eff_prior_applied_to_pdraw=True``, and
-``spin_prior_mode="include"``, consistent with the PE export's ``p_pe``.
-Downstream (darksirens) MUST NOT multiply the chi_eff prior again — doing so
-double-counts it.
+Spin bases of the export
+------------------------
+On load, the injection spin-draw density is removed from the legacy draw PDF
+(step 3 above) and kept, exactly, as the per-injection component density
+(``ln_spin_component``).  The versioned exporter, :meth:`SelectionSet.export`
+/ :meth:`CombinedSelectionSet.export` (``format_version
+"gwcat-selection-2.0"``), writes ``pdraw`` in the spin basis ``spin_basis``:
+
+  * ``"component"`` -- the exact component draw density in (m1det, q, dL, a1,
+    a2, cosθ1, cosθ2); valid for any campaign.
+  * ``"chieff_reference"`` -- the (m1det, q, dL, chi_eff) density REWEIGHTED
+    from that exact component draw to a declared isotropic uniform-magnitude
+    reference spin prior (``spin_reference_amax``, the ceiling the paired PE
+    export divides out); valid for any campaign whose magnitudes cover the
+    reference.  The production O3+O4ab product is this basis at 0.99.
+  * ``"chieff"`` / ``"chieff_chip"`` -- the swaps: the campaign's own spin
+    draw is REPLACED by the analytic isotropic chi_eff (or (chi_eff, chi_p))
+    prior, which is right only for a campaign that drew uniform-magnitude
+    isotropic spins and is refused otherwise.  The O4ab campaign did not.
+
+In every chi_eff basis the exported ``pdraw`` already contains the 1-D chi_eff
+prior (``chi_eff_prior_applied_to_pdraw=True``, ``spin_prior_mode="include"``,
+consistent with the PE export's ``p_pe``); downstream MUST NOT multiply it
+again.  The frozen format-1.0 writer :meth:`SelectionSet.to_darksirens`
+always applies the 1-D swap, so it refuses the O4ab campaign under its
+default ``strict=True``.
 
 Usage:
     from gwcat.selection import SelectionSet, CombinedSelectionSet
 
-    # Single campaign
+    # Single campaign, exact component basis
     sel = SelectionSet("injection_file.hdf")
-    sel.to_darksirens("selection.h5", far_threshold=1.0)
+    sel.export("selection.h5", spin_basis="component", far_threshold=1.0)
 
-    # Combined O3 + O4
-    sel_o3 = SelectionSet("endo3_bbhpop-...-v12.hdf5")
-    sel_o4 = SelectionSet("injections-O4ab/...-cartesian_spins_*.hdf")
+    # Combined O3 + O4ab, chi_eff against the PE side's 0.99 reference
+    sel_o3 = SelectionSet("endo3_bbhpop-LIGO-T2100113-v12.hdf5")
+    sel_o4 = SelectionSet("samples-rpo4ab-1366933504-55469568-clipped.hdf")
     combined = CombinedSelectionSet([sel_o3, sel_o4])
-    combined.to_darksirens("selection_bbh.h5", far_threshold=1.0)
+    combined.export("selection_bbh.h5", spin_basis="chieff_reference",
+                    spin_reference_amax=0.99, far_threshold=1.0)
 """
 from __future__ import annotations
 
+import json
+import os
 import warnings
 from typing import Optional
 
@@ -105,6 +124,26 @@ PDRAW_STATE_CHIEFF_REFERENCE = (
     "via spin_reference_excluded_pdraw; normalised by T_obs and injection "
     "weights. Detector-frame masses in Msun, dL in Mpc."
 )
+
+#: The exact normalisation behind every exported ``pdraw`` (review 2026-10-20,
+#: low-5).  The ``pdraw_state`` strings above say "normalised by T_obs and
+#: injection weights", which a reader rebuilding pdraw takes as the summed
+#: T_obs_yr and is then off by 0.22 (O3) and 1.42 (O4ab): each campaign is
+#: divided by its OWN T_k and multiplied by N_k/N_total.  Those strings are
+#: kept verbatim -- the validator compares them exactly and every published
+#: product carries them -- and this attr states the arithmetic.
+PDRAW_NORMALISATION = (
+    "pdraw_i = p_draw,k(theta_i) * m1det_i / ((1 + z_i)^2 * ddL/dz_i) "
+    "* (spin factor of pdraw_state) / (T_k * w_i) * (N_k / N_total), for "
+    "injection i of campaign k: p_draw,k is the campaign's source-frame "
+    "(m1src, m2src, z) draw density, T_k ITS OWN analysis time in years "
+    "(total_analysis_time or analysis_time_s over 365.25 d; per campaign in "
+    "campaign_T_obs_yr), w_i the file's per-row weights (events format) or "
+    "mixture_weight (injections format; 1 when absent), N_k its "
+    "total_generated (campaign_ndraws) and N_total = sum_k N_k = ndraw; "
+    "N_k / N_total = 1 for a single-campaign export. T_obs_yr is sum_k T_k "
+    "and divides no row. The selection integral is "
+    "mu = (1/ndraw) * sum_detected p_pop / pdraw.")
 
 # pdraw_state keyed by spin basis (used by gwcat.export.selection_builder).
 PDRAW_STATE_BY_BASIS = {
@@ -313,26 +352,93 @@ def _search_names(f):
     return [str(raw)]
 
 
-def _events_far_columns(table, f):
-    """The FAR columns the events loader will threshold on, in its own order.
+def _h5_field_list(table):
+    """Column names of ``table`` in FILE order.
+
+    :func:`_h5_field_names` returns a set, whose iteration order changes with
+    ``PYTHONHASHSEED``; anything that iterates the columns to choose or order
+    them uses this instead (review 2026-10-20, low-36).
+    """
+    if isinstance(table, _PlannedFields):
+        return list(table._dset.dtype.names)
+    if isinstance(table, h5py.Dataset) and table.dtype.names is not None:
+        return list(table.dtype.names)
+    return list(table.keys())
+
+
+def _looks_like_far(key):
+    """Whether an ``events`` column name looks like a search FAR."""
+    return isinstance(key, str) and (key.endswith("_far")
+                                     or key.startswith("far_"))
+
+
+def _events_far_discovery(table, f):
+    """Which FAR columns the events loader thresholds on, and what it left out.
 
     One declared search contributes one column (``<search>_far`` or
-    ``far_<search>``); a file that declares none falls back to every column that
-    looks like a FAR.  Shared with :func:`_events_field_plan` so the plan asks
-    for exactly the columns the read will use.
+    ``far_<search>``); a file that declares none (or none that matches) falls
+    back to every column that looks like a FAR, in file order.  Returns a dict
+    with the ``declared`` searches, the ``columns`` used (in this order), the
+    ``unmatched_searches`` that are declared but have no column under either
+    spelling, the ``unclaimed_columns`` that look like a FAR and are not used,
+    and the ``source`` of the choice.  The last two used to be dropped without
+    a word (review 2026-10-20, medium-31): a file declaring ``mbta`` whose
+    column is ``mbta-bbh_far`` lost its MBTA-only detections, mu low and the
+    rate high, with no message.
     """
     have = _h5_field_names(table)
-    columns = []
-    for s in _search_names(f):
+    declared = _search_names(f)
+    columns, unmatched = [], []
+    for s in declared:
         for col in (s + "_far", "far_" + s):
             if col in have:
                 columns.append(col)
                 break
+        else:
+            unmatched.append(s)
+    source = "declared_searches"
     if not columns:
-        columns = [key for key in have
-                   if isinstance(key, str)
-                   and (key.endswith("_far") or key.startswith("far_"))]
-    return columns
+        columns = [key for key in _h5_field_list(table)
+                   if _looks_like_far(key)]
+        source = "fallback_scan"
+    unclaimed = [key for key in _h5_field_list(table)
+                 if _looks_like_far(key) and key not in columns]
+    return {"declared": list(declared), "columns": list(columns),
+            "unmatched_searches": unmatched, "unclaimed_columns": unclaimed,
+            "source": source}
+
+
+def _report_far_discovery(path, disc):
+    """Warn when FAR discovery dropped a declared search or an unused column."""
+    unmatched, unclaimed = disc["unmatched_searches"], disc["unclaimed_columns"]
+    if not (unmatched or unclaimed):
+        return
+    parts = []
+    if unmatched:
+        parts.append(
+            f"it declares search(es) {unmatched} with no FAR column spelled "
+            f"'<search>_far' or 'far_<search>', so detections made only by "
+            f"them are NOT in the detection mask (mu biased low, the inferred "
+            f"rate high)")
+    if unclaimed:
+        parts.append(
+            f"FAR-looking column(s) {unclaimed} belong to no search it "
+            f"declares and are not thresholded")
+    warnings.warn(
+        f"{path}: " + "; ".join(parts) + f". Thresholding on "
+        f"{disc['columns']} ({disc['source']}). If a declared search's column "
+        f"is spelled otherwise, rename it or declare the name it uses. "
+        f"Recorded in significance_far_discovery_per_campaign.")
+
+
+def _events_far_columns(table, f):
+    """The FAR columns the events loader will threshold on, in its own order.
+
+    The ``columns`` of :func:`_events_far_discovery`; shared with
+    :func:`_events_field_plan` so the plan asks for exactly the columns the
+    read will use.
+    """
+    return _events_far_discovery(table, f)["columns"]
 
 
 def _events_field_plan(table, f):
@@ -457,6 +563,8 @@ def _selection_provenance_dict(source_class, nsbh_mass_threshold,
     d = {}
     # ── pdraw state (v1 default; the v2 builder overrides per spin basis) ───
     d["pdraw_state"] = PDRAW_STATE
+    # The exact per-campaign normalisation pdraw_state only summarises.
+    d["pdraw_normalisation"] = PDRAW_NORMALISATION
 
     # ── Source-class filter provenance ─────────────────────────────────────
     d["source_class_filter"] = format_source_class_filter(source_class)
@@ -605,6 +713,56 @@ def detect_generation_cosmology(z, dL_mpc, n_sample: int = 4000,
     return best
 
 
+#: The astropy realisations :func:`detect_named_cosmology` tries, newest first.
+#: Every one is flat, and every one carries radiation (Tcmb0 > 0) -- which the
+#: radiation-free fit of :func:`detect_generation_cosmology` cannot reproduce
+#: to its tolerance (review 2026-10-20, low-35).
+NAMED_GENERATION_COSMOLOGIES = ("Planck18", "Planck15", "Planck13", "WMAP9",
+                                "WMAP7", "WMAP5")
+
+
+def detect_named_cosmology(z, dL_mpc, n_sample: int = 4000,
+                           rtol: float = COSMOLOGY_DETECT_RTOL):
+    """The named astropy cosmology a campaign's ``(z, dL)`` pairs were made with.
+
+    Returns ``(name, cosmology, max_rel_residual)`` for the first of
+    :data:`NAMED_GENERATION_COSMOLOGIES` that reproduces every sampled pair to
+    ``rtol``, else ``None``.  Tried before the radiation-free flat-LCDM fit of
+    :func:`detect_generation_cosmology`: a campaign generated with astropy's
+    ``Planck15``/``Planck18`` includes radiation, which that fit either misses
+    (it then fell back to a radiation-free Jacobian at Planck15's (H0, Om0),
+    a z-dependent ~1e-3 error in ddL/dz) or absorbs into shifted parameters.
+    """
+    import astropy.cosmology as _ac
+
+    z = np.asarray(z, dtype=float).ravel()
+    dL = np.asarray(dL_mpc, dtype=float).ravel()
+    good = np.isfinite(z) & np.isfinite(dL) & (z > 0) & (dL > 0)
+    if good.sum() < 16:
+        return None
+    z, dL = z[good], dL[good]
+    if z.size > n_sample:
+        step = int(np.ceil(z.size / n_sample))
+        z, dL = z[::step], dL[::step]
+    for name in NAMED_GENERATION_COSMOLOGIES:
+        cosmo = getattr(_ac, name)
+        if float(cosmo.Ok0) != 0.0:
+            continue
+        resid = float(np.max(np.abs(
+            cosmo.luminosity_distance(z).value / dL - 1.0)))
+        if resid <= rtol:
+            return name, cosmo, resid
+    return None
+
+
+def _ddL_dz_of(z, dL_mpc, cosmo):
+    """d(dL)/dz for a FLAT astropy cosmology object (radiation included)."""
+    c_kms = 299792.458
+    return (dL_mpc / (1 + z)
+            + (1 + z) * (c_kms / float(cosmo.H0.value))
+            / cosmo.efunc(np.asarray(z, dtype=float)))
+
+
 def _cosmo_or_nan(s, attr):
     """A recorded per-campaign cosmology value, or NaN when none applies.
 
@@ -690,8 +848,14 @@ def _v1_chieff_swap(set_list, keeps, amax, *, strict=True):
     copy, both exporters now call the v2 helpers outright -- one implementation,
     so the two generations cannot drift again.
 
-    Returns ``(ln_factor, in_support, amax_pairs, amax_sources, mode)`` with the
-    factor concatenated in campaign order over each campaign's ``keep`` mask.
+    Returns ``(ln_factor, in_support, amax_pairs, amax_sources, mode,
+    violations)`` with the factor concatenated in campaign order over each
+    campaign's ``keep`` mask.  ``violations`` is what the gate let through
+    under ``strict=False`` (review 2026-10-20, medium-14): it used to be a
+    throwaway list, so a v1 file written past a failed gate carried no
+    ``spin_basis_assumption_violations`` and core's only spin-swap guard
+    (which reads that attr and ``injected_spin_uniform_isotropic``) accepted
+    it.  :func:`_write_spin_swap_validity_attrs` writes both.
     """
     # Function-local: gwcat.export.selection_builder imports this module.
     from .export.selection_builder import (
@@ -700,7 +864,8 @@ def _v1_chieff_swap(set_list, keeps, amax, *, strict=True):
     from .spin import parse_amax_option
 
     forced_amax = parse_amax_option(amax, what="amax")
-    _check_chieff_swap_valid(set_list, strict=strict, violations=[])
+    violations = []
+    _check_chieff_swap_valid(set_list, strict=strict, violations=violations)
 
     ln_parts, sup_parts, pairs, sources = [], [], [], []
     for s, keep in zip(set_list, keeps):
@@ -712,7 +877,25 @@ def _v1_chieff_swap(set_list, keeps, amax, *, strict=True):
         sources.append(src)
     mode = "fixed" if forced_amax is not None else "per_campaign"
     return (np.concatenate(ln_parts), np.concatenate(sup_parts),
-            pairs, sources, mode)
+            pairs, sources, mode, violations)
+
+
+def _write_spin_swap_validity_attrs(f, set_list, violations):
+    """The spin-swap validity record, on a v1 file exactly as on the v2 one.
+
+    ``injected_spin_uniform_isotropic`` per campaign and the gate's
+    ``spin_basis_assumption_violations`` (JSON; ``"[]"`` when the gate passed)
+    with its two summary booleans -- the attrs the 2.0 builder writes and
+    darksirens-core's ``_require_valid_spin_swap`` reads (medium-14).
+    """
+    f.attrs["injected_spin_uniform_isotropic"] = np.array(
+        [bool((s.spin_meta or {}).get("uniform_isotropic")) for s in set_list],
+        dtype=bool)
+    f.attrs["spin_basis_assumption_violations"] = json.dumps(violations)
+    f.attrs["spin_basis_assumption_violated"] = bool(
+        [v for v in violations if v.get("verified")])
+    f.attrs["spin_basis_assumption_unverified"] = bool(
+        [v for v in violations if not v.get("verified")])
 
 
 def _v1_refuse_unsupported(ln_factor, in_support, amax_pairs, what):
@@ -744,12 +927,20 @@ def _write_chieff_amax_attrs(f, amax_pairs, amax_sources, mode):
 
     ``chi_eff_amax`` stays scalar for backward compatibility when every
     campaign resolved to the same ceiling, and is NaN otherwise so a reader
-    cannot mistake one campaign's ceiling for the file's.
+    cannot mistake one campaign's ceiling for the file's.  The per-campaign
+    arrays have one entry per campaign of the export, in campaign order; a
+    campaign that contributed no rows has NaN ceilings and the source
+    ``"no_detections"`` (review 2026-10-20, low-15: they used to skip it, so
+    a reader zipping them with the other per-campaign arrays by index gave a
+    ceiling to the wrong campaign) and does not enter the scalar.
     """
     a1s = [a1 for a1, _ in amax_pairs]
     a2s = [a2 for _, a2 in amax_pairs]
-    uniform = len(set(a1s)) == 1 and len(set(a2s)) == 1
-    f.attrs["chi_eff_amax"] = float(a1s[0]) if uniform else float("nan")
+    used = [(a1, a2) for a1, a2 in amax_pairs
+            if np.isfinite(a1) and np.isfinite(a2)]
+    uniform = (len({a1 for a1, _ in used}) == 1
+               and len({a2 for _, a2 in used}) == 1)
+    f.attrs["chi_eff_amax"] = float(used[0][0]) if uniform else float("nan")
     f.attrs["chi_eff_amax_1_per_campaign"] = np.asarray(a1s, dtype=float)
     f.attrs["chi_eff_amax_2_per_campaign"] = np.asarray(a2s, dtype=float)
     f.attrs["chi_eff_amax_source_per_campaign"] = [str(s) for s in amax_sources]
@@ -761,6 +952,230 @@ def _write_chieff_amax_attrs(f, amax_pairs, amax_sources, mode):
     f.attrs["chi_eff_prior_method"] = CHI_EFF_PRIOR_METHODS[impl]
 
 
+# ── Declared injection draw domains (review 2026-10-20, high-4) ──────────────
+#: The root attrs an injection file declares the domain of its draws with, per
+#: source-frame quantity: ``(name, lower-bound attrs, upper-bound attrs)``, the
+#: first attr present winning.  endo3 (Zenodo 7890437) declares
+#: ``min_mass1 = min_mass2 = 2``, ``max_mass1 = max_mass2 = 100`` and
+#: ``max_redshift = max_z = 1.9``; the O4-era ``events`` files declare none.
+DRAW_DOMAIN_ATTRS = (
+    ("mass1_source", ("min_mass1",), ("max_mass1",)),
+    ("mass2_source", ("min_mass2",), ("max_mass2",)),
+    ("redshift", ("min_redshift", "min_z"), ("max_redshift", "max_z")),
+)
+
+#: ``draw_domain=`` values of the selection builder.  ``None`` records each
+#: campaign's declared domain and changes nothing else (the default, and what
+#: every product before the record was); ``"intersection"`` SUBSETS every
+#: campaign's detected injections to the domain all of them declare.
+DRAW_DOMAIN_POLICIES = (None, "intersection")
+
+
+def _first_attr(attr_sets, keys):
+    """The first of ``keys`` found in ``attr_sets`` (in order), as a float."""
+    for attrs in attr_sets:
+        for k in keys:
+            if k in attrs:
+                return float(attrs[k])
+    return None
+
+
+def _domain_name(s, k):
+    """A short campaign label for messages: index + file name."""
+    return f"campaign {k} ({os.path.basename(str(s.path))})"
+
+
+def draw_domain_mismatches(set_list):
+    """Where one campaign's draws reach past another campaign's DECLARED domain.
+
+    Each campaign's Monte-Carlo term in the combined selection integral covers
+    only the domain that campaign drew from, so wherever another campaign drew
+    (and could detect) beyond it, the summed integral has no contribution from
+    the first one there.  endo3 against rpo4ab is the live case: O3 declares
+    ``m1, m2 <= 100 Msun`` and ``z <= 1.9`` while O4ab draws to ``m1 ~ 990`` and
+    ``z = 3``, so mu has no O3 sensitivity above 100 Msun or 1.9 although O3's
+    detected fraction there is not small.  Returns one dict per (campaign,
+    bound, other campaign) that is crossed; empty when none is.
+    """
+    out = []
+    for k, s in enumerate(set_list):
+        declared = getattr(s, "_declared_draw_domain", None) or {}
+        for name, (lo, hi) in declared.items():
+            for j, o in enumerate(set_list):
+                if j == k:
+                    continue
+                elo, ehi = (getattr(o, "_draw_extent", None) or {}).get(
+                    name, (None, None))
+                if hi is not None and ehi is not None and ehi > hi:
+                    out.append({"campaign": k, "quantity": name,
+                                "bound": "max", "declared": hi,
+                                "other_campaign": j, "other_drawn": ehi})
+                if lo is not None and elo is not None and elo < lo:
+                    out.append({"campaign": k, "quantity": name,
+                                "bound": "min", "declared": lo,
+                                "other_campaign": j, "other_drawn": elo})
+    return out
+
+
+def intersect_draw_domains(set_list):
+    """The domain every campaign declares: ``{name: [lo, hi]}``, ``None`` = open.
+
+    Only DECLARED bounds enter; a campaign that declares nothing (every O4-era
+    file) constrains nothing.  Raises when no campaign declares any bound, since
+    there is then no domain to restrict to.
+    """
+    out = {}
+    for name, _, _ in DRAW_DOMAIN_ATTRS:
+        los = [s._declared_draw_domain[name][0] for s in set_list
+               if s._declared_draw_domain[name][0] is not None]
+        his = [s._declared_draw_domain[name][1] for s in set_list
+               if s._declared_draw_domain[name][1] is not None]
+        if los or his:
+            out[name] = [max(los) if los else None, min(his) if his else None]
+    if not out:
+        raise ValueError(
+            "draw_domain='intersection' was requested but none of the "
+            "campaigns declares a draw domain (no min/max_mass1, min/max_mass2 "
+            "or max_redshift attrs): there is no common domain to restrict "
+            "to. " + "; ".join(str(s.path) for s in set_list))
+    for name, (lo, hi) in out.items():
+        if lo is not None and hi is not None and lo > hi:
+            raise ValueError(
+                f"draw_domain='intersection': the campaigns' declared "
+                f"{name} ranges do not overlap ({lo} > {hi}), so no injection "
+                f"lies in every campaign's domain.")
+    return out
+
+
+def draw_domain_mask(s, domain):
+    """Rows of campaign ``s`` inside ``domain`` (closed bounds, ``None`` open)."""
+    cols = {"mass1_source": s._m1src, "mass2_source": s._m2src,
+            "redshift": s._z}
+    mask = np.ones(len(s._m1src), dtype=bool)
+    for name, (lo, hi) in (domain or {}).items():
+        x = np.asarray(cols[name], dtype=float)
+        if lo is not None:
+            mask &= x >= lo
+        if hi is not None:
+            mask &= x <= hi
+    return mask
+
+
+def resolve_draw_domain(set_list, draw_domain=None):
+    """``(applied_domain_or_None, mismatches)`` for a product, warning on gaps.
+
+    ``draw_domain=None`` (default) applies nothing: the record is written and a
+    crossed bound WARNS, because the combined mu then lacks that campaign's
+    sensitivity beyond its domain (low for any population with support there).
+    ``"intersection"`` returns the common declared domain for the caller to
+    subset every campaign to -- subsetting, not reweighting, so ``ndraw`` and
+    the Essick fractions are unchanged, and the population model and the PE
+    samples must then be truncated to the same domain.
+    """
+    if draw_domain not in DRAW_DOMAIN_POLICIES:
+        raise ValueError(
+            f"unknown draw_domain={draw_domain!r}; known values are "
+            f"{list(DRAW_DOMAIN_POLICIES)}.")
+    mismatches = draw_domain_mismatches(set_list)
+    if draw_domain == "intersection":
+        applied = intersect_draw_domains(set_list)
+        warnings.warn(
+            f"draw_domain='intersection': every campaign's detected injections "
+            f"are restricted to the domain all of them declare, {applied} "
+            f"(source-frame Msun / redshift; None = open). This is subsetting, "
+            f"so ndraw is unchanged, and mu is the selection integral OF THAT "
+            f"DOMAIN: the population model and the PE samples must be "
+            f"truncated to it too. Recorded in injection_draw_domain_applied.")
+        return applied, mismatches
+    if mismatches:
+        rows = "; ".join(
+            f"{_domain_name(set_list[m['campaign']], m['campaign'])} declares "
+            f"{m['quantity']} {m['bound']} {m['declared']:g} while "
+            f"{_domain_name(set_list[m['other_campaign']], m['other_campaign'])}"
+            f" drew to {m['other_drawn']:.6g}" for m in mismatches)
+        warnings.warn(
+            f"the campaigns' declared injection draw domains differ: {rows}. "
+            f"Each campaign's term in the combined selection integral covers "
+            f"only its own domain, so mu has no contribution from the first "
+            f"campaign beyond its bound -- low by that campaign's missing "
+            f"sensitivity for any population with support there, and PE "
+            f"samples beyond the bound are compared with a selection that "
+            f"lacks it. Recorded in injection_draw_domain_per_campaign and "
+            f"injection_draw_domain_mismatch; draw_domain='intersection' "
+            f"restricts every campaign to the common declared domain instead.")
+    return None, mismatches
+
+
+def campaign_provenance_attrs(set_list, *, draw_domain=None,
+                              draw_domain_applied=None,
+                              draw_domain_mismatch=None):
+    """Per-campaign provenance attrs shared by every selection exporter.
+
+    Records only: nothing here changes a number in the product.  The
+    declared injection draw domain (review 2026-10-20, high-4): each
+    campaign's declared bounds (``None`` = undeclared), the extent its rows
+    actually span, whether some campaign drew past another's declared bound,
+    and which ``draw_domain`` policy the export applied; the FAR-column
+    discovery record (medium-31); the detected generation cosmology, which
+    an override does not erase (medium-33); each campaign's own observing
+    time, the T_k of ``pdraw_normalisation`` (low-5); the spin-removal
+    ceiling check (low-13); and the (z, dL) model of each Jacobian (low-35).
+    """
+    if draw_domain_mismatch is None:
+        draw_domain_mismatch = draw_domain_mismatches(set_list)
+    domain_rows = []
+    for s in set_list:
+        declared = getattr(s, "_declared_draw_domain", None) or {}
+        domain_rows.append({
+            "declared": declared,
+            "declared_source": ("file_attrs" if any(
+                v is not None for b in declared.values() for v in b)
+                else "undeclared"),
+            "drawn_extent": getattr(s, "_draw_extent", None) or {},
+        })
+    return {
+        # Each campaign's own T_k, the divisor of its rows (low-5).
+        "campaign_T_obs_yr": np.array([float(s._T_yr) for s in set_list],
+                                      dtype=float),
+        "injection_draw_domain_per_campaign": json.dumps(domain_rows),
+        "injection_draw_domain_mismatch": bool(draw_domain_mismatch),
+        "injection_draw_domain_mismatch_detail": json.dumps(
+            draw_domain_mismatch),
+        "injection_draw_domain_policy": (
+            "not_applied" if draw_domain is None else str(draw_domain)),
+        "injection_draw_domain_applied": json.dumps(
+            draw_domain_applied if draw_domain_applied is not None else {}),
+        # How each campaign's FAR columns were chosen, and the declared
+        # searches / FAR-looking columns that were not used (medium-31).
+        "significance_far_discovery_per_campaign": json.dumps(
+            [getattr(s, "_far_discovery", None) or {} for s in set_list]),
+        # The generation cosmology detected from each campaign's (z, dL)
+        # pairs, also when an override was used for the Jacobian instead;
+        # NaN where none was detected or none applies (medium-33).
+        "cosmology_generation_H0_per_campaign": np.array(
+            [_cosmo_or_nan(s, "_cosmology_generation_H0") for s in set_list],
+            dtype=float),
+        "cosmology_generation_Om0_per_campaign": np.array(
+            [_cosmo_or_nan(s, "_cosmology_generation_Om0") for s in set_list],
+            dtype=float),
+        # Which (z, dL) model each campaign's Jacobian used (low-35): a
+        # radiation-free flat LCDM at cosmology_H0/Om0_per_campaign, a named
+        # astropy realisation (radiation included), or the file's ddL/dz.
+        "cosmology_model_per_campaign": np.array(
+            [str(getattr(s, "_cosmology_model", None)) for s in set_list],
+            dtype=h5py.string_dtype()),
+        # The ceiling the spin-removal step's assumed amax was checked
+        # against (detected, or the largest drawn magnitude) and the constant
+        # factor it implies; NaN where no removal branch ran (low-13).
+        "spin_removal_amax_reference_per_campaign": np.array(
+            [_cosmo_or_nan(s, "_removal_amax_reference") for s in set_list],
+            dtype=float),
+        "spin_removal_amax_factor_per_campaign": np.array(
+            [_cosmo_or_nan(s, "_removal_amax_factor") for s in set_list],
+            dtype=float),
+    }
+
+
 def _ddL_dz(z, dL_mpc, H0, Om0):
     """d(dL)/dz evaluated at z.  dL in Mpc."""
     c_kms = 299792.458
@@ -769,6 +1184,11 @@ def _ddL_dz(z, dL_mpc, H0, Om0):
     DC = dL_mpc / (1 + z)
     return DC + (1 + z) * dH / E
 
+
+#: The search FAR columns of the O3 ``injections`` format (endo3), in the order
+#: the loader stacks them.
+O3_FAR_COLUMNS = ("far_gstlal", "far_pycbc_bbh", "far_pycbc_hyperbank",
+                  "far_mbta", "far_cwb")
 
 #: The spin-magnitude ceiling the cartesian/polar spin-REMOVAL step assumes when
 #: subtracting the analytic injected spin prior.  It is NOT necessarily the amax a
@@ -815,6 +1235,15 @@ class SelectionSet:
         self._cosmology_used_H0 = None
         self._cosmology_used_Om0 = None
         self._cosmology_detect_residual = None
+        # The generation cosmology detected from the file's (z, dL) pairs,
+        # recorded even when an override is used instead (medium-33).
+        self._cosmology_generation_H0 = None
+        self._cosmology_generation_Om0 = None
+        # Which (z, dL) model the Jacobian used ("flat_lcdm_no_radiation",
+        # "astropy.cosmology.<name>" or "file_ddL_dz") and, for a named match,
+        # the astropy object itself (low-35).
+        self._cosmology_model = None
+        self._jacobian_cosmology = None
         # PR4 read-time spin checks: "warn" (default) records + emits a warning
         # on failure, "raise" raises, "off" records silently.  Normalised here
         # so an invalid value fails loudly at construction.
@@ -843,6 +1272,12 @@ class SelectionSet:
         # Names of the FAR/significance columns actually used for thresholding;
         # populated by _read_events / _read_injections (explicit provenance).
         self._far_columns = []
+        # How those columns were chosen and what was left out (medium-31).
+        self._far_discovery = None
+        # What the spin-removal ceiling was checked against, and the constant
+        # factor it leaves (None when not applicable); see _check_removal_amax.
+        self._removal_amax_reference = None
+        self._removal_amax_factor = None
         # GW-39: what kind of campaign this is, the per-row run label (a
         # cumulative mixture only; None otherwise), the per-row time and the
         # semianalytic SNR column (None when the file carries none), and the
@@ -854,6 +1289,11 @@ class SelectionSet:
         self._gps_range = None
         self._gps_range_source = None
         self._total_analysis_time_s = None
+        # The draw domain the file DECLARES (``{name: [lo, hi]}``, ``None`` per
+        # undeclared bound) and the extent its rows actually span; set on load
+        # by _set_draw_domain (review 2026-10-20, high-4).
+        self._declared_draw_domain = None
+        self._draw_extent = None
         # Mock-data provenance: True when the injection file's root attrs say
         # mock_data=True (a synthetic campaign). Read in _load().
         self._mock_data = False
@@ -891,11 +1331,15 @@ class SelectionSet:
     def _resolve_jacobian_cosmology(self, z, dL):
         """Pick the cosmology for ``ddL/dz`` on a file that does not ship it.
 
-        An explicit override wins -- an analyst may be deliberately probing a
-        different cosmology -- but the campaign's *own* generation cosmology is
-        the default, because using anything else silently mis-states the
-        Jacobian that converts the generated ``(m1src, m2src, z)`` density into
-        the ``(m1det, q, dL)`` one.
+        The campaign's *own* generation cosmology is the default, because using
+        anything else mis-states the Jacobian that converts the generated
+        ``(m1src, m2src, z)`` density into the ``(m1det, q, dL)`` one.  An
+        explicit override is still honoured, but it is never a valid draw
+        density when the generation cosmology is detectable: the ``(z, dL)``
+        pairs in the file fix the draw, so the override changes only ``ddL/dz``
+        (review 2026-10-20, medium-33).  It therefore warns with the size of
+        the z-dependent distortion and records the detected generation
+        cosmology next to the override (``cosmology_generation_*``).
 
         The production build passed ``(67.74, 0.3089)``.  The endo3 BBH campaign
         was generated at ``(67.90, 0.3065)``, so its ``pdraw`` carried a
@@ -906,23 +1350,90 @@ class SelectionSet:
         """
         if self._cosmology_override:
             self._record_cosmology("override", self.H0, self.Om0)
+            self._cosmology_model = "flat_lcdm_no_radiation"
+            gen = self._detect_generation(z, dL)
+            if gen is not None:
+                H0_g, Om0_g, _, _, cosmo_g = gen
+                self._cosmology_generation_H0 = float(H0_g)
+                self._cosmology_generation_Om0 = float(Om0_g)
+                if not (np.isclose(H0_g, self.H0, rtol=1e-5, atol=0.0)
+                        and np.isclose(Om0_g, self.Om0, rtol=1e-5, atol=0.0)):
+                    ddL_g = (_ddL_dz(z, dL, H0_g, Om0_g) if cosmo_g is None
+                             else _ddL_dz_of(z, dL, cosmo_g))
+                    ratio = ddL_g / _ddL_dz(z, dL, self.H0, self.Om0)
+                    warnings.warn(
+                        f"{self.path}: the explicit cosmology (H0={self.H0}, "
+                        f"Om0={self.Om0}) differs from the generation "
+                        f"cosmology detected from the campaign's own (z, dL) "
+                        f"pairs (H0={H0_g:.6g}, Om0={Om0_g:.6g}). The draws "
+                        f"were made at the latter, so the override changes "
+                        f"only ddL/dz and scales pdraw by a z-dependent "
+                        f"factor in [{float(np.min(ratio)):.6f}, "
+                        f"{float(np.max(ratio)):.6f}] -- not a valid draw "
+                        f"density. Drop H0/Om0 to use the generation "
+                        f"cosmology. Recorded as cosmology_source='override' "
+                        f"with cosmology_generation_H0/Om0_per_campaign.")
             return self.H0, self.Om0
 
-        det = detect_generation_cosmology(z, dL)
-        if det is None:
+        gen = self._detect_generation(z, dL)
+        if gen is None:
             warnings.warn(
                 f"{self.path}: could not identify the campaign's generation "
-                f"cosmology from its (z, dL) pairs, and the file does not ship "
-                f"dluminosity_distance_dredshift; falling back to Planck15 "
-                f"({self.H0}, {self.Om0}) for the ddL/dz Jacobian. The draw "
-                f"density is approximate to whatever the true generation "
-                f"cosmology differs by.")
+                f"cosmology from its (z, dL) pairs (neither a radiation-free "
+                f"flat LCDM nor any of {list(NAMED_GENERATION_COSMOLOGIES)}), "
+                f"and the file does not ship dluminosity_distance_dredshift; "
+                f"falling back to a radiation-free flat LCDM at Planck15's "
+                f"(H0, Om0) = ({self.H0}, {self.Om0}) for the ddL/dz "
+                f"Jacobian. The draw density is approximate to whatever the "
+                f"true generation cosmology differs by.")
             self._record_cosmology("default", self.H0, self.Om0)
+            self._cosmology_model = "flat_lcdm_no_radiation"
             return self.H0, self.Om0
 
-        H0, Om0, resid = det
+        H0, Om0, resid, model, cosmo = gen
         self._record_cosmology("detected", H0, Om0, resid)
+        self._cosmology_generation_H0 = float(H0)
+        self._cosmology_generation_Om0 = float(Om0)
+        self._cosmology_model = model
+        self._jacobian_cosmology = cosmo
         return H0, Om0
+
+    def _detect_generation(self, z, dL):
+        """``(H0, Om0, residual, model, cosmology-or-None)`` that made the pairs.
+
+        A named astropy realisation first (:func:`detect_named_cosmology`,
+        low-35), whose object is returned so the Jacobian uses its own E(z),
+        radiation included; then the radiation-free flat-LCDM fit
+        (:func:`detect_generation_cosmology`).  Named first because an exact
+        named match is exact, while the two-parameter radiation-free fit can
+        absorb radiation to just under its tolerance at z <~ 1.5 (9.5e-6 on
+        Planck18 pairs) and would then be "detected" with shifted parameters.
+        endo3 sits >= 1.9e-3 from every named realisation, so it is still
+        identified by the fit, exactly as before.  ``None`` when neither
+        matches.
+        """
+        named = detect_named_cosmology(z, dL)
+        if named is not None:
+            name, cosmo, resid = named
+            return (float(cosmo.H0.value), float(cosmo.Om0), resid,
+                    f"astropy.cosmology.{name}", cosmo)
+        det = detect_generation_cosmology(z, dL)
+        if det is not None:
+            return det[0], det[1], det[2], "flat_lcdm_no_radiation", None
+        return None
+
+    def _jacobian_ddL_dz(self, z, dL):
+        """``ddL/dz`` for a file that does not ship it, from the resolved cosmology.
+
+        The radiation-free closed form :func:`_ddL_dz` at the resolved
+        (H0, Om0), unless the generation cosmology was matched to a named
+        astropy object, whose own ``E(z)`` (radiation included) is used.
+        """
+        H0_j, Om0_j = self._resolve_jacobian_cosmology(z, dL)
+        cosmo = getattr(self, "_jacobian_cosmology", None)
+        if cosmo is not None:
+            return _ddL_dz_of(z, dL, cosmo)
+        return _ddL_dz(z, dL, H0_j, Om0_j)
 
     def _load(self):
         if self._loaded:
@@ -975,12 +1486,19 @@ class SelectionSet:
            divides out.  Measured on the real O4ab campaign: perturbing the
            assumed ceiling 0.99 -> 0.998 moves ``component_pdraw`` by 0 (to
            1e-14) while it moves ``pdraw_base`` by the predicted 1.0162269.
-        2. **No real file reaches it.**  ``ASSUMED_REMOVAL_AMAX`` is used only in
-           the ``joint_cartesian`` and ``joint_polar`` branches, and both shipped
-           campaigns are factored formats (``o4_factored``, ``endo3_factored``)
-           that read their spin-free density directly with no assumed-prior
-           subtraction.  So this is a latent defect on a path production data
-           does not take -- not a bias in any shipped product.
+        2. **The production O3+O4ab product does not reach it.**
+           ``ASSUMED_REMOVAL_AMAX`` is used only in the ``joint_cartesian`` and
+           ``joint_polar`` branches, and endo3 and rpo4ab are factored formats
+           (``endo3_factored``, ``o4_factored``) that read their spin-free
+           density directly with no assumed-prior subtraction.  A real file
+           DOES take the branch: the GWTC-5.0 cumulative O1-O4b mixture
+           (``joint_cartesian``, and its ``joint_polar`` twin), whose
+           magnitudes reach 0.998 (O3 rows) and ~1 (O4 rows), past the
+           assumed 0.99.  A joint density carries no detectable ceiling, so
+           the comparison is then with the largest DRAWN magnitude (review
+           2026-10-20, low-13: this check used to need both a removal branch
+           and a detected ceiling, which are set in mutually exclusive
+           branches, so it could never fire).
 
         For a projection basis on a joint-format file it would be live, and the
         following describes what it would then do.
@@ -1024,12 +1542,43 @@ class SelectionSet:
         # NB: the private attribute, not the `spin_meta` property -- that one is
         # lazy and calls _load(), which is what invoked us.
         detected = (getattr(self, "_spin_meta", None) or {}).get("amax_detected")
-        if detected is None or not all(np.isfinite(a) for a in detected):
-            return None
-        worst = max(float(a) for a in detected)
+        if (detected is not None
+                and all(a is not None and np.isfinite(a) for a in detected[:2])):
+            worst = max(float(a) for a in detected[:2])
+            drawn = False
+        else:
+            mags = [np.asarray(a, dtype=float) for a in (self._a1, self._a2)
+                    if a is not None]
+            mags = [m[np.isfinite(m)] for m in mags]
+            mags = [m for m in mags if m.size]
+            if not mags:
+                return None
+            worst = float(max(m.max() for m in mags))
+            drawn = True
+            # A sample maximum BELOW the assumed ceiling proves no smaller one.
+            if worst <= removal:
+                return None
+        self._removal_amax_reference = worst
         if np.isclose(worst, removal, rtol=1e-9, atol=1e-12):
             return None
         factor = (removal / worst) ** 2
+        if drawn:
+            warnings.warn(
+                f"{self.path}: the spin-removal step subtracted an isotropic "
+                f"uniform-magnitude cartesian spin prior assuming amax="
+                f"{removal}, but this campaign's spin magnitudes reach "
+                f"{worst:.6g}, past that ceiling. The joint draw density "
+                f"carries no detectable ceiling, so the size is known only "
+                f"if the draw is uniform-isotropic up to that maximum: then "
+                f"pdraw carries the CONSTANT factor c={factor:.6f} (only log "
+                f"Z moves, by N_obs*ln(c) = {np.log(factor):+.4f} nats per "
+                f"observed event). Otherwise the legacy pdraw of the "
+                f"projection bases is off by a spin-dependent factor. The "
+                f"component and chieff_reference bases are exact either way "
+                f"(the removal cancels there). Recorded in "
+                f"spin_removal_amax_reference_per_campaign. Tracked for "
+                f"GW-19.")
+            return factor
         warnings.warn(
             f"{self.path}: the spin-removal step subtracted a cartesian spin "
             f"prior assuming amax={removal}, but this campaign's injected amax "
@@ -1207,9 +1756,9 @@ class SelectionSet:
                     f"with a campaign that DOES honour the override is "
                     f"refused.")
             self._record_cosmology("file", None, None)
+            self._cosmology_model = "file_ddL_dz"
         else:
-            H0_j, Om0_j = self._resolve_jacobian_cosmology(z, dL)
-            ddL = _ddL_dz(z, dL, H0_j, Om0_j)
+            ddL = self._jacobian_ddL_dz(z, dL)
         pdraw = np.exp(ln_pdraw_no_spin) * m1det / (1 + z) ** 2 / ddL
 
         # Time normalisation and mixture/month weights.  The O4 examples keep
@@ -1233,14 +1782,14 @@ class SelectionSet:
         # names (e.g. "pycbc_far", "cwb-bbh_far") and older names.  The
         # discovery is _events_far_columns, shared with the field plan so the
         # one-pass read asks for exactly these columns (GW-32).
-        fars_per_search = []
-        far_columns = []
-        for col in _events_far_columns(ev, f):
-            try:
-                fars_per_search.append(_h5_read_field(ev, col))
-                far_columns.append(col)
-            except Exception:
-                pass
+        # A column that cannot be read is a broken file, not a missing search:
+        # the read error is raised, not swallowed (review 2026-10-20,
+        # medium-31), and a dropped declared search or unused FAR column warns.
+        disc = _events_far_discovery(ev, f)
+        _report_far_discovery(self.path, disc)
+        self._far_discovery = disc
+        far_columns = list(disc["columns"])
+        fars_per_search = [_h5_read_field(ev, col) for col in far_columns]
         self._fars = np.column_stack(fars_per_search) if fars_per_search else None
         self._far_columns = far_columns
 
@@ -1277,6 +1826,7 @@ class SelectionSet:
         self._ndraw = ndraw
         self._T_yr = T_yr
         self._weights = weights
+        self._set_draw_domain(f.attrs)
 
         # ── Additive component-basis spin state (PR4) ──────────────────────
         self._compute_events_spin_state(
@@ -1386,8 +1936,10 @@ class SelectionSet:
                 ln_spin = ln_p_comp - ln_pdraw_no_spin
 
                 # amax auto-detection + isotropy.
-                amax1, uni1 = _sspin.detect_uniform_amax_from_lnmag(lnp_mag1)
-                amax2, uni2 = _sspin.detect_uniform_amax_from_lnmag(lnp_mag2)
+                amax1, uni1 = _sspin.detect_uniform_amax_from_lnmag(
+                    lnp_mag1, a=sa1)
+                amax2, uni2 = _sspin.detect_uniform_amax_from_lnmag(
+                    lnp_mag2, a=sa2)
                 iso1, dev_i1 = _sspin.check_isotropy_polar(lnp_pol1, scost1)
                 iso2, dev_i2 = _sspin.check_isotropy_polar(lnp_pol2, scost2)
                 amax_detected = (amax1, amax2)
@@ -1490,8 +2042,7 @@ class SelectionSet:
         ln_pdraw_no_spin = np.log(p_mass * p_z)
 
         # Jacobian: (m1src, m2src, z) → (m1det, q, dL)
-        H0_j, Om0_j = self._resolve_jacobian_cosmology(z, dL)
-        ddL = _ddL_dz(z, dL, H0_j, Om0_j)
+        ddL = self._jacobian_ddL_dz(z, dL)
         pdraw = np.exp(ln_pdraw_no_spin) * m1det / (1 + z) ** 2 / ddL
 
         # Time normalisation
@@ -1537,20 +2088,28 @@ class SelectionSet:
         # FAR columns: O3 uses hardcoded names
         fars_per_search = []
         far_columns = []
-        for col in ["far_gstlal", "far_pycbc_bbh", "far_pycbc_hyperbank",
-                     "far_mbta", "far_cwb"]:
+        source = "o3_search_names"
+        for col in O3_FAR_COLUMNS:
             if col in inj:
                 fars_per_search.append(np.asarray(inj[col], float))
                 far_columns.append(col)
-        # Also scan for any other *far* columns we might have missed
+        # Also scan for any other *far* columns we might have missed.  A column
+        # that cannot be read is raised, not skipped (review 2026-10-20,
+        # medium-31).
+        far_like = [key for key in inj
+                    if isinstance(key, str) and key.startswith("far_")]
         if not fars_per_search:
-            for key in inj:
-                if isinstance(key, str) and key.startswith("far_"):
-                    try:
-                        fars_per_search.append(np.asarray(inj[key], float))
-                        far_columns.append(key)
-                    except Exception:
-                        pass
+            source = "fallback_scan"
+            for key in far_like:
+                fars_per_search.append(np.asarray(inj[key], float))
+                far_columns.append(key)
+        disc = {"declared": _search_names(f), "columns": list(far_columns),
+                "unmatched_searches": [],
+                "unclaimed_columns": [k for k in far_like
+                                      if k not in far_columns],
+                "source": source}
+        _report_far_discovery(self.path, disc)
+        self._far_discovery = disc
         self._fars = np.column_stack(fars_per_search) if fars_per_search else None
         self._far_columns = far_columns
 
@@ -1582,6 +2141,7 @@ class SelectionSet:
         self._ndraw = ndraw
         self._T_yr = T_yr
         self._weights = weights
+        self._set_draw_domain(f.attrs, inj.attrs)
 
         # ── Additive component-basis spin state (PR4, Format A / endo3) ────
         self._compute_injections_spin_state(inj, ln_pdraw_no_spin, p_mass, p_z,
@@ -1630,9 +2190,14 @@ class SelectionSet:
                 ln_joint, self._a1, self._a2)
             ln_spin = ln_p_comp - ln_pdraw_no_spin
         elif have_cart and have_spin_pdf:
-            # Fall back to the factored per-spin cartesian marginals.
-            spd1 = np.asarray(inj[spd1_key], float)
-            spd2 = np.asarray(inj[spd2_key], float)
+            # Fall back to the factored per-spin cartesian marginals --
+            # validated, not floored at 1e-300 (review 2026-10-20, low-17):
+            # a zero per-spin density is a malformed row, exactly as a zero
+            # joint sampling_pdf is above.
+            spd1 = _require_positive_finite(
+                np.asarray(inj[spd1_key], float), spd1_key, self.path)
+            spd2 = _require_positive_finite(
+                np.asarray(inj[spd2_key], float), spd2_key, self.path)
             ln_spin = (_sspin.ln_p_spin_cart_component(spd1, self._a1)
                        + _sspin.ln_p_spin_cart_component(spd2, self._a2))
 
@@ -1696,6 +2261,45 @@ class SelectionSet:
                 return
         self._gps_range = None
         self._gps_range_source = "unknown"
+
+    def _set_draw_domain(self, *attr_sets):
+        """Record the draw domain the file declares and the one its rows span.
+
+        Declared bounds come from :data:`DRAW_DOMAIN_ATTRS` (first attr set
+        that carries one wins); ``None`` where the file declares nothing, which
+        is NOT a statement that the draws are unbounded.  The extent is the
+        min/max over the file's rows (finite values), i.e. over what the file
+        retained.  Nothing here touches pdraw or any mask.
+        """
+        cols = {"mass1_source": self._m1src, "mass2_source": self._m2src,
+                "redshift": self._z}
+        declared, extent = {}, {}
+        for name, lo_keys, hi_keys in DRAW_DOMAIN_ATTRS:
+            declared[name] = [_first_attr(attr_sets, lo_keys),
+                              _first_attr(attr_sets, hi_keys)]
+            x = np.asarray(cols[name], dtype=float)
+            x = x[np.isfinite(x)]
+            extent[name] = ([float(x.min()), float(x.max())] if x.size
+                            else [None, None])
+        self._declared_draw_domain = declared
+        self._draw_extent = extent
+
+    @property
+    def declared_draw_domain(self) -> dict:
+        """``{quantity: [lo, hi]}`` the file declares its draws on (None = undeclared).
+
+        Source-frame ``mass1_source``/``mass2_source`` in Msun and
+        ``redshift``.  endo3 declares ``[2, 100]``, ``[2, 100]`` and
+        ``[None, 1.9]``; the O4-era files declare nothing.
+        """
+        self._load()
+        return {k: list(v) for k, v in self._declared_draw_domain.items()}
+
+    @property
+    def draw_extent(self) -> dict:
+        """``{quantity: [min, max]}`` over the rows the file carries."""
+        self._load()
+        return {k: list(v) for k, v in self._draw_extent.items()}
 
     def _assign_mixture_runs(self):
         """Label every mixture row with its run, from ``time_geocenter`` alone.
@@ -2183,8 +2787,9 @@ class SelectionSet:
         chieff_det = self._chieff[keep]
         m1src_det = self._m1src[keep]
         m2src_det = self._m2src[keep]
-        logp_chi, in_support, amax_pairs, amax_sources, amax_mode = (
-            _v1_chieff_swap([self], [keep], amax, strict=strict))
+        (logp_chi, in_support, amax_pairs, amax_sources, amax_mode,
+         swap_violations) = _v1_chieff_swap([self], [keep], amax,
+                                            strict=strict)
         # No -50 floor (GW-03): a detected injection with zero assumed draw
         # density is a contradiction, not a small number -- see
         # gwcat/export/selection_builder.py.  The v2 twin refuses identically.
@@ -2236,6 +2841,7 @@ class SelectionSet:
                 getattr(self, "_sky_position_available", True))
             f.attrs["chi_eff_swap_applied"] = True
             _write_chieff_amax_attrs(f, amax_pairs, amax_sources, amax_mode)
+            _write_spin_swap_validity_attrs(f, [self], swap_violations)
             # ── Spin-prior contract provenance (PR 3) ──────────────────────
             # Selection export always applies the chi_eff swap (Mode A); the
             # naming mirrors the PE export so downstream can cross-check the two.
@@ -2251,6 +2857,8 @@ class SelectionSet:
                 nsbh_mass_threshold=self._nsbh_mass_threshold,
                 n_before=n_before, n_after=n_after,
                 far_columns=self._far_columns, far_threshold=far_threshold)
+            for k, v in campaign_provenance_attrs([self]).items():
+                f.attrs[k] = v
 
             for name, arr in [
                 ("m1det", self._m1det[keep]), ("m2det", self._m2det[keep]),
@@ -2357,10 +2965,11 @@ class CombinedSelectionSet:
 
     Usage
     -----
-    >>> sel_o3 = SelectionSet("endo3_bbhpop-...-v12.hdf5")
-    >>> sel_o4 = SelectionSet("injections-O4ab/...-cartesian_spins_*.hdf")
+    >>> sel_o3 = SelectionSet("endo3_bbhpop-LIGO-T2100113-v12.hdf5")
+    >>> sel_o4 = SelectionSet("samples-rpo4ab-1366933504-55469568-clipped.hdf")
     >>> combined = CombinedSelectionSet([sel_o3, sel_o4])
-    >>> combined.to_darksirens("selection_bbh.h5", far_threshold=1.0)
+    >>> combined.export("selection_bbh.h5", spin_basis="chieff_reference",
+    ...                 spin_reference_amax=0.99, far_threshold=1.0)
     """
 
     def __init__(self, selection_sets):
@@ -2507,7 +3116,7 @@ class CombinedSelectionSet:
         # The campaigns that actually CONTRIBUTED rows, in concatenation order
         # (empty ones are skipped below).  The chi_eff swap resolves its ceiling
         # per campaign, so it needs the same list in the same order (GW-37).
-        contrib_sets, contrib_keeps = [], []
+        contrib_sets, contrib_keeps, contrib_index = [], [], []
 
         for k, s in enumerate(self._sets):
             det = s.detected_mask(far_threshold)
@@ -2544,6 +3153,7 @@ class CombinedSelectionSet:
             cols["pdraw"].append(pdraw_k)
             contrib_sets.append(s)
             contrib_keeps.append(keep)
+            contrib_index.append(k)
             n_det_total += n_det_k
             campaign_info.append(
                 f"{s.path}: N={ndraw_per[k]}, T={s._T_yr:.2f}yr, "
@@ -2561,8 +3171,9 @@ class CombinedSelectionSet:
 
         # Apply 1-D chi_eff prior swap, per-campaign ceilings and support gate
         # shared with the v2 builder (GW-37).
-        logp_chi, in_support, amax_pairs, amax_sources, amax_mode = (
-            _v1_chieff_swap(contrib_sets, contrib_keeps, amax, strict=strict))
+        (logp_chi, in_support, amax_pairs, amax_sources, amax_mode,
+         swap_violations) = _v1_chieff_swap(contrib_sets, contrib_keeps, amax,
+                                            strict=strict)
         # No -50 floor (GW-03); see the sibling exporter above.
         _v1_refuse_unsupported(logp_chi, in_support, amax_pairs,
                                "to_combined_selection_file")
@@ -2580,6 +3191,10 @@ class CombinedSelectionSet:
         # pdraw exactly as it does on the v2 path (GW-09); this exporter has
         # every campaign in view too, so it refuses identically.
         _refuse_mixed_cosmology(self._sets)
+        # Declared draw domains: recorded, and a crossed bound warns, exactly
+        # as on the v2 path (review 2026-10-20, high-4).  This legacy writer
+        # applies no domain restriction.
+        _, domain_mismatch = resolve_draw_domain(self._sets)
 
         # Write
         with h5py.File(out_path, "w") as f:
@@ -2641,7 +3256,14 @@ class CombinedSelectionSet:
                     f"silently drop the NaN campaigns' injections; cut on "
                     f"campaign, not on finiteness, if that is not intended.")
             f.attrs["chi_eff_swap_applied"] = True
-            _write_chieff_amax_attrs(f, amax_pairs, amax_sources, amax_mode)
+            # One entry per campaign, aligned with every other per-campaign
+            # attr; a campaign without detections gets NaN (low-15).
+            pairs_all = [(float("nan"), float("nan"))] * len(self._sets)
+            sources_all = ["no_detections"] * len(self._sets)
+            for i, k in enumerate(contrib_index):
+                pairs_all[k], sources_all[k] = amax_pairs[i], amax_sources[i]
+            _write_chieff_amax_attrs(f, pairs_all, sources_all, amax_mode)
+            _write_spin_swap_validity_attrs(f, self._sets, swap_violations)
             # ── Spin-prior contract provenance (PR 3) ──────────────────────
             f.attrs["spin_prior_mode"] = "include"
             f.attrs["chi_eff_prior_applied_to_pdraw"] = True
@@ -2658,6 +3280,10 @@ class CombinedSelectionSet:
                 nsbh_mass_threshold=self._sets[0]._nsbh_mass_threshold,
                 n_before=n_before_total, n_after=n_after_total,
                 far_columns=far_columns_union, far_threshold=far_threshold)
+            for k, v in campaign_provenance_attrs(
+                    self._sets,
+                    draw_domain_mismatch=domain_mismatch).items():
+                f.attrs[k] = v
 
             for name, arr in [
                 ("m1det", data["m1det"]), ("m2det", data["m2det"]),
