@@ -455,3 +455,33 @@ def test_chieff_assumption_violated_flag_is_refused(tmp_path):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             validate_export_v2(str(pe), str(sel))
+
+
+# ======================================================================
+# The SNR legs: posterior-median AND vs injection OR
+# ======================================================================
+def test_pe_median_snr_and_cut_does_not_pair_with_a_far_or_snr_mask(tmp_path):
+    """GWCatalog(store).select(snr_min=10).export(..., far_max=1.0) with a
+    selection exported at far_threshold=1.0, snr_threshold=10.0: statistic,
+    threshold and snr_min agree in both files, the injection mask is looser
+    than the event cut (25 of 40 detected against 15 under the AND), and
+    validate reported nothing."""
+    from test_export_v2_selection import _write_o4_with_snr
+
+    n = 40
+    far = np.full(n, 5.0)
+    far[:20] = 0.1
+    snr = np.zeros(n)
+    snr[25:30] = 15.0
+    inj = _write_o4_with_snr(tmp_path / "o4snr.hdf", n, far, snr)
+    sel = tmp_path / "sel_snr.h5"
+    SelectionSet(inj).export(str(sel), spin_basis="component",
+                             far_threshold=1.0, snr_threshold=10.0)
+    pe = _pe_component(tmp_path, name="pe_snr.h5")
+    with h5py.File(pe, "r+") as f:
+        f.attrs["far_max"] = 1.0
+        f.attrs["snr_min"] = 10.0
+    with pytest.raises(ValueError, match="posterior-median SNR"):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            validate_export_v2(str(pe), str(sel))

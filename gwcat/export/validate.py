@@ -1244,6 +1244,25 @@ def _xcheck_detection_cut(_fail, results, pe_attrs, sel_attrs):
     sel_snr = _num(sel_attrs.get("significance_snr_threshold",
                                  sel_attrs.get("snr_threshold")))
 
+    # The two SNR legs are different STATISTICS even at one threshold (review
+    # 2026-10-20).  select(snr_min=) keeps the events whose posterior-MEDIAN
+    # SNR passes, ANDed with any FAR cut; a selection's significance SNR is an
+    # injection SNR ORed with its FAR mask ('far_or_snr', or the mixture's
+    # semianalytic rule).  No selection mode reproduces the PE cut, so a
+    # threshold match on the two is not a match.
+    if not np.isnan(pe_snr) and not np.isnan(sel_snr):
+        _fail("xcheck_detection_cut",
+              f"SNR: the PE event list was cut on the posterior-median SNR "
+              f"(snr_min={pe_snr}"
+              + (f", AND far_max={pe_far}" if not np.isnan(pe_far) else "")
+              + f") while the selection detects on the injection SNR "
+                f"(significance_snr_threshold={sel_snr}, ORed with its FAR "
+                f"mask; significance_type="
+                f"{sel_attrs.get('significance_type')!r}). The same threshold "
+                f"on different statistics, combined differently, is not the "
+                f"same cut. Drop snr_min from the PE selection, or select the "
+                f"events by name.")
+
     mism, unstated = [], []
     for label, pe_v, sel_v, pe_name, sel_name in (
             ("FAR", pe_far, sel_far, "far_max", "far_threshold"),
