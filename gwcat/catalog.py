@@ -1979,10 +1979,27 @@ class GWCatalog:
             # letting one event's ceiling stand for the file's.
             _a1 = np.asarray(kept_amax1, dtype=float)
             _a2 = np.asarray(kept_amax2, dtype=float)
+            # One scalar names ONE ceiling for BOTH spins (review 2026-10-20):
+            # in "exclude" mode the consumer evaluates the chi_eff prior at
+            # this value for both components, so writing amax_1 when amax_2
+            # differs (a (0.99, 0.05) event evaluated at (0.99, 0.99)) was a
+            # silently wrong prior.  NaN unless every event has the same
+            # ceiling on both spins.
             _uniform_amax = (_a1.size > 0 and np.ptp(_a1) == 0
-                             and np.ptp(_a2) == 0)
+                             and np.ptp(_a2) == 0
+                             and float(_a1[0]) == float(_a2[0]))
             f.attrs["chi_eff_amax"] = (float(_a1[0]) if _uniform_amax
                                        else float("nan"))
+            if not chi_eff_included and not _uniform_amax and _a1.size:
+                warnings.warn(
+                    f"spin_prior_mode='exclude': the exported events do not "
+                    f"share one spin ceiling on both spins (amax_1 in "
+                    f"[{_a1.min():g}, {_a1.max():g}], amax_2 in "
+                    f"[{_a2.min():g}, {_a2.max():g}]), so chi_eff_amax is NaN. "
+                    f"A consumer that applies the chi_eff prior from that one "
+                    f"scalar cannot evaluate it for this file; it must read "
+                    f"chi_eff_amax_1_per_event / chi_eff_amax_2_per_event, or "
+                    f"export with spin_prior_mode='include'.")
             f.attrs["chi_eff_amax_1_per_event"] = _a1
             f.attrs["chi_eff_amax_2_per_event"] = _a2
             f.attrs["chi_eff_amax_source_per_event"] = np.array(

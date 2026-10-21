@@ -338,3 +338,31 @@ def test_far_cut_names_events_on_the_rounded_threshold(tmp_path):
     assert "GW231002_143916" in set(sub.event_names)
     assert sub.selection_spec.to_dict()["far_cut_operator"] == "<="
     assert sub.selection_spec.to_attrs()["far_cut_operator"] == "<="
+
+
+# ==========================================================================
+# v1 'exclude' files state one spin ceiling only when it is one ceiling
+# ==========================================================================
+def test_v1_exclude_scalar_ceiling_is_nan_for_asymmetric_spins(tmp_path):
+    """Core applies chi_eff_amax to both spins in exclude mode; an event at
+    (0.99, 0.05) was written as 0.99 and evaluated at (0.99, 0.99)."""
+    rows = [_row("GW900001_000001", spin_amax_1=0.99, spin_amax_2=0.05),
+            _row("GW900002_000002", spin_amax_1=0.99, spin_amax_2=0.05)]
+    out = tmp_path / "exc.h5"
+    with pytest.warns(UserWarning, match="chi_eff_amax is NaN"):
+        GWCatalog(_store(tmp_path, rows)).to_darksirens(
+            str(out), nsamp=8, seed=0, cosmology=_COSMO,
+            spin_prior_mode="exclude")
+    with h5py.File(out, "r") as f:
+        assert np.isnan(float(f.attrs["chi_eff_amax"]))
+        np.testing.assert_array_equal(f.attrs["chi_eff_amax_2_per_event"],
+                                      [0.05, 0.05])
+
+
+def test_v1_symmetric_ceiling_is_still_written(tmp_path):
+    out = tmp_path / "exc_sym.h5"
+    GWCatalog(_three(tmp_path)).to_darksirens(
+        str(out), nsamp=8, seed=0, cosmology=_COSMO,
+        spin_prior_mode="exclude")
+    with h5py.File(out, "r") as f:
+        assert float(f.attrs["chi_eff_amax"]) == 0.99
