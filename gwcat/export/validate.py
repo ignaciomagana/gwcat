@@ -433,6 +433,14 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
             else:
                 _check("sel_pdraw_nonempty", False, "pdraw is empty")
 
+        # The reference basis's zero-weight rows must be exactly the rows
+        # outside the reference support, and their sentinel must really weigh
+        # nothing.  a1/a2 were required above for this purpose but never
+        # compared, so a sentinel on in-support rows (beta biased low) or a
+        # finite weight on out-of-reference rows (biased high) passed.
+        if sel_basis == "chieff_reference":
+            _reference_sentinel_checks(_check, sel_attrs, sel_cols)
+
         # Every name a 2.1 file declares in its OWN fit_columns must exist as a
         # dataset (GW-37).  A generic check beats extending two more hardcoded
         # lists: the selection file declared `q` and shipped no `q`, and nothing
@@ -1438,6 +1446,64 @@ def _xcheck_reference_pair(_check, _fail, results, pe_attrs, sel_attrs,
             f"reference support has a region with no draws in it and the "
             f"selection integral is biased low. See "
             f"spin_reference_coverage_per_campaign.")
+
+
+#: How much larger than every in-support pdraw the out-of-reference sentinel
+#: must be: its inverse weight is then at least this factor below any real
+#: row's, i.e. zero to every precision a selection integral is computed at.
+_SENTINEL_MIN_RATIO = 1e100
+
+
+def _reference_sentinel_checks(_check, attrs, cols):
+    """The ``chieff_reference`` sentinel rows against ``a1``/``a2``.
+
+    The builder writes ``spin_reference_excluded_pdraw`` (default 1e300) at
+    exactly the rows with ``a1 > a_ref`` or ``a2 > a_ref`` (or no magnitude),
+    and counts them in ``spin_reference_excluded_rows``.  Checked here: the two
+    row sets are identical, the count matches, and the sentinel is so large
+    that its inverse weight is negligible against every in-support row.
+    """
+    if not all(k in cols for k in ("pdraw", "a1", "a2")):
+        return  # the sel_has_* checks above have already failed
+    pd = np.asarray(cols["pdraw"], dtype=float)
+    a1 = np.asarray(cols["a1"], dtype=float)
+    a2 = np.asarray(cols["a2"], dtype=float)
+    if not (pd.shape == a1.shape == a2.shape):
+        return  # the length checks above have already failed
+    names = ("spin_reference_amax", "spin_reference_excluded_pdraw",
+             "spin_reference_excluded_rows")
+    missing = [k for k in names if attrs.get(k) is None]
+    if not _check("sel_reference_sentinel_recorded", not missing,
+                  f"spin_basis='chieff_reference' but attr(s) {missing} are "
+                  f"missing, so which rows carry the zero-weight sentinel "
+                  f"cannot be checked"):
+        return
+    a_ref = float(attrs["spin_reference_amax"])
+    sentinel = float(attrs["spin_reference_excluded_pdraw"])
+    n_rec = int(attrs["spin_reference_excluded_rows"])
+    outside = ~((a1 <= a_ref) & (a2 <= a_ref))
+    is_sent = pd == sentinel
+    n_in_sent = int(np.sum(is_sent & ~outside))
+    n_out_real = int(np.sum(outside & ~is_sent))
+    _check("sel_reference_sentinel_rows", n_in_sent == 0 and n_out_real == 0,
+           f"{n_in_sent} row(s) with a1, a2 <= a_ref={a_ref} carry the "
+           f"out-of-reference sentinel pdraw={sentinel:.3e} (their weight is "
+           f"zeroed: beta biased low), and {n_out_real} row(s) with a1 or a2 "
+           f"> a_ref carry a real pdraw (the reference prior is zero there: "
+           f"beta biased high)")
+    _check("sel_reference_excluded_rows_count", int(np.sum(is_sent)) == n_rec,
+           f"{int(np.sum(is_sent))} rows carry the sentinel but "
+           f"spin_reference_excluded_rows={n_rec}")
+    real = pd[~is_sent]
+    if outside.any() and real.size and np.all(np.isfinite(real)):
+        top = float(np.max(real))
+        _check("sel_reference_sentinel_negligible",
+               np.isfinite(sentinel) and sentinel >= _SENTINEL_MIN_RATIO * top,
+               f"spin_reference_excluded_pdraw={sentinel:.3e} is not far above "
+               f"the largest in-support pdraw {top:.3e} (required: at least "
+               f"{_SENTINEL_MIN_RATIO:.0e} times larger), so the "
+               f"out-of-reference rows the attrs call zero-weight carry a "
+               f"real weight")
 
 
 def _fit_columns_present(_check, attrs, present, prefix):

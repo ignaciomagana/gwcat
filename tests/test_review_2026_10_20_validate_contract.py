@@ -108,3 +108,71 @@ def test_z_max_reaches_the_hash():
     assert contract_hash(trunc) != contract_hash(other)
     assert contract_hash(trunc) == contract_hash(
         build_contract(parameter_space="component", z_max=1.0))
+
+
+# ======================================================================
+# chieff_reference: the sentinel rows are exactly the out-of-reference rows
+# ======================================================================
+from test_validate_v2 import _pe_chieff_at, _sel_reference  # noqa: E402
+
+
+def _ref_pair(tmp_path):
+    pe = _pe_chieff_at(tmp_path, 0.99, name="pe_sent.h5")
+    sel = _sel_reference(tmp_path, 0.99, name="sel_sent.h5")
+    return pe, sel
+
+
+def test_reference_sentinel_on_an_in_support_row_fails(tmp_path):
+    """A builder or merge bug that puts the sentinel on an in-support
+    injection biases beta low; it passed --strict."""
+    pe, sel = _ref_pair(tmp_path)
+    validate_export_v2(str(pe), str(sel), strict=True)      # clean first
+    with h5py.File(sel, "r+") as f:
+        a1, a2, pd = f["a1"][()], f["a2"][()], f["pdraw"][()]
+        k = int(np.flatnonzero((a1 <= 0.99) & (a2 <= 0.99))[0])
+        pd[k] = float(f.attrs["spin_reference_excluded_pdraw"])
+        f["pdraw"][...] = pd
+        f.attrs["spin_reference_excluded_rows"] = int(
+            np.sum(pd == f.attrs["spin_reference_excluded_pdraw"]))
+    with pytest.raises(AssertionError, match="sel_reference_sentinel_rows"):
+        validate_export_v2(str(pe), str(sel), strict=True)
+
+
+def test_reference_out_of_support_row_with_a_real_weight_fails(tmp_path):
+    """An out-of-reference row with a finite weight biases beta high."""
+    pe, sel = _ref_pair(tmp_path)
+    with h5py.File(sel, "r+") as f:
+        a1, pd = f["a1"][()], f["pdraw"][()]
+        k = int(np.flatnonzero(pd != f.attrs["spin_reference_excluded_pdraw"])[0])
+        a1[k] = 0.995                      # above a_ref, pdraw left real
+        f["a1"][...] = a1
+    res = validate_export_v2(str(pe), str(sel))
+    assert res["sel_reference_sentinel_rows"] is False
+
+
+def test_reference_excluded_row_count_must_match(tmp_path):
+    pe, sel = _ref_pair(tmp_path)
+    with h5py.File(sel, "r+") as f:
+        f.attrs["spin_reference_excluded_rows"] = (
+            int(f.attrs["spin_reference_excluded_rows"]) + 3)
+    res = validate_export_v2(str(pe), str(sel))
+    assert res["sel_reference_excluded_rows_count"] is False
+
+
+def test_reference_sentinel_that_is_a_real_weight_fails(tmp_path):
+    """A caller-chosen out_of_reference_pdraw of 1.0 gives the excluded rows
+    a real weight while the attrs still call them zero-weight."""
+    pe, sel = _ref_pair(tmp_path)
+    with h5py.File(sel, "r+") as f:
+        a1, pd = f["a1"][()], f["pdraw"][()]
+        old = float(f.attrs["spin_reference_excluded_pdraw"])
+        a1[0] = 0.995
+        pd[0] = old
+        pd[pd == old] = 1.0
+        f["a1"][...] = a1
+        f["pdraw"][...] = pd
+        f.attrs["spin_reference_excluded_pdraw"] = 1.0
+        f.attrs["spin_reference_excluded_rows"] = int(np.sum(pd == 1.0))
+    res = validate_export_v2(str(pe), str(sel))
+    assert res["sel_reference_sentinel_rows"] is True
+    assert res["sel_reference_sentinel_negligible"] is False
