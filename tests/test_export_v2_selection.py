@@ -738,3 +738,57 @@ def test_an_unjudgeable_overlap_warns(tmp_path):
     with pytest.warns(UserWarning, match="cannot rule out a time overlap"):
         build_selection_product([SelectionSet(o3), SelectionSet(o4)],
                                 spin_basis="component")
+
+
+def _fixture_cosmology():
+    """A radiation-free flat LCDM that is NOT the SelectionSet default, so a
+    scalar stamped from the constructor default cannot pass for it."""
+    from astropy.cosmology import FlatLambdaCDM, Planck15
+    return FlatLambdaCDM(H0=1.02 * Planck15.H0, Om0=Planck15.Om0)
+
+
+def _endo3_cosmology_consistent(path, n, seed, cosmo):
+    """endo3 fixture whose ``distance`` IS ``cosmo``'s dL(z), so the loader's
+    generation-cosmology detection runs (the plain fixture draws dL
+    independently of z and never reaches that path)."""
+    write_endo3_full(path, n=n, max_spin=0.9, seed=seed)
+    with h5py.File(path, "r+") as f:
+        inj = f["injections"]
+        z = inj["redshift"][:]
+        inj["distance"][:] = cosmo.luminosity_distance(z).to("Mpc").value
+    return str(path)
+
+
+def test_scalar_cosmology_is_the_one_pdraw_used(tmp_path):
+    """The scalar used to be set_list[0].H0 -- the constructor default -- even
+    when the campaign's pdraw used its DETECTED generation cosmology, and the
+    validator refused PE files for disagreeing with it."""
+    from gwcat.export import build_selection_product
+
+    cosmo = _fixture_cosmology()
+    e3 = _endo3_cosmology_consistent(tmp_path / "e3.hdf", 300, 12, cosmo)
+    s = SelectionSet(e3)
+    prod = build_selection_product(s, spin_basis="component")
+    a = prod.attrs
+    assert [x.decode() if isinstance(x, bytes) else x
+            for x in a["cosmology_source_per_campaign"]] == ["detected"]
+    assert float(a["cosmology_H0"]) == float(a["cosmology_H0_per_campaign"][0])
+    assert float(a["cosmology_Om0"]) == float(
+        a["cosmology_Om0_per_campaign"][0])
+    assert float(a["cosmology_H0"]) == pytest.approx(cosmo.H0.value, rel=1e-4)
+    assert abs(float(a["cosmology_H0"]) - s.H0) > 0.5     # not the default
+    assert prod.summary["cosmology_H0"] == float(a["cosmology_H0"])
+
+    # An events-format campaign reads ddL/dz from the file: no cosmology.
+    o4 = write_o4_full(tmp_path / "o4.hdf", n=20, seed=13)
+    a4 = build_selection_product(SelectionSet(o4),
+                                 spin_basis="component").attrs
+    assert np.isnan(a4["cosmology_H0"]) and np.isnan(a4["cosmology_Om0"])
+
+    # Campaigns that differ (the production O3 + O4 shape): NaN.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ac = build_selection_product([SelectionSet(e3), SelectionSet(o4)],
+                                     spin_basis="component").attrs
+    assert bool(ac["cosmology_mixed_across_campaigns"]) is True
+    assert np.isnan(ac["cosmology_H0"]) and np.isnan(ac["cosmology_Om0"])

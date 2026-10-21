@@ -1325,6 +1325,11 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
 
     # ── Provenance attrs ────────────────────────────────────────────────────
     _str = h5py.string_dtype()
+    _mixed_cosmology = _cosmology_is_mixed(set_list)
+    scalar_H0 = (float("nan") if _mixed_cosmology
+                 else _cosmo_or_nan(set_list[0], "_cosmology_used_H0"))
+    scalar_Om0 = (float("nan") if _mixed_cosmology
+                  else _cosmo_or_nan(set_list[0], "_cosmology_used_Om0"))
     attrs = dict(_selection_provenance_dict(
         source_class=source_class,
         nsbh_mass_threshold=set_list[0]._nsbh_mass_threshold,
@@ -1344,14 +1349,21 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         "T_obs_yr": float(sum(s._T_yr for s in set_list)),
         "far_threshold": float(far_threshold),
         "n_detected": int(n_det_total),
-        "cosmology_H0": float(set_list[0].H0),
-        "cosmology_Om0": float(set_list[0].Om0),
+        # The cosmology every campaign's pdraw used, NaN when they differ or
+        # when none entered pdraw at all (an events-format campaign reads its
+        # ddL/dz from the file) -- the v1 combined writer's convention.  It
+        # used to be the first campaign's constructor default (Planck15),
+        # which no campaign of the production pair used, so the validator
+        # refused PE files for disagreeing with a cosmology nothing was built
+        # under (review fix).
+        "cosmology_H0": scalar_H0,
+        "cosmology_Om0": scalar_Om0,
         "cosmology_override_used": bool(
             any(getattr(s, "_cosmology_override", False) for s in set_list)),
         # Per-campaign, because a combined export legitimately mixes campaigns
-        # whose pdraw used DIFFERENT cosmologies -- or none at all.  The scalar
-        # above is the first campaign's reference value, kept for backward
-        # compatibility; these are the authoritative record (GW-09).
+        # whose pdraw used DIFFERENT cosmologies -- or none at all.  These are
+        # the authoritative record (GW-09); the scalar above is finite only
+        # when they all agree.
         "cosmology_source_per_campaign": np.array(
             [str(getattr(s, "_cosmology_source", None)) for s in set_list],
             dtype=_str),
@@ -1579,8 +1591,8 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         CUT_ESTIMATOR_ATTR: selection_cut_estimator(source_class),
         "source_class_counts_detected": value_counts(
             [normalize_source_class(c) for c in classes_det]),
-        "cosmology_H0": float(set_list[0].H0),
-        "cosmology_Om0": float(set_list[0].Om0),
+        "cosmology_H0": scalar_H0,
+        "cosmology_Om0": scalar_Om0,
         "cosmology_override_used": bool(
             any(getattr(s, "_cosmology_override", False) for s in set_list)),
         "cosmology_source_per_campaign": [
