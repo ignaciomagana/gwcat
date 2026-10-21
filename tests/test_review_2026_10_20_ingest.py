@@ -178,3 +178,52 @@ def test_mixed_constituents_that_agree_are_recorded_as_agreeing(
                         cfg=ing.IngestConfig(mixed_prior_mismatch="raise",
                                              **_CFG))
     assert _meta(store, "mixed_constituent_priors") == "agree"
+
+
+# ==========================================================================
+# high-2: C01:Mixed samples above the 0.99 ceiling (SEOBNRv4PHM half)
+# ==========================================================================
+C1X, C1M, C1S = "C01:IMRPhenomXPHM", "C01:Mixed", "C01:SEOBNRv4PHM"
+O3_NAME = "IGWN-GWTC3p0-v2-GW951109_010717_PEDataRelease_mixed_cosmo.h5"
+
+
+def _gw191109_like(seed=1, n=200):
+    """XPHM samples stop at 0.99; SEOBNRv4PHM's reach ~1.0 (no analytic group,
+    config ceiling 0.99) -- the real C01:Mixed layout."""
+    rng = np.random.default_rng(seed)
+    xp = _samples(rng, n, amax=0.99, gps=1257296855.2)
+    se = _samples(rng, n, amax=1.0, gps=1257296855.2)
+    mixed = _concat(_take(xp, np.arange(n // 2)), _take(se, np.arange(n // 2)))
+    sd = {C1X: xp, C1M: mixed, C1S: se}
+    dl = ("PowerLaw(alpha=2, minimum=10, maximum=10000, "
+          "name='luminosity_distance', latex_label='$d_L$', unit='Mpc', "
+          "boundary=None)")
+    priors = {"analytic": {C1X: dict(_analytic(), luminosity_distance=dl)}}
+    extra = {C1M: {"meta_data": {"combined": "Prod5, Prod6_extended"}}}
+    return _Data(sd, extra=extra), sd, priors
+
+
+def test_spin_samples_above_the_ceiling_are_recorded_per_constituent(
+        tmp_path, monkeypatch):
+    files = {O3_NAME: _gw191109_like()}
+    with pytest.warns(UserWarning, match="samples exceed resolved amax"):
+        store = _ingest(tmp_path, monkeypatch, files)
+    assert _meta(store, "analysis_used") == C1M
+    assert float(_meta(store, "spin_amax_1")) == pytest.approx(0.99)
+    smax = max(float(_meta(store, "spin_sample_max_1")),
+               float(_meta(store, "spin_sample_max_2")))
+    assert smax > 0.995
+    per = json.loads(_meta(store, "spin_sample_max_per_constituent"))
+    assert set(per) == {C1X, C1S}
+    assert max(per[C1X]) <= 0.99 and max(per[C1S]) > 0.995
+    # GWTC-3 names run tags, not labels, in meta_data/combined
+    assert _meta(store, "mixed_constituent_priors") == (
+        "unverified:no_constituent_labels")
+
+
+def test_spin_samples_above_the_ceiling_refused_on_request(
+        tmp_path, monkeypatch):
+    files = {O3_NAME: _gw191109_like()}
+    cfg = ing.IngestConfig(spin_exceeds_amax="raise", **_CFG)
+    with pytest.raises(ing.SpinCeilingExceededError, match="0.99"):
+        _ingest(tmp_path, monkeypatch, files, cfg=cfg)

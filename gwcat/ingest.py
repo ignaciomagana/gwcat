@@ -221,6 +221,12 @@ META_STR_FIELDS += ["spin_amax_config_per_constituent"]
 # "unverified:<why>".  A Mixed row divides out ONE sibling's prior, which is
 # the Mixed set's prior only when its constituents' priors agree.
 META_STR_FIELDS += ["mixed_constituent_labels", "mixed_constituent_priors"]
+# max|a_i| over each row's samples, and per constituent of a combined set
+# (JSON {label: [max|a_1|, max|a_2|] | null}, "" for a non-Mixed row), so a
+# sample above the resolved ceiling is a number on the row, not only a
+# substring of spin_prior_source (review 2026-10-20, high-2).
+META_FLOAT_FIELDS += ["spin_sample_max_1", "spin_sample_max_2"]
+META_STR_FIELDS += ["spin_sample_max_per_constituent"]
 
 # Default waveform priority when no Mixed set exists (O4b/GWTC-5 events).
 O4_WAVEFORM_PRIORITY = [
@@ -293,6 +299,15 @@ class IngestConfig:
     #: constituent-aware prior for it.  Which prior a Mixed set should divide
     #: out is the owner's convention; this only makes the disagreement visible.
     mixed_prior_mismatch: str = "warn"
+    #: What to do when a row's spin samples exceed the ceiling its resolved
+    #: prior declares (review 2026-10-20, high-2; 57 GWTC-2.1/3 C01:Mixed rows,
+    #: whose SEOBNRv4PHM half reaches a spin of about 1.0 under a 0.99
+    #: ceiling).  "warn" (default) keeps the declared ceiling, warns and
+    #: records spin_sample_max_*; "raise" refuses the row.  Whether such
+    #: samples are dropped or the ceiling widened is the owner's decision (the
+    #: exporter's opt-in spin-ceiling cut is one answer); ingest only refuses
+    #: on request.
+    spin_exceeds_amax: str = "warn"
 
 
 # --------------------------------------------------------------------------
@@ -1241,6 +1256,15 @@ class ResolvedSpinPrior:
     source: str
     source_label: str = ""
     source_kind: str = ""
+    #: ``max|a_i|`` over the ingested samples (NaN when absent), and whether
+    #: either exceeds its resolved ceiling (review 2026-10-20, high-2).
+    sample_max_1: float = float("nan")
+    sample_max_2: float = float("nan")
+    samples_exceed_amax: bool = False
+
+
+class SpinCeilingExceededError(ValueError):
+    """Samples exceed the resolved spin ceiling (``spin_exceeds_amax='raise'``)."""
 
 
 #: The LALInference ``[engine]`` keys that declare the spin-magnitude ceilings.
@@ -1335,6 +1359,35 @@ def constituent_spin_amax_config(data, analysis, analyses):
         out[str(an)] = (None if got is None
                         else [float(got[0]), float(got[1])])
     return _json.dumps(out, sort_keys=True)
+
+
+def constituent_spin_sample_max(analysis, analyses, samples_dict,
+                                constituents=()):
+    """JSON ``{constituent: [max|a_1|, max|a_2|] | null}`` for a Mixed label.
+
+    The constituents are the ones ``meta_data/combined`` names when it names
+    any, else every same-prefix, non-Mixed sibling (the GWTC-2.1/3 records
+    name run tags, not labels).  ``""`` for a label that is not a combined
+    set.  This is what makes a per-half ceiling difference checkable (review
+    2026-10-20, high-2): GWTC-2.1/3 ``C01:Mixed`` divides out
+    IMRPhenomXPHM's U(0, 0.99) while its C01:SEOBNRv4PHM half was sampled up
+    to a spin of about 1.0.
+    """
+    prefix, base, _variant = _label_parts(analysis)
+    if base != "Mixed":
+        return ""
+    labs = list(constituents) or [
+        an for an in analyses if an != analysis
+        and _label_parts(an)[0] == prefix and _label_parts(an)[1] != "Mixed"]
+    out = {}
+    for lab in labs:
+        smp = samples_dict.get(lab) if hasattr(samples_dict, "get") else None
+        if smp is None or "a_1" not in smp or "a_2" not in smp:
+            out[str(lab)] = None
+            continue
+        out[str(lab)] = [float(np.nanmax(np.abs(np.asarray(smp[k], float))))
+                         for k in ("a_1", "a_2")]
+    return json.dumps(out, sort_keys=True)
 
 
 def resolve_spin_prior(analysis, analyses, priors, a1_samples, a2_samples,
@@ -1521,12 +1574,15 @@ def resolve_spin_prior_full(analysis, analyses, priors, a1_samples,
 
     # Validate the spin samples against the resolved bounds (warn, don't clamp).
     viol = []
+    smaxes = []
     for lbl, samp, amax in (("a_1", a1_samples, amax_1),
                             ("a_2", a2_samples, amax_2)):
+        smax = float("nan")
         if samp is not None and np.size(samp):
             smax = float(np.nanmax(np.abs(np.asarray(samp, float))))
             if np.isfinite(smax) and smax > amax * (1 + 1e-3):
                 viol.append(f"{lbl}:max={smax:.4g}>amax={amax:.4g}")
+        smaxes.append(smax)
     if viol:
         warnings.warn("spin prior: samples exceed resolved amax "
                       f"({'; '.join(viol)}); prior bounds may be wrong")
@@ -1534,7 +1590,9 @@ def resolve_spin_prior_full(analysis, analyses, priors, a1_samples,
 
     return ResolvedSpinPrior(amax_1=amax_1, amax_2=amax_2, kind=kind,
                              source=source, source_label=src_label,
-                             source_kind=src_kind)
+                             source_kind=src_kind, sample_max_1=smaxes[0],
+                             sample_max_2=smaxes[1],
+                             samples_exceed_amax=bool(viol))
 
 
 #: The single chi_p implementation (GW-08).  ``ingest`` previously carried a
@@ -2051,10 +2109,11 @@ def build_store(paths, out_path, params=None, extra_params=None,
                    byte-identical to one written before the flag existed.
     """
     cfg = cfg or IngestConfig()
-    if cfg.mixed_prior_mismatch not in ("warn", "raise"):
-        raise ValueError(
-            f"IngestConfig.mixed_prior_mismatch={cfg.mixed_prior_mismatch!r} "
-            f"is invalid; use 'warn' or 'raise'.")
+    for _opt in ("mixed_prior_mismatch", "spin_exceeds_amax"):
+        if getattr(cfg, _opt) not in ("warn", "raise"):
+            raise ValueError(
+                f"IngestConfig.{_opt}={getattr(cfg, _opt)!r} is invalid; use "
+                f"'warn' or 'raise'.")
     params = list(params or DEFAULT_PARAMS)
     if extra_params:
         params += [p for p in extra_params if p not in params]
@@ -2206,6 +2265,14 @@ def build_store(paths, out_path, params=None, extra_params=None,
                 data=data)
             spin_amax_1, spin_amax_2, spin_kind, spin_src = (
                 sp.amax_1, sp.amax_2, sp.kind, sp.source)
+            if sp.samples_exceed_amax and cfg.spin_exceeds_amax == "raise":
+                raise SpinCeilingExceededError(
+                    f"{name} [{analysis}]: spin samples reach "
+                    f"max|a_1|={sp.sample_max_1:.6g}, "
+                    f"max|a_2|={sp.sample_max_2:.6g} above the resolved "
+                    f"ceilings ({spin_amax_1:g}, {spin_amax_2:g}) from "
+                    f"{sp.source_label or sp.source}; refused "
+                    f"(spin_exceeds_amax='raise').")
             # ── Constituent-mixture prior for C00:Mixed (GW-40f, opt-in) ─────
             cmix = None
             if (cfg.constituent_mixture_prior
@@ -2312,6 +2379,11 @@ def build_store(paths, out_path, params=None, extra_params=None,
                 constituent_spin_amax_config(data, analysis, analyses))
             meta["mixed_constituent_labels"].append("+".join(constituents))
             meta["mixed_constituent_priors"].append(mixed_priors)
+            meta["spin_sample_max_1"].append(float(sp.sample_max_1))
+            meta["spin_sample_max_2"].append(float(sp.sample_max_2))
+            meta["spin_sample_max_per_constituent"].append(
+                constituent_spin_sample_max(analysis, analyses, samples_dict,
+                                            constituents))
             meta["prior_source_label_dL"].append(res.prior_source_label)
             meta["prior_source_kind_dL"].append(res.prior_source_kind)
             meta["mass_prior_chirp_min"].append(
@@ -3306,6 +3378,10 @@ def _cli(
                          "--constituent-mixture-prior builds a "
                          "constituent-aware prior for it. Default: warn and "
                          "record mixed_constituent_priors.")
+    ap.add_argument("--refuse-spin-above-amax", action="store_true",
+                    help="Refuse a row whose spin samples exceed the ceiling "
+                         "its resolved spin prior declares. Default: warn and "
+                         "record spin_sample_max_1/2.")
     a = ap.parse_args(argv)
     if a.inspect:
         inspect(a.inspect)
@@ -3334,7 +3410,8 @@ def _cli(
         constituent_mixture_prior=a.constituent_mixture_prior,
         dL_prior_impl="auto" if a.legacy_grid_priors else "exact",
         mixed_prior_mismatch=("raise" if a.refuse_mixed_prior_mismatch
-                              else "warn"))
+                              else "warn"),
+        spin_exceeds_amax=("raise" if a.refuse_spin_above_amax else "warn"))
     build_store(paths, a.out, event_table=event_table, sample_sets=sample_sets,
                 cache_dir=a.cache_dir, offline=offline, cfg=cfg,
                 file_provenance=file_provenance, write_summary=write_summary)
