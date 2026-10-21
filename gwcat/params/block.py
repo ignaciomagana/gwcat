@@ -126,6 +126,10 @@ class CampaignRequirement:
             if (amax is None
                     or any(a is None or not np.isfinite(a) for a in amax)):
                 out.append("single_amax")
+        if self.uniform_azimuth:
+            az = checks.get("azimuth_uniform")
+            if az is not None and not all(bool(x) for x in np.atleast_1d(az)):
+                out.append("uniform_azimuth")
         if self.needs_sky_draw and meta.get("sky_position_available") is False:
             out.append("needs_sky_draw")
         return tuple(out)
@@ -135,10 +139,16 @@ class CampaignRequirement:
 class ParameterBlock:
     """One group of fit coordinates plus its two-sided density contract.
 
-    The callables are intentionally optional: GW-17 is a pure assembly PR, so a
-    block may declare its contract (columns, ranges, map kind, campaign
-    requirements) before its densities are wired to the builders.  Nothing in
-    :mod:`gwcat` imports this package yet.
+    The callables are intentionally optional: a block may declare its
+    contract (columns, ranges, map kind, campaign requirements) before its
+    densities are wired to the builders.  The builders import this package:
+    they compose the MASS block's PE factor through
+    :func:`gwcat.params.compose.block_prior_factor_pe`, read the column views
+    and requirements off the registry, and evaluate the campaign requirements
+    no basis-specific check enforces
+    (:meth:`gwcat.params.registry.ParameterSpace.refuse_unmet_requirements`).
+    The spin blocks' ``ln_prior_pe`` are the same densities the builders
+    evaluate directly; they are kept equal to them, not called by them.
     """
     name: str
     kind: str

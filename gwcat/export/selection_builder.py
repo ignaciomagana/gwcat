@@ -978,6 +978,10 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                                      zip(set_list, is_mixture) if m)
             + ". Each already carries every run's exposure; export one.")
     _refuse_overlapping_campaigns(set_list)
+    # The block requirement no basis-specific check below enforces: uniform
+    # azimuths (review 2026-10-20: declared in the registry, never evaluated).
+    get_space(spin_basis).refuse_unmet_requirements(
+        [(str(s.path), s.spin_meta) for s in set_list])
     if acknowledge_semianalytic_excluded and snr_threshold is not None:
         raise ValueError(
             "acknowledge_semianalytic_excluded=True (--acknowledge-semianalytic-"

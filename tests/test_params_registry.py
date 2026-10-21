@@ -122,11 +122,17 @@ def test_two_blocks_cannot_claim_the_same_fit_column():
 # --------------------------------------------------------------------------
 def test_component_is_exact_and_chieff_is_not():
     """The load-bearing claim: the component basis assumes nothing about the
-    campaign, the projections assume a uniform-isotropic parent."""
+    campaign's magnitudes or tilts, the projections assume a uniform-isotropic
+    parent.  Review 2026-10-20: the component basis does assume uniform
+    AZIMUTHS (a joint-density campaign's 6-D density is reduced to 4-D by
+    dividing them out), which is now declared and evaluated."""
     comp = get_space("component")
     assert comp.is_exact is True
     assert comp.projections == ()
-    assert comp.spin_block.requires_campaign.any_required is False
+    req = comp.spin_block.requires_campaign
+    assert not (req.uniform_magnitude or req.isotropic_tilts
+                or req.single_amax or req.needs_sky_draw)
+    assert req.uniform_azimuth is True
 
     for basis in ("chieff", "chieff_chip"):
         sp = get_space(basis)

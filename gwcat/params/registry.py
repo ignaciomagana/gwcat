@@ -24,6 +24,10 @@ from .blocks import (DISTANCE_DL, MASS_DET_PAIR, SKY_RADEC, SPIN_ALIGNED_Z,
 #: Always present, in this order.
 _CORE: Tuple[ParameterBlock, ...] = (MASS_DET_PAIR, DISTANCE_DL, SKY_RADEC)
 
+class CampaignRequirementError(ValueError):
+    """An injection campaign contradicts a block's declared requirement."""
+
+
 #: Every registered block, by name.
 BLOCKS: Dict[str, ParameterBlock] = {
     b.name: b for b in (MASS_DET_PAIR, DISTANCE_DL, SKY_RADEC, SPIN_NONE,
@@ -145,6 +149,55 @@ class ParameterSpace:
             if bad:
                 out[b.name] = bad
         return out
+
+    def refuse_unmet_requirements(self, campaigns):
+        """Refuse campaigns that contradict a requirement nothing else checks.
+
+        ``campaigns`` is a list of ``(name, campaign_meta)`` (a
+        ``SelectionSet.spin_meta``).  Only ``uniform_azimuth`` is enforced
+        here, for ANY campaign whose azimuth check failed: the 4-D component
+        density every spin basis starts from divides the azimuths out as
+        uniform.  The spin-distribution requirements of a projection are the
+        chi_eff swap check's, with its own strict/warn policy; the sky draw is
+        checked on the exported rows by the 2.1 writer, whose contract
+        declares ra/dec fittable (:meth:`refuse_empty_fit_columns`): a 2.0
+        cumulative mixture keeps its NaN-sky rows, as before.
+        """
+        az = []
+        for name, meta in campaigns:
+            blocks = [b for b, r in self.unmet_requirements(meta).items()
+                      if "uniform_azimuth" in r]
+            if blocks:
+                az.append((name, blocks))
+        if az:
+            raise CampaignRequirementError(
+                f"parameter space {self.name!r}: campaign(s) whose spin "
+                f"azimuths are not uniform, which block(s) "
+                f"{sorted({b for _n, bl in az for b in bl})} assume (the 4-D "
+                f"component density divides them out as uniform): "
+                f"{[n for n, _b in az]}.")
+
+    def refuse_empty_fit_columns(self, columns, *, context="export"):
+        """Refuse a product whose FIT column holds no finite row at all.
+
+        A fit column is one the density covers; one that is NaN in every row
+        (``ra``/``dec`` of a selection whose campaigns drew no sky, written
+        as 2.1 and validated) is not a column a consumer can fit.  A column
+        the product omits (``sky_marginal``) is not checked.
+        """
+        import numpy as np
+
+        empty = [c for c in self.fit_columns if c in columns
+                 and np.size(columns[c])
+                 and not np.isfinite(np.asarray(columns[c], dtype=float)).any()]
+        if empty:
+            raise CampaignRequirementError(
+                f"{context}: fit column(s) {empty} of parameter space "
+                f"{self.name!r} have no finite row"
+                + (" -- no campaign drew a sky position; export with "
+                   "sky_marginal=True (--sky-marginal)"
+                   if {"ra", "dec"} & set(empty) else "")
+                + ".")
 
     def describe(self) -> dict:
         return {

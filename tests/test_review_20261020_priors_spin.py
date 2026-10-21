@@ -344,3 +344,92 @@ def test_json_map_with_a_duplicated_event_is_refused(tmp_path):
                  % (E1, NR, E1, XP))
     with pytest.raises(SampleSetMapError, match="duplicate key"):
         load_sample_set_map(str(p))
+
+
+# ==========================================================================
+# Registry: campaign requirements are evaluated, not only declared
+# ==========================================================================
+def _o4_with_azimuth(tmp_path, uniform):
+    from test_selection_spin import write_o4_full
+    path = write_o4_full(tmp_path / ("o4_uni.hdf" if uniform else "o4_az.hdf"),
+                         400, seed=3)
+    if not uniform:
+        with h5py.File(path, "r+") as f:
+            ph = f["events/spin1_azimuthal_angle"][()]
+            # a normalised but NON-uniform azimuth density, 1 + 0.5 cos(phi)
+            f["events/lnpdraw_spin1_azimuthal_angle"][...] = (
+                np.log1p(0.5 * np.cos(ph)) - np.log(2 * np.pi))
+    return path
+
+
+def test_component_selection_refuses_non_uniform_azimuths(tmp_path):
+    """spin.component_polar was declared 'exact for any campaign' while the
+    4-D density divides the azimuths out as uniform, which nothing checked."""
+    from gwcat.export import build_selection_product
+    from gwcat.params.registry import CampaignRequirementError
+    from gwcat.selection import SelectionSet
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        build_selection_product(SelectionSet(_o4_with_azimuth(tmp_path, True)),
+                                spin_basis="component")
+        with pytest.raises(CampaignRequirementError, match="azimuths"):
+            build_selection_product(
+                SelectionSet(_o4_with_azimuth(tmp_path, False)),
+                spin_basis="component")
+
+
+def test_21_selection_with_no_sky_in_any_row_is_refused(tmp_path):
+    """Review scenario: a 2.1 selection was written and validated with ra/dec
+    as fit columns and every row NaN."""
+    from gwcat.params.registry import CampaignRequirementError
+    from gwcat.selection import SelectionSet
+    from test_selection_cumulative_mixture import (_ANCHORS,
+                                                   write_cumulative_mixture)
+    path, _, _ = write_cumulative_mixture(tmp_path / "mix.hdf")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pytest.raises(CampaignRequirementError, match="no finite row"):
+            SelectionSet(path).export(str(tmp_path / "x21.h5"),
+                                      format="gwcat2.1",
+                                      spin_basis="component",
+                                      snr_threshold=10.0,
+                                      mixture_anchors=_ANCHORS)
+        # 2.0 keeps writing the NaN-sky rows, as before (GW-39).
+        SelectionSet(path).export(str(tmp_path / "x20.h5"), format="gwcat2",
+                                  spin_basis="component", snr_threshold=10.0,
+                                  mixture_anchors=_ANCHORS)
+
+
+# ==========================================================================
+# Spin blocks: the declared PE densities are the builders' densities
+# ==========================================================================
+def _ctx(amax_1, amax_2, m1, m2, name="GWx"):
+    from gwcat.params import PEContext
+    return PEContext(event_name=name, m1src=m1, m2src=m2, amax_1=amax_1,
+                     amax_2=amax_2)
+
+
+def test_chieff_block_density_uses_both_ceilings_and_the_support():
+    from gwcat.params import BLOCKS
+    from gwcat.spin import chi_eff_prior_logprob_in_support
+    chi = np.array([0.1, 0.3, 0.7])
+    m1, m2 = np.array([30.0] * 3), np.array([20.0] * 3)
+    got = BLOCKS["spin.chieff"].ln_prior_pe({"chieff": chi},
+                                            _ctx(0.99, 0.05, m1, m2))
+    want, _ = chi_eff_prior_logprob_in_support(chi, m1, m2, amax=0.99,
+                                               amax_2=0.05)
+    np.testing.assert_array_equal(got, want)
+    assert got[2] == -np.inf               # past (30*.99 + 20*.05)/50 = 0.614
+    # and the reference block's PE half is the same density
+    np.testing.assert_array_equal(
+        BLOCKS["spin.chieff_reference"].ln_prior_pe(
+            {"chieff": chi}, _ctx(0.99, 0.05, m1, m2)), want)
+
+
+def test_chieff_chip_block_refuses_two_ceilings():
+    from gwcat.params import BLOCKS
+    m1, m2 = np.array([30.0]), np.array([20.0])
+    with pytest.raises(ValueError, match="one shared ceiling"):
+        BLOCKS["spin.chieff_chip"].ln_prior_pe(
+            {"chieff": np.array([0.1]), "chip": np.array([0.3])},
+            _ctx(0.99, 0.05, m1, m2))
