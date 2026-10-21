@@ -542,3 +542,37 @@ def test_config_ceilings_of_the_same_variant_are_still_used():
     assert (sp.amax_1, sp.amax_2) == (0.99, 0.99)
     assert sp.source_kind == "config_file_declared"
     assert sp.source_label == "C01:IMRPhenomXPHM,C01:SEOBNRv4PHM"
+
+
+# ==========================================================================
+# medium-47: `gwcat ingest --inspect` ignored the prior-changing flags
+# ==========================================================================
+def test_cli_inspect_uses_the_build_flags(tmp_path, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(ing, "inspect",
+                        lambda path, cfg=None: seen.setdefault("cfg", cfg))
+    tab = tmp_path / "table.yaml"
+    ing._cli(["--inspect", str(tmp_path / "x.h5"),
+              "--release-reweight-cosmology-table", str(tab),
+              "--legacy-grid-priors", "--constituent-mixture-prior"],
+             _deprecated=False)
+    cfg = seen["cfg"]
+    assert cfg is not None
+    assert cfg.release_reweight_cosmology_table == str(tab)
+    assert cfg.dL_prior_impl == "auto"
+    assert cfg.constituent_mixture_prior is True
+
+
+def test_inspect_reports_the_constituent_mixture(tmp_path, monkeypatch,
+                                                 capsys):
+    data, sd, priors = _gw230702_like()
+    monkeypatch.setattr(ing, "_read_event_pesummary",
+                        lambda path: (data, sd, list(sd), priors))
+    path = tmp_path / O4_NAME
+    path.write_bytes(b"")
+    info = ing.inspect(str(path), ing.IngestConfig(
+        constituent_mixture_prior=True, **_CFG))
+    assert info["constituent_mixture"]["labels"] == [XP, NR, SE]
+    assert info["mixed_constituents"]["priors"] == (
+        "differ:mass_ratio,total_mass")
+    assert info["ingest_config"]["dL_prior_impl"] == "astropy"

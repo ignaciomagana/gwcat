@@ -2070,6 +2070,27 @@ def inspect(path: str, cfg: Optional[IngestConfig] = None):
     spin_amax_1, spin_amax_2, spin_kind, spin_src = (sp.amax_1, sp.amax_2,
                                                      sp.kind, sp.source)
     mass_prior = resolve_mass_prior(analysis, analyses, priors)
+    constituents = combined_constituents(data, analysis, analyses)
+    mixed_priors = (compare_constituent_priors(analysis, constituents, priors)
+                    if constituents or _label_parts(analysis)[1] == "Mixed"
+                    else "")
+    cmix_info = None
+    if (cfg.constituent_mixture_prior and _label_parts(analysis)[0] == "C00"
+            and _label_parts(analysis)[1] == "Mixed"):
+        # What the build would do with --constituent-mixture-prior: the
+        # verified constituents, or why the row would be refused.
+        from .constituent_mixture import ConstituentMixtureError
+        try:
+            cm = _constituent_mixture_prior(catalog, analysis, analyses,
+                                            samples_dict, priors, cfg, flavour)
+            cmix_info = {"labels": cm["labels"],
+                         "counts": [int(cm["counts"][lab])
+                                    for lab in cm["labels"]],
+                         "dL_prior_kind": cm["dl_kind"],
+                         "dmin": cm["dmin"], "dmax": cm["dmax"],
+                         "q_min": cm["q_min"], "q_max": cm["q_max"]}
+        except ConstituentMixtureError as e:
+            cmix_info = {"refused": str(e)}
     avail = [p for p in DEFAULT_PARAMS if p in s]
     missing = [p for p in WAVEFORM_PARAMS if p not in s]
     info = {
@@ -2116,6 +2137,17 @@ def inspect(path: str, cfg: Optional[IngestConfig] = None):
                        "chirp_min": mass_prior.chirp_min,
                        "chirp_max": mass_prior.chirp_max,
                        "q_min": mass_prior.q_min, "q_max": mass_prior.q_max},
+        # Combined-set constituents and whether their priors agree, and the
+        # constituent-mixture result when that option is on (review
+        # 2026-10-20, critical-1 / medium-47).
+        "mixed_constituents": {"labels": constituents,
+                               "priors": mixed_priors},
+        "constituent_mixture": cmix_info,
+        "ingest_config": {
+            "dL_prior_impl": cfg.dL_prior_impl,
+            "release_reweight_cosmology_table":
+                cfg.release_reweight_cosmology_table,
+            "constituent_mixture_prior": cfg.constituent_mixture_prior},
         "prior_validation": val,
         "waveform_params_missing": missing,
         "stored_params_available": avail,
@@ -3754,8 +3786,19 @@ def _cli(
                          "its resolved spin prior declares. Default: warn and "
                          "record spin_sample_max_1/2.")
     a = ap.parse_args(argv)
+    # The config is built BEFORE --inspect, so the smoke test reports the
+    # prior the build will use (review 2026-10-20, medium-47): inspect used
+    # to run on the defaults whatever --release-reweight-cosmology-table,
+    # --legacy-grid-priors or --constituent-mixture-prior said.
+    cfg = IngestConfig(
+        release_reweight_cosmology_table=a.release_reweight_cosmology_table,
+        constituent_mixture_prior=a.constituent_mixture_prior,
+        dL_prior_impl="auto" if a.legacy_grid_priors else "exact",
+        mixed_prior_mismatch=("raise" if a.refuse_mixed_prior_mismatch
+                              else "warn"),
+        spin_exceeds_amax=("raise" if a.refuse_spin_above_amax else "warn"))
     if a.inspect:
-        inspect(a.inspect)
+        inspect(a.inspect, cfg)
         return
     paths, seen = [], set()
     for g in a.glob:
@@ -3782,13 +3825,6 @@ def _cli(
     offline = True if a.offline else None
     write_summary = default_write_summary and not a.no_summary
 
-    cfg = IngestConfig(
-        release_reweight_cosmology_table=a.release_reweight_cosmology_table,
-        constituent_mixture_prior=a.constituent_mixture_prior,
-        dL_prior_impl="auto" if a.legacy_grid_priors else "exact",
-        mixed_prior_mismatch=("raise" if a.refuse_mixed_prior_mismatch
-                              else "warn"),
-        spin_exceeds_amax=("raise" if a.refuse_spin_above_amax else "warn"))
     build_store(paths, a.out, event_table=event_table, sample_sets=sample_sets,
                 cache_dir=a.cache_dir, offline=offline, cfg=cfg,
                 file_provenance=file_provenance, write_summary=write_summary)
