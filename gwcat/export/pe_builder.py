@@ -622,6 +622,9 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     #: The store rows behind each kept event's nsamp exported rows (the ESS
     #: over distinct samples needs to know which rows repeat).
     drawn_rows = []
+    #: Samples each kept event's draw chose from (after z_max and the spin
+    #: cut) -- the pool size a reproduction of the draw needs.
+    n_kept_pool = []
 
     # ── Per-event spin-prior ceiling scaffolding (every spin basis) ─────────
     # Per-event spin amax from the store meta (aligned with selected events).
@@ -855,6 +858,8 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             # factor -- the very diagnostic that should flag it as unusable.
             n_unique_per_event.append(int(np.unique(idx_orig).size))
             drawn_rows.append(idx_orig)
+            # The pool the draw chose from, after every cut (review Low 2).
+            n_kept_pool.append(int(n_kept))
             if rep and n_kept < nsamp:
                 upsampled_events.append(str(sub.event_names[e]))
 
@@ -1537,6 +1542,13 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                                                  dtype=np.int64),
         "resampled_with_replacement": bool(upsampled_events),
         "n_events_resampled_with_replacement": int(len(upsampled_events)),
+        # ── How the rows were drawn (review Low 2) ───────────────────────────
+        # A seed-1 rebuild used to carry the same provenance as the seed-0
+        # file; the seed lived only in the build script.
+        "resample_seed": _seed_attr(seed),
+        "resample_replace_policy": str(replace),
+        "resample_rng_scheme": RESAMPLE_RNG_SCHEME,
+        "n_kept_samples_per_event": np.asarray(n_kept_pool, dtype=np.int64),
         "sample_set_name_per_event": np.array(
             [str(x) for x in kept_ss_name], dtype=_str),
         "sample_set_approximant_per_event": np.array(
@@ -1690,6 +1702,9 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         "n_unique_samples_per_event": [int(x) for x in n_unique_per_event],
         "resampled_with_replacement": bool(upsampled_events),
         "n_events_resampled_with_replacement": int(len(upsampled_events)),
+        "resample_seed": _seed_attr(seed),
+        "resample_replace_policy": str(replace),
+        "n_kept_samples_per_event": [int(x) for x in n_kept_pool],
         "n_samples_out_of_support": int(n_out),
         "frac_samples_out_of_support": float(frac_out),
         "prior_reweight_ess_min": (float(np.min(ess_per_event))
@@ -1721,6 +1736,25 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
 
     return ExportProduct(kind="pe", columns=columns, attrs=attrs,
                          spin_basis=spin_basis, summary=summary)
+
+
+#: How the exported rows are drawn, recorded on every PE file (review Low 2):
+#: with the seed, the replace policy and the per-event pool sizes, enough to
+#: reproduce the draw from the store.
+RESAMPLE_RNG_SCHEME = (
+    "numpy.random.default_rng(resample_seed), ONE stream for the whole "
+    "export: rng.choice(n_kept, nsamp, replace) once per exported event, in "
+    "selection order, over that event's samples left after z_max and the spin "
+    "cut (n_kept_samples_per_event); events skipped before the draw consume "
+    "no random state")
+
+
+def _seed_attr(seed):
+    """The seed as an HDF5-storable attr: the integer itself, else its repr
+    (``"None"`` = OS entropy, not reproducible)."""
+    if isinstance(seed, (int, np.integer)) and not isinstance(seed, bool):
+        return int(seed)
+    return repr(seed)
 
 
 #: The one resolver whose output is the bundled GWTC-5 BBH population.

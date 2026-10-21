@@ -320,3 +320,38 @@ def test_an_event_wholly_above_z_max_is_named_and_recorded(tmp_path):
                             nsamp=32, seed=0, cosmology=_COSMO)
     _cols, a2 = _read(out2)
     assert len(a2["events_dropped_by_z_max"]) == 0
+
+
+# ==========================================================================
+# The draw is reproducible from the file's own record (review Low 2)
+# ==========================================================================
+def test_the_file_records_enough_to_reproduce_its_draw(tmp_path):
+    """A seed-1 rebuild had the same provenance as the seed-0 file apart from
+    the ESS; the seed, replace policy and pool sizes were nowhere."""
+    events = [{"name": "GWd_000001", "n": 150}, {"name": "GWd_000002", "n": 40}]
+    store, raw = _build_spin_store(tmp_path, events, name="draw.h5")
+    attrs_by_seed = {}
+    for seed in (0, 1):
+        out = tmp_path / f"pe_{seed}.h5"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            GWCatalog(store).export(str(out), format="gwcat2",
+                                    spin_basis="chieff", nsamp=64, seed=seed,
+                                    cosmology=_COSMO)
+        attrs_by_seed[seed] = _read(out)
+    cols, attrs = attrs_by_seed[1]
+    assert int(attrs["resample_seed"]) == 1
+    assert int(attrs_by_seed[0][1]["resample_seed"]) == 0
+    pol = attrs["resample_replace_policy"]
+    assert (pol.decode() if isinstance(pol, bytes) else pol) == "auto"
+    assert "default_rng" in str(attrs["resample_rng_scheme"])
+    n_kept = [int(x) for x in attrs["n_kept_samples_per_event"]]
+    assert n_kept == [150, 40]
+
+    # Reproduce the draw from the record alone.
+    nsamp = int(attrs["nsamp"])
+    rng = np.random.default_rng(int(attrs["resample_seed"]))
+    for i, name in enumerate(_names(attrs["event_names"])):
+        idx = rng.choice(n_kept[i], size=nsamp, replace=n_kept[i] < nsamp)
+        np.testing.assert_array_equal(cols["m1det"][i * nsamp:(i + 1) * nsamp],
+                                      raw[name]["mass_1"][idx])
