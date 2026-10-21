@@ -303,3 +303,127 @@ def test_v1_exporter_refuses_a_mixture_row(tmp_path, monkeypatch):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             GWCatalog(store).to_darksirens(str(tmp_path / "v1.h5"), nsamp=16)
+
+
+# --------------------------------------------------------------------------
+# Review 2026-10-20: every Constraint enters the support (NRSur7dq4 total mass)
+# --------------------------------------------------------------------------
+#: GW230708_053705's own C00:NRSur7dq4 group: 20.18 <= Mc <= 46.55,
+#: q >= 1/6, 1 <= m_i <= 1000 and Constraint(60 <= total_mass <= 400).
+_NR_MC = (20.181598915151937, 46.54562366822528)
+_NR_TOTAL_MASS = "Constraint(minimum=60, maximum=400, name='total_mass')"
+
+
+def _area_reference(mc_min, mc_max, q_min, q_max, m_min, m_max, mt_min,
+                    mt_max):
+    """The support's (m1, m2) area by an independent route: for each m1, the
+    m2 interval cut by every bound (Mc is monotone in m2), integrated over m1
+    with adaptive quadrature."""
+    from scipy.integrate import quad
+    from scipy.optimize import brentq
+
+    def mc(m1, m2):
+        return (m1 * m2) ** 0.6 / (m1 + m2) ** 0.2
+
+    def m2_at(m1, target):
+        return brentq(lambda m2: mc(m1, m2) - target, 1e-12, 1e6,
+                      xtol=1e-14, rtol=1e-15)
+
+    def length(m1):
+        lo = max(q_min * m1, m_min, mt_min - m1, m2_at(m1, mc_min))
+        hi = min(q_max * m1, m_max, mt_max - m1, m2_at(m1, mc_max))
+        return max(hi - lo, 0.0)
+
+    val, _err = quad(length, m_min, min(m_max, mt_max), limit=2000,
+                     epsabs=0.0, epsrel=1e-11)
+    return val
+
+
+def test_total_mass_constraint_enters_the_normalisation():
+    """The NRSur7dq4 Mtot cut binds: without it Z is ~1.076x too large for
+    GW230708 (bilby's own normalisation), with it Z is the true area."""
+    b = dict(mc_min=_NR_MC[0], mc_max=_NR_MC[1], q_min=QNR, q_max=1.0,
+             m1_min=1.0, m1_max=1000.0, m2_min=1.0, m2_max=1000.0)
+    Z_cut = uic_normalisation(**b, mt_min=60.0, mt_max=400.0)
+    ref = _area_reference(_NR_MC[0], _NR_MC[1], QNR, 1.0, 1.0, 1000.0, 60.0,
+                          400.0)
+    assert Z_cut == pytest.approx(ref, rel=1e-8)
+    Z_uncut = uic_normalisation(**b)
+    assert Z_uncut / Z_cut == pytest.approx(1.076, abs=1e-3)
+    # and the density is exactly zero below the cut, m1/Z above it
+    m1 = np.array([40.0, 40.0])
+    q = np.array([0.45, 0.55])            # Mtot 58 and 62
+    d = uic_density_m1q(m1, q, Z=Z_cut, **b, mt_min=60.0, mt_max=400.0)
+    assert d[0] == 0.0 and d[1] == pytest.approx(40.0 / Z_cut, rel=1e-15)
+
+
+def _ingest_with(tmp_path, monkeypatch, nr, xp, nr_analytic, xp_analytic,
+                 cfg_kw=None):
+    import gwcat.ingest as ing
+    mixed = _concat(nr, xp)
+    analyses = {XP: xp, MX: mixed, NR: nr}
+    priors = {"analytic": {NR: nr_analytic, XP: xp_analytic}}
+
+    class _D:
+        config = {}
+    monkeypatch.setattr(ing, "_read_event_pesummary",
+                        lambda path: (_D(), analyses, list(analyses), priors))
+    raw = tmp_path / _NAME
+    raw.write_bytes(b"")
+    out = tmp_path / "store_cut.h5"
+    build_store([str(raw)], str(out), event_table={},
+                cfg=IngestConfig(validate_prior=False,
+                                 constituent_mixture_prior=True,
+                                 dL_prior_impl="astropy", **(cfg_kw or {})))
+    return str(out), analyses
+
+
+def _nr_xp_samples_around_the_cut(n=200):
+    rng = np.random.default_rng(11)
+    # NRSur rows obey their own prior: q >= 1/6 and Mtot >= 60.
+    nr = _constituent_samples(rng, QNR, n)
+    nr["mass_1"] = rng.uniform(52.0, 60.0, n)
+    nr["mass_2"] = rng.uniform(max(QNR, 0.2), 1.0, n) * nr["mass_1"]
+    xp = _constituent_samples(rng, QXP, n)
+    return nr, xp
+
+
+def test_mixture_ingest_applies_the_nrsur_total_mass_cut(tmp_path,
+                                                          monkeypatch):
+    """Failure scenario of the review: Mixed rows from the other constituent
+    with Mtot < 60 must get NO NRSur7dq4 density, and Z_NRSur must be the
+    cut area."""
+    nr, xp = _nr_xp_samples_around_the_cut()
+    nr_an = dict(_analytic(QNR), total_mass=_NR_TOTAL_MASS)
+    store, an = _ingest_with(tmp_path, monkeypatch, nr, xp, nr_an,
+                             _analytic(QXP))
+    with h5py.File(store, "r") as f:
+        pmd = f["samples/p_mass_dL_pe"][:]
+    mixed = an[MX]
+    m1 = mixed["mass_1"]
+    q = mixed["mass_2"] / m1
+    mtot = m1 * (1.0 + q)
+    bx, bn = _bounds(QXP), _bounds(QNR)
+    Zx = uic_normalisation(**bx)
+    pd = truncated_dL_density("UniformSourceFrame", LAL_PLANCK15, 100.0,
+                              6000.0, impl="astropy")
+    # Inside NRSur's (Mc, q) bounds but below its Mtot cut: XPHM-ST alone.
+    low = (mtot < 60.0) & (q >= QNR)
+    assert low.sum() > 5
+    np.testing.assert_allclose(
+        pmd[low], 0.5 * m1[low] / Zx * pd(mixed["luminosity_distance"][low]),
+        rtol=1e-10)
+    Zn = uic_normalisation(**bn, mt_min=60.0, mt_max=400.0)
+    expected = 0.5 * (
+        uic_density_m1q(m1, q, Z=Zn, **bn, mt_min=60.0, mt_max=400.0)
+        + uic_density_m1q(m1, q, Z=Zx, **bx)) * pd(mixed["luminosity_distance"])
+    np.testing.assert_allclose(pmd, expected, rtol=1e-10)
+
+
+def test_a_constraint_the_support_does_not_implement_is_refused(tmp_path,
+                                                                 monkeypatch):
+    nr, xp = _nr_xp_samples_around_the_cut()
+    nr_an = dict(_analytic(QNR), comoving_distance=(
+        "Constraint(minimum=10, maximum=5000, name='comoving_distance')"))
+    with pytest.raises(ConstituentMixtureError, match="does not implement"):
+        _ingest_with(tmp_path, monkeypatch, nr, xp, nr_an, _analytic(QXP))

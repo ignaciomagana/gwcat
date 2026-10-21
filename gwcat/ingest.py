@@ -1788,6 +1788,7 @@ def _constituent_mixture_prior(catalog, analysis, analyses, samples_dict,
     refused (:class:`~gwcat.constituent_mixture.ConstituentMixtureError`).
     """
     from .constituent_mixture import (ConstituentMixtureError,
+                                      mass_constraint_bounds,
                                       match_constituent_rows,
                                       mixture_prior_densities,
                                       truncated_dL_density, uic_normalisation)
@@ -1820,12 +1821,20 @@ def _constituent_mixture_prior(catalog, analysis, analyses, samples_dict,
                 or sp.source_kind != "own_analytic"):
             bad.append(f"{lab}: spin prior {sp.kind}/{sp.source_kind}")
             continue
+        # EVERY Constraint of the constituent's own group (total_mass
+        # included); one the support does not implement is refused.
+        try:
+            cons = mass_constraint_bounds(
+                (priors.get("analytic") or {}).get(lab) or {},
+                _parse_analytic_spin)
+        except ConstituentMixtureError as exc:
+            bad.append(f"{lab}: {exc}")
+            continue
         amaxes.add((sp.amax_1, sp.amax_2))
         cosmos.add((rd.H0, rd.Om0, rd.cosmology_name))
         dl_kinds.add(rd.kind)
         bounds = dict(mc_min=mp.chirp_min, mc_max=mp.chirp_max,
-                      q_min=mp.q_min, q_max=mp.q_max, m1_min=mp.m1_min,
-                      m1_max=mp.m1_max, m2_min=mp.m2_min, m2_max=mp.m2_max)
+                      q_min=mp.q_min, q_max=mp.q_max, **cons)
         comps.append(dict(
             bounds, label=lab, Z=uic_normalisation(**bounds),
             dmin=rd.dmin, dmax=rd.dmax, dl_kind=rd.kind,
