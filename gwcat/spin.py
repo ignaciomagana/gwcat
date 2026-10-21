@@ -424,13 +424,34 @@ _CACHE = {}
 AMAX_AUTO = "auto"
 
 
+def check_amax_value(amax, *, what="amax") -> float:
+    """``amax`` as a float, refused unless it is a spin ceiling: ``0 < a <= 1``.
+
+    A NaN ceiling matched no event in the builders' float-equality grouping,
+    so ``p_pe`` came out multiplied by uninitialised memory and still
+    validated; ``1.7``, ``inf`` or a negative value is no spin magnitude
+    either (review 2026-10-20).
+    """
+    try:
+        a = float(amax)
+    except (TypeError, ValueError):
+        raise ValueError(f"{what}={amax!r}: a spin ceiling must be a number "
+                         f"in (0, 1].") from None
+    if not (np.isfinite(a) and 0.0 < a <= 1.0):
+        raise ValueError(
+            f"{what}={amax!r}: a spin ceiling must be finite and in (0, 1] "
+            f"(a dimensionless spin magnitude); got {a!r}.")
+    return a
+
+
 def parse_amax_option(amax, *, what="amax"):
     """Normalise an ``amax`` argument to ``None`` (auto) or a float.
 
     ``"auto"`` (the default of both v2 builders) means *resolve the ceiling from
     each proposal's own provenance* and returns ``None``; anything numeric
     (including a numeric string, so a CLI can pass either) forces that one
-    ceiling on every event / campaign and returns the float.
+    ceiling on every event / campaign and returns the float, which must be a
+    spin ceiling (:func:`check_amax_value`).
     """
     if amax is None:
         return None
@@ -438,12 +459,13 @@ def parse_amax_option(amax, *, what="amax"):
         if amax.strip().lower() == AMAX_AUTO:
             return None
         try:
-            return float(amax)
+            value = float(amax)
         except ValueError:
             raise ValueError(
                 f"{what}={amax!r}: expected {AMAX_AUTO!r} (resolve each "
                 f"proposal's own ceiling) or a number (force one ceiling).")
-    return float(amax)
+        return check_amax_value(value, what=what)
+    return check_amax_value(amax, what=what)
 
 
 def get_chi_eff_prior(amax=0.99, amax_2=None, impl=None):

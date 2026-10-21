@@ -230,3 +230,30 @@ def test_grid_density_past_the_true_edge_is_masked():
     lp_x, sup_x = chi_eff_prior_logprob_in_support(chi, m1, m2, amax=0.99,
                                                    amax_2=0.05, impl="exact")
     assert not sup_x.any()
+
+
+# ==========================================================================
+# Spin ceilings must be spin ceilings
+# ==========================================================================
+@pytest.mark.parametrize("bad", ["nan", float("nan"), "inf", -0.1, 0.0, 1.7])
+def test_parse_amax_option_refuses_non_ceilings(bad):
+    from gwcat.spin import parse_amax_option
+    with pytest.raises(ValueError, match="spin ceiling"):
+        parse_amax_option(bad)
+
+
+@pytest.mark.parametrize("good,want", [("auto", None), (None, None),
+                                       ("0.99", 0.99), (1.0, 1.0)])
+def test_parse_amax_option_accepts_ceilings(good, want):
+    from gwcat.spin import parse_amax_option
+    assert parse_amax_option(good) == want
+
+
+def test_nan_amax_export_is_refused(tmp_path):
+    """Review scenario: --amax nan wrote p_pe times leftover memory, and the
+    file validated."""
+    store = _two_event_store(tmp_path)
+    with pytest.raises(ValueError, match="spin ceiling"):
+        _export(store, tmp_path / "pe.h5", amax="nan")
+    with pytest.raises(ValueError, match="amax_fallback"):
+        _export(store, tmp_path / "pe2.h5", amax_fallback=float("nan"))

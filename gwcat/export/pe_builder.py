@@ -95,7 +95,7 @@ from ..params import (DEFAULT_PARAMETER_SPACE, PEContext,
                       block_prior_factor_pe, get_space)
 from ..params.blocks.mass import UNSTATED_MASS_PRIOR, classify_mass_prior
 from ..source_class import CUT_ESTIMATOR_ATTR, PE_MEDIAN_CUT_WARNING
-from ..spin import AMAX_AUTO, parse_amax_option
+from ..spin import AMAX_AUTO, check_amax_value, parse_amax_option
 from .contract import event_list_digest, mixed_prior_impl_events
 from .product import ExportProduct, resolve_mock_data
 
@@ -358,6 +358,9 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     # chi_eff density depends on that ceiling in a chi_eff-DEPENDENT way, so the
     # error does not cancel in any per-event normalisation.
     forced_amax = parse_amax_option(amax, what="amax")
+    # The fallback is substituted for a missing stored ceiling, so it must be a
+    # ceiling too (a NaN one matched no row of the chieff grouping below).
+    amax_fallback = check_amax_value(amax_fallback, what="amax_fallback")
     # Every basis that divides out a SPIN prior needs a ceiling; nospin does not.
     need_amax = need_extras or spin_basis == "chieff"
     if drop_spin_above_ceiling and not need_amax:
@@ -1717,17 +1720,24 @@ def _apply_chieff_basis(data, amax1_ps, amax2_ps):
     in_support = np.ones(p_pe.shape, dtype=bool)
     if data["chieff"].size > 0:
         from ..spin import chi_eff_prior_logprob_in_support
-        logp_chi = np.empty(p_pe.shape, dtype=float)
-        pairs = np.unique(np.stack([np.asarray(amax1_ps, dtype=float),
-                                    np.asarray(amax2_ps, dtype=float)],
-                                   axis=1), axis=0)
-        for a1, a2 in pairs:
-            m = (amax1_ps == a1) & (amax2_ps == a2)
+        # NaN-initialised and grouped by np.unique's inverse index, not by
+        # float equality: a NaN ceiling matched no group and left np.empty's
+        # leftover memory in p_pe (review 2026-10-20).
+        logp_chi = np.full(p_pe.shape, np.nan, dtype=float)
+        pairs, which = np.unique(np.stack([np.asarray(amax1_ps, dtype=float),
+                                           np.asarray(amax2_ps, dtype=float)],
+                                          axis=1), axis=0, return_inverse=True)
+        which = np.asarray(which).reshape(-1)
+        for k, (a1, a2) in enumerate(pairs):
+            m = which == k
             lp, sup = chi_eff_prior_logprob_in_support(
                 data["chieff"][m], data["m1src"][m], data["m2src"][m],
                 amax=float(a1), amax_2=float(a2))
             logp_chi[m] = lp
             in_support[m] = sup
+        if np.isnan(logp_chi).any():
+            raise RuntimeError("internal error: a chieff row was assigned no "
+                               "chi_eff prior ceiling.")
         with np.errstate(over="ignore"):
             p_pe = p_pe * np.exp(logp_chi)
         p_pe = np.where(in_support, p_pe, 0.0)
@@ -1842,14 +1852,20 @@ def _apply_chieff_chip_basis(data, amax1_ps, chip, extras):
     in_support = np.ones(p_pe.shape, dtype=bool)
     if p_pe.size > 0:
         from ..spin import chi_eff_chi_p_prior_logprob_in_support
-        logp = np.empty(p_pe.shape, dtype=float)
-        for a in np.unique(amax1_ps):
-            m = amax1_ps == a
+        logp = np.full(p_pe.shape, np.nan, dtype=float)
+        uniq, which = np.unique(np.asarray(amax1_ps, dtype=float),
+                                return_inverse=True)
+        which = np.asarray(which).reshape(-1)
+        for k, a in enumerate(uniq):
+            m = which == k
             lp, sup = chi_eff_chi_p_prior_logprob_in_support(
                 data["chieff"][m], chip[m], data["m1src"][m], data["m2src"][m],
                 amax=float(a))
             logp[m] = lp
             in_support[m] = sup
+        if np.isnan(logp).any():
+            raise RuntimeError("internal error: a chieff_chip row was "
+                               "assigned no spin prior ceiling.")
         with np.errstate(over="ignore"):
             p_pe = p_pe * np.exp(logp)
         p_pe = np.where(in_support, p_pe, 0.0)
