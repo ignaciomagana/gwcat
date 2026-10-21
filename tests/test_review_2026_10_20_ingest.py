@@ -576,3 +576,52 @@ def test_inspect_reports_the_constituent_mixture(tmp_path, monkeypatch,
     assert info["mixed_constituents"]["priors"] == (
         "differ:mass_ratio,total_mass")
     assert info["ingest_config"]["dL_prior_impl"] == "astropy"
+
+
+# ==========================================================================
+# medium-48: the prior-sample bounds and KS checks against sampling noise
+# ==========================================================================
+_PL2 = ("PowerLaw(alpha=2, minimum=10, maximum=10000, "
+        "name='luminosity_distance', latex_label='$d_L$', unit='Mpc', "
+        "boundary=None)")
+_O4_PL = "IGWN-GWTC4p1-18965dda8_5-GW950101_000001-combined_PEDataRelease.hdf5"
+
+
+def _pl2_draws(rng, n, lo=10.0, hi=10000.0):
+    u = rng.uniform(0.0, 1.0, n)
+    return (lo ** 3 + u * (hi ** 3 - lo ** 3)) ** (1.0 / 3.0)
+
+
+def _prior_sample_file(n_prior, seed, hi=10000.0):
+    rng = np.random.default_rng(seed)
+    sd = {XP: _samples(rng, 100)}
+    priors = {"analytic": {XP: dict(_analytic(), luminosity_distance=_PL2)},
+              "samples": {XP: {"luminosity_distance":
+                               _pl2_draws(rng, n_prior, hi=hi)}}}
+    return _Data(sd), sd, priors
+
+
+@pytest.mark.parametrize("n_prior, seed", [(50, 11), (200, 12), (5000, 13)])
+def test_correct_prior_draws_pass_the_audited_gates(tmp_path, monkeypatch,
+                                                    n_prior, seed):
+    cfg = ing.IngestConfig(validate_prior=True, prior_ks_fatal=True,
+                           dL_prior_impl="astropy")
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", message=".*describe different ranges")
+        store = _ingest(tmp_path, monkeypatch,
+                        {_O4_PL: _prior_sample_file(n_prior, seed)}, cfg=cfg)
+    assert float(_meta(store, "dL_prior_n_prior_samples")) == n_prior
+    assert float(_meta(store, "dL_prior_frac_samples_outside")) == 0.0
+    assert 0.0 < float(_meta(store, "dL_prior_frac_mass_uncovered")) < 0.2
+    assert float(_meta(store, "dL_prior_bounds_pvalue")) > 1e-3
+    assert float(_meta(store, "dL_prior_ks")) <= float(
+        _meta(store, "dL_prior_ks_threshold"))
+
+
+def test_a_genuine_bounds_mismatch_still_warns(tmp_path, monkeypatch):
+    cfg = ing.IngestConfig(validate_prior=True, dL_prior_impl="astropy")
+    with pytest.warns(UserWarning, match="describe different ranges"):
+        store = _ingest(tmp_path, monkeypatch,
+                        {_O4_PL: _prior_sample_file(5000, 14, hi=5000.0)},
+                        cfg=cfg)
+    assert float(_meta(store, "dL_prior_bounds_pvalue")) < 1e-3

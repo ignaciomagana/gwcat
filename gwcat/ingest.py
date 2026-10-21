@@ -226,6 +226,15 @@ META_STR_FIELDS += ["mixed_constituent_labels", "mixed_constituent_priors"]
 # sample above the resolved ceiling is a number on the row, not only a
 # substring of spin_prior_source (review 2026-10-20, high-2).
 META_FLOAT_FIELDS += ["spin_sample_max_1", "spin_sample_max_2"]
+# The prior-sample checks of the distance prior, as numbers (review
+# 2026-10-20, medium-48): the KS threshold applied (scaled with N), the
+# number of prior samples, the declared prior's mass beyond their range and
+# its p-value for correct draws, and the fraction of samples outside the
+# declared bounds.  NaN when the file carries no prior samples.
+META_FLOAT_FIELDS += ["dL_prior_ks_threshold", "dL_prior_n_prior_samples",
+                      "dL_prior_frac_mass_uncovered",
+                      "dL_prior_frac_samples_outside",
+                      "dL_prior_bounds_pvalue"]
 META_STR_FIELDS += ["spin_sample_max_per_constituent"]
 
 # Default waveform priority when no Mixed set exists (O4b/GWTC-5 events).
@@ -279,11 +288,27 @@ class IngestConfig:
     #: KS threshold above which the file's own prior samples are taken to reject
     #: the parsed distance prior (GW-02).  This compares the SAMPLING class the
     #: file declares against its own prior draws, so exceeding it means the parse
-    #: / bounds / cosmology mapping is wrong.
+    #: / bounds mapping is wrong.  It is a FLOOR since the 2026-10-20 review:
+    #: the threshold rises with ``prior_ks_alpha`` for few prior samples.  The
+    #: KS checks the distribution class and bounds; it cannot tell a cosmology
+    #: in the plausible range from another (see ``defaulted_cosmology_fatal``).
     prior_ks_max: float = 0.05
+    #: Significance for the N-scaled KS threshold (review 2026-10-20,
+    #: medium-48): the threshold applied is the larger of ``prior_ks_max`` and
+    #: the Kolmogorov critical value at this significance for the row's number
+    #: of prior samples, so correct parses with few samples are not rejected
+    #: (they were 100% of the time at N = 50 and 57% at N = 200).
+    prior_ks_alpha: float = 1e-3
     #: Make that a hard failure rather than a warning.  Default False so a single
     #: odd release cannot block a 282-file ingest; set True for an audited build.
     prior_ks_fatal: bool = False
+    #: Warn on a prior-sample BOUNDS mismatch when the declared prior's mass
+    #: outside the samples' range is this improbable for correct draws
+    #: (p-value of Beta(2, N-1)), or when any prior sample lies outside the
+    #: declared bounds (``dL_outside_warn_frac``).  The old test compared the
+    #: sum against 0.0, which every correct parse exceeds by ~2/(N+1), so it
+    #: fired on 273 of 282 production rows and buried the real mismatches.
+    prior_bounds_pvalue_min: float = 1e-3
     #: Warn when more than this FRACTION of a row's dL samples fall outside the
     #: recorded distance-prior bounds.  The default warns on any occurrence: the
     #: samples are no longer zeroed (GW-01), but the mismatch means the recorded
@@ -1932,7 +1957,7 @@ def _derive_spin_columns(rec):
 
 
 def _ks_against_prior_samples(dlp, *, kind, cosmo, dmin, dmax, alpha, impl,
-                              return_outside=False):
+                              return_outside=False, return_parts=False):
     """KS distance between prior samples ``dlp`` and one candidate density.
 
     Both CDFs are conditioned on the SAME window (GW-37).  The model CDF was
@@ -1947,16 +1972,26 @@ def _ks_against_prior_samples(dlp, *, kind, cosmo, dmin, dmax, alpha, impl,
     wrong", naming bounds first), so conditioning does not hide it: the fraction
     of prior samples falling OUTSIDE the recorded bounds is returned alongside,
     to be reported as what it is rather than disguised as a failed shape test.
+
+    ``return_parts=True`` returns ``(ks, frac_outside, mass_uncovered,
+    frac_samples_outside)``: the declared prior's mass outside the samples'
+    range, which is about ``2/(N+1)`` for CORRECT draws, and the fraction of
+    samples outside the declared bounds, which is 0 for them (review
+    2026-10-20, medium-48).
     """
     lo = max(dmin, dlp.min())
     hi = min(dmax, dlp.max())
     inside = (dlp >= lo) & (dlp <= hi)
+    nan4 = (float("nan"), 1.0, float("nan"), float("nan"))
     # How much of the DECLARED prior's mass the samples never reach.  Nonzero in
     # BOTH directions of a bounds mismatch -- samples beyond the bounds leave
     # `inside` short, bounds wider than the samples leave model mass uncovered
     # -- which is what makes it a bounds diagnostic rather than half of one.
     frac_outside = float("nan")
+    uncovered, samples_out = float("nan"), float(1.0 - inside.mean())
     if not inside.any() or not np.isfinite(hi - lo) or hi <= lo:
+        if return_parts:
+            return nan4[:3] + (samples_out,)
         return (float("nan"), 1.0) if return_outside else float("nan")
 
     full = np.linspace(dmin, dmax, 2000)
@@ -1968,8 +2003,8 @@ def _ks_against_prior_samples(dlp, *, kind, cosmo, dmin, dmax, alpha, impl,
         covered = (np.interp(hi, full, cdf_full)
                    - np.interp(lo, full, cdf_full)) / cdf_full[-1]
         # Samples outside the bounds count too: both are range disagreements.
-        frac_outside = float(max(0.0, 1.0 - covered)
-                             + (1.0 - inside.mean()))
+        uncovered = float(max(0.0, 1.0 - covered))
+        frac_outside = float(uncovered + samples_out)
 
     grid = np.linspace(lo, hi, 200)
     pdf = dL_prior_prob(grid, kind=kind, cosmology=cosmo, dmin=dmin,
@@ -1977,13 +2012,43 @@ def _ks_against_prior_samples(dlp, *, kind, cosmo, dmin, dmax, alpha, impl,
     cdf_model = np.concatenate(
         [[0], np.cumsum(0.5 * (pdf[1:] + pdf[:-1]) * np.diff(grid))])
     if cdf_model[-1] <= 0:
+        if return_parts:
+            return float("nan"), frac_outside, uncovered, samples_out
         return (float("nan"), frac_outside) if return_outside else float("nan")
     cdf_model = cdf_model / cdf_model[-1]
     # Conditioned on the same window as the model, so the two are comparable.
     dlp_in = np.sort(dlp[inside])
     ecdf = np.searchsorted(dlp_in, grid, side="right") / dlp_in.size
     ks = float(np.max(np.abs(cdf_model - ecdf)))
+    if return_parts:
+        return ks, frac_outside, uncovered, samples_out
     return (ks, frac_outside) if return_outside else ks
+
+
+def _range_uncovered_pvalue(uncovered, n):
+    """P(U >= ``uncovered``) for N draws from the declared prior.
+
+    U is the prior mass outside the draws' range; for N iid draws it is
+    Beta(2, N-1), P(U > u) = (1-u)^(N-1) (1 + (N-1) u).  A small value means
+    the samples do not reach bounds they should reach: a bounds mismatch, not
+    the ~2/(N+1) every correct parse shows (review 2026-10-20, medium-48).
+    """
+    if not (np.isfinite(uncovered) and n and n > 1):
+        return float("nan")
+    u = min(max(float(uncovered), 0.0), 1.0)
+    return float((1.0 - u) ** (n - 1) * (1.0 + (n - 1) * u))
+
+
+def _ks_threshold(n, cfg):
+    """The KS threshold for ``n`` prior samples: ``cfg.prior_ks_max``, raised
+    to the Kolmogorov critical value at ``cfg.prior_ks_alpha`` when that is
+    larger (small N), so a correct parse is not refused for sampling noise
+    (review 2026-10-20, medium-48).  For N above ~1500 at the defaults it is
+    ``prior_ks_max``, as before."""
+    if not n or n < 1 or not (0.0 < cfg.prior_ks_alpha < 1.0):
+        return float(cfg.prior_ks_max)
+    crit = float(np.sqrt(-0.5 * np.log(cfg.prior_ks_alpha / 2.0) / n))
+    return max(float(cfg.prior_ks_max), crit)
 
 
 def validate_prior_against_samples(priors, analyses_to_try, resolved,
@@ -2022,9 +2087,11 @@ def validate_prior_against_samples(priors, analyses_to_try, resolved,
     dmin, dmax = resolved.dmin, resolved.dmax
 
     sampling_kind = resolved.sampling_kind or resolved.kind
-    ks_sampling, frac_outside = _ks_against_prior_samples(
-        dlp, kind=sampling_kind, cosmo=cosmo, dmin=dmin, dmax=dmax,
-        alpha=resolved.sampling_alpha, impl=impl, return_outside=True)
+    ks_sampling, frac_outside, uncovered, samples_out = (
+        _ks_against_prior_samples(
+            dlp, kind=sampling_kind, cosmo=cosmo, dmin=dmin, dmax=dmax,
+            alpha=resolved.sampling_alpha, impl=impl, return_parts=True))
+    n_in = int(np.sum((dlp >= dmin) & (dlp <= dmax)))
     ks_effective = (
         ks_sampling if sampling_kind == resolved.kind
         else _ks_against_prior_samples(
@@ -2036,6 +2103,11 @@ def validate_prior_against_samples(priors, analyses_to_try, resolved,
             # diagnosed as a bounds mismatch instead of surfacing as a rejected
             # parse -- the two used to be conflated in one number.
             "frac_prior_bounds_uncovered": frac_outside,
+            # ... and in its two parts, with the sampling expectation of the
+            # first (review 2026-10-20, medium-48).
+            "frac_prior_mass_uncovered": uncovered,
+            "frac_prior_samples_outside_bounds": samples_out,
+            "prior_bounds_pvalue": _range_uncovered_pvalue(uncovered, n_in),
             "n_prior_samples": int(dlp.size), "analysis": used}
 
 
@@ -2504,17 +2576,20 @@ def build_store(paths, out_path, params=None, extra_params=None,
             H0, Om0, dmin, dmax, src = (res.H0, res.Om0, res.dmin, res.dmax,
                                         res.source)
             ks_val = None
+            v = None
+            ks_thr = float("nan")
             if cfg.validate_prior:
                 v = validate_prior_against_samples(
                     priors, [analysis] + analyses, res, impl=cfg.dL_prior_impl)
                 if v is not None:
                     ks_val = v["ks"]
+                    ks_thr = _ks_threshold(v["n_prior_samples"], cfg)
                     # The KS is now against the SAMPLING class the file declares,
                     # so a failure means the parse is wrong -- not that "the
                     # assumed cosmology may be wrong", which is what the
                     # pre-GW-02 message said while comparing two different
                     # distributions on every GWTC-2.1/3 event.
-                    if np.isfinite(ks_val) and ks_val > cfg.prior_ks_max:
+                    if np.isfinite(ks_val) and ks_val > ks_thr:
                         msg = (
                             f"{name} [{analysis}]: the file's own prior samples "
                             f"reject the parsed distance prior "
@@ -2522,7 +2597,7 @@ def build_store(paths, out_path, params=None, extra_params=None,
                             f"{'' if res.sampling_alpha is None else f'(alpha={res.sampling_alpha:g})'}"
                             f" on [{dmin:.4g}, {dmax:.4g}] Mpc with "
                             f"cosmology={res.cosmology_name or f'(H0={H0}, Om0={Om0})'}: "
-                            f"KS={ks_val:.4f} > {cfg.prior_ks_max} over "
+                            f"KS={ks_val:.4f} > {ks_thr:.4g} over "
                             f"{v['n_prior_samples']} samples from "
                             f"{v['analysis']}. The parse, the bounds or the "
                             f"cosmology mapping is wrong.")
@@ -2534,19 +2609,27 @@ def build_store(paths, out_path, params=None, extra_params=None,
                     # sides, so it no longer absorbs missing tail mass -- which
                     # means this has to be said separately or it stops being
                     # said at all.
-                    frac_out = v.get("frac_prior_bounds_uncovered")
-                    if (frac_out is not None and np.isfinite(frac_out)
-                            and frac_out > cfg.dL_outside_warn_frac):
+                    # Judged against what correct draws give (medium-48):
+                    # any sample outside the bounds, or bounds the samples
+                    # reach improbably short of.
+                    s_out = v.get("frac_prior_samples_outside_bounds")
+                    pval = v.get("prior_bounds_pvalue")
+                    if ((s_out is not None and np.isfinite(s_out)
+                         and s_out > cfg.dL_outside_warn_frac)
+                            or (pval is not None and np.isfinite(pval)
+                                and pval < cfg.prior_bounds_pvalue_min)):
                         warnings.warn(
                             f"{name} [{analysis}]: the file's own distance "
                             f"PRIOR samples and the recorded prior bounds "
                             f"[{dmin:.4g}, {dmax:.4g}] Mpc from {src} describe "
-                            f"different ranges -- {100 * frac_out:.2f}% of the "
-                            f"declared prior's mass is unaccounted for (samples "
-                            f"outside the bounds, or bounds the samples never "
-                            f"reach). The KS is computed on the overlap and so "
-                            f"does not see this; it usually means the bounds "
-                            f"came from a sibling analysis.")
+                            f"different ranges -- {100 * s_out:.2f}% of the "
+                            f"samples fall outside the bounds and "
+                            f"{100 * v['frac_prior_mass_uncovered']:.2f}% of "
+                            f"the declared prior's mass lies beyond the "
+                            f"samples (p={pval:.3g} for correct draws). The KS "
+                            f"is computed on the overlap and so does not see "
+                            f"this; it usually means the bounds came from a "
+                            f"sibling analysis.")
             # distance prior evaluated per sample, stored mass-prior-agnostic.
             # Dispatched on the EFFECTIVE distribution class (GW-02) and
             # evaluated over the FULL sample range rather than truncated at the
@@ -2781,6 +2864,16 @@ def build_store(paths, out_path, params=None, extra_params=None,
                 else float(res.sampling_alpha))
             meta["dL_prior_ks"].append(
                 np.nan if ks_val is None else float(ks_val))
+            meta["dL_prior_ks_threshold"].append(float(ks_thr))
+            meta["dL_prior_n_prior_samples"].append(
+                np.nan if v is None else float(v["n_prior_samples"]))
+            meta["dL_prior_frac_mass_uncovered"].append(
+                np.nan if v is None else float(v["frac_prior_mass_uncovered"]))
+            meta["dL_prior_frac_samples_outside"].append(
+                np.nan if v is None
+                else float(v["frac_prior_samples_outside_bounds"]))
+            meta["dL_prior_bounds_pvalue"].append(
+                np.nan if v is None else float(v["prior_bounds_pvalue"]))
             # `if f_ref` was also a truthiness bug: a legitimate f_ref of 0.0
             # would have been stored as NaN.  _read_f_ref already rejects
             # non-positive values explicitly, so test against None (GW-07).
