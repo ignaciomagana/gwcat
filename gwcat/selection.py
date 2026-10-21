@@ -20,29 +20,46 @@ the multi-campaign VT estimator in Essick et al. (2023):
   ndraw = N_O3 + N_O4
   pdraw_i *= N_k / ndraw  for injection i from campaign k
 
-Spin-prior contract (Mode A, matching the PE export)
-----------------------------------------------------
-On load, the injection spin-draw distribution is removed from the draw PDF
-(step 3 above).  On export (``to_darksirens``), it is REPLACED by the 1-D
-isotropic chi_eff prior — the "chi_eff swap" — so the exported ``pdraw``
-already contains the 1-D chi_eff prior.  This is recorded as
-``chi_eff_swap_applied=True``, ``chi_eff_prior_applied_to_pdraw=True``, and
-``spin_prior_mode="include"``, consistent with the PE export's ``p_pe``.
-Downstream (darksirens) MUST NOT multiply the chi_eff prior again — doing so
-double-counts it.
+Spin bases of the export
+------------------------
+On load, the injection spin-draw density is removed from the legacy draw PDF
+(step 3 above) and kept, exactly, as the per-injection component density
+(``ln_spin_component``).  The versioned exporter, :meth:`SelectionSet.export`
+/ :meth:`CombinedSelectionSet.export` (``format_version
+"gwcat-selection-2.0"``), writes ``pdraw`` in the spin basis ``spin_basis``:
+
+  * ``"component"`` -- the exact component draw density in (m1det, q, dL, a1,
+    a2, cosθ1, cosθ2); valid for any campaign.
+  * ``"chieff_reference"`` -- the (m1det, q, dL, chi_eff) density REWEIGHTED
+    from that exact component draw to a declared isotropic uniform-magnitude
+    reference spin prior (``spin_reference_amax``, the ceiling the paired PE
+    export divides out); valid for any campaign whose magnitudes cover the
+    reference.  The production O3+O4ab product is this basis at 0.99.
+  * ``"chieff"`` / ``"chieff_chip"`` -- the swaps: the campaign's own spin
+    draw is REPLACED by the analytic isotropic chi_eff (or (chi_eff, chi_p))
+    prior, which is right only for a campaign that drew uniform-magnitude
+    isotropic spins and is refused otherwise.  The O4ab campaign did not.
+
+In every chi_eff basis the exported ``pdraw`` already contains the 1-D chi_eff
+prior (``chi_eff_prior_applied_to_pdraw=True``, ``spin_prior_mode="include"``,
+consistent with the PE export's ``p_pe``); downstream MUST NOT multiply it
+again.  The frozen format-1.0 writer :meth:`SelectionSet.to_darksirens`
+always applies the 1-D swap, so it refuses the O4ab campaign under its
+default ``strict=True``.
 
 Usage:
     from gwcat.selection import SelectionSet, CombinedSelectionSet
 
-    # Single campaign
+    # Single campaign, exact component basis
     sel = SelectionSet("injection_file.hdf")
-    sel.to_darksirens("selection.h5", far_threshold=1.0)
+    sel.export("selection.h5", spin_basis="component", far_threshold=1.0)
 
-    # Combined O3 + O4
-    sel_o3 = SelectionSet("endo3_bbhpop-...-v12.hdf5")
-    sel_o4 = SelectionSet("injections-O4ab/...-cartesian_spins_*.hdf")
+    # Combined O3 + O4ab, chi_eff against the PE side's 0.99 reference
+    sel_o3 = SelectionSet("endo3_bbhpop-LIGO-T2100113-v12.hdf5")
+    sel_o4 = SelectionSet("samples-rpo4ab-1366933504-55469568-clipped.hdf")
     combined = CombinedSelectionSet([sel_o3, sel_o4])
-    combined.to_darksirens("selection_bbh.h5", far_threshold=1.0)
+    combined.export("selection_bbh.h5", spin_basis="chieff_reference",
+                    spin_reference_amax=0.99, far_threshold=1.0)
 """
 from __future__ import annotations
 
@@ -2948,10 +2965,11 @@ class CombinedSelectionSet:
 
     Usage
     -----
-    >>> sel_o3 = SelectionSet("endo3_bbhpop-...-v12.hdf5")
-    >>> sel_o4 = SelectionSet("injections-O4ab/...-cartesian_spins_*.hdf")
+    >>> sel_o3 = SelectionSet("endo3_bbhpop-LIGO-T2100113-v12.hdf5")
+    >>> sel_o4 = SelectionSet("samples-rpo4ab-1366933504-55469568-clipped.hdf")
     >>> combined = CombinedSelectionSet([sel_o3, sel_o4])
-    >>> combined.to_darksirens("selection_bbh.h5", far_threshold=1.0)
+    >>> combined.export("selection_bbh.h5", spin_basis="chieff_reference",
+    ...                 spin_reference_amax=0.99, far_threshold=1.0)
     """
 
     def __init__(self, selection_sets):
