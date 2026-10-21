@@ -769,3 +769,35 @@ def test_mixed_plus_xo4a_row_carries_its_constituent_record(tmp_path,
     assert sorted(json.loads(_meta(store, "spin_amax_config_per_constituent"))
                   ) == sorted([XP, NR, SE])
     assert _meta(store, "mixed_constituent_labels") == f"{XP}+{SE}+{NR}"
+
+
+# ==========================================================================
+# low-27: a defaulted cosmology the KS gate cannot catch
+# ==========================================================================
+_USF_ODD = ("bilby.gw.prior.UniformSourceFrame(minimum=100.0, maximum=10000.0, "
+            "cosmology='Planck99_XYZ', name='luminosity_distance')")
+
+
+def _odd_cosmology_file():
+    rng = np.random.default_rng(19)
+    sd = {XP: _samples(rng, 80)}
+    return _Data(sd), sd, {"analytic": {
+        XP: dict(_analytic(), luminosity_distance=_USF_ODD)}}
+
+
+def test_defaulted_cosmology_is_refused_in_an_audited_build(tmp_path,
+                                                            monkeypatch):
+    cfg = ing.IngestConfig(defaulted_cosmology_fatal=True, **_CFG)
+    with pytest.raises(ing.PriorMismatchError, match="catalog default"):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            _ingest(tmp_path, monkeypatch, {_O4_PL: _odd_cosmology_file()},
+                    cfg=cfg)
+
+
+def test_defaulted_cosmology_warning_does_not_overclaim_the_ks(tmp_path,
+                                                               monkeypatch):
+    with pytest.warns(UserWarning, match="cannot detect a wrong cosmology"):
+        store = _ingest(tmp_path, monkeypatch,
+                        {_O4_PL: _odd_cosmology_file()})
+    assert _meta(store, "dL_prior_cosmology_source") == "catalog_default"

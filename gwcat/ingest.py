@@ -43,6 +43,7 @@ import h5py
 
 from .cosmology import (make_cosmology, uniform_source_frame_prob,
                         dL_prior_prob, DL_PRIOR_KINDS, DL_PRIOR_NEEDS_ALPHA,
+                        DL_PRIOR_NEEDS_COSMOLOGY,
                         DistancePriorKindError, NAMED_COSMOLOGIES,
                         PLANCK15, O4_FALLBACK)
 from .source_class import (normalize_source_class, classify_by_mass,
@@ -312,6 +313,14 @@ class IngestConfig:
     #: sum against 0.0, which every correct parse exceeds by ~2/(N+1), so it
     #: fired on 273 of 282 production rows and buried the real mismatches.
     prior_bounds_pvalue_min: float = 1e-3
+    #: Refuse a row whose distance prior depends on a cosmology
+    #: (UniformSourceFrame / UniformComovingVolume) that the file does not
+    #: declare, so that gwcat would evaluate it at the per-catalog default
+    #: (review 2026-10-20, low-27).  The KS gate cannot catch a wrong
+    #: cosmology, so an audited build should not rely on a guessed one.
+    #: Default False keeps the catalog default (recorded as
+    #: dL_prior_cosmology_source="catalog_default").
+    defaulted_cosmology_fatal: bool = False
     #: Warn when more than this FRACTION of a row's dL samples fall outside the
     #: recorded distance-prior bounds.  The default warns on any occurrence: the
     #: samples are no longer zeroed (GW-01), but the mismatch means the recorded
@@ -1249,9 +1258,12 @@ def resolve_dL_prior(catalog, analysis, analyses, priors, dL_samples,
                 f"{analysis}: analytic distance prior names an unrecognised "
                 f"cosmology {parsed.cosmology_name!r}; falling back to "
                 f"(H0={H0}, Om0={Om0}). Add it to "
-                f"gwcat.cosmology.NAMED_COSMOLOGIES if it is real -- the KS "
-                f"check against the file's own prior samples is the only thing "
-                f"standing between this guess and a wrong p_dL_pe.")
+                f"gwcat.cosmology.NAMED_COSMOLOGIES if it is real. The KS "
+                f"check against the file's own prior samples tests the "
+                f"distribution class and bounds only: it cannot detect a "
+                f"wrong cosmology (H0 anywhere from 50 to 90 passes), so "
+                f"set IngestConfig.defaulted_cosmology_fatal=True for an "
+                f"audited build.")
 
     kind = sampling_kind or "UniformSourceFrame"
     alpha = parsed.alpha
@@ -2661,6 +2673,14 @@ def build_store(paths, out_path, params=None, extra_params=None,
                                    constituents=constituents)
             H0, Om0, dmin, dmax, src = (res.H0, res.Om0, res.dmin, res.dmax,
                                         res.source)
+            if (cfg.defaulted_cosmology_fatal
+                    and res.cosmology_source == "catalog_default"
+                    and res.kind in DL_PRIOR_NEEDS_COSMOLOGY):
+                raise PriorMismatchError(
+                    f"{name} [{analysis}]: the {res.kind} distance prior "
+                    f"({src}) declares no cosmology gwcat recognises, so it "
+                    f"would be evaluated at the catalog default (H0={H0}, "
+                    f"Om0={Om0}); refused (defaulted_cosmology_fatal=True).")
             ks_val = None
             v = None
             ks_thr = float("nan")
@@ -3996,6 +4016,11 @@ def _cli(
                     help="Refuse a row whose spin samples exceed the ceiling "
                          "its resolved spin prior declares. Default: warn and "
                          "record spin_sample_max_1/2.")
+    ap.add_argument("--refuse-defaulted-cosmology", action="store_true",
+                    help="Refuse a row whose cosmology-dependent distance "
+                         "prior declares no recognised cosmology (it would be "
+                         "evaluated at the catalog default). Default: use the "
+                         "default and record it.")
     a = ap.parse_args(argv)
     # The config is built BEFORE --inspect, so the smoke test reports the
     # prior the build will use (review 2026-10-20, medium-47): inspect used
@@ -4007,7 +4032,8 @@ def _cli(
         dL_prior_impl="auto" if a.legacy_grid_priors else "exact",
         mixed_prior_mismatch=("raise" if a.refuse_mixed_prior_mismatch
                               else "warn"),
-        spin_exceeds_amax=("raise" if a.refuse_spin_above_amax else "warn"))
+        spin_exceeds_amax=("raise" if a.refuse_spin_above_amax else "warn"),
+        defaulted_cosmology_fatal=a.refuse_defaulted_cosmology)
     if a.inspect:
         inspect(a.inspect, cfg)
         return
