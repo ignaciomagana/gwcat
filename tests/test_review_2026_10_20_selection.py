@@ -165,3 +165,134 @@ def test_v1_valid_swap_records_a_clean_gate(tmp_path):
     assert list(attrs["injected_spin_uniform_isotropic"]) == [True, True]
     assert attrs["spin_basis_assumption_violations"] == "[]"
     assert not _core_spin_swap_problems(attrs)
+
+
+# ======================================================================
+# medium-15 / medium-16: the spin-ceiling detectors
+# ======================================================================
+def _rewrite_endo3_spins(path, a1, a2, p_a1, p_a2, seed=0):
+    """Give an endo3 fixture isotropic spins with magnitudes ``a_i`` drawn
+    from ``p(a_i)``, and the per-spin cartesian pdfs / joint sampling_pdf of
+    exactly that draw: ``p_cart = p(a) / (4 pi a^2)``."""
+    rng = np.random.default_rng(seed)
+    with h5py.File(path, "r+") as f:
+        g = f["injections"]
+        n = len(g["mass1_source"])
+        cols = {}
+        for i, (a, pa) in enumerate(((a1, p_a1), (a2, p_a2)), start=1):
+            cost = rng.uniform(-1.0, 1.0, n)
+            st = np.sqrt(1.0 - cost ** 2)
+            ph = rng.uniform(0.0, 2 * np.pi, n)
+            cols[f"spin{i}x"] = a * st * np.cos(ph)
+            cols[f"spin{i}y"] = a * st * np.sin(ph)
+            cols[f"spin{i}z"] = a * cost
+            cols[f"spin{i}x_spin{i}y_spin{i}z_sampling_pdf"] = (
+                pa / (4.0 * np.pi * a ** 2))
+        cols["sampling_pdf"] = (
+            g["mass1_source_mass2_source_sampling_pdf"][:]
+            * g["redshift_sampling_pdf"][:]
+            * cols["spin1x_spin1y_spin1z_sampling_pdf"]
+            * cols["spin2x_spin2y_spin2z_sampling_pdf"])
+        for k, v in cols.items():
+            del g[k]
+            g.create_dataset(k, data=v)
+    return path
+
+
+def _mixture_mags(rng, n):
+    """90% U(0, 0.95) + 10% U(0.40, 0.42), and its density."""
+    pick = rng.uniform(size=n) < 0.9
+    a = np.where(pick, rng.uniform(0.0, 0.95, n), rng.uniform(0.40, 0.42, n))
+    p = 0.9 / 0.95 + np.where((a >= 0.40) & (a <= 0.42), 0.1 / 0.02, 0.0)
+    return a, p
+
+
+def test_cartesian_detector_gives_no_ceiling_for_a_non_uniform_draw(tmp_path):
+    rng = np.random.default_rng(21)
+    path = write_endo3_full(tmp_path / "o3mix.hdf", n=600, seed=21)
+    (a1, p1), (a2, p2) = _mixture_mags(rng, 600), _mixture_mags(rng, 600)
+    _rewrite_endo3_spins(path, a1, a2, p1, p2)
+    s = SelectionSet(path, strict_spin_checks="off")
+    meta = s.spin_meta
+    assert meta["amax_detected"] == (None, None)        # was 1.056
+    assert meta["uniform_isotropic"] is False
+    # The chieff_reference coverage check no longer takes a fabricated
+    # ceiling above 1 as proof that magnitudes reach a_ref = 0.99: nothing
+    # above 0.95 was drawn, and the file says so.
+    out = tmp_path / "ref.h5"
+    with pytest.warns(UserWarning, match="sample maximum"):
+        s.export(str(out), spin_basis="chieff_reference",
+                 spin_reference_amax=0.99)
+    with h5py.File(out, "r") as f:
+        assert bool(f.attrs["spin_reference_coverage_ok"]) is False
+        src = [x.decode() if isinstance(x, bytes) else x
+               for x in f.attrs["spin_reference_coverage_source_per_campaign"]]
+        assert src == ["drawn_max"]
+
+
+def test_cartesian_detector_does_not_refuse_a_covering_non_uniform_draw(
+        tmp_path):
+    # p(a) = 2a on [0, 1]: the old detector called its ceiling 0.71 and a
+    # strict a_ref = 0.99 export was refused as a proven coverage hole.
+    rng = np.random.default_rng(22)
+    path = write_endo3_full(tmp_path / "o3lin.hdf", n=600, seed=22)
+    a1, a2 = np.sqrt(rng.uniform(size=600)), np.sqrt(rng.uniform(size=600))
+    _rewrite_endo3_spins(path, a1, a2, 2 * a1, 2 * a2)
+    s = SelectionSet(path, strict_spin_checks="off")
+    assert s.spin_meta["amax_detected"] == (None, None)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        s.export(str(tmp_path / "ref.h5"), spin_basis="chieff_reference",
+                 spin_reference_amax=0.99)
+
+
+def test_constant_density_not_from_zero_is_not_a_ceiling_cartesian(tmp_path):
+    # a ~ U(0.05, 0.99): constant density 1/0.94, but no draw below 0.05.
+    rng = np.random.default_rng(23)
+    path = write_endo3_full(tmp_path / "o3shift.hdf", n=600, seed=23)
+    a1, a2 = rng.uniform(0.05, 0.99, 600), rng.uniform(0.05, 0.99, 600)
+    p = np.full(600, 1.0 / 0.94)
+    _rewrite_endo3_spins(path, a1, a2, p, p)
+    s = SelectionSet(path, strict_spin_checks="off")
+    assert s.spin_meta["amax_detected"] == (None, None)  # was (0.94, 0.94)
+    assert s.spin_meta["uniform_isotropic"] is False
+    from gwcat.export.selection_builder import BlockCampaignMismatch
+    with pytest.raises(BlockCampaignMismatch):
+        s.export(str(tmp_path / "chieff.h5"), spin_basis="chieff")
+
+
+def test_constant_density_not_from_zero_is_not_a_ceiling_factored(tmp_path):
+    path = write_o4_full(tmp_path / "o4shift.hdf", n=600, seed=24)
+    rng = np.random.default_rng(24)
+    with h5py.File(path, "r+") as f:
+        g = f["events"]
+        for i in (1, 2):
+            a = rng.uniform(0.05, 0.99, 600)
+            th = g[f"spin{i}_polar_angle"][:]
+            ph = g[f"spin{i}_azimuthal_angle"][:]
+            new = {f"spin{i}_magnitude": a,
+                   f"spin{i}x": a * np.sin(th) * np.cos(ph),
+                   f"spin{i}y": a * np.sin(th) * np.sin(ph),
+                   f"spin{i}z": a * np.cos(th),
+                   f"lnpdraw_spin{i}_magnitude": np.full(600, -np.log(0.94))}
+            for k, v in new.items():
+                del g[k]
+                g.create_dataset(k, data=v)
+    s = SelectionSet(path, strict_spin_checks="off")
+    assert s.spin_meta["amax_detected"] == (None, None)  # was (0.94, 0.94)
+    assert s.spin_meta["uniform_isotropic"] is False
+
+
+def test_detectors_keep_a_genuine_uniform_ceiling():
+    from gwcat import selection_spin as sspin
+    rng = np.random.default_rng(25)
+    a = rng.uniform(0.0, 0.998, 5000)
+    amax, ok = sspin.detect_max_spin_cart(1.0 / (4 * np.pi * a ** 2 * 0.998), a)
+    assert ok and np.isclose(amax, 0.998, rtol=1e-12)
+    amax, ok = sspin.detect_uniform_amax_from_lnmag(
+        np.full(5000, -np.log(0.998)), a=a)
+    assert ok and np.isclose(amax, 0.998, rtol=1e-12)
+    # A "ceiling" above 1 is never physical.
+    amax, ok = sspin.detect_max_spin_cart(
+        1.0 / (4 * np.pi * a ** 2 * 1.2), a * 1.2 / 0.998)
+    assert (amax, ok) == (None, False)

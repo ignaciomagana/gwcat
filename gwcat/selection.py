@@ -1608,8 +1608,10 @@ class SelectionSet:
                 ln_spin = ln_p_comp - ln_pdraw_no_spin
 
                 # amax auto-detection + isotropy.
-                amax1, uni1 = _sspin.detect_uniform_amax_from_lnmag(lnp_mag1)
-                amax2, uni2 = _sspin.detect_uniform_amax_from_lnmag(lnp_mag2)
+                amax1, uni1 = _sspin.detect_uniform_amax_from_lnmag(
+                    lnp_mag1, a=sa1)
+                amax2, uni2 = _sspin.detect_uniform_amax_from_lnmag(
+                    lnp_mag2, a=sa2)
                 iso1, dev_i1 = _sspin.check_isotropy_polar(lnp_pol1, scost1)
                 iso2, dev_i2 = _sspin.check_isotropy_polar(lnp_pol2, scost2)
                 amax_detected = (amax1, amax2)
