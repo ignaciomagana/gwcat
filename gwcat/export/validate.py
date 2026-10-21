@@ -279,7 +279,7 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
     # ── PE file (internal) ──────────────────────────────────────────────────
     print(f"Validating gwcat-2.0 PE export: {pe_path}")
     pe_attrs, pe_present, pe_cols = _read_export(
-        pe_path, _PE_LEGACY + _PE_COMPONENT_EXTRA + ["in_support"])
+        pe_path, _PE_LEGACY + _PE_COMPONENT_EXTRA + ["in_support", "q"])
 
     _validator_generation(_fail, pe_attrs.get("format_version"), "pe")
     _check("pe_format_version",
@@ -409,6 +409,7 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
                           pe_attrs.get("chi_eff_amax_2_per_event", []),
                           pe_attrs.get("chi_eff_amax", []))
     _range_checks(_check, pe_cols, pe_amax, prefix="pe")
+    _mass_distance_checks(_check, pe_cols, prefix="pe")
     _sky_checks(_check, pe_cols, prefix="pe")
     _fit_columns_present(_check, pe_attrs, pe_present, prefix="pe")
 
@@ -420,7 +421,7 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
     if selection_path is not None:
         print(f"Validating gwcat-2.0 selection export: {selection_path}")
         sel_attrs, sel_present, sel_cols = _read_export(
-            selection_path, _SEL_LEGACY + _SPIN_COLUMNS)
+            selection_path, _SEL_LEGACY + _SPIN_COLUMNS + ["q"])
 
         _validator_generation(_fail, sel_attrs.get("format_version"),
                               "selection")
@@ -615,6 +616,7 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
         else:
             sel_amax = 1.0
         _range_checks(_check, sel_cols, sel_amax, prefix="sel")
+        _mass_distance_checks(_check, sel_cols, prefix="sel")
         # A campaign that genuinely drew no sky position exempts its NaN rows,
         # but only if the file SAYS so -- the flag exists to be read (GW-20).
         _sky_avail = sel_attrs.get("sky_position_available")
@@ -2037,6 +2039,37 @@ def _sky_rows_follow_campaigns(_check, cols, flags):
            f"sky_position_available={flags.tolist()} cannot produce: some "
            f"NaN sky rows lie inside a campaign that drew a sky, and would "
            f"reach hp.ang2pix as NaN")
+
+
+def _mass_distance_checks(_check, cols, prefix):
+    """Masses, distance and redshift: finite, positive and ordered.
+
+    The validator's only finiteness checks were on ``p_pe``/``pdraw`` and the
+    sky (August review, export-sel 4; review 2026-10-20), so a file with NaN or
+    negative ``dL``, NaN masses, ``m2 > m1`` or a negative redshift passed.
+    Every mass and ``dL`` must be finite and > 0, ``redshift`` finite and > 0,
+    ``m2 <= m1`` in both frames, and ``q`` (when written) in ``(0, 1]``.
+    """
+    for name in ("m1det", "m2det", "m1src", "m2src", "dL", "redshift"):
+        if name in cols and cols[name].size:
+            v = np.asarray(cols[name], dtype=float)
+            bad = ~(np.isfinite(v) & (v > 0.0))
+            _check(f"{prefix}_{name}_finite_positive", not bad.any(),
+                   f"{int(bad.sum())} of {v.size} {name} values are "
+                   f"non-finite or <= 0")
+    for m1, m2 in (("m1det", "m2det"), ("m1src", "m2src")):
+        if m1 in cols and m2 in cols and cols[m1].shape == cols[m2].shape:
+            a = np.asarray(cols[m1], dtype=float)
+            b = np.asarray(cols[m2], dtype=float)
+            n_bad = int(np.sum(b > a * (1.0 + _TOL)))
+            _check(f"{prefix}_{m2}_le_{m1}", n_bad == 0,
+                   f"{n_bad} rows have {m2} > {m1}; the mass density is in "
+                   f"(m1, q = m2/m1 <= 1)")
+    if "q" in cols and cols["q"].size:
+        q = np.asarray(cols["q"], dtype=float)
+        bad = ~(np.isfinite(q) & (q > 0.0) & (q <= 1.0 + _TOL))
+        _check(f"{prefix}_q_range", not bad.any(),
+               f"{int(bad.sum())} of {q.size} q values are outside (0, 1]")
 
 
 def _range_checks(_check, cols, amax, prefix):

@@ -550,3 +550,34 @@ def test_one_skyless_campaign_does_not_exempt_the_other(tmp_path):
         f["dec"][...] = dec
     res = validate_export_v2(str(pe), str(sel))
     assert res["sel_sky_nan_rows_follow_campaigns"] is False
+
+
+# ======================================================================
+# Masses, distance and redshift are checked, not only p_pe/pdraw and sky
+# ======================================================================
+@pytest.mark.parametrize("side,col,value", [
+    ("pe", "dL", np.nan), ("pe", "dL", -10.0), ("pe", "m1det", np.nan),
+    ("pe", "redshift", -0.1), ("sel", "dL", np.nan), ("sel", "m2src", 0.0),
+    ("sel", "redshift", np.nan)])
+def test_nonphysical_masses_distance_redshift_fail(tmp_path, side, col, value):
+    """The validator checked finiteness only for p_pe, pdraw and the sky, so
+    NaN or negative dL, NaN masses or a negative redshift passed --strict."""
+    pe = _pe_component(tmp_path, name="pe_phys.h5")
+    sel = _sel(tmp_path, name="sel_phys.h5")
+    with h5py.File(pe if side == "pe" else sel, "r+") as f:
+        v = f[col][()]
+        v[1] = value
+        f[col][...] = v
+    res = validate_export_v2(str(pe), str(sel))
+    assert res[f"{side}_{col}_finite_positive"] is False
+
+
+def test_m2_above_m1_fails(tmp_path):
+    pe = _pe_component(tmp_path, name="pe_q.h5")
+    with h5py.File(pe, "r+") as f:
+        m1, m2 = f["m1det"][()], f["m2det"][()]
+        m1[0], m2[0] = m2[0], m1[0]
+        f["m1det"][...] = m1
+        f["m2det"][...] = m2
+    res = validate_export_v2(str(pe))
+    assert res["pe_m2det_le_m1det"] is False
