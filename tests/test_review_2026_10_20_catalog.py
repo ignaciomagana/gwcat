@@ -230,3 +230,37 @@ def test_v1_untruncated_file_records_no_z_max(tmp_path):
         assert np.isnan(float(f.attrs["z_max"]))
     results = validate_export(str(out), _make_combined_selection(tmp_path))
     assert results["xcheck_z_max"] is True
+
+
+# ==========================================================================
+# A name whitelist is not "reproducible by construction"
+# ==========================================================================
+def test_a_whitelist_against_an_unfiltered_selection_warns():
+    """The bundled 259-event BBH list equals {posterior-median m2 >= 3} on the
+    production store, and the production selection applies no class cut, yet
+    the pairing judgement passed it as reproducible by construction."""
+    from gwcat.source_class import (assess_cut_estimator_pair,
+                                    CUT_ESTIMATOR_NAME_WHITELIST,
+                                    CUT_ESTIMATOR_INJECTED_TRUTH,
+                                    CUT_ESTIMATOR_NONE, CUT_ESTIMATOR_REMEDY)
+    verdict, msg = assess_cut_estimator_pair(
+        CUT_ESTIMATOR_NAME_WHITELIST, CUT_ESTIMATOR_NONE, False, False)
+    assert verdict == "warn"
+    assert "m2" in msg and "posterior-median" in msg
+    # A selection that does cut its injections on a class is the declared
+    # approximation and still passes.
+    assert assess_cut_estimator_pair(
+        CUT_ESTIMATOR_NAME_WHITELIST, CUT_ESTIMATOR_INJECTED_TRUTH,
+        False, True) == ("pass", "")
+    # The remedy no longer sends a refused median cut back as an event list.
+    assert "reproducible on the injection side, so a" not in CUT_ESTIMATOR_REMEDY
+
+
+def test_v1_whitelist_pair_validates_with_the_warning(tmp_path):
+    from test_selection_cbc import _make_pe_export
+    pe = _make_pe_export(tmp_path, event_list=["GW900001_000001"],
+                         name="pe_wl.h5")
+    sel = _make_combined_selection(tmp_path, name="sel_wl.h5")
+    with pytest.warns(UserWarning, match="selected by NAME"):
+        results = validate_export(pe, sel)
+    assert results["xcheck_source_class_estimator"] is True

@@ -477,8 +477,9 @@ class SelectionSpec:
             f"\n"
             f"Cut on FAR instead (far_max=, CLI --far-max: the statistic the "
             f"campaigns threshold on directly), or select the events by name "
-            f"(event_list= / allowed_names=, which is membership rather than a "
-            f"cut on a statistic). Pass allow_unpaired_pastro_min=True to write "
+            f"(event_list= / allowed_names=) from a list that was not itself "
+            f"built by thresholding p_astro -- such a list is this same cut "
+            f"under another spelling. Pass allow_unpaired_pastro_min=True to write "
             f"the file anyway -- it is then NOT usable with a selection "
             f"function.")
 

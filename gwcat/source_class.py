@@ -90,8 +90,12 @@ def classify_by_mass(m1_source, m2_source,
 
     This is the shared mass-threshold classifier.  It is used both to label
     ingested PE events (via :func:`gwcat.ingest._classify`) and to filter
-    selection injections by injected mass (:mod:`gwcat.selection`), guaranteeing
-    the two paths apply *identical* thresholds and can never diverge.
+    selection injections by injected mass (:mod:`gwcat.selection`), so the two
+    paths share one *threshold*.  They do not share one *cut*: events are
+    classified from their posterior MEDIAN source-frame masses and injections
+    from their TRUE masses, and the same threshold on different quantities
+    selects different systems near the boundary (see the GW-12 note below and
+    :func:`assess_cut_estimator_pair`).
 
     A component with source-frame mass ``>= thr`` is treated as a black hole and
     ``< thr`` as a neutron star.  With the mass-ordering convention m1 >= m2:
@@ -172,8 +176,12 @@ CUT_ESTIMATOR_NONE = "none"
 #: Events classified from posterior MEDIAN source-frame masses (PE side).
 CUT_ESTIMATOR_POSTERIOR_MEDIAN = "posterior_median_mass"
 #: Events selected by name from an explicit list (PE side).  Membership in a
-#: fixed list is not a mass cut: it is reproducible on the injection side by
-#: construction, so it does not carry the boundary bias above.
+#: fixed list is not a cut on a statistic the file can see -- but it is
+#: reproducible on the injection side only when the list was not itself built
+#: from measured event properties.  The bundled BBH population list was: on the
+#: production store it equals the events with posterior-median m2 >= 3 Msun
+#: (and FAR < 1/yr or missing), i.e. the median cut above under another
+#: spelling.  See :func:`assess_cut_estimator_pair`.
 CUT_ESTIMATOR_NAME_WHITELIST = "name_whitelist"
 #: Injections classified from their INJECTED TRUE masses (selection side).
 CUT_ESTIMATOR_INJECTED_TRUTH = "injected_truth"
@@ -191,9 +199,11 @@ def pe_cut_estimator(source_class, event_list=None) -> str:
     median-based cut, and takes precedence in the record even when an event list
     is also supplied (the median cut is the part that cannot be reproduced).
 
-    An ``event_list`` alone restricts by NAME.  That is membership in a fixed
-    list, not a cut on a noisy statistic, so it is recorded distinctly and the
-    pairing check treats it as reproducible.
+    An ``event_list`` alone restricts by NAME.  It is recorded distinctly
+    because the file cannot tell what the list was built from: a list of
+    events chosen by posterior-median mass is the median cut in another form,
+    and the pairing check says so when the selection side applies no class
+    cut (review 2026-10-20).
     """
     if source_class is not None:
         return CUT_ESTIMATOR_POSTERIOR_MEDIAN
@@ -223,13 +233,37 @@ def _estimator_str(raw) -> str:
 
 #: The escape hatches named in the refusal, kept in one place so the two
 #: validators and the export-time warning cannot drift apart.
+#:
+#: It used to recommend resubmitting the refused median cut as an event list,
+#: as if list membership were reproducible on the injection side by
+#: construction.  A list drawn from the same median-mass classification is the
+#: same cut in another spelling (review 2026-10-20), so the remedy no longer
+#: presents it as a fix.
 CUT_ESTIMATOR_REMEDY = (
-    "Either (1) select the events by NAME instead -- pass event_list= (CLI: "
-    "--event-list) with the names you mean and drop --source-class from the PE "
-    "side; list membership is reproducible on the injection side, so a "
-    "whitelisted pair is accepted -- or (2) drop the source-class filter from "
-    "BOTH sides and model the classes in the population instead of cutting on "
-    "them.")
+    "Either (1) drop the source-class filter from BOTH sides and model the "
+    "classes in the population instead of cutting on them, or (2) select the "
+    "events by an explicit name list (event_list=, CLI --event-list) whose "
+    "membership does NOT come from the events' measured masses -- a list built "
+    "by classifying posterior medians is this same cut under another name, "
+    "and the validators warn about it when the selection side applies no "
+    "class cut.")
+
+
+#: What the pairing check says about a name-whitelisted PE file paired with a
+#: selection that applies no class cut (review 2026-10-20).
+WHITELIST_WITHOUT_CLASS_CUT_WARNING = (
+    "the PE events were selected by NAME "
+    f"({CUT_ESTIMATOR_ATTR}='{CUT_ESTIMATOR_NAME_WHITELIST}') and the selection "
+    "file applies no source-class cut. A name list is reproducible on the "
+    "injection side only when its membership does not depend on measured "
+    "event properties. The bundled BBH population list is not such a list: on "
+    "the production store it equals the events with posterior-median "
+    "m2 >= 3 Msun (and FAR < 1/yr or missing). If this list was built that "
+    "way, beta counts detectable injected systems with m2 below the class "
+    "boundary that the list can never contain -- an artificial floor near "
+    "3 Msun for any population model that reaches below it (Essick & "
+    "Fishbach). The files cannot show which kind of list this is; check it "
+    "before quoting a mass-function or rate result.")
 
 
 def assess_cut_estimator_pair(pe_estimator, sel_estimator,
@@ -249,12 +283,19 @@ def assess_cut_estimator_pair(pe_estimator, sel_estimator,
     sel = _estimator_str(sel_estimator)
 
     if pe == CUT_ESTIMATOR_NAME_WHITELIST:
-        # The PE restriction is membership in a fixed list of names, not a cut
-        # on a measured quantity, so there is no point estimate to disagree
-        # about: whatever the injection side cuts on, it is not being asked to
-        # reproduce a median.  This is the shipped BBH-whitelist configuration
-        # and it is unaffected by GW-12.
-        return "pass", ""
+        # The PE restriction is membership in a fixed list of names.  The file
+        # cannot show what the list was built from, so this cannot FAIL -- but
+        # it used to PASS on the grounds that membership is reproducible on the
+        # injection side by construction, and the shipped BBH list is not: it
+        # equals {posterior-median m2 >= 3 Msun} on the production store, while
+        # the production selection applies no class cut at all (21,477 of its
+        # detected injections have m2 < 3).  Say so when the selection side has
+        # no class cut (review 2026-10-20).  Whether to cut the injections on
+        # injected-truth m2 instead is an analysis decision (an approximation
+        # of the median cut); the default pairing is unchanged.
+        if sel_filtered:
+            return "pass", ""
+        return "warn", WHITELIST_WITHOUT_CLASS_CUT_WARNING
 
     if not pe_filtered and not sel_filtered:
         return "pass", ""
