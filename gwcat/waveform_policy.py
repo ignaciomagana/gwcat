@@ -521,17 +521,25 @@ def resolve_event_map(event_names: Sequence, sel, meta: dict, sample_set_map,
             order.append(key)
         groups[key].setdefault(_decode(ss[r]), int(r))
 
-    # A label names a sample set only if the store holds ONE row for it.  Two
-    # (event, label) rows -- two releases of one analysis -- made the map keep
-    # the LAST selected row while the q-rule measured the store's FIRST, so
-    # the verdict and the exported samples could come from different
-    # releases.  Counted over the whole store, since the rule reads it all.
-    n_rows: Dict[tuple, int] = {}
-    for r in range(len(names)):
-        k = (_key(names[r]), _decode(ss[r]))
-        n_rows[k] = n_rows.get(k, 0) + 1
+    # A label names a sample set only if ONE row holds it.  Two (event, label)
+    # rows -- two releases of one analysis -- made the map keep the LAST
+    # selected row while the q-rule measured the store's FIRST, so the verdict
+    # and the exported samples could come from different releases.  A label
+    # only exported is counted over the SELECTED rows, which are all the
+    # export reads.  Under the q-rule, the labels it measures (an NRSur
+    # label's reference, a declared q-rule substitute) and the NRSur label it
+    # rules on are counted over the whole STORE, because q_frac_fn reads the
+    # store's first matching row whatever the selection holds.
+    def _count(rows_):
+        out: Dict[tuple, int] = {}
+        for r in rows_:
+            k = (_key(names[r]), _decode(ss[r]))
+            out[k] = out.get(k, 0) + 1
+        return out
+    n_sel = _count(sel)
+    n_store = _count(range(len(names)))
 
-    unmapped, missing, duplicated = [], [], []
+    unmapped, missing, dup_sel, dup_store = [], [], [], []
     q_viol, q_unjust, q_noref = [], [], []
     chosen: Dict[str, Tuple[int, str]] = {}
     substitutes: Dict[str, dict] = {}
@@ -568,12 +576,21 @@ def resolve_event_map(event_names: Sequence, sel, meta: dict, sample_set_map,
         else:
             missing.append((ev, want, sorted(rows)))
             continue
-        ambiguous = [lab for lab in (
-            label, nrsur_reference_label(label) if (
-                nrsur_q_rule is not None and is_nrsur_label(label)) else None)
-            if lab is not None and n_rows.get((ev, lab), 0) > 1]
-        if ambiguous:
-            duplicated.append((ev, ambiguous))
+        ruled = []
+        if nrsur_q_rule is not None:
+            if is_nrsur_label(label):
+                ruled = [label, nrsur_reference_label(label)]
+            elif substitutes.get(ev, {}).get("reason", "").startswith(
+                    NRSUR_Q_RULE_REASON):
+                ruled = [label]
+        amb_store = [lab for lab in ruled if n_store.get((ev, lab), 0) > 1]
+        amb_sel = ([label] if label not in ruled
+                   and n_sel.get((ev, label), 0) > 1 else [])
+        if amb_store or amb_sel:
+            if amb_sel:
+                dup_sel.append((ev, amb_sel))
+            if amb_store:
+                dup_store.append((ev, amb_store))
             continue
 
         if nrsur_q_rule is not None:
@@ -633,13 +650,19 @@ def resolve_event_map(event_names: Sequence, sel, meta: dict, sample_set_map,
             + ("" if len(missing) <= 10 else f" (+{len(missing) - 10} more)")
             + ". Add a substitutes entry {event: {'label': ..., 'reason': ...}}"
               " to the map, or re-ingest with --sample-sets all.")
-    if duplicated:
+    if dup_sel or dup_store:
         raise SampleSetMapError(
-            f"waveform_policy='event-map': {len(duplicated)} event(s) have "
-            f"more than one store row for a label the map resolves (or the "
-            f"q-rule measures): {duplicated[:10]}. A label then does not say "
-            f"which release to export; de-duplicate the store (merge "
-            f"on_duplicate_key) or restrict the selection to one release.")
+            f"waveform_policy='event-map': a label does not say which release "
+            f"to export when more than one row holds it."
+            + (f" {len(dup_sel)} event(s) have more than one SELECTED row for "
+               f"the label the map resolves: {dup_sel[:10]}." if dup_sel
+               else "")
+            + (f" {len(dup_store)} event(s) have more than one STORE row for "
+               f"a label the q-rule rules on or measures, which it reads from "
+               f"the whole store whatever the selection holds: "
+               f"{dup_store[:10]}." if dup_store else "")
+            + " De-duplicate the store: merge_stores with on_duplicate_key="
+              "'skip' or 'refresh' keeps one row per (event, label).")
     if q_noref:
         raise NRSurQRuleError(
             f"nrsur_q_rule: cannot evaluate the rule for {len(q_noref)} "

@@ -298,12 +298,31 @@ def test_event_map_refuses_duplicate_event_label_rows(tmp_path):
     took release B's NRSur samples, with no warning."""
     from gwcat.waveform_policy import SampleSetMapError
     store = _two_release_store(tmp_path)
-    with pytest.raises(SampleSetMapError, match="more than one store row"):
+    with pytest.raises(SampleSetMapError, match="more than one STORE row"):
         _map_export(store, tmp_path / "pe.h5", waveform_policy="event-map",
                     sample_set_map={E1: f"C01:{NR}"}, nrsur_q_rule=0.01)
-    with pytest.raises(SampleSetMapError, match="more than one store row"):
+    with pytest.raises(SampleSetMapError, match="more than one SELECTED row"):
         _map_export(store, tmp_path / "pe2.h5", waveform_policy="event-map",
                     sample_set_map={E1: f"C01:{NR}"})
+
+
+def test_event_map_counts_an_exported_label_over_the_selection(tmp_path):
+    """An exported label is read from the selected rows only, so a selection
+    holding one release's row is unambiguous; a label the q-rule rules on is
+    read store-wide, so there the store's second release still refuses."""
+    from gwcat.waveform_policy import SampleSetMapError, resolve_event_map
+    cat = GWCatalog(_two_release_store(tmp_path))
+    smap = {E1: f"C01:{NR}"}
+    release_a = [0, 1]
+    kept, _reasons, homogeneous, _report = resolve_event_map(
+        cat.names, release_a, cat.meta, smap)
+    assert list(kept) == [1] and homogeneous
+    with pytest.raises(SampleSetMapError, match="more than one SELECTED row"):
+        resolve_event_map(cat.names, [0, 1, 2, 3], cat.meta, smap)
+    with pytest.raises(SampleSetMapError, match="more than one STORE row"):
+        resolve_event_map(cat.names, release_a, cat.meta, smap,
+                          q_frac_fn=cat._q_below_nrsur_floor_frac,
+                          nrsur_q_rule=0.01)
 
 
 def test_q_rule_substitute_needs_the_rule_and_the_event_map(tmp_path):
