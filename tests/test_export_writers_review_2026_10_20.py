@@ -111,6 +111,47 @@ def test_the_validator_refuses_a_posterior_median_snr_event_cut():
 
 
 # ==========================================================================
+# Medium 43. The distance-prior class reaches the file and the contract
+# ==========================================================================
+def test_the_pe_contract_states_the_distance_prior_class(tmp_path):
+    """A _nocosmo PowerLaw(2) product and a UniformSourceFrame product had the
+    same dL_prior_kind (None) and the same contract."""
+    pl = _store(tmp_path, name="pl.h5",
+                dL_prior_kind=["PowerLaw", "PowerLaw"],
+                dL_prior_alpha=[2.0, 2.0],
+                dL_prior_basis=["analytic", "analytic"])
+    usf = _store(tmp_path, name="usf.h5",
+                 dL_prior_kind=["UniformSourceFrame", "UniformSourceFrame"],
+                 dL_prior_alpha=[np.nan, np.nan],
+                 dL_prior_basis=["analytic", "analytic"])
+    contracts = {}
+    for label, store in (("pl", pl), ("usf", usf)):
+        out = tmp_path / f"pe_{label}.h5"
+        product = build_pe_product(GWCatalog(store), spin_basis="chieff",
+                                   nsamp=8, seed=0)
+        get_exporter("gwcat2.1", kind="pe")(product, str(out))
+        contracts[label] = _contract(out)
+        with h5py.File(out, "r") as f:
+            kinds = [x.decode() if isinstance(x, bytes) else str(x)
+                     for x in f.attrs["dL_prior_kind_per_event"]]
+            assert len(kinds) == int(f.attrs["nobs"])
+            assert len(f.attrs["dL_prior_alpha_per_event"]) == len(kinds)
+            assert len(f.attrs["dL_prior_basis_per_event"]) == len(kinds)
+    assert contracts["pl"]["dL_prior_kind"] == "PowerLaw(alpha=2)"
+    assert contracts["usf"]["dL_prior_kind"] == "UniformSourceFrame"
+
+
+def test_a_store_without_the_class_states_nothing(tmp_path):
+    """No dL_prior_kind column (a pre-GW-02 store): no guessed class."""
+    out = tmp_path / "pe.h5"
+    product = build_pe_product(GWCatalog(_store(tmp_path)),
+                               spin_basis="chieff", nsamp=8, seed=0)
+    assert "dL_prior_kind" not in product.attrs
+    get_exporter("gwcat2.1", kind="pe")(product, str(out))
+    assert _contract(out)["dL_prior_kind"] is None
+
+
+# ==========================================================================
 # Medium 13. A selection product core cannot load says so when written
 # ==========================================================================
 def _sky_marginal_product():

@@ -404,6 +404,9 @@ def _contract_attrs(product, kind):
         spin_basis_kind=spin.map_kind,
         spin_density_exact=bool(space.is_exact),
         mass_prior_kind=a.get("mass_prior_basis") or a.get("mass_prior_kind"),
+        # The PE builder's label over the store's per-row class (review
+        # 2026-10-20, Medium 43); None on the selection side and for a store
+        # that records no class.
         dL_prior_kind=a.get("dL_prior_kind"),
         sky_prior_in_density=True,      # sky.radec declares -ln4pi both sides
         source_class=a.get("source_class_filter") or None,

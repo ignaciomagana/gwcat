@@ -657,6 +657,10 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     # --legacy-grid-priors).  A meta read, like the provenance above.
     sel_dL_impl = _meta_str_sel("dL_prior_impl") or [""] * sub.n_events
     kept_dL_impl = []
+    # Which distance-prior CLASS each event's p_pe divides out (review
+    # 2026-10-20, Medium 43) -- also a meta read.
+    sel_dL_class = _dL_prior_class_sel(sub, sel_idx, _meta_str_sel)
+    kept_dL_class = []
     kept_prior_kind = {p: [] for p in ("mass", "spin", "dL")}
     kept_prior_label = {p: [] for p in ("mass", "spin", "dL")}
     #: Raw samples removed by the GW-40c spin-support cut, per kept event --
@@ -838,6 +842,7 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                 kept_prior_label[_p].append(sel_prior_label[_p][e])
             kept_cfg_amax.append(sel_cfg_amax[e])
             kept_dL_impl.append(sel_dL_impl[e])
+            kept_dL_class.append(sel_dL_class[e])
             kept_H0.append(float(per_event_H0[e]))
             kept_Om0.append(float(per_event_Om0[e]))
             row = sel_rows[e]
@@ -1414,6 +1419,7 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         # ── How the two analytic prior factors were evaluated (GW-40i) ──────
         "dL_prior_impl_per_event": np.array(
             [str(x) for x in kept_dL_impl], dtype=_str),
+        **_dL_prior_class_attrs(kept_dL_class),
     }
     if chi_eff_included:
         from ..spin import CHI_EFF_PRIOR_METHODS, current_chi_eff_prior_impl
@@ -1525,6 +1531,52 @@ def _names_sha256(names):
     uniq = sorted({(n.decode() if isinstance(n, (bytes, bytearray))
                     else str(n)) for n in names})
     return hashlib.sha256(("\n".join(uniq) + "\n").encode()).hexdigest()
+
+
+def _dL_prior_class_sel(sub, sel_idx, meta_str_sel):
+    """Per selected row, ``(kind, alpha, basis)`` of the distance prior that
+    the store's ``p_dL_pe`` evaluates, or ``None`` for every row of a store
+    that records no ``dL_prior_kind`` (written before GW-02)."""
+    kinds = meta_str_sel("dL_prior_kind")
+    if kinds is None:
+        return [None] * len(sel_idx)
+    bases = meta_str_sel("dL_prior_basis") or [""] * len(kinds)
+    alpha = sub.meta.get("dL_prior_alpha")
+    alpha = (np.full(len(kinds), np.nan) if alpha is None
+             else np.asarray(alpha, dtype=float)[sel_idx])
+    return [(k, float(a), b) for k, a, b in zip(kinds, alpha, bases)]
+
+
+def _dL_prior_class_attrs(kept_dL_class):
+    """The distance-prior class divided out of p_pe, per event and as one label.
+
+    Review 2026-10-20, Medium 43: the 2.1 writer read ``dL_prior_kind`` from the
+    product attrs, but no builder set it, so the contract field was always
+    null -- a product built from ``_nocosmo`` releases (PowerLaw(2), a 3x swing
+    across the posterior) and one built from ``_cosmo`` releases stated the same
+    contract.  The label is the sorted set of ``kind`` (with ``alpha`` for a
+    power law) over the exported events, joined by ``+`` when they differ.  A
+    store that records no class states nothing rather than a guess.
+    """
+    if not kept_dL_class or any(c is None for c in kept_dL_class):
+        return {}
+    import h5py
+    _str = h5py.string_dtype()
+
+    def _label(kind, alpha):
+        kind = kind or "unrecorded"
+        return f"{kind}(alpha={alpha:g})" if np.isfinite(alpha) else kind
+
+    return {
+        "dL_prior_kind_per_event": np.array(
+            [k for k, _, _ in kept_dL_class], dtype=_str),
+        "dL_prior_alpha_per_event": np.array(
+            [a for _, a, _ in kept_dL_class], dtype=float),
+        "dL_prior_basis_per_event": np.array(
+            [b for _, _, b in kept_dL_class], dtype=_str),
+        "dL_prior_kind": "+".join(sorted(
+            {_label(k, a) for k, a, _ in kept_dL_class})),
+    }
 
 
 def _population_resolver_attrs(cat, kept):
