@@ -460,3 +460,55 @@ def test_skip_keeps_the_old_preferred_row_when_the_label_changed(
     with pytest.warns(UserWarning, match="skipped"):
         labels = _rerelease(tmp_path, monkeypatch, "skip")
     assert labels == ["C00:IMRPhenomXPHM"]
+
+
+# ==========================================================================
+# medium-44: a _nocosmo O1-O3 release with no analytic distance prior
+# ==========================================================================
+_NOCOSMO = "IGWN-GWTC2p1-v2-GW950608_020116_PEDataRelease_mixed_nocosmo.h5"
+
+
+def _gw170608_like(config=True, seed=4, n=150):
+    """The real GW170608 layout: no analytic group on any label; the two
+    LALInference constituents declare distance-max 1000 and 10000."""
+    rng = np.random.default_rng(seed)
+    xp, se = _samples(rng, n), _samples(rng, n)
+    for smp in (xp, se):
+        smp["luminosity_distance"] = rng.uniform(150.0, 600.0, n)
+    mixed = _concat(_take(xp, np.arange(n // 2)), _take(se, np.arange(n // 2)))
+    sd = {C1X: xp, C1M: mixed, C1S: se}
+    eng = {C1X: {"a_spin1-max": b"0.99", "a_spin2-max": b"0.99",
+                 "distance-max": b"1000"},
+           C1S: {"a_spin1-max": b"0.99", "a_spin2-max": b"0.99",
+                 "distance-max": b"10000"}}
+    cfg = {lab: {"engine": e} for lab, e in eng.items()} if config else {}
+    return _Data(sd, config=cfg), sd, {}
+
+
+def test_nocosmo_lalinference_rows_divide_out_dL_squared(tmp_path,
+                                                          monkeypatch):
+    from gwcat.cosmology import dL_prior_prob, make_cosmology
+    data, sd, priors = _gw170608_like()
+    store = _ingest(tmp_path, monkeypatch, {_NOCOSMO: (data, sd, priors)})
+    assert _meta(store, "dL_prior_kind") == "PowerLaw"
+    assert float(_meta(store, "dL_prior_alpha")) == 2.0
+    assert _meta(store, "dL_prior_basis") == "config_file_declared"
+    assert _meta(store, "prior_source_kind_dL") == "config_file_declared"
+    assert (float(_meta(store, "dL_prior_min")),
+            float(_meta(store, "dL_prior_max"))) == (1.0, 10000.0)
+    with h5py.File(store, "r") as f:
+        p = f["samples/p_dL_pe"][:]
+    dL = sd[C1M]["luminosity_distance"]
+    expected = dL_prior_prob(dL, kind="PowerLaw", alpha=2.0,
+                             cosmology=make_cosmology(67.74, 0.3075),
+                             dmin=1.0, dmax=10000.0, impl="astropy")
+    np.testing.assert_allclose(p, expected, rtol=1e-12)
+    np.testing.assert_allclose(p / dL ** 2, (p / dL ** 2)[0], rtol=1e-10)
+
+
+def test_nocosmo_row_with_no_declaration_at_all_is_refused(tmp_path,
+                                                           monkeypatch):
+    from gwcat.cosmology import DistancePriorKindError
+    with pytest.raises(DistancePriorKindError, match="refusing"):
+        _ingest(tmp_path, monkeypatch,
+                {_NOCOSMO: _gw170608_like(config=False)})

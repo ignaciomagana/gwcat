@@ -983,15 +983,80 @@ class ResolvedDLPrior:
         return make_cosmology(self.H0, self.Om0)
 
 
+#: LALInference's distance prior when its ``[engine]`` sets only the bounds:
+#: p(dL) ~ dL^2 on [distance-min, distance-max], distance-min defaulting to
+#: 1 Mpc.  Any other distance/volume option in the engine section means a
+#: different prior, which gwcat refuses to guess.
+_LALINFERENCE_DL_ALPHA = 2.0
+_LALINFERENCE_DL_MIN_DEFAULT = 1.0
+
+
+def _dL_prior_from_config(data, analysis, analyses):
+    """The LALInference ``config_file/engine`` distance prior, or None.
+
+    Returns ``(dmin, dmax, labels, note)`` from ``analysis``'s own engine
+    section, else from every same-prefix sibling that declares
+    ``distance-max`` (the constituents of a GWTC-2.1 ``C01:Mixed``, which
+    carry no analytic group).  ``note`` is "" or says how the siblings
+    differ.  Raises :class:`DistancePriorKindError` when an engine section
+    sets a distance option other than the bounds.
+    """
+    cfg_all = getattr(data, "config", None) if data is not None else None
+    if not isinstance(cfg_all, dict):
+        return None
+
+    def _one(an):
+        try:
+            cfgd = cfg_all.get(an)
+        except Exception:
+            return None
+        eng = cfgd.get("engine") if isinstance(cfgd, dict) else None
+        if not isinstance(eng, dict):
+            return None
+        dmax = _config_float(eng.get("distance-max"))
+        if dmax is None:
+            return None
+        odd = sorted(k for k in eng
+                     if ("dist" in k.lower() or "volume" in k.lower()
+                         or "malmquist" in k.lower() or "cosmo" in k.lower())
+                     and k not in ("distance-min", "distance-max"))
+        if odd:
+            raise DistancePriorKindError(
+                f"{an}: config_file/engine sets distance option(s) {odd}; "
+                f"gwcat cannot tell which distance prior that run used and "
+                f"refuses to assume LALInference's default dL^2.")
+        dmin = _config_float(eng.get("distance-min"))
+        return (_LALINFERENCE_DL_MIN_DEFAULT if dmin is None else dmin), dmax
+
+    own = _one(analysis)
+    if own is not None:
+        return own[0], own[1], [analysis], ""
+    pfx = _label_parts(analysis)[0]
+    hits = [(an, _one(an)) for an in analyses
+            if an != analysis and _label_parts(an)[0] == pfx]
+    hits = [(an, v) for an, v in hits if v is not None]
+    if not hits:
+        return None
+    lo = min(v[0] for _an, v in hits)
+    hi = max(v[1] for _an, v in hits)
+    note = ("" if len({v for _an, v in hits}) == 1 else
+            "constituent_bounds_differ(" + ";".join(
+                f"{an}:{v[0]:g}-{v[1]:g}" for an, v in hits) + ")")
+    return lo, hi, [an for an, _v in hits], note
+
+
 def resolve_dL_prior(catalog, analysis, analyses, priors, dL_samples,
                      cfg: IngestConfig, flavour: str = "native",
-                     release_table=None):
+                     release_table=None, data=None):
     """Resolve the effective distance prior for one ingested analysis.
 
     Strategy for the bounds is unchanged: read analytic from the chosen
     analysis; if absent (e.g. the GWTC-2.1/3 ``Mixed`` sets, whose analytic AND
     prior-sample groups are both empty), search sibling analyses; if still absent
-    use the bounds of the dL sample range.
+    use the bounds of the dL sample range.  A non-reweighted O1-O3 release with
+    no analytic group anywhere takes LALInference's dL^2 prior on the bounds
+    its ``config_file/engine`` declares (``data``, the pesummary read object),
+    or is refused (review 2026-10-20, medium-44).
 
     GW-02 added the distribution CLASS and an exact cosmology-token mapping.  The
     effective class is the declared one EXCEPT for a reweighted ``_cosmo``
@@ -1047,6 +1112,8 @@ def resolve_dL_prior(catalog, analysis, analyses, priors, dL_samples,
         # No analytic anywhere (9 of the GWTC-2.1 rows).  A cosmo-flavour
         # release is still reweighted, so UniformSourceFrame remains the
         # effective prior; there is simply no declaration to compare it to.
+        # A non-reweighted O1-O3 release is on its LALInference sampling
+        # prior, read from the config below (or refused).
         if reweighted:
             return ResolvedDLPrior(
                 kind="UniformSourceFrame", H0=table_row.H0, Om0=table_row.Om0,
@@ -1058,6 +1125,34 @@ def resolve_dL_prior(catalog, analysis, analyses, priors, dL_samples,
                 cosmology_table_sha256=table_sha,
                 prior_source_label="", prior_source_kind="release_reweighted")
         H0, Om0 = default_cosmo
+        if _catalog_era(catalog, _label_parts(analysis)[0]) == "O1-O3":
+            # A non-reweighted O1-O3 release with no analytic group: the
+            # GWTC-2.1 LALInference runs, whose posteriors are on the
+            # LALInference default dL^2 prior, NOT UniformSourceFrame --
+            # assuming USF here was a silent, distance-dependent error in
+            # 1/p_pe (review 2026-10-20, medium-44).  Read the bounds from
+            # the config, or refuse.
+            declared = _dL_prior_from_config(data, analysis, analyses)
+            if declared is None:
+                raise DistancePriorKindError(
+                    f"{analysis}: a {flavour!r} {catalog} release with no "
+                    f"analytic distance prior on any label and no "
+                    f"LALInference config_file/engine distance-max. Its "
+                    f"posteriors are on the sampling prior, which gwcat "
+                    f"cannot identify; refusing to assume UniformSourceFrame.")
+            cmin, cmax, clabels, note = declared
+            where = ",".join(clabels)
+            return ResolvedDLPrior(
+                kind="PowerLaw", H0=H0, Om0=Om0, dmin=cmin, dmax=cmax,
+                source=(f"config_file[{where}]/engine/distance-min={cmin:g},"
+                        f"distance-max={cmax:g}:LALInference_default_dL^2"
+                        + (f" | {note}" if note else "")),
+                alpha=_LALINFERENCE_DL_ALPHA, sampling_kind="PowerLaw",
+                sampling_alpha=_LALINFERENCE_DL_ALPHA, flavour=flavour,
+                basis="config_file_declared",
+                cosmology_source="catalog_default",
+                prior_source_label=where,
+                prior_source_kind="config_file_declared")
         return ResolvedDLPrior(
             kind="UniformSourceFrame", H0=H0, Om0=Om0, dmin=dmin, dmax=dmax,
             source="default(no_analytic)", sampling_kind="",
@@ -1920,7 +2015,7 @@ def inspect(path: str, cfg: Optional[IngestConfig] = None):
     dL = np.asarray(s["luminosity_distance"], float)
     flavour = detect_release_flavour(path)
     res = resolve_dL_prior(catalog, analysis, analyses, priors, dL, cfg,
-                           flavour=flavour)
+                           flavour=flavour, data=data)
     val = (validate_prior_against_samples(priors, [analysis] + analyses, res,
                                           impl=cfg.dL_prior_impl)
            if cfg.validate_prior else None)
@@ -2335,7 +2430,7 @@ def build_store(paths, out_path, params=None, extra_params=None,
             dL = np.asarray(s["luminosity_distance"], float)
             res = resolve_dL_prior(catalog, analysis, analyses, priors, dL, cfg,
                                    flavour=flavour,
-                                   release_table=release_table)
+                                   release_table=release_table, data=data)
             H0, Om0, dmin, dmax, src = (res.H0, res.Om0, res.dmin, res.dmax,
                                         res.source)
             ks_val = None
