@@ -914,3 +914,43 @@ def test_non_finite_far_threshold_is_refused(tmp_path, far):
     with pytest.raises(ValueError, match="far_threshold"):
         build_selection_product(SelectionSet(path), spin_basis="component",
                                 far_threshold=far)
+
+
+def test_endo3_jacobian_matches_astropy_on_a_cosmology_consistent_file(tmp_path):
+    """The computed ddL/dz (the O3 half of the production selection) was only
+    ever checked against gwcat's own _ddL_dz, so dropping its (1+z) factor --
+    a 5-44% error over the O3 range -- passed every test.  Here the fixture's
+    dL IS a flat-LCDM dL(z), the loader detects that cosmology, and pdraw is
+    recomputed from the file with h5py and astropy alone (a central-difference
+    derivative of astropy's luminosity distance), no gwcat function in it."""
+    from astropy.cosmology import FlatLambdaCDM
+    from gwcat.export import build_selection_product
+
+    truth = _fixture_cosmology()
+    path = _endo3_cosmology_consistent(tmp_path / "e3.hdf", 400, 21, truth)
+    prod = build_selection_product(SelectionSet(path), spin_basis="component")
+    a = prod.attrs
+    assert [x.decode() if isinstance(x, bytes) else x
+            for x in a["cosmology_source_per_campaign"]] == ["detected"]
+    H0 = float(a["cosmology_H0_per_campaign"][0])
+    Om0 = float(a["cosmology_Om0_per_campaign"][0])
+    assert H0 == pytest.approx(truth.H0.value, rel=1e-4)
+    assert Om0 == pytest.approx(truth.Om0, rel=1e-3)
+
+    with h5py.File(path, "r") as f:
+        inj = f["injections"]
+        pdf = inj["sampling_pdf"][:]
+        m1det, z = inj["mass1"][:], inj["redshift"][:]
+        a1 = np.sqrt(inj["spin1x"][:] ** 2 + inj["spin1y"][:] ** 2
+                     + inj["spin1z"][:] ** 2)
+        a2 = np.sqrt(inj["spin2x"][:] ** 2 + inj["spin2y"][:] ** 2
+                     + inj["spin2z"][:] ** 2)
+    used = FlatLambdaCDM(H0=H0, Om0=Om0)
+    h = 1e-5
+    ddL = ((used.luminosity_distance(z + h) - used.luminosity_distance(z - h))
+           .to("Mpc").value / (2 * h))
+    # p(m1src, m2src, z, spins) -> p(m1det, q, dL, a, cos t): the spin part
+    # 1/(4 pi a^2) per body (cartesian -> polar) is undone by (2 pi)^2 a^2.
+    expected = (pdf * (2 * np.pi) ** 2 * a1 ** 2 * a2 ** 2
+                * m1det / (1 + z) ** 2 / ddL)
+    np.testing.assert_allclose(prod.columns["pdraw"], expected, rtol=1e-7)
