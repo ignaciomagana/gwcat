@@ -419,3 +419,44 @@ def test_cli_ingests_a_file_matched_by_two_globs_once(tmp_path, monkeypatch):
               "--out", str(tmp_path / "s.h5")], _deprecated=False)
     assert [os.path.basename(p) for p in seen["p"]] == [
         "GW950101_000001_a.h5", "GW950102_000002_b.h5"]
+
+
+# ==========================================================================
+# medium-25: a re-release whose preferred label changed
+# ==========================================================================
+_R4 = "IGWN-GWTC4-v1-GW950529_181500-combined_PEDataRelease.hdf5"
+_R41 = "IGWN-GWTC4p1-v1-GW950529_181500-combined_PEDataRelease.hdf5"
+
+
+def _rerelease(tmp_path, monkeypatch, how):
+    files = {_R4: _one_label_file(1, label="C00:IMRPhenomXPHM"),
+             _R41: _one_label_file(2, label="C00:SEOBNRv5PHM")}
+    store = _ingest(tmp_path, monkeypatch, {_R4: files[_R4]}, name="a.h5")
+    p41 = tmp_path / _R41
+    p41.write_bytes(b"")
+
+    def _read(path):
+        data, sd, priors = files[os.path.basename(path)]
+        return data, sd, list(sd), priors
+    monkeypatch.setattr(ing, "_read_event_pesummary", _read)
+    out = tmp_path / f"merged_{how}.h5"
+    ing.merge_store(store, [str(p41)], out_path=str(out),
+                    cfg=ing.IngestConfig(**_CFG), event_table={},
+                    on_duplicate_key=how)
+    with h5py.File(out, "r") as f:
+        return [x.decode() if isinstance(x, bytes) else x
+                for x in f["meta/sample_set_name"][:]]
+
+
+def test_refresh_replaces_the_preferred_row_when_the_label_changed(
+        tmp_path, monkeypatch):
+    with pytest.warns(UserWarning, match="Refreshed"):
+        labels = _rerelease(tmp_path, monkeypatch, "refresh")
+    assert labels == ["C00:SEOBNRv5PHM"]
+
+
+def test_skip_keeps_the_old_preferred_row_when_the_label_changed(
+        tmp_path, monkeypatch):
+    with pytest.warns(UserWarning, match="skipped"):
+        labels = _rerelease(tmp_path, monkeypatch, "skip")
+    assert labels == ["C00:IMRPhenomXPHM"]

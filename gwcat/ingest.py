@@ -3239,13 +3239,60 @@ def _row_keys(S):
 
     A row of the ragged store is one ``(event, sample_set)`` pair -- that is the
     uniqueness the sample-set contract declares (see SAMPLE_SET_STR_FIELDS) and
-    what ``sample_sets="all"`` produces.  Stores written before the contract, and
-    the single-sample-set default, carry ``sample_set_name = ""`` for every row,
-    so keying on the pair reduces to keying on the name for them.
+    what ``sample_sets="all"`` produces.  Every row :func:`build_store` writes
+    carries its analysis label in ``sample_set_name``, the single-sample-set
+    default included; only stores written before the contract lack the column,
+    and for them (``""``) keying on the pair reduces to keying on the name.
     """
     ss = S["meta"].get("sample_set_name") or [""] * S["n_events"]
     return [(n, str(ss[i]) if i < len(ss) else "")
             for i, n in enumerate(S["names"])]
+
+
+def _preferred_flags(S):
+    """Whether each row of an in-memory store is its event's preferred set."""
+    v = S["meta"].get("is_preferred")
+    if v is None:
+        return [False] * S["n_events"]
+    out = []
+    for x in v:
+        try:
+            out.append(float(x) > 0.5)
+        except (TypeError, ValueError):
+            out.append(False)
+    return out
+
+
+def _duplicate_rows(A, B):
+    """``(A rows, B rows, labels)`` of the rows of ``B`` that duplicate ``A``.
+
+    A ``B`` row duplicates an ``A`` row when the two share the ``(event,
+    sample_set)`` key, OR when both are their event's PREFERRED row.  The
+    second case is a re-release whose preferred label changed
+    (``C00:IMRPhenomNSBH`` -> ``C00:Mixed:HighSpin``): it is the same event's
+    preferred sample set, and keying on the label alone kept both rows, each
+    marked preferred, so "refresh" replaced nothing (review 2026-10-20,
+    medium-25).  A non-preferred new sample set is still not a duplicate.
+    """
+    a_keys, b_keys = _row_keys(A), _row_keys(B)
+    a_pref, b_pref = _preferred_flags(A), _preferred_flags(B)
+    by_key, pref_by_name = {}, {}
+    for i, k in enumerate(a_keys):
+        by_key.setdefault(k, []).append(i)
+        if a_pref[i]:
+            pref_by_name.setdefault(k[0], []).append(i)
+    a_dup, b_dup, listed = set(), set(), []
+    for j, k in enumerate(b_keys):
+        hit = set(by_key.get(k, []))
+        if b_pref[j]:
+            hit |= set(pref_by_name.get(k[0], []))
+        if hit:
+            b_dup.add(j)
+            a_dup |= hit
+            olds = sorted({a_keys[i][1] for i in hit} - {k[1]})
+            tag = f"{k[0]}[{k[1]}]" if k[1] else k[0]
+            listed.append(tag + (f" (preferred; was {olds})" if olds else ""))
+    return a_dup, b_dup, sorted(listed)
 
 
 def merge_stores(store_a, store_b, out_path, cfg: Optional[IngestConfig] = None,
@@ -3263,7 +3310,12 @@ def merge_stores(store_a, store_b, out_path, cfg: Optional[IngestConfig] = None,
     contract declares -- NOT the event name.  A ``store_b`` row whose event
     already appears in ``store_a`` under a DIFFERENT sample set is therefore
     added, not dropped: that is how a second waveform's samples enter an
-    existing catalog (GW-14).
+    existing catalog (GW-14).  The exception is an event's PREFERRED row: a
+    ``store_b`` preferred row duplicates ``store_a``'s preferred row of the
+    same event whatever its label, so a re-release whose preferred label
+    changed replaces (or is skipped against) the old one instead of leaving
+    two preferred rows (review 2026-10-20, medium-25).  A merge that still
+    leaves an event with two preferred rows (``"keep"``) warns.
 
     on_duplicate_key : {"skip", "refresh", "keep"} or None
         What to do with a ``store_b`` row whose full key matches a ``store_a``
@@ -3296,21 +3348,18 @@ def merge_stores(store_a, store_b, out_path, cfg: Optional[IngestConfig] = None,
     B = _read_store_meta(store_b)
 
     if on_duplicate_key != "keep":
-        a_keys = _row_keys(A)
-        b_keys = _row_keys(B)
-        dupes = set(a_keys) & set(b_keys)
-        if dupes:
-            listed = sorted(f"{n}[{s}]" if s else n for n, s in dupes)
+        a_dup, b_dup, listed = _duplicate_rows(A, B)
+        if b_dup:
             if on_duplicate_key == "skip":
                 warnings.warn(f"Duplicate events skipped from the second "
                               f"store: {listed}")
-                B = _subset_meta(B, [i for i, k in enumerate(b_keys)
-                                     if k not in dupes])
+                B = _subset_meta(B, [i for i in range(B["n_events"])
+                                     if i not in b_dup])
             else:
                 warnings.warn(f"Refreshed from the second store (the first "
                               f"store's rows are replaced): {listed}")
-                A = _subset_meta(A, [i for i, k in enumerate(a_keys)
-                                     if k not in dupes])
+                A = _subset_meta(A, [i for i in range(A["n_events"])
+                                     if i not in a_dup])
 
     # Union parameter order: store A's columns first, then B's new columns.
     union_params = list(A["params"]) + [p for p in B["params"]
@@ -3352,6 +3401,8 @@ def merge_stores(store_a, store_b, out_path, cfg: Optional[IngestConfig] = None,
     resolved_pastro = resolve_pastro_column(merged_meta, n_total)
     for k in PASTRO_KEYS:
         merged_meta[k] = list(resolved_pastro)
+    _warn_multiple_preferred(names, merged_meta.get("is_preferred"),
+                             "merge_stores")
 
     # The copy reads the inputs WHILE writing the output, so an in-place merge
     # -- out_path IS one of the inputs, which the old in-memory merge allowed
