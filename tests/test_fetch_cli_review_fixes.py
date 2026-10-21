@@ -8,6 +8,10 @@
   3. ``writer_commit`` names gwcat's own commit or says "unknown": an install
      inside another repository's checkout was stamped with that repository's
      HEAD.
+  4. CLI help and argument checks: the --H0 help says what the code does (it
+     is not applied to every campaign), --strict no longer claims every
+     cross-file check raises, and a NaN/out-of-range cosmology or a zero
+     --nsamp is refused at parse time.
 
 Every test is offline: GWOSC and Zenodo are monkeypatched.
 """
@@ -239,3 +243,78 @@ def test_gwcats_own_checkout_is_stamped_with_its_commit(tmp_path,
     _git(repo, "add", ".")
     _git(repo, "commit", "-q", "-m", "gwcat")
     assert vs.gwcat_commit() == _git(repo, "rev-parse", "HEAD")
+
+
+# ==========================================================================
+# 4. CLI help says what the code does; bad numbers are refused at parse time
+# ==========================================================================
+def _help(capsys, *argv):
+    from gwcat.cli import main
+    with pytest.raises(SystemExit) as ei:
+        main([*argv, "--help"])
+    assert ei.value.code == 0
+    return " ".join(capsys.readouterr().out.split())
+
+
+@pytest.mark.parametrize("argv", [("export", "selection"), ("selection",)])
+def test_the_h0_help_no_longer_claims_it_reaches_every_campaign(capsys, argv):
+    """Every documented O3+O4ab command passed --H0 on that promise and exited
+    1: the override cannot reach a campaign that ships its own ddL/dz, and an
+    override that reaches only some campaigns is refused."""
+    text = _help(capsys, *argv)
+    assert "applied to every" not in text
+    assert "refused" in text
+    assert "dluminosity_distance_dredshift" in text
+
+
+def test_the_v1_selection_help_names_the_route_that_builds_o3_plus_o4ab(capsys):
+    from gwcat.cli import main
+    with pytest.raises(SystemExit):
+        main(["--help"])
+    text = " ".join(capsys.readouterr().out.split())
+    assert "chieff_reference" in text and "--spin-reference-amax" in text
+
+
+def test_the_strict_help_no_longer_claims_cross_file_checks_always_raise(
+        capsys):
+    text = _help(capsys, "validate")
+    assert "always raise" not in text
+    assert "only warn" in text
+
+
+@pytest.mark.parametrize("spec", ["nan,0.3", "inf,0.3", "-70,0.3", "0,0.3",
+                                  "70,nan", "70,1.5", "70,0", "70,-0.1"])
+def test_a_bad_cosmology_is_refused_at_parse_time(spec):
+    from gwcat.cli import _parse_cosmology
+    with pytest.raises(SystemExit, match="must be finite"):
+        _parse_cosmology(spec)
+
+
+def test_a_good_cosmology_still_parses():
+    from gwcat.cli import _parse_cosmology
+    assert _parse_cosmology("67.74,0.3089") == (67.74, 0.3089)
+    assert _parse_cosmology("70,1") == (70.0, 1.0)
+    assert _parse_cosmology(None) is None
+
+
+@pytest.mark.parametrize("flags", [("--H0", "nan"), ("--Om0", "1.5"),
+                                   ("--H0", "-1")])
+def test_a_bad_selection_override_is_refused_before_any_file_is_read(
+        tmp_path, flags):
+    from gwcat.cli import main
+    missing = str(tmp_path / "no_such_injections.hdf")
+    out = str(tmp_path / "x.h5")
+    for argv in (["export", "selection", missing, "--out", out],
+                 ["selection", "--injections", missing, "--out", out]):
+        with pytest.raises(SystemExit, match="must be finite"):
+            main(argv + list(flags))
+
+
+@pytest.mark.parametrize("sub", [("export", "pe"), ("export-darksirens",)])
+def test_nsamp_zero_is_refused(sub, capsys):
+    from gwcat.cli import build_parser
+    with pytest.raises(SystemExit) as ei:
+        build_parser().parse_args([*sub, "store.h5", "--out", "x.h5",
+                                   "--nsamp", "0"])
+    assert ei.value.code == 2
+    assert "must be >= 1" in capsys.readouterr().err

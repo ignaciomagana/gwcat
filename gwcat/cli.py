@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from typing import Optional, Sequence
@@ -91,6 +92,14 @@ def _add_space_argument(parser, kind) -> None:
                              f"--spin-basis is an accepted alias. "
                              f"Run 'export list-spaces' for every declared "
                              f"space, including ones no builder ships yet.")
+
+
+def _positive_int(text: str) -> int:
+    """argparse type: an integer >= 1 (``--nsamp 0`` wrote an empty product)."""
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {value}")
+    return value
 
 
 def _invoked_program_name() -> str:
@@ -182,7 +191,7 @@ def build_parser() -> argparse.ArgumentParser:
     far_group = p_export.add_mutually_exclusive_group()
     far_group.add_argument("--allow-missing-far", action="store_true")
     far_group.add_argument("--require-far", action="store_true")
-    p_export.add_argument("--nsamp", type=int, default=4096)
+    p_export.add_argument("--nsamp", type=_positive_int, default=4096)
     p_export.add_argument("--seed", type=int, default=0)
     p_export.add_argument("--z-max", type=float, default=None)
     # "auto" like the v2 `export pe` sibling (GW-37): one hardcoded ceiling
@@ -260,7 +269,7 @@ def build_parser() -> argparse.ArgumentParser:
     pe_far_group.add_argument("--allow-missing-far", action="store_true")
     pe_far_group.add_argument("--require-far", action="store_true")
     p_pe.add_argument("--pastro-min", type=float, default=None)
-    p_pe.add_argument("--nsamp", type=int, default=4096)
+    p_pe.add_argument("--nsamp", type=_positive_int, default=4096)
     p_pe.add_argument("--seed", type=int, default=0)
     p_pe.add_argument("--z-max", type=float, default=None)
     p_pe.add_argument("--amax", default="auto", metavar="AMAX",
@@ -483,6 +492,23 @@ def build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 # Subcommand implementations (thin argparse -> library-call translation)
 # ---------------------------------------------------------------------------
+def _cosmology_problems(H0: Optional[float], Om0: Optional[float]) -> list:
+    """What is wrong with a command-line cosmology, if anything.
+
+    ``float()`` accepts ``nan`` and ``inf``, so an empty shell variable or a
+    typo used to reach the builders as a cosmology: ``--cosmology nan,0.3``
+    exited 0 with all-NaN source-frame columns that ``validate --strict``
+    passed, and ``70,1.5`` died in astropy with a raw ``TypeError``.
+    """
+    problems = []
+    if H0 is not None and not (math.isfinite(H0) and H0 > 0):
+        problems.append(f"H0={H0!r} must be finite and > 0")
+    if Om0 is not None and not (math.isfinite(Om0) and 0 < Om0 <= 1):
+        problems.append(f"Om0={Om0!r} must be finite with 0 < Om0 <= 1 "
+                        f"(flat LCDM)")
+    return problems
+
+
 def _parse_cosmology(spec: Optional[str]):
     if not spec:
         return None
@@ -491,9 +517,26 @@ def _parse_cosmology(spec: Optional[str]):
         raise SystemExit(
             f"--cosmology must be 'H0,Om0' (e.g. 67.74,0.3089), got {spec!r}")
     try:
-        return float(parts[0]), float(parts[1])
+        H0, Om0 = float(parts[0]), float(parts[1])
     except ValueError as e:
         raise SystemExit(f"--cosmology: {e}")
+    problems = _cosmology_problems(H0, Om0)
+    if problems:
+        raise SystemExit(f"--cosmology {spec!r}: " + "; ".join(problems))
+    return H0, Om0
+
+
+def _selection_cosmology_kwargs(args) -> dict:
+    """The ``--H0``/``--Om0`` override as SelectionSet kwargs, checked first."""
+    problems = _cosmology_problems(args.H0, args.Om0)
+    if problems:
+        raise SystemExit("--H0/--Om0: " + "; ".join(problems))
+    kwargs = {}
+    if args.H0 is not None:
+        kwargs["H0"] = args.H0
+    if args.Om0 is not None:
+        kwargs["Om0"] = args.Om0
+    return kwargs
 
 
 def _cmd_inspect(args) -> int:
@@ -678,11 +721,7 @@ def _cmd_export_selection(args) -> int:
             "exposure, which biases the detection probability low and the "
             "inferred rate high.")
 
-    kwargs = {}
-    if args.H0 is not None:
-        kwargs["H0"] = args.H0
-    if args.Om0 is not None:
-        kwargs["Om0"] = args.Om0
+    kwargs = _selection_cosmology_kwargs(args)
 
     sets = [SelectionSet(path, **kwargs) for path in args.injections]
     target = sets[0] if len(sets) == 1 else CombinedSelectionSet(sets)
@@ -725,11 +764,7 @@ def _cmd_selection(args) -> int:
 def _cmd_selection_impl(args) -> int:
     from .selection import SelectionSet, CombinedSelectionSet
 
-    kwargs = {}
-    if args.H0 is not None:
-        kwargs["H0"] = args.H0
-    if args.Om0 is not None:
-        kwargs["Om0"] = args.Om0
+    kwargs = _selection_cosmology_kwargs(args)
 
     sets = [SelectionSet(path, **kwargs) for path in args.injections]
     target = sets[0] if len(sets) == 1 else CombinedSelectionSet(sets)
