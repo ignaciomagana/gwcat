@@ -307,19 +307,30 @@ def _contained_dest(dest_dir, key: str) -> str:
     absolute path, which ``/`` discards the left operand for -- wrote wherever
     it liked. Nothing about the fetch path authenticates the record contents, so
     the destination has to be constrained here.
+
+    The check is on the NAME, lexically: no absolute path, no ``..`` or empty
+    component, no backslash.  It used to resolve the joined path, which
+    follows a symlink at the destination -- so a data directory whose files
+    link into a shared group copy (matching checksums, nothing to download)
+    was refused, even offline, as a record naming a path outside it.  Links
+    the user made inside the data directory are the user's, and the remote
+    name can no longer climb out of it.  Only the base is resolved.
     """
-    from pathlib import Path
+    from pathlib import Path, PurePosixPath
     base = Path(dest_dir).resolve()
-    target = (base / str(key)).resolve()
-    try:
-        target.relative_to(base)
-    except ValueError:
+    name = str(key)
+    parts = PurePosixPath(name).parts
+    if (not name or "\\" in name or "\x00" in name
+            or PurePosixPath(name).is_absolute()
+            or any(p in ("", ".", "..") for p in name.split("/"))
+            or not parts):
         raise RuntimeError(
-            f"refusing to download {key!r}: the remote file name resolves to "
-            f"{target}, outside the data directory {base}. A release record "
-            f"that names a path outside its own download directory is not one "
-            f"to trust.")
-    return str(target)
+            f"refusing to download {key!r}: the remote file name is not a "
+            f"plain relative path inside the data directory {base} (it is "
+            f"absolute, empty, or has a '.', '..' or empty component). A "
+            f"release record that names a path outside its own download "
+            f"directory is not one to trust.")
+    return str(base.joinpath(*parts))
 
 
 def download_file(url: str, dest: str, expected_md5: Optional[str] = None,
