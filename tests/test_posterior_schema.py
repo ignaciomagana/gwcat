@@ -342,7 +342,10 @@ def test_merge_adds_second_sample_set(tmp_path):
 
 
 def test_merge_refreshes_matching_key(tmp_path):
-    """on_duplicate_key='refresh' replaces one sample set's row in place."""
+    """on_duplicate_key='refresh' replaces one sample set's row.
+
+    Not in place: the refreshed row moves to the end of the store, which
+    matters for seeded exports (their draws follow store row order)."""
     store_a = _build_store(tmp_path / "a.h5",
                            [{"name": "GWref", "params": _CORE,
                              "sample_set": "C01:IMRPhenomXPHM"},
