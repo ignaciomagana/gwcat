@@ -585,3 +585,37 @@ def test_pdraw_normalisation_and_campaign_times_are_recorded(tmp_path):
             np.testing.assert_allclose(f.attrs["campaign_T_obs_yr"],
                                        [0.5, 1.25], rtol=1e-12)
             assert np.isclose(float(f.attrs["T_obs_yr"]), 1.75, rtol=1e-12)
+
+
+# ======================================================================
+# low-13: the spin-removal ceiling check can fire on a joint-format file
+# ======================================================================
+def test_removal_ceiling_check_fires_on_a_joint_file_drawn_past_it(tmp_path):
+    from test_selection_spin import write_mixture
+    path = write_mixture(tmp_path / "mix.hdf", "cartesian", n=3000, seed=81,
+                         amax=(0.4, 0.998))
+    s = SelectionSet(path, strict_spin_checks="off")
+    with pytest.warns(UserWarning, match="spin magnitudes reach"):
+        s._load()
+    drawn = max(float(np.max(s.a1)), float(np.max(s.a2)))
+    assert drawn > 0.99
+    assert s._removal_amax_reference == drawn
+    assert np.isclose(s._removal_amax_factor, (0.99 / drawn) ** 2)
+    out = tmp_path / "sel.h5"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        s.export(str(out), spin_basis="component")
+    with h5py.File(out, "r") as f:
+        assert np.isclose(
+            f.attrs["spin_removal_amax_reference_per_campaign"][0], drawn)
+
+
+def test_removal_ceiling_check_is_silent_below_the_assumed_ceiling(tmp_path):
+    from test_selection_spin import write_mixture
+    path = write_mixture(tmp_path / "mix.hdf", "polar", n=200, seed=82,
+                         amax=(0.4, 0.9))
+    s = SelectionSet(path, strict_spin_checks="off")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        s._load()
+    assert s._removal_amax_factor is None

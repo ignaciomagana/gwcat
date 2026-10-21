@@ -1042,8 +1042,9 @@ def campaign_provenance_attrs(set_list, *, draw_domain=None,
     actually span, whether some campaign drew past another's declared bound,
     and which ``draw_domain`` policy the export applied; the FAR-column
     discovery record (medium-31); the detected generation cosmology, which
-    an override does not erase (medium-33); and each campaign's own observing
-    time, the T_k of ``pdraw_normalisation`` (low-5).
+    an override does not erase (medium-33); each campaign's own observing
+    time, the T_k of ``pdraw_normalisation`` (low-5); and the spin-removal
+    ceiling check (low-13).
     """
     if draw_domain_mismatch is None:
         draw_domain_mismatch = draw_domain_mismatches(set_list)
@@ -1081,6 +1082,15 @@ def campaign_provenance_attrs(set_list, *, draw_domain=None,
             dtype=float),
         "cosmology_generation_Om0_per_campaign": np.array(
             [_cosmo_or_nan(s, "_cosmology_generation_Om0") for s in set_list],
+            dtype=float),
+        # The ceiling the spin-removal step's assumed amax was checked
+        # against (detected, or the largest drawn magnitude) and the constant
+        # factor it implies; NaN where no removal branch ran (low-13).
+        "spin_removal_amax_reference_per_campaign": np.array(
+            [_cosmo_or_nan(s, "_removal_amax_reference") for s in set_list],
+            dtype=float),
+        "spin_removal_amax_factor_per_campaign": np.array(
+            [_cosmo_or_nan(s, "_removal_amax_factor") for s in set_list],
             dtype=float),
     }
 
@@ -1178,6 +1188,10 @@ class SelectionSet:
         self._far_columns = []
         # How those columns were chosen and what was left out (medium-31).
         self._far_discovery = None
+        # What the spin-removal ceiling was checked against, and the constant
+        # factor it leaves (None when not applicable); see _check_removal_amax.
+        self._removal_amax_reference = None
+        self._removal_amax_factor = None
         # GW-39: what kind of campaign this is, the per-row run label (a
         # cumulative mixture only; None otherwise), the per-row time and the
         # semianalytic SNR column (None when the file carries none), and the
@@ -1342,12 +1356,19 @@ class SelectionSet:
            divides out.  Measured on the real O4ab campaign: perturbing the
            assumed ceiling 0.99 -> 0.998 moves ``component_pdraw`` by 0 (to
            1e-14) while it moves ``pdraw_base`` by the predicted 1.0162269.
-        2. **No real file reaches it.**  ``ASSUMED_REMOVAL_AMAX`` is used only in
-           the ``joint_cartesian`` and ``joint_polar`` branches, and both shipped
-           campaigns are factored formats (``o4_factored``, ``endo3_factored``)
-           that read their spin-free density directly with no assumed-prior
-           subtraction.  So this is a latent defect on a path production data
-           does not take -- not a bias in any shipped product.
+        2. **The production O3+O4ab product does not reach it.**
+           ``ASSUMED_REMOVAL_AMAX`` is used only in the ``joint_cartesian`` and
+           ``joint_polar`` branches, and endo3 and rpo4ab are factored formats
+           (``endo3_factored``, ``o4_factored``) that read their spin-free
+           density directly with no assumed-prior subtraction.  A real file
+           DOES take the branch: the GWTC-5.0 cumulative O1-O4b mixture
+           (``joint_cartesian``, and its ``joint_polar`` twin), whose
+           magnitudes reach 0.998 (O3 rows) and ~1 (O4 rows), past the
+           assumed 0.99.  A joint density carries no detectable ceiling, so
+           the comparison is then with the largest DRAWN magnitude (review
+           2026-10-20, low-13: this check used to need both a removal branch
+           and a detected ceiling, which are set in mutually exclusive
+           branches, so it could never fire).
 
         For a projection basis on a joint-format file it would be live, and the
         following describes what it would then do.
@@ -1391,12 +1412,43 @@ class SelectionSet:
         # NB: the private attribute, not the `spin_meta` property -- that one is
         # lazy and calls _load(), which is what invoked us.
         detected = (getattr(self, "_spin_meta", None) or {}).get("amax_detected")
-        if detected is None or not all(np.isfinite(a) for a in detected):
-            return None
-        worst = max(float(a) for a in detected)
+        if (detected is not None
+                and all(a is not None and np.isfinite(a) for a in detected[:2])):
+            worst = max(float(a) for a in detected[:2])
+            drawn = False
+        else:
+            mags = [np.asarray(a, dtype=float) for a in (self._a1, self._a2)
+                    if a is not None]
+            mags = [m[np.isfinite(m)] for m in mags]
+            mags = [m for m in mags if m.size]
+            if not mags:
+                return None
+            worst = float(max(m.max() for m in mags))
+            drawn = True
+            # A sample maximum BELOW the assumed ceiling proves no smaller one.
+            if worst <= removal:
+                return None
+        self._removal_amax_reference = worst
         if np.isclose(worst, removal, rtol=1e-9, atol=1e-12):
             return None
         factor = (removal / worst) ** 2
+        if drawn:
+            warnings.warn(
+                f"{self.path}: the spin-removal step subtracted an isotropic "
+                f"uniform-magnitude cartesian spin prior assuming amax="
+                f"{removal}, but this campaign's spin magnitudes reach "
+                f"{worst:.6g}, past that ceiling. The joint draw density "
+                f"carries no detectable ceiling, so the size is known only "
+                f"if the draw is uniform-isotropic up to that maximum: then "
+                f"pdraw carries the CONSTANT factor c={factor:.6f} (only log "
+                f"Z moves, by N_obs*ln(c) = {np.log(factor):+.4f} nats per "
+                f"observed event). Otherwise the legacy pdraw of the "
+                f"projection bases is off by a spin-dependent factor. The "
+                f"component and chieff_reference bases are exact either way "
+                f"(the removal cancels there). Recorded in "
+                f"spin_removal_amax_reference_per_campaign. Tracked for "
+                f"GW-19.")
+            return factor
         warnings.warn(
             f"{self.path}: the spin-removal step subtracted a cartesian spin "
             f"prior assuming amax={removal}, but this campaign's injected amax "
