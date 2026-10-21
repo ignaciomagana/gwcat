@@ -1227,7 +1227,9 @@ class GWCatalog:
                         and not nrsur_q_rule_substitute)
         same_as_view = (
             waveform_policy == view_policy
-            and approximant in (None, self._waveform_approximant)
+            # resolve_policy reads approximant under strict-approximant only
+            and (waveform_policy != "strict-approximant"
+                 or approximant in (None, self._waveform_approximant))
             and (map_digest is None
                  or map_digest == self._sample_set_map_digest)
             and (nrsur_q_rule is None
