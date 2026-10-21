@@ -501,3 +501,16 @@ def test_chieff_chip_records_the_events_that_drop_the_component_columns(
     _cols, a2 = _read(out2)
     assert bool(a2["component_columns_emitted"]) is True
     assert len(a2["component_columns_missing_events"]) == 0
+
+
+# ==========================================================================
+# A draw with replacement is warned about (August catalog 2)
+# ==========================================================================
+def test_an_undersampled_event_drawn_with_replacement_warns(tmp_path):
+    events = [{"name": "GWu_000001", "n": 40}, {"name": "GWu_000002", "n": 300}]
+    store, _ = _build_spin_store(tmp_path, events, name="under.h5")
+    with pytest.warns(UserWarning, match=r"1 of 2 event.*WITH replacement.*"
+                                         r"GWu_000001"):
+        GWCatalog(store).export(str(tmp_path / "pe.h5"), format="gwcat2",
+                                spin_basis="chieff", nsamp=64, seed=0,
+                                cosmology=_COSMO)

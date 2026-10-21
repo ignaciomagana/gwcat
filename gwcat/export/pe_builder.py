@@ -634,6 +634,8 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     #: Samples each kept event's draw chose from (after z_max and the spin
     #: cut) -- the pool size a reproduction of the draw needs.
     n_kept_pool = []
+    #: (name, pool size, distinct rows) of each event drawn with replacement.
+    rep_detail = []
 
     # ── Per-event spin-prior ceiling scaffolding (every spin basis) ─────────
     # Per-event spin amax from the store meta (aligned with selected events).
@@ -883,6 +885,8 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             # too (review Low 64), and its rows repeat just the same.
             if rep:
                 upsampled_events.append(str(sub.event_names[e]))
+                rep_detail.append((str(sub.event_names[e]), int(n_kept),
+                                   n_unique_per_event[-1]))
 
             # The draw is settled: NOW read, and read only the rows it kept.
             drawn = reader.read(e, _read_plan(e), rows=idx_orig)
@@ -1538,6 +1542,23 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
               "injection campaign defined at its own f_ref -- mixes "
               "frequencies; f_ref_per_event records each event's. No "
               "pairing check compares f_ref yet.")
+
+    # ── Draws with replacement are said, not only recorded (August catalog 2)
+    # Their repeated rows are not independent samples: the row ESS and a
+    # consumer's per-event MC variance overstate them by up to the
+    # duplication factor.
+    if rep_detail:
+        listed = ", ".join(f"{nm}: {nu} distinct of {nsamp} rows (pool {nk})"
+                           for nm, nk, nu in rep_detail[:10])
+        more = ("" if len(rep_detail) <= 10
+                else f", ... (+{len(rep_detail) - 10} more)")
+        warnings.warn(
+            f"{len(rep_detail)} of {nobs} event(s) were drawn WITH "
+            f"replacement (replace={replace!r}), so their rows repeat: "
+            f"{listed}{more}. Repeated rows are not independent samples; use "
+            f"n_unique_samples_per_event and "
+            f"prior_reweight_ess_distinct_per_event, not nsamp, for their "
+            f"Monte Carlo error.")
 
     # Counted over the SELECTED events, so an event the cut removed entirely
     # is in both numbers (review Medium 39).
