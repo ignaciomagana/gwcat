@@ -1013,3 +1013,21 @@ def test_per_campaign_spin_attrs_keep_empty_campaigns(tmp_path, basis):
         assert amax.shape == (2,)
         assert amax[0] == pytest.approx(0.9, rel=1e-9) and np.isnan(amax[1])
     assert float(a["chi_eff_amax"]) == pytest.approx(0.9, rel=1e-9)
+
+
+@pytest.mark.parametrize("sentinel", [1.0, 1e50, np.inf, np.nan, -1e300])
+def test_out_of_reference_sentinel_must_be_negligible(tmp_path, sentinel):
+    """A caller-set out_of_reference_pdraw of 1.0 gave the excluded rows a real
+    weight while the attrs still said they carry none."""
+    from gwcat.export import build_selection_product
+
+    path = write_o4_full(tmp_path / "o4.hdf", n=40, amax=(0.998, 0.998),
+                         seed=18)
+    with pytest.raises(ValueError, match="out_of_reference_pdraw"):
+        build_selection_product(SelectionSet(path),
+                                spin_basis="chieff_reference",
+                                spin_reference_amax=0.99,
+                                out_of_reference_pdraw=sentinel)
+    # The default is accepted.
+    build_selection_product(SelectionSet(path), spin_basis="chieff_reference",
+                            spin_reference_amax=0.99)

@@ -215,6 +215,10 @@ _REFERENCE_BASES = ("chieff_reference",)
 #: Same value as the sentinel the marked-transition analysis had been patching in
 #: downstream, so a product built here matches one built there row for row.
 OUT_OF_REFERENCE_PDRAW = 1e300
+#: The smallest ``out_of_reference_pdraw`` accepted: an excluded row's weight
+#: ``p_pop * J / pdraw`` must be negligible against every real one, as the
+#: attrs (``spin_reference_excluded_rows``, "weight exactly zero") say it is.
+_MIN_OUT_OF_REFERENCE_PDRAW = 1e100
 
 #: The cumulative-mixture SNR column used by the optional OR-branch.
 _SNR_COLUMN = SNR_COLUMN
@@ -1071,7 +1075,7 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         ``pdraw`` written for a row the reference assigns zero density to
         (``a_i > a_ref``), so its importance weight underflows to exactly zero
         while the file keeps a finite positive ``pdraw`` everywhere.  Reference
-        bases only.
+        bases only; must be finite and at least 1e100.
     z_max : float, optional
         Redshift truncation matching the PE export's per-sample ``z_max``
         (GW-37).  Injections above it are SUBSET out (``ndraw`` untouched, so
@@ -1161,6 +1165,23 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     # `None` for every non-reference basis; a validated float for a reference
     # basis, which never defaults it.
     a_ref = _parse_reference_amax(spin_basis, spin_reference_amax)
+    if a_ref is not None:
+        # Review fix: never validated, so a caller-set 1.0 gave excluded rows
+        # a real weight while the attrs still called it zero.
+        try:
+            sentinel = float(out_of_reference_pdraw)
+        except (TypeError, ValueError):
+            sentinel = float("nan")
+        if not (np.isfinite(sentinel)
+                and sentinel >= _MIN_OUT_OF_REFERENCE_PDRAW):
+            raise ValueError(
+                f"out_of_reference_pdraw={out_of_reference_pdraw!r}: the pdraw "
+                f"written for rows the reference assigns zero density must be "
+                f"finite (the file stays finite-and-positive) and at least "
+                f"{_MIN_OUT_OF_REFERENCE_PDRAW:g}, so that their importance "
+                f"weight is negligible; anything smaller gives them a real "
+                f"weight while spin_reference_excluded_rows records them as "
+                f"excluded. The default is {OUT_OF_REFERENCE_PDRAW:g}.")
 
     if isinstance(sets, CombinedSelectionSet):
         set_list = list(sets._sets)
