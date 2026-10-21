@@ -140,6 +140,36 @@ def test_the_declared_license_ships_with_its_text():
 _DIST_OF = {"yaml": "pyyaml"}
 
 
+def _is_stdlib(name):
+    """Whether top-level module ``name`` belongs to the standard library.
+
+    ``sys.stdlib_module_names`` where it exists (3.10+).  Before 3.10: a
+    built-in or frozen module, or one whose file lies in the interpreter's
+    standard-library directories and not in site-packages.
+    """
+    import importlib.util
+    import sys
+    import sysconfig
+
+    known = getattr(sys, "stdlib_module_names", None)
+    if known is not None:
+        return name in known
+    if name in sys.builtin_module_names:
+        return True
+    spec = importlib.util.find_spec(name)
+    if spec is None or spec.origin is None:
+        return False
+    if spec.origin in ("built-in", "frozen"):
+        return True
+    origin = Path(spec.origin).resolve()
+    paths = sysconfig.get_paths()
+
+    def under(*keys):
+        return any(Path(paths[k]).resolve() in origin.parents for k in keys)
+
+    return under("stdlib", "platstdlib") and not under("purelib", "platlib")
+
+
 @needs_source_tree
 def test_import_gwcat_needs_only_declared_dependencies():
     """scipy was a hard import of ``import gwcat`` (gwcat/chi_eff_exact.py)
@@ -157,7 +187,6 @@ def test_import_gwcat_needs_only_declared_dependencies():
         capture_output=True, text=True, check=True, cwd=str(REPO_ROOT))
     files = [Path(x) for x in out.stdout.split() if x.endswith(".py")]
     assert files, "import gwcat loaded no gwcat modules?"
-    stdlib = set(getattr(sys, "stdlib_module_names", ())) | {"__future__"}
     third = set()
     for f in files:
         for node in ast.parse(f.read_text()).body:     # module scope only
@@ -167,9 +196,8 @@ def test_import_gwcat_needs_only_declared_dependencies():
                 names = [node.module]
             else:
                 continue
-            third |= {n.split(".")[0] for n in names} - stdlib - {"gwcat"}
-    if not getattr(sys, "stdlib_module_names", None):  # py < 3.10
-        third -= {"typing", "dataclasses", "contextlib", "contextvars"}
+            third |= {n.split(".")[0] for n in names} - {"__future__", "gwcat"}
+    third = {n for n in third if not _is_stdlib(n)}
     declared = {re.split(r"[<>=!~\[ ;]", d, maxsplit=1)[0].lower()
                 for d in _pyproject()["project"]["dependencies"]}
     missing = sorted(n for n in third

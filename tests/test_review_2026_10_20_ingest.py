@@ -658,7 +658,8 @@ def test_sparse_broad_posterior_gets_no_fake_small_sky_area():
 
 
 def test_well_sampled_posterior_keeps_the_nside_64_value():
-    import healpy as hp
+    # healpy is optional (no extra declares it): without it the sky area is NaN.
+    hp = pytest.importorskip("healpy")
     rng = np.random.default_rng(18)
     n = 20000
     ra = 1.0 + 0.03 * rng.standard_normal(n)
