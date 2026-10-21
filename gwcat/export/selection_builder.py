@@ -895,6 +895,20 @@ def _campaign_reference_lnfactor(s, keep, a_ref):
             f"magnitudes a1/a2 to evaluate the reference support "
             f"(a_i <= a_ref), and this file carries none "
             f"(spin_format={s.spin_meta.get('spin_format')!r}).")
+    # A NaN chi_eff or magnitude fails every support comparison, so it used to
+    # turn a DETECTED injection into a zero-weight row counted as a physical
+    # exclusion (review fix).  It is malformed input, not "outside the
+    # reference", and is refused by name.
+    for name, arr in (("chieff", s._chieff), ("a1", s._a1), ("a2", s._a2)):
+        vals = np.asarray(arr, dtype=float)[keep]
+        n_bad = int(np.count_nonzero(~np.isfinite(vals)))
+        if n_bad:
+            raise ValueError(
+                f"{s.path}: {n_bad} of {vals.size} detected injections have a "
+                f"non-finite {name!r}. spin_basis='chieff_reference' decides "
+                f"each row's reference support from chieff, a1 and a2, and a "
+                f"NaN would silently mark a detected injection as excluded "
+                f"(weight zero) rather than as malformed.")
     lnp, chi_sup = chi_eff_prior_logprob_in_support(
         s._chieff[keep], s._m1src[keep], s._m2src[keep], amax=a_ref)
     in_ref = (np.asarray(chi_sup, dtype=bool)

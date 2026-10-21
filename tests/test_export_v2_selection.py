@@ -1067,3 +1067,21 @@ def test_the_finished_pdraw_is_rechecked_for_every_basis(tmp_path, ln_spin):
     s._ln_spin_component[3] = ln_spin
     with pytest.raises(ValueError, match="FINISHED selection pdraw"):
         build_selection_product(s, spin_basis="component")
+
+
+@pytest.mark.parametrize("field", ["_chieff", "_a1", "_a2"])
+def test_reference_basis_refuses_a_nan_spin_on_a_detected_row(tmp_path, field):
+    """A NaN chi_eff or magnitude failed every support comparison, so a
+    detected injection was written with the exclusion sentinel and counted in
+    spin_reference_excluded_rows as if the reference had excluded it."""
+    from gwcat.export import build_selection_product
+
+    path = write_o4_full(tmp_path / "o4.hdf", n=30, amax=(0.9, 0.9), seed=22)
+    s = SelectionSet(path)
+    s._load()
+    arr = np.array(getattr(s, field), dtype=float)
+    arr[5] = np.nan
+    setattr(s, field, arr)
+    with pytest.raises(ValueError, match="detected injections have a non-finite"):
+        build_selection_product(s, spin_basis="chieff_reference",
+                                spin_reference_amax=0.9, strict=False)
