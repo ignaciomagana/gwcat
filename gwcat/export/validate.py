@@ -1129,16 +1129,18 @@ def _xcheck_mixture_event_runs(_fail, results, pe_attrs, sel_attrs):
     """
     names = pe_attrs.get("event_names")
     runs = sel_attrs.get("run_labels")
-    if names is None or runs is None:
-        # The sel_mixture_has_* checks report a missing run_labels; a PE file
-        # without event_names has nothing to place.
+    if (names is None or runs is None
+            or sel_attrs.get("n_detected_per_run") is None
+            or sel_attrs.get("detection_rule_per_run") is None):
+        # The sel_mixture_has_* checks report a missing per-run record; a PE
+        # file without event_names has nothing to place.
         results["xcheck_mixture_event_runs"] = True
         return
     runs = [_impl_str(r) for r in np.atleast_1d(runs)]
     n_per = np.atleast_1d(np.asarray(
-        sel_attrs.get("n_detected_per_run", [0] * len(runs)))).astype(int)
+        sel_attrs["n_detected_per_run"])).astype(int)
     rules = [_impl_str(r) for r in np.atleast_1d(
-        sel_attrs.get("detection_rule_per_run", [""] * len(runs)))]
+        sel_attrs["detection_rule_per_run"])]
     if not (len(runs) == n_per.size == len(rules)):
         # The alignment checks above have failed already.
         results["xcheck_mixture_event_runs"] = True
