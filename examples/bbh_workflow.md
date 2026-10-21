@@ -76,10 +76,14 @@ O1/O2 events, and the O3+O4ab injections have no O1/O2 exposure; the
 selection file records its campaigns' GPS spans and runs, but `gwcat validate`
 does not yet compare them with the PE events, so drop those events (or use the
 cumulative O1-O4b mixture, which darksirens-core cannot load yet) for a
-consistent pair. Under `--strict`, the posterior rows above the 0.99 spin
-ceiling are refused unless step 5 adds `--drop-spin-above-ceiling`, and the
-Mixed-label events that divide out a borrowed spin prior need
-`--spin-prior-allow-list`.
+consistent pair. And as written, step 7 exits 1 (with or without
+`--strict`) until the owner settles two open choices (CHANGES.md, options 2
+and 9): every validate refuses the Mixed-label events that divide out a
+borrowed spin prior unless `--spin-prior-allow-list` names them (154 of the
+259), and `--strict` also refuses the posterior rows above the 0.99 spin
+ceiling (1,168 rows in 54 events) unless step 5 adds
+`--drop-spin-above-ceiling`. With both, the pair passes all 120 checks; the
+owner has approved neither.
 
 For a strict mass-classified BBH sample instead, use `--source-class bbh` on
 both PE and selection exports. That is a different sample and should not be

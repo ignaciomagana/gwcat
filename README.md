@@ -77,12 +77,27 @@ combined.export("selection_bbh.h5", format="gwcat2",
 
 # ── 8. Validate before running darksirens ────────────────────
 # strict=True raises on every failed check; without it some cross-file checks
-# only warn and record the failure in the returned dict.  On this pair strict
-# mode refuses the posterior rows above the 0.99 spin ceiling unless step 6
-# drops them (drop_spin_above_ceiling=True), and the Mixed-label events that
-# divide out a borrowed spin prior unless they are on a spin-prior allow-list
-# (spin_prior_allow_list=...).
+# only warn and record the failure in the returned dict.  As written, this
+# step RAISES ValueError on a store of the GWTC releases, strict or not, until
+# the owner settles two open choices (CHANGES.md, options 2 and 9):
+#   - any validate refuses the Mixed-label events that divide out a borrowed
+#     spin prior unless a spin-prior allow-list names them (on the production
+#     store, 144 of these 249 events; xcheck_reference_spin_prior_source);
+#   - strict=True also refuses the PE rows above the 0.99 spin ceiling, which
+#     step 6 keeps (there, 1,010 rows in 46 events;
+#     xcheck_reference_spin_support).
 results = validate_export("gw_bbh.h5", "selection_bbh.h5", strict=True)
+
+# The variant that passes all 120 checks there takes both choices, which the
+# owner has NOT approved: step 6 with drop_spin_above_ceiling=True (the rows
+# above the ceiling are removed before the draw, so the samples differ) and
+# an allow-list of every event whose prior_source_kind_spin_per_event is not
+# own_analytic.
+# bbh.export("gw_bbh_cut.h5", format="gwcat2", spin_basis="chieff",
+#            waveform_policy="mixed-first", nsamp=4096, seed=0,
+#            drop_spin_above_ceiling=True)
+# results = validate_export("gw_bbh_cut.h5", "selection_bbh.h5", strict=True,
+#                           spin_prior_allow_list="spin_prior_allow_list.json")
 
 # ── 9. Run darksirens ────────────────────────────────────────
 # darksirens-core reads this gwcat-2.0 pair.  The legacy darksirens reads the
@@ -196,7 +211,25 @@ gwcat export selection endo3_bbhpop-LIGO-T2100113-v12.hdf5 \
     --format gwcat2 --parameter-space chieff_reference --spin-reference-amax 0.99 \
     --far-threshold 1.0
 
-gwcat validate --strict gw_bbh.h5 selection_bbh.h5    # exit 0 iff every check passes
+# As written this pair is REFUSED (exit 1, with or without --strict) on a store
+# of the GWTC releases, until the owner settles two open choices (CHANGES.md,
+# options 2 and 9).  Every validate refuses the Mixed-label events that divide
+# out a borrowed spin prior unless a spin-prior allow-list names them (154 of
+# the 259 production events; xcheck_reference_spin_prior_source), and --strict
+# also refuses the PE rows above the 0.99 spin ceiling, which this export keeps
+# (1,168 rows in 54 events; xcheck_reference_spin_support).
+gwcat validate --strict gw_bbh.h5 selection_bbh.h5    # exit 1 as written, see above
+
+# The variant that passes (120 of 120 checks on the production store) takes
+# both choices, which the owner has NOT approved: a PE file exported with
+# --drop-spin-above-ceiling (the rows above the ceiling are removed before the
+# draw, so the samples differ), and an allow-list of every event whose
+# prior_source_kind_spin_per_event is not own_analytic.
+gwcat export pe store.h5 --out gw_bbh_cut.h5 --format gwcat2 --parameter-space chieff \
+    --event-list population.txt --waveform-policy mixed-first --nsamp 4096 --seed 0 \
+    --drop-spin-above-ceiling
+gwcat validate --strict gw_bbh_cut.h5 selection_bbh.h5 \
+    --spin-prior-allow-list spin_prior_allow_list.json   # list NOT APPROVED (option 9)
 
 # gwcat-1.0 files for the legacy darksirens.  `gwcat selection` is the v1
 # chi_eff swap: it needs uniform-isotropic spin draws and refuses O4ab.
