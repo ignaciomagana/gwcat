@@ -885,7 +885,8 @@ class GWCatalog:
             kept, reasons, homogeneous = resolve_policy(
                 self.names, sel, self.meta, policy=waveform_policy,
                 approximant=approximant, sample_set_map=sample_set_map,
-                nrsur_q_rule=nrsur_q_rule)
+                nrsur_q_rule=nrsur_q_rule,
+                nrsur_q_rule_substitute=nrsur_q_rule_substitute)
 
         # ── The EFFECTIVE selection (GW-33) ───────────────────────────────────
         # Composed with the spec of the view this call was made on, because the

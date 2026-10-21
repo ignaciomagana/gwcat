@@ -257,3 +257,90 @@ def test_nan_amax_export_is_refused(tmp_path):
         _export(store, tmp_path / "pe.h5", amax="nan")
     with pytest.raises(ValueError, match="amax_fallback"):
         _export(store, tmp_path / "pe2.h5", amax_fallback=float("nan"))
+
+
+# ==========================================================================
+# Event map: duplicates, the substitute flag, and the substitute chain
+# ==========================================================================
+from test_waveform_event_map import (E1, E2, E3, NR, XP,  # noqa: E402
+                                     _store as _map_store)
+
+
+def _map_export(store, out, **kw):
+    kw = dict(dict(format="gwcat2", spin_basis="chieff", nsamp=32, seed=0,
+                   cosmology=_COSMO), **kw)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        GWCatalog(store).export(str(out), **kw)
+    with h5py.File(out, "r") as f:
+        return dict(f.attrs)
+
+
+def _two_release_store(tmp_path, n=400):
+    """E1 twice: release A (XPHM-ST with no mass below q = 1/6, NRSur) and
+    release B (XPHM-ST with 50% below q = 1/6, NRSur)."""
+    events = [{"name": E1, "waveform": wf, "n": n}
+              for wf in (XP, NR, XP, NR)]
+    store, _ = _build_spin_store(tmp_path, events, name="two_releases.h5")
+    with h5py.File(store, "r+") as f:
+        off = f["index/offsets"][:]
+        m1 = f["samples/mass_1"][:]
+        m2 = f["samples/mass_2"][:]
+        m2[off[0]:off[1]] = np.maximum(m2[off[0]:off[1]], 0.5 * m1[off[0]:off[1]])
+        lo = int(off[2])
+        m2[lo:lo + n // 2] = 0.1 * m1[lo:lo + n // 2]
+        f["samples/mass_2"][...] = m2
+    return store
+
+
+def test_event_map_refuses_duplicate_event_label_rows(tmp_path):
+    """Review scenario: the 1% rule passed on release A's 0% and the export
+    took release B's NRSur samples, with no warning."""
+    from gwcat.waveform_policy import SampleSetMapError
+    store = _two_release_store(tmp_path)
+    with pytest.raises(SampleSetMapError, match="more than one store row"):
+        _map_export(store, tmp_path / "pe.h5", waveform_policy="event-map",
+                    sample_set_map={E1: f"C01:{NR}"}, nrsur_q_rule=0.01)
+    with pytest.raises(SampleSetMapError, match="more than one store row"):
+        _map_export(store, tmp_path / "pe2.h5", waveform_policy="event-map",
+                    sample_set_map={E1: f"C01:{NR}"})
+
+
+def test_q_rule_substitute_needs_the_rule_and_the_event_map(tmp_path):
+    store = _map_store(tmp_path)
+    with pytest.raises(ValueError, match="needs nrsur_q_rule"):
+        _map_export(store, tmp_path / "pe.h5", waveform_policy="event-map",
+                    sample_set_map={E1: f"C01:{NR}", E2: f"C01:{NR}",
+                                    E3: f"C01:{XP}"},
+                    nrsur_q_rule_substitute=True)
+    with pytest.raises(ValueError, match="apply only to"):
+        _map_export(store, tmp_path / "pe2.h5", waveform_policy="mixed-first",
+                    nrsur_q_rule_substitute=True)
+
+
+def test_auto_substitution_keeps_the_declared_substitute_chain(tmp_path):
+    """The rule replaces a DECLARED substitute: the map's own label and the
+    declared label and reason stay in the product."""
+    store = _map_store(tmp_path, q_frac={E1: 0.5})
+    smap = {"events": {E1: "C01:SEOBNRv5PHM", E2: f"C01:{NR}",
+                       E3: f"C01:{XP}"},
+            "substitutes": {E1: {"label": f"C01:{NR}",
+                                 "reason": "seob_not_released"}}}
+    attrs = _map_export(store, tmp_path / "pe.h5", waveform_policy="event-map",
+                        sample_set_map=smap, nrsur_q_rule=0.01,
+                        nrsur_q_rule_substitute=True)
+    assert _strs(attrs["sample_set_substitute_events"]) == [E1]
+    assert _strs(attrs["sample_set_substitute_labels"]) == [f"C01:{XP}"]
+    assert _strs(attrs["sample_set_substitute_original_labels"]) == [
+        "C01:SEOBNRv5PHM"]
+    assert _strs(attrs["sample_set_substitute_reasons"]) == [
+        f"nrsur_q_rule;replaced=C01:{NR}(seob_not_released)"]
+
+
+def test_json_map_with_a_duplicated_event_is_refused(tmp_path):
+    from gwcat.waveform_policy import SampleSetMapError, load_sample_set_map
+    p = tmp_path / "map.json"
+    p.write_text('{"events": {"%s": "C01:%s", "%s": "C01:%s"}}'
+                 % (E1, NR, E1, XP))
+    with pytest.raises(SampleSetMapError, match="duplicate key"):
+        load_sample_set_map(str(p))
