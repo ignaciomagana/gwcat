@@ -502,3 +502,34 @@ def test_a_live_superset_does_not_replace_the_curated_list_by_default(
                                           prefer_gwosc=True)
     assert names == sorted(ban.BBH_ALL)
     assert any("GW200322_091133" in str(r.message) for r in rec)
+
+
+# ==========================================================================
+# compact_type is one canonical class, matched case-insensitively
+# ==========================================================================
+def test_compact_type_is_normalised(tmp_path):
+    cat = GWCatalog(_classes(tmp_path))
+    sub = cat.select(compact_type="bbh")
+    assert sorted(sub.event_names) == ["GW900001_000001", "GW900003_000003"]
+    assert sub.selection_spec.compact_type == ("BBH",)
+    with pytest.raises(ValueError, match="unrecognised source-class"):
+        cat.select(compact_type="BBHs")
+    with pytest.raises(ValueError, match="ONE class"):
+        cat.select(compact_type="cbc")
+
+
+def test_compact_type_on_a_store_without_the_column_is_refused(tmp_path):
+    cat = GWCatalog(_store(tmp_path, [_row("GW900001_000001")],
+                           drop_meta=("compact_type",)))
+    with pytest.raises(ValueError, match="'compact_type' meta column"):
+        cat.select(compact_type="BBH")
+
+
+def test_v1_refuses_to_write_a_zero_event_file(tmp_path):
+    out = tmp_path / "empty.h5"
+    with pytest.raises(ValueError, match="left 0 of"):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            GWCatalog(_three(tmp_path)).to_darksirens(
+                str(out), nsamp=8, seed=0, cosmology=_COSMO, z_max=1e-6)
+    assert not out.exists()

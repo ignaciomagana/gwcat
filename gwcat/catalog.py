@@ -873,11 +873,32 @@ class GWCatalog:
         # compact_type that allowed_names overrules is NOT a cut this view made.
         applied_compact_type = None
         name_filters = []
+        ct_column = None
         if compact_type is not None:
+            # One canonical class, matched against the normalised column
+            # (review 2026-10-20).  The match used to be exact and
+            # case-sensitive: compact_type="bbh" selected nothing while the
+            # provenance recorded "BBH", and the v1 exporter wrote an empty
+            # file.  A token that names no single class, and a store without
+            # the column, are configuration errors.
+            ct_classes = resolve_filter_classes(compact_type)
+            if len(ct_classes) != 1:
+                raise ValueError(
+                    f"compact_type={compact_type!r} names {sorted(ct_classes)}; "
+                    f"compact_type is ONE class (BBH, NSBH, BNS, MassGap or "
+                    f"Unknown). Use source_class= for a set of classes.")
+            compact_type = next(iter(ct_classes))
+            if "compact_type" not in self.meta:
+                raise ValueError(
+                    f"select(compact_type={compact_type!r}) needs the "
+                    f"'compact_type' meta column and this store has none "
+                    f"(columns: {sorted(self.meta)}); use source_class=.")
+            ct_column = np.array([normalize_source_class(x)
+                                  for x in self.meta["compact_type"]])
             apply_compact_type = (allowed_names is None or
                                   not allowed_names_authoritative)
             if apply_compact_type:
-                c = (self.meta["compact_type"] == compact_type)
+                c = (ct_column == compact_type)
                 m &= c
                 m_row &= c
                 applied_compact_type = compact_type
@@ -1010,7 +1031,7 @@ class GWCatalog:
             if compact_type is not None and allowed_names is not None:
                 present = np.isin(self.names, _whitelist_arr)
                 dropped = self.names[present &
-                                     (self.meta["compact_type"] != compact_type)]
+                                     (ct_column != compact_type)]
                 if len(dropped):
                     action = ("will not be dropped because allowed_names is "
                               "authoritative" if allowed_names_authoritative
@@ -1929,6 +1950,16 @@ class GWCatalog:
                 and e < len(reasons_arr) else "")
 
         nobs = len(kept)
+        if nobs == 0:
+            # The 2.0 builder's guard (review 2026-10-20): a zero-event file
+            # passes every length check (0 == 0 * nsamp) and validated, so an
+            # empty selection -- a mistyped class, a FAR outage -- exported
+            # "successfully".  Core refuses nobs = 0 anyway.
+            raise ValueError(
+                f"the export's cuts left 0 of {sub.n_events} selected "
+                f"event(s), so there is no PE file to write. Effective "
+                f"selection: {spec.to_json()}. Check the class, FAR and z_max "
+                f"cuts, and whether the store's FARs were populated at ingest.")
         data = {k: np.concatenate(v) if v else np.array([])
                 for k, v in cols.items()}
 
