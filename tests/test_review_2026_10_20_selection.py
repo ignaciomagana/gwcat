@@ -435,3 +435,129 @@ def test_no_override_records_the_detected_generation_cosmology(tmp_path):
         s._load()
     assert s._cosmology_source == "detected"
     assert np.isclose(s._cosmology_generation_Om0, 0.3065, rtol=1e-5)
+
+
+# ======================================================================
+# medium-56: the per-campaign 1/T_k with non-unit, unequal times
+# ======================================================================
+def _set_time(path, years, fmt):
+    with h5py.File(path, "r+") as f:
+        if fmt == "events":
+            f.attrs["total_analysis_time"] = years * 365.25 * 24 * 3600
+        else:
+            f["injections"].attrs["analysis_time_s"] = (
+                years * 365.25 * 24 * 3600)
+    return path
+
+
+@pytest.mark.parametrize("fmt", ["events", "injections"])
+def test_pdraw_scales_as_one_over_each_campaigns_own_time(tmp_path, fmt):
+    writer = write_o4_full if fmt == "events" else write_endo3_full
+    a = writer(tmp_path / "a.hdf", n=80, seed=41)
+    b = _set_time(writer(tmp_path / "b.hdf", n=80, seed=41), 0.911, fmt)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        sa, sb = SelectionSet(a), SelectionSet(b)
+        sa._load(), sb._load()
+    np.testing.assert_allclose(sb._pdraw / sa._pdraw, 1.0 / 0.911, rtol=1e-12)
+
+
+def _component_density_from_file(path):
+    """The o4_factored component draw density in (m1det, q, dL, a, cos),
+    from the file's own columns (no gwcat call), and the row weights."""
+    with h5py.File(path, "r") as f:
+        g = f["events"]
+        c = {k: g[k][:] for k in g}
+    ln = (c["lnpdraw_mass1_source"] + c["lnpdraw_mass2_source_GIVEN_mass1_source"]
+          + c["lnpdraw_z"])
+    for i in (1, 2):
+        ln = ln + (c[f"lnpdraw_spin{i}_magnitude"]
+                   + c[f"lnpdraw_spin{i}_polar_angle"]
+                   - np.log(np.sin(c[f"spin{i}_polar_angle"])))
+    jac = c["mass1_detector"] / (1 + c["z"]) ** 2 / c[
+        "dluminosity_distance_dredshift"]
+    return np.exp(ln) * jac, c["weights"], c["pycbc_far"]
+
+
+def test_combined_mu_is_the_sum_of_T_k_times_each_campaigns_efficiency(
+        tmp_path):
+    """Essick: mu = sum_k T_k P_det,k for the campaigns' common draw density,
+    with unequal non-unit T_k, partial detection, and one campaign that
+    detects nothing (skipped, but its N_k stays in ndraw)."""
+    times, gens = (0.5, 2.25, 1.7), (900, 3000, 1500)
+    paths = []
+    for k, (T, N) in enumerate(zip(times, gens)):
+        p = write_o4_full(tmp_path / f"c{k}.hdf", n=120, seed=50 + k,
+                          total_generated=N)
+        _set_time(p, T, "events")
+        with h5py.File(p, "r+") as f:
+            far = np.full(120, 5.0) if k == 2 else np.where(
+                np.arange(120) % 3 == 0, 0.1, np.inf)
+            del f["events"]["pycbc_far"]
+            f["events"].create_dataset("pycbc_far", data=far)
+        paths.append(p)
+    out = tmp_path / "sel.h5"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        CombinedSelectionSet([SelectionSet(p) for p in paths]).export(
+            str(out), spin_basis="component")
+    lam, expected = [], 0.0
+    for p, T, N in zip(paths, times, gens):
+        dens, w, far = _component_density_from_file(p)
+        det = far < 1.0
+        lam.append(dens[det])
+        expected += T * float(np.sum(w[det])) / N
+    lam = np.concatenate(lam)
+    with h5py.File(out, "r") as f:
+        ndraw = int(f.attrs["ndraw"])
+        pdraw = f["pdraw"][:]
+        np.testing.assert_array_equal(f.attrs["campaign_ndraws"], gens)
+    assert ndraw == sum(gens)
+    np.testing.assert_allclose(np.sum(lam / pdraw) / ndraw, expected,
+                               rtol=1e-12)
+
+
+# ======================================================================
+# medium-57: the FAR cut is an OR over every pipeline, not the first one
+# ======================================================================
+def test_far_cut_ors_every_pipeline_events_format(tmp_path):
+    inf, nan = np.inf, np.nan
+    # Each row fires on ONE pipeline (never only the first), plus no-fire
+    # rows with inf / NaN.
+    cols = {"pycbc_far":   np.array([5.0, 5.0, 0.3, inf, nan, nan, 5.0]),
+            "gstlal_far":  np.array([0.2, 5.0, inf, inf, 5.0, nan, nan]),
+            "mbta_far":    np.array([inf, 0.9, 5.0, nan, inf, 0.5, 5.0]),
+            "cwb-bbh_far": np.array([nan, inf, 5.0, 5.0, inf, 5.0, 0.99])}
+    path = _events_far_file(tmp_path / "or.hdf", cols,
+                            searches=["pycbc", "gstlal", "mbta", "cwb-bbh"])
+    s = SelectionSet(path, strict_spin_checks="off")
+    assert s.detected_mask(1.0).tolist() == [True, True, True, False, False,
+                                             True, True]
+    assert int(s.detected_mask(1.0).sum()) == 5
+    # Every column alone detects something the first one does not.
+    fars = s._fars
+    for j in range(1, fars.shape[1]):
+        assert np.any((fars[:, j] < 1.0) & ~(fars[:, 0] < 1.0))
+
+
+def test_far_cut_ors_every_pipeline_injections_format(tmp_path):
+    path = write_endo3_full(tmp_path / "o3.hdf", n=6, seed=61)
+    inf, nan = np.inf, np.nan
+    cols = {"far_gstlal":          np.array([5.0, inf, nan, 5.0, inf, 5.0]),
+            "far_pycbc_bbh":       np.array([inf, 0.4, 5.0, nan, inf, 5.0]),
+            "far_pycbc_hyperbank": np.array([5.0, 5.0, 0.7, inf, inf, 5.0]),
+            "far_mbta":            np.array([nan, 5.0, 5.0, 0.1, inf, 5.0]),
+            "far_cwb":             np.array([0.6, 5.0, inf, 5.0, nan, 5.0])}
+    with h5py.File(path, "r+") as f:
+        g = f["injections"]
+        for k, v in cols.items():
+            if k in g:
+                del g[k]
+            g.create_dataset(k, data=v)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        s = SelectionSet(path)
+        mask = s.detected_mask(1.0)
+    assert s._far_columns == ["far_gstlal", "far_pycbc_bbh",
+                              "far_pycbc_hyperbank", "far_mbta", "far_cwb"]
+    assert mask.tolist() == [True, True, True, True, False, False]
