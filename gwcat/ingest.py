@@ -2460,6 +2460,7 @@ def _constituent_mixture_prior(catalog, analysis, analyses, samples_dict,
     labels, counts = match_constituent_rows(samples_dict[analysis], cands)
 
     comps, amaxes, cosmos, dl_kinds, bad = [], set(), set(), set(), []
+    alphas, cosmo_sources = set(), set()
     for lab in labels:
         smp = samples_dict[lab]
         mp = resolve_mass_prior(lab, [lab], priors, siblings=False)
@@ -2483,6 +2484,8 @@ def _constituent_mixture_prior(catalog, analysis, analyses, samples_dict,
         amaxes.add((sp.amax_1, sp.amax_2))
         cosmos.add((rd.H0, rd.Om0, rd.cosmology_name))
         dl_kinds.add(rd.kind)
+        alphas.add(rd.alpha)
+        cosmo_sources.add(rd.cosmology_source)
         bounds = dict(mc_min=mp.chirp_min, mc_max=mp.chirp_max,
                       q_min=mp.q_min, q_max=mp.q_max, m1_min=mp.m1_min,
                       m1_max=mp.m1_max, m2_min=mp.m2_min, m2_max=mp.m2_max)
@@ -2521,6 +2524,9 @@ def _constituent_mixture_prior(catalog, analysis, analyses, samples_dict,
     return dict(labels=labels, counts=counts, p_mass_dL=joint, p_dL=marg,
                 amax_1=a1, amax_2=a2, H0=H0, Om0=Om0, cosmology_name=cname,
                 dl_kind=(dl_kinds.pop() if len(dl_kinds) == 1 else "mixture"),
+                alpha=(next(iter(alphas)) if len(alphas) == 1 else None),
+                cosmology_source=(next(iter(cosmo_sources))
+                                  if len(cosmo_sources) == 1 else "mixture"),
                 dmin=min(c["dmin"] for c in comps),
                 dmax=max(c["dmax"] for c in comps),
                 chirp_min=min(c["mc_min"] for c in comps),
@@ -3069,6 +3075,26 @@ def build_store(paths, out_path, params=None, extra_params=None,
                     "spin_amax_2": float(cmix["amax_2"]),
                     "spin_prior_kind": "uniform_magnitude_isotropic",
                     "spin_prior_source": f"constituent_mixture[{joined}]",
+                    # The rest of the distance-prior record describes the
+                    # MIXTURE too, not the sibling first resolved (review
+                    # 2026-10-20, low-32: n_samples_outside counted 80
+                    # samples outside a sibling's [100, 6000] when none lie
+                    # outside the mixture's bounds).
+                    "n_samples_outside_dL_prior_bounds": float(np.sum(
+                        (dL < cmix["dmin"]) | (dL > cmix["dmax"]))),
+                    "dL_prior_sampling_kind": cmix["dl_kind"],
+                    "dL_prior_alpha": (np.nan if cmix["alpha"] is None
+                                       else float(cmix["alpha"])),
+                    "dL_prior_sampling_alpha": (
+                        np.nan if cmix["alpha"] is None
+                        else float(cmix["alpha"])),
+                    "dL_prior_cosmology_source": cmix["cosmology_source"],
+                    "dL_prior_ks": np.nan,
+                    "dL_prior_ks_threshold": np.nan,
+                    "dL_prior_n_prior_samples": np.nan,
+                    "dL_prior_frac_mass_uncovered": np.nan,
+                    "dL_prior_frac_samples_outside": np.nan,
+                    "dL_prior_bounds_pvalue": np.nan,
                 }
                 for p in ("mass", "spin", "dL"):
                     over[f"prior_source_label_{p}"] = joined

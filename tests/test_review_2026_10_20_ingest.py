@@ -832,3 +832,26 @@ def test_merge_stores_records_its_inputs(tmp_path, monkeypatch):
     ins = json.loads(prov["store_inputs_json"])["stores"]
     assert [i["path"] for i in ins] == ["a.h5", "b.h5"]
     assert all(i["store_writer"] == "build_store" for i in ins)
+
+
+# ==========================================================================
+# low-32: constituent-mixture rows kept the sibling's distance-prior record
+# ==========================================================================
+_DL_NARROW = DL_USF.replace("maximum=10000.0", "maximum=600.0")
+
+
+def test_mixture_row_distance_record_describes_the_mixture(tmp_path,
+                                                           monkeypatch):
+    data, sd, priors = _gw230702_like()
+    priors["analytic"][XP]["luminosity_distance"] = _DL_NARROW
+    cfg = ing.IngestConfig(constituent_mixture_prior=True, **_CFG)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        store = _ingest(tmp_path, monkeypatch, {O4_NAME: (data, sd, priors)},
+                        cfg=cfg)
+    assert _meta(store, "dL_prior_basis") == "constituent_mixture"
+    assert (float(_meta(store, "dL_prior_min")),
+            float(_meta(store, "dL_prior_max"))) == (100.0, 10000.0)
+    assert float(_meta(store, "n_samples_outside_dL_prior_bounds")) == 0.0
+    assert _meta(store, "dL_prior_sampling_kind") == "UniformSourceFrame"
+    assert np.isnan(float(_meta(store, "dL_prior_ks")))
