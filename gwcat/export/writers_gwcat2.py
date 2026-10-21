@@ -197,10 +197,10 @@ def _write_selection(product, out_path, format_version, *, with_contract=False,
             "'gwcat2' (2.0) format.")
     if with_contract:
         # Review 2026-10-20: the contract declares the space's fit columns, so
-        # one with no finite row (ra/dec when no campaign drew a sky) must not
-        # be declared fittable -- it was written and validated.
+        # a column with non-finite rows (ra/dec of any campaign that drew no
+        # sky) must not be declared fittable -- it was written and validated.
         from ..params import get_space
-        get_space(product.spin_basis).refuse_empty_fit_columns(
+        get_space(product.spin_basis).refuse_nonfinite_fit_columns(
             product.columns, context=f"{format_version} writer")
     extra_attrs = _contract_attrs(product, "selection") if with_contract else {}
 

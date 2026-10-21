@@ -422,17 +422,35 @@ def test_only_a_block_that_keeps_the_azimuths_needs_them_uniform():
     assert get_space("chieff_reference").unmet_requirements(meta) == {}
 
 
+def _without_sky(path):
+    with h5py.File(path, "r+") as f:
+        ev = f["events"]
+        if isinstance(ev, h5py.Dataset):
+            keep = [n for n in ev.dtype.names
+                    if n not in ("right_ascension", "declination")]
+            sub = np.zeros(ev.shape, dtype=[(n, ev.dtype[n]) for n in keep])
+            for n in keep:
+                sub[n] = ev[n]
+            del f["events"]
+            f.create_dataset("events", data=sub)
+        else:
+            for n in ("right_ascension", "declination"):
+                if n in ev:
+                    del ev[n]
+    return path
+
+
 def test_21_selection_with_no_sky_in_any_row_is_refused(tmp_path):
     """Review scenario: a 2.1 selection was written and validated with ra/dec
     as fit columns and every row NaN."""
-    from gwcat.params.registry import CampaignRequirementError
     from gwcat.selection import SelectionSet
     from test_selection_cumulative_mixture import (_ANCHORS,
                                                    write_cumulative_mixture)
     path, _, _ = write_cumulative_mixture(tmp_path / "mix.hdf")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        with pytest.raises(CampaignRequirementError, match="no finite row"):
+        # CampaignRequirementError, a ValueError
+        with pytest.raises(ValueError, match="non-finite rows"):
             SelectionSet(path).export(str(tmp_path / "x21.h5"),
                                       format="gwcat2.1",
                                       spin_basis="component",
@@ -442,6 +460,28 @@ def test_21_selection_with_no_sky_in_any_row_is_refused(tmp_path):
         SelectionSet(path).export(str(tmp_path / "x20.h5"), format="gwcat2",
                                   spin_basis="component", snr_threshold=10.0,
                                   mixture_anchors=_ANCHORS)
+
+
+def test_21_selection_with_a_sky_less_campaign_is_refused(tmp_path):
+    """The partial case: a sky-less campaign combined with a sky-bearing one
+    left some ra/dec rows NaN, and the 2.1 file declared them fittable."""
+    from gwcat.selection import CombinedSelectionSet, SelectionSet
+    from test_selection_spin import write_o4_full
+    sky = write_o4_full(tmp_path / "sky.hdf", 60, seed=4)
+    nosky = _without_sky(write_o4_full(tmp_path / "nosky.hdf", 40, seed=5))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pytest.raises(ValueError,
+                           match=r"non-finite rows \{'ra': 40, 'dec': 40\} "
+                                 r"\(of 100\).*sky_marginal"):
+            CombinedSelectionSet([SelectionSet(str(sky)),
+                                  SelectionSet(str(nosky))]).export(
+                str(tmp_path / "x21.h5"), format="gwcat2.1",
+                spin_basis="component")
+        # The sky-bearing campaign alone still writes as 2.1.
+        SelectionSet(str(sky)).export(str(tmp_path / "ok21.h5"),
+                                      format="gwcat2.1",
+                                      spin_basis="component")
 
 
 # ==========================================================================

@@ -150,8 +150,8 @@ class ParameterBlock:
     and column views off the registry.  The campaign requirements are not
     read from here: a projection's are enforced by the selection builder's
     own chi_eff swap check (GW-06), and the sky block's ``needs_sky_draw`` by
-    the 2.1 selection writer
-    (:meth:`gwcat.params.registry.ParameterSpace.refuse_empty_fit_columns`).
+    the 2.1 selection writer, row by row
+    (:meth:`gwcat.params.registry.ParameterSpace.refuse_nonfinite_fit_columns`).
     The spin blocks' ``ln_prior_pe`` are the same densities the builders
     evaluate directly; they are kept equal to them, not called by them.
     """

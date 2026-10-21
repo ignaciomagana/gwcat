@@ -166,26 +166,37 @@ class ParameterSpace:
                 out[b.name] = bad
         return out
 
-    def refuse_empty_fit_columns(self, columns, *, context="export"):
-        """Refuse a product whose FIT column holds no finite row at all.
+    def refuse_nonfinite_fit_columns(self, columns, *, context="export"):
+        """Refuse a product whose FIT column holds a non-finite row.
 
-        A fit column is one the density covers; one that is NaN in every row
-        (``ra``/``dec`` of a selection whose campaigns drew no sky, written
-        as 2.1 and validated) is not a column a consumer can fit.  A column
-        the product omits (``sky_marginal``) is not checked.
+        A fit column is one the density covers, so every row of it must be a
+        point a consumer can evaluate.  ``ra``/``dec`` of a campaign that drew
+        no sky position (a semianalytic O1/O2 mixture's rows, or a sky-less
+        file combined with sky-bearing ones) are NaN, and a 2.1 file declares
+        them fittable: it was written and validated, whether every row or only
+        some were NaN (review 2026-10-20; core refuses such a file at load).
+        This is the per-row form of the sky block's ``needs_sky_draw``
+        requirement, which the per-campaign spin metadata cannot carry.  A
+        column the product omits (``sky_marginal``) is not checked.
         """
         import numpy as np
 
-        empty = [c for c in self.fit_columns if c in columns
-                 and np.size(columns[c])
-                 and not np.isfinite(np.asarray(columns[c], dtype=float)).any()]
-        if empty:
+        bad = {}
+        for c in self.fit_columns:
+            if c in columns and np.size(columns[c]):
+                n = int(np.count_nonzero(
+                    ~np.isfinite(np.asarray(columns[c], dtype=float))))
+                if n:
+                    bad[c] = n
+        if bad:
+            n_rows = int(np.size(columns[next(iter(bad))]))
             raise CampaignRequirementError(
-                f"{context}: fit column(s) {empty} of parameter space "
-                f"{self.name!r} have no finite row"
-                + (" -- no campaign drew a sky position; export with "
-                   "sky_marginal=True (--sky-marginal)"
-                   if {"ra", "dec"} & set(empty) else "")
+                f"{context}: fit column(s) of parameter space {self.name!r} "
+                f"have non-finite rows {bad} (of {n_rows})"
+                + (" -- a campaign drew no sky position (see "
+                   "sky_position_available); export with sky_marginal=True "
+                   "(--sky-marginal)"
+                   if {"ra", "dec"} & set(bad) else "")
                 + ".")
 
     def describe(self) -> dict:
