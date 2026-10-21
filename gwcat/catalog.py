@@ -1563,6 +1563,8 @@ class GWCatalog:
                       source_class=None, event_list=None,
                       allow_missing_far=False, require_far=False,
                       waveform_policy="preferred", approximant=None,
+                      sample_set_map=None, nrsur_q_rule=None,
+                      nrsur_q_rule_substitute=False,
                       write_summary: bool = False,
                       summary_context: Optional[dict] = None,
                       allow_zero_p_pe: bool = False,
@@ -1683,6 +1685,12 @@ class GWCatalog:
             homogeneous.
         approximant : str or None
             Required approximant for ``waveform_policy="strict-approximant"``.
+        sample_set_map, nrsur_q_rule, nrsur_q_rule_substitute
+            ``waveform_policy="event-map"`` only, as in :meth:`select`.  This
+            path used to offer the policy without taking a map, so it could
+            never succeed (review 2026-10-20).  The ``gwcat export-darksirens``
+            command still has no option for a map: use ``gwcat export pe
+            --waveform-policy event-map --sample-set-map MAP`` there.
         write_summary : bool, default False
             (PR 10) When True, write ``<out_path>.validation_summary.json`` and
             ``.md`` next to ``out_path`` (see :mod:`gwcat.validation_summary`).
@@ -1727,6 +1735,16 @@ class GWCatalog:
                 f"of {valid_spin_modes}. 'passthrough' is not offered because "
                 f"the store keeps a spin-prior-agnostic p_dL_pe, so 'exclude' "
                 f"already means 'no chi_eff prior applied'.")
+        if (waveform_policy == "event-map" and sample_set_map is None
+                and self._waveform_policy != "event-map"):
+            from .waveform_policy import SampleSetMapError
+            raise SampleSetMapError(
+                "waveform_policy='event-map' needs a sample-set map: pass "
+                "sample_set_map= to to_darksirens (a JSON file, a popsummary "
+                "file, a mapping or a SampleSetMap), or export a view already "
+                "selected with one. The `gwcat export-darksirens` command has "
+                "no option for a map; use `gwcat export pe --waveform-policy "
+                "event-map --sample-set-map MAP` instead.")
         sub = self.select(compact_type=compact_type, far_max=far_max,
                           pastro_min=pastro_min, allowed_names=allowed_names,
                           allowed_names_authoritative=allowed_names_authoritative,
@@ -1735,6 +1753,9 @@ class GWCatalog:
                           require_far=require_far,
                           waveform_policy=waveform_policy,
                           approximant=approximant,
+                          sample_set_map=sample_set_map,
+                          nrsur_q_rule=nrsur_q_rule,
+                          nrsur_q_rule_substitute=nrsur_q_rule_substitute,
                           allow_unpaired_point_estimate_cuts=(
                               allow_unpaired_point_estimate_cuts))
         # The EFFECTIVE selection: this call's filters composed with those the
@@ -2335,6 +2356,14 @@ class GWCatalog:
             f.attrs.create("event_names",
                            np.array([str(k) for k in kept],
                                     dtype=h5py.string_dtype()))
+            # The event-map provenance, as the 2.0 builder writes it -- only
+            # when a map chose the sample sets, so other v1 files are
+            # unchanged.
+            if getattr(sub, "_sample_set_map_report", None) is not None:
+                from .export.pe_builder import _sample_set_map_attrs
+                for _k, _v in _sample_set_map_attrs(
+                        sub._sample_set_map_report, kept).items():
+                    f.attrs[_k] = _v
             # --- Datasets ---
             for k in ["ra", "dec", "m1det", "m2det", "chieff", "dL", "p_pe",
                        "redshift", "m1src", "m2src"]:

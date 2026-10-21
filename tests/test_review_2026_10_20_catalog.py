@@ -577,3 +577,31 @@ def test_the_event_map_identity_enters_the_spec(tmp_path):
     assert spec["nrsur_q_rule"] is None
     # A map built in code no longer records an empty identity.
     assert in_code._sample_set_map_report["map_sha256"]
+
+
+# ==========================================================================
+# The v1 exporter can take the event map it offers
+# ==========================================================================
+def test_v1_event_map_export_takes_a_map(tmp_path):
+    cat = GWCatalog(_store(tmp_path, _multiset_rows()))
+    smap = {"GW900001_000001": "C01:IMRPhenomXPHM",
+            "GW900002_000002": "C01:Mixed"}
+    out = tmp_path / "v1_emap.h5"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        cat.to_darksirens(str(out), nsamp=8, seed=0, cosmology=_COSMO,
+                          waveform_policy="event-map", sample_set_map=smap)
+    with h5py.File(out, "r") as f:
+        assert _attr(f, "waveform_policy") == "event-map"
+        assert _strs(f.attrs["sample_set_name_per_event"]) == [
+            "C01:IMRPhenomXPHM", "C01:Mixed"]
+        assert _attr(f, "sample_set_map_sha256") != ""
+
+
+def test_v1_event_map_without_a_map_names_a_route_that_works(tmp_path):
+    from gwcat.waveform_policy import SampleSetMapError
+    store = _store(tmp_path, _multiset_rows())
+    with pytest.raises(SampleSetMapError, match="gwcat export pe"):
+        GWCatalog(store).to_darksirens(str(tmp_path / "x.h5"), nsamp=8,
+                                       seed=0, cosmology=_COSMO,
+                                       waveform_policy="event-map")
