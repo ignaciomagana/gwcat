@@ -639,3 +639,61 @@ def test_removal_amax_is_recorded_per_campaign(tmp_path):
     assert s.spin_meta["spin_format"] == "o4_factored"
     assert getattr(s, "_removal_amax", None) is None, (
         "a factored file must not go through the assumed-prior removal")
+
+
+# ==========================================================================
+# Review 2026-10-20: selection export builder fixes
+# ==========================================================================
+def _o4_with_times(path, n, t_lo, t_hi, seed, **kw):
+    """An O4 factored fixture whose rows carry ``time_geocenter`` in a window."""
+    write_o4_full(path, n=n, amax=(0.9, 0.9), seed=seed, **kw)
+    rng = np.random.default_rng(seed + 1000)
+    with h5py.File(path, "r+") as f:
+        f["events"].create_dataset("time_geocenter",
+                                   data=rng.uniform(t_lo, t_hi, n))
+    return str(path)
+
+
+def test_time_coverage_is_recorded_per_campaign(tmp_path):
+    """A single-campaign product used to say nothing about WHEN its injections
+    were drawn, so a PE file holding O1/O2 events validated cleanly against an
+    O3+O4 selection.  The GPS span, the observing runs it overlaps and each
+    campaign's own exposure are now recorded per campaign."""
+    from gwcat.export import build_selection_product
+    from gwcat.observing_runs import EXPOSURE_WINDOWS_GPS
+
+    o3a = EXPOSURE_WINDOWS_GPS["O3a"]
+    o4a = EXPOSURE_WINDOWS_GPS["O4a"]
+    p1 = _o4_with_times(tmp_path / "a.hdf", 40, o3a[0] + 10, o3a[1] - 10, 1)
+    p2 = _o4_with_times(tmp_path / "b.hdf", 30, o4a[0] + 10, o4a[1] - 10, 2)
+    sets = [SelectionSet(p1), SelectionSet(p2)]
+    prod = build_selection_product(sets, spin_basis="component")
+    a = prod.attrs
+    with h5py.File(p1, "r") as f:
+        t1 = f["events"]["time_geocenter"][:]
+    with h5py.File(p2, "r") as f:
+        t2 = f["events"]["time_geocenter"][:]
+    np.testing.assert_array_equal(
+        a["campaign_gps_range_per_campaign"],
+        [[t1.min(), t1.max()], [t2.min(), t2.max()]])
+    assert [x.decode() if isinstance(x, bytes) else x for x in
+            a["campaign_gps_range_source_per_campaign"]] == ["row_times"] * 2
+    assert json.loads(a["campaign_runs_per_campaign"]) == [["O3a"], ["O4a"]]
+    assert json.loads(a["observing_runs_covered"]) == ["O3a", "O4a"]
+    np.testing.assert_allclose(a["T_obs_yr_per_campaign"],
+                               [s._T_yr for s in sets], rtol=0)
+    assert float(a["T_obs_yr"]) == pytest.approx(
+        float(np.sum(a["T_obs_yr_per_campaign"])), rel=1e-15)
+
+
+def test_time_coverage_unknown_is_nan_not_absent(tmp_path):
+    from gwcat.export import build_selection_product
+
+    p = write_o4_full(tmp_path / "o4.hdf", n=20, seed=3)   # no row times
+    prod = build_selection_product(SelectionSet(p), spin_basis="component")
+    rng = np.asarray(prod.attrs["campaign_gps_range_per_campaign"])
+    assert rng.shape == (1, 2) and np.isnan(rng).all()
+    src = prod.attrs["campaign_gps_range_source_per_campaign"][0]
+    assert (src.decode() if isinstance(src, bytes) else src) == "unknown"
+    assert json.loads(prod.attrs["campaign_runs_per_campaign"]) == [[]]
+    assert json.loads(prod.attrs["observing_runs_covered"]) == []

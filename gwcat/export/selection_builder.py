@@ -1459,6 +1459,10 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     attrs["acknowledge_semianalytic_excluded"] = bool(
         acknowledge_semianalytic_excluded)
     attrs["sky_marginalized"] = bool(sky_marginal)
+    # Which time (GPS span, observing runs, exposure) each campaign covers, so
+    # a PE file holding events from uncovered time can be refused downstream.
+    time_coverage = _time_coverage_attrs(set_list)
+    attrs.update(time_coverage)
     if mixture_attrs is not None:
         attrs.update(mixture_attrs)
     if reference_coverage_runs is not None:
@@ -1524,6 +1528,14 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         "injected_spin_format": [str(s.spin_meta.get("spin_format"))
                                  for s in set_list],
         "component_columns_emitted": bool(extras_available),
+        "campaign_gps_range_per_campaign": time_coverage[
+            "campaign_gps_range_per_campaign"].tolist(),
+        "campaign_runs_per_campaign": json.loads(
+            time_coverage["campaign_runs_per_campaign"]),
+        "observing_runs_covered": json.loads(
+            time_coverage["observing_runs_covered"]),
+        "T_obs_yr_per_campaign": time_coverage[
+            "T_obs_yr_per_campaign"].tolist(),
     }
     if a_ref is not None:
         summary["spin_reference_amax"] = float(a_ref)
@@ -1563,6 +1575,57 @@ def _sky_availability(set_list):
             f"campaigns' injections; cut on campaign, not on finiteness, if "
             f"that is not intended.")
     return sky
+
+
+def _time_coverage_attrs(set_list):
+    """Per-campaign time coverage of the selection integral (review fix).
+
+    Each campaign's injections stand for the exposure of the time they were
+    drawn over, and only that time: an event from a run no campaign covers
+    enters the likelihood with no matching selection term.  Only the
+    cumulative-mixture branch used to write any GPS information, so a
+    single-campaign product (endo3 + rpo4ab, say) gave a reader no way to see
+    that a PE file paired with it held O1/O2 events.  Recorded here per
+    campaign so a validator or consumer can compare it with the events' times:
+
+    * ``campaign_gps_range_per_campaign`` -- ``(n_campaigns, 2)`` GPS
+      ``[min, max]`` of the campaign's rows (or its ``gps_start``/``gps_end``
+      attrs), NaN when unknown; ``campaign_gps_range_source_per_campaign``
+      says which (``row_times`` / ``attrs_gps_start_end`` / ``unknown``);
+    * ``campaign_runs_per_campaign`` -- JSON list, per campaign, of the
+      observing runs whose official window
+      (:data:`gwcat.observing_runs.EXPOSURE_WINDOWS_GPS`) that range overlaps,
+      and ``observing_runs_covered``, their union in run order;
+    * ``T_obs_yr_per_campaign`` -- each campaign's own exposure (``T_obs_yr``
+      is their sum).
+
+    Recording only: nothing here changes which rows are written or ``pdraw``.
+    """
+    _str = h5py.string_dtype()
+    ranges, sources, runs = [], [], []
+    for s in set_list:
+        rng = s.gps_range
+        sources.append(str(getattr(s, "_gps_range_source", "unknown")))
+        if rng is None:
+            ranges.append((float("nan"), float("nan")))
+            runs.append([])
+            continue
+        lo, hi = float(rng[0]), float(rng[1])
+        ranges.append((lo, hi))
+        runs.append([r for r in RUN_LABELS
+                     if EXPOSURE_WINDOWS_GPS[r][0] <= hi
+                     and lo <= EXPOSURE_WINDOWS_GPS[r][1]])
+    covered = [r for r in RUN_LABELS if any(r in rr for rr in runs)]
+    return {
+        "campaign_gps_range_per_campaign": np.array(
+            ranges, dtype=float).reshape(-1, 2),
+        "campaign_gps_range_source_per_campaign": np.array(sources,
+                                                           dtype=_str),
+        "campaign_runs_per_campaign": json.dumps(runs),
+        "observing_runs_covered": json.dumps(covered),
+        "T_obs_yr_per_campaign": np.array(
+            [float(s._T_yr) for s in set_list], dtype=float),
+    }
 
 
 def _amax_pair(amax_detected):
