@@ -21,12 +21,22 @@
      use; a MissingParameterError is a clean CLI error; ``--parameter-space
      chieff_chip`` and ``--pastro-min`` have the opt-in flags they need.
   8. validation_summary.json is strict JSON: a NaN at any depth is null.
+  9. Zenodo fetch: the destination check is lexical (a per-file symlink into
+     a shared copy is accepted); sha256 and absent checksums are handled; the
+     cached record resolution is written only by a run that resolved, never
+     clobbered by a dry run, records a failed resolution, and is checked
+     offline; superseded files are reported and every run writes a fetch
+     manifest; an alias is its release (one directory, fetched once); the CLI
+     fills the store's record_id / file_checksum; the GWOSC event table also
+     answers to the full names of the O1/O2 events.
 
 Every test is offline: GWOSC and Zenodo are monkeypatched.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import subprocess
 import warnings
 from urllib.parse import parse_qs, urlparse
@@ -525,3 +535,310 @@ def test_validation_summary_json_has_no_nan_tokens(tmp_path):
     assert data["arr"] == [0.5, None]
     assert data["nested"] == {"x": [None, 2]}
     assert data["count"] == 3
+
+
+# ==========================================================================
+# 9. Zenodo fetch: destination, checksums, resolution, manifest, aliases
+# ==========================================================================
+_GWTC21_FILE = "IGWN-GWTC2p1-v2-GW150914_095045_PEDataRelease_cosmo.h5"
+_GWTC21_PINNED = 6513631
+
+
+def _entry(key, content, checksum="md5"):
+    if checksum == "md5":
+        cs = "md5:" + hashlib.md5(content).hexdigest()
+    elif checksum == "sha256":
+        cs = "sha256:" + hashlib.sha256(content).hexdigest()
+    else:
+        cs = checksum
+    return {"key": key, "size": len(content), "checksum": cs,
+            "links": {"self": "https://example.invalid/" + key}}
+
+
+def _listing(monkeypatch, entries, seen=None):
+    def fake_list_files(record_id, **kw):
+        if seen is not None:
+            seen.append(record_id)
+        return entries
+    monkeypatch.setattr(fetch, "list_files", fake_list_files)
+
+
+def _no_download(monkeypatch):
+    def _boom(*a, **k):
+        raise AssertionError("nothing should be downloaded")
+    monkeypatch.setattr(fetch, "download_file", _boom)
+
+
+@pytest.mark.parametrize("key", ["../evil.h5", "a/../../evil.h5", "/etc/x.h5",
+                                 "", "a//b.h5", "./a.h5", "a\\b.h5"])
+def test_a_remote_name_that_leaves_the_data_directory_is_refused(tmp_path,
+                                                                 key):
+    with pytest.raises(RuntimeError, match="refusing to download"):
+        fetch._contained_dest(tmp_path, key)
+
+
+def test_a_per_file_symlink_into_a_shared_copy_is_accepted_offline(
+        tmp_path, monkeypatch):
+    """The guard resolved the joined path, which follows the link, and refused
+    a data directory whose files link into a group share -- even offline."""
+    content = b"shared PE bytes"
+    shared = tmp_path / "share" / "GWTC-2p1"
+    shared.mkdir(parents=True)
+    (shared / _GWTC21_FILE).write_bytes(content)
+    data = tmp_path / "data"
+    (data / "GWTC-2p1").mkdir(parents=True)
+    os.symlink(shared / _GWTC21_FILE, data / "GWTC-2p1" / _GWTC21_FILE)
+    _listing(monkeypatch, [_entry(_GWTC21_FILE, content)])
+    _no_download(monkeypatch)
+    paths = fetch.fetch_catalog("GWTC-2.1", data_dir=str(data),
+                                cache_dir=str(tmp_path / "cache"),
+                                offline=True, resolve=False,
+                                show_progress=False)
+    assert paths == [str((data / "GWTC-2p1").resolve() / _GWTC21_FILE)]
+
+
+def test_a_sha256_checksum_verifies_a_cached_file(tmp_path, monkeypatch):
+    """A sha256 entry was compared with the file's md5: never a match."""
+    content = b"sha256-listed bytes"
+    (tmp_path / "GWTC-2p1").mkdir()
+    (tmp_path / "GWTC-2p1" / _GWTC21_FILE).write_bytes(content)
+    _listing(monkeypatch, [_entry(_GWTC21_FILE, content, "sha256")])
+    _no_download(monkeypatch)
+    paths = fetch.fetch_catalog("GWTC-2.1", data_dir=str(tmp_path),
+                                resolve=False, show_progress=False)
+    assert len(paths) == 1
+
+
+def test_download_file_verifies_a_sha256_checksum(tmp_path, monkeypatch):
+    import sys
+
+    class _Resp:
+        headers = {"Content-Length": "4"}
+
+        def raise_for_status(self):
+            pass
+
+        def iter_content(self, chunk_size=0):
+            yield b"data"
+
+    fake_tqdm = type(sys)("tqdm")
+    fake_tqdm.tqdm = lambda *a, **kw: None
+    fake_requests = type(sys)("requests")
+    fake_requests.get = lambda *a, **kw: _Resp()
+    monkeypatch.setitem(sys.modules, "tqdm", fake_tqdm)
+    monkeypatch.setitem(sys.modules, "requests", fake_requests)
+    good = ("sha256", hashlib.sha256(b"data").hexdigest())
+    dest = tmp_path / "x.h5"
+    fetch.download_file("https://example.invalid/x", str(dest),
+                        show_progress=False, expected_checksum=good)
+    assert dest.read_bytes() == b"data"
+    dest.unlink()
+    with pytest.raises(RuntimeError, match="Checksum mismatch"):
+        fetch.download_file("https://example.invalid/x", str(dest),
+                            show_progress=False,
+                            expected_checksum=("sha256", "0" * 64))
+    assert not dest.exists()
+
+
+def test_a_file_without_a_published_checksum_is_reused_not_refetched(
+        tmp_path, monkeypatch):
+    """With no checksum and none required, an existing file was downloaded
+    again on every call, and refused offline."""
+    content = b"no checksum published"
+    (tmp_path / "GWTC-2p1").mkdir()
+    (tmp_path / "GWTC-2p1" / _GWTC21_FILE).write_bytes(content)
+    entry = _entry(_GWTC21_FILE, content, checksum="")
+    monkeypatch.setattr(fetch, "_require_checksums", lambda info: False)
+    _listing(monkeypatch, [entry])
+    _no_download(monkeypatch)
+    for kw in ({}, {"offline": True, "cache_dir": str(tmp_path / "c")}):
+        assert len(fetch.fetch_catalog("GWTC-2.1", data_dir=str(tmp_path),
+                                       resolve=False, show_progress=False,
+                                       **kw)) == 1
+    # ... but a copy of the wrong size is not a finished download
+    (tmp_path / "GWTC-2p1" / _GWTC21_FILE).write_bytes(content[:-1])
+    with pytest.raises(fetch_cache.OfflineCacheMissError):
+        fetch.fetch_catalog("GWTC-2.1", data_dir=str(tmp_path), resolve=False,
+                            show_progress=False, offline=True,
+                            cache_dir=str(tmp_path / "c"))
+
+
+def _resolution(cache_dir):
+    return json.loads((cache_dir / "metadata" /
+                       "resolution_GWTC-2.1.json").read_text())["payload"]
+
+
+def test_a_no_resolve_run_does_not_overwrite_the_resolved_record(
+        tmp_path, monkeypatch):
+    cache_dir = tmp_path / "cache"
+    _listing(monkeypatch, [_entry(_GWTC21_FILE, b"x")])
+    monkeypatch.setattr(fetch, "resolve_latest", lambda cid: 99999999)
+    fetch.fetch_catalog("GWTC-2.1", data_dir=str(tmp_path), dry_run=True,
+                        cache_dir=cache_dir)
+    fetch.fetch_catalog("GWTC-2.1", data_dir=str(tmp_path), dry_run=True,
+                        cache_dir=cache_dir, resolve=False)
+    assert _resolution(cache_dir)["record_ids"] == [99999999]
+
+
+def test_a_dry_run_does_not_overwrite_a_real_runs_record(tmp_path,
+                                                         monkeypatch):
+    content = b"pe"
+    (tmp_path / "GWTC-2p1").mkdir()
+    (tmp_path / "GWTC-2p1" / _GWTC21_FILE).write_bytes(content)
+    cache_dir = tmp_path / "cache"
+    _listing(monkeypatch, [_entry(_GWTC21_FILE, content)])
+    _no_download(monkeypatch)
+    monkeypatch.setattr(fetch, "resolve_latest", lambda cid: 11111111)
+    fetch.fetch_catalog("GWTC-2.1", data_dir=str(tmp_path),
+                        cache_dir=cache_dir, show_progress=False)
+    monkeypatch.setattr(fetch, "resolve_latest", lambda cid: 22222222)
+    fetch.fetch_catalog("GWTC-2.1", data_dir=str(tmp_path), dry_run=True,
+                        cache_dir=cache_dir)
+    assert _resolution(cache_dir)["record_ids"] == [11111111]
+
+
+def test_a_failed_resolution_is_recorded_and_not_replayed_as_resolved(
+        tmp_path, monkeypatch):
+    cache_dir = tmp_path / "cache"
+    seen = []
+    _listing(monkeypatch, [_entry(_GWTC21_FILE, b"x")], seen)
+
+    def _down(cid):
+        raise OSError("no route to host")
+    monkeypatch.setattr(fetch, "resolve_latest", _down)
+    with pytest.warns(UserWarning, match="Could not resolve concept"):
+        fetch.fetch_catalog("GWTC-2.1", data_dir=str(tmp_path), dry_run=True,
+                            cache_dir=cache_dir)
+    record = _resolution(cache_dir)
+    assert record["resolved_latest"] is False
+    assert record["failed_concept_ids"]
+    seen.clear()
+    with pytest.raises(fetch_cache.OfflineCacheMissError,
+                       match="could not resolve"):
+        fetch.fetch_catalog("GWTC-2.1", data_dir=str(tmp_path), dry_run=True,
+                            cache_dir=cache_dir, offline=True)
+    assert seen == []
+
+
+def test_an_unresolved_record_is_not_replayed_as_a_resolution(tmp_path):
+    """A record a --no-resolve run wrote (resolved_latest=False) was read back
+    by an offline resolve=True replay; the flag was never consulted."""
+    cache_dir = tmp_path / "cache"
+    fetch_cache.write_metadata_cache(
+        cache_dir, fetch_cache.resolution_cache_key("GWTC-2.1"),
+        {"catalog": "GWTC-2.1", "record_ids": [_GWTC21_PINNED],
+         "resolved_latest": False, "pinned_record_ids": [_GWTC21_PINNED],
+         "concept_ids": [None]})
+    with pytest.raises(fetch_cache.OfflineCacheMissError,
+                       match="did not resolve"):
+        fetch.fetch_catalog("GWTC-2.1", data_dir=str(tmp_path), dry_run=True,
+                            cache_dir=cache_dir, offline=True)
+
+
+def test_superseded_files_are_reported_and_a_manifest_is_written(
+        tmp_path, monkeypatch):
+    content = b"current release"
+    old_name = _GWTC21_FILE.replace("-v2-", "-v1-")
+    rel = tmp_path / "GWTC-2p1"
+    rel.mkdir()
+    (rel / _GWTC21_FILE).write_bytes(content)
+    (rel / old_name).write_bytes(b"older release")
+    _listing(monkeypatch, [_entry(_GWTC21_FILE, content)])
+    _no_download(monkeypatch)
+    with pytest.warns(UserWarning, match="in none of the record"):
+        fetch.fetch_catalog("GWTC-2.1", data_dir=str(tmp_path),
+                            resolve=False, show_progress=False)
+    manifest = json.loads((rel / fetch.FETCH_MANIFEST_NAME).read_text())
+    assert manifest["record_ids"] == [_GWTC21_PINNED]
+    assert manifest["record_source"] == "pinned"
+    assert [f["key"] for f in manifest["files"]] == [_GWTC21_FILE]
+    assert manifest["files"][0]["checksum"].startswith("md5:")
+    assert manifest["superseded_files"] == [old_name]
+    assert (rel / old_name).exists()          # reported, never deleted
+
+
+def test_naming_an_alias_and_its_release_fetches_it_once(tmp_path,
+                                                        monkeypatch):
+    """GWTC-4 and GWTC-4.1 had two directories and two cache keys, so naming
+    both fetched the release twice and ingested every O4a event twice."""
+    calls = []
+    monkeypatch.setattr(fetch, "fetch_catalog",
+                        lambda cat, **kw: calls.append(cat) or [])
+    fetch._cli(["--catalog", "GWTC-4", "GWTC-4.1", "GWTC-3", "--dry-run",
+                "--data-dir", str(tmp_path)], _deprecated=False)
+    assert calls == ["GWTC-4.1", "GWTC-3"]
+
+
+def test_an_alias_shares_its_releases_cache_key(tmp_path, monkeypatch):
+    _listing(monkeypatch, [_entry("GW230529_181500.hdf5", b"x")])
+    monkeypatch.setattr(fetch, "resolve_latest", lambda cid: 33333333)
+    cache_dir = tmp_path / "cache"
+    fetch.fetch_catalog("GWTC-4", data_dir=str(tmp_path), dry_run=True,
+                        cache_dir=cache_dir)
+    assert sorted(p.name for p in (cache_dir / "metadata").iterdir()
+                  if p.name.startswith("resolution_")) == [
+        "resolution_GWTC-4.1.json"]
+
+
+def test_an_alias_is_its_release(tmp_path, monkeypatch):
+    key = "IGWN-GWTC4p0-1a206db3d_721-GW230529_181500-combined_PEDataRelease.hdf5"
+    assert fetch.RELEASES["GWTC-4.1"].file_filter(key)
+    content = b"o4a"
+    legacy = tmp_path / "GWTC-4"
+    legacy.mkdir()
+    (legacy / key).write_bytes(content)
+    _listing(monkeypatch, [_entry(key, content)])
+    _no_download(monkeypatch)
+    paths = fetch.fetch_catalog("GWTC-4", data_dir=str(tmp_path),
+                                resolve=False, show_progress=False)
+    # one release directory, and the copy the alias fetched earlier is reused
+    # in place instead of being downloaded again
+    assert paths == [str(legacy.resolve() / key)]
+    assert (tmp_path / "GWTC-4p1" / fetch.FETCH_MANIFEST_NAME).exists()
+
+
+def test_the_cli_fills_the_stores_record_id_and_checksum(tmp_path,
+                                                         monkeypatch):
+    content = b"pe for the store"
+    (tmp_path / "GWTC-2p1").mkdir()
+    (tmp_path / "GWTC-2p1" / _GWTC21_FILE).write_bytes(content)
+    _listing(monkeypatch, [_entry(_GWTC21_FILE, content)])
+    _no_download(monkeypatch)
+    import gwcat.ingest as ing
+    seen = {}
+    monkeypatch.setattr(ing, "build_store",
+                        lambda paths, out, **kw: seen.update(kw))
+    fetch._cli(["--catalog", "GWTC-2.1", "--data-dir", str(tmp_path),
+                "--no-resolve", "--no-progress", "--no-event-table",
+                "--out", str(tmp_path / "store.h5")], _deprecated=False)
+    assert seen["file_provenance"] == {_GWTC21_FILE: {
+        "record_id": str(_GWTC21_PINNED),
+        "file_checksum": hashlib.sha256(content).hexdigest()}}
+
+
+def test_the_event_table_answers_to_the_full_o1o2_names(monkeypatch):
+    page = {"events": {
+        "GW150914-v4": {"far": 1e-7, "p_astro": 1.0},
+        "GW170817-v3": {"far": 1e-7, "p_astro": 1.0},
+        "GW190412_053044-v4": {"far": 1e-5, "p_astro": 1.0},
+        "GW170104-v3": {"far": None, "p_astro": None},
+        "GW170104_101158-v9": {"far": 3.0, "p_astro": 0.5},
+    }, "links": {}}
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps(page).encode()
+
+    monkeypatch.setattr(fetch, "urlopen", lambda req, timeout=30: _Resp())
+    table = fetch.fetch_event_table_gwosc()
+    assert table["GW150914_095045"]["far"] == pytest.approx(1e-7)
+    assert table["GW170817_124104"]["pastro"] == pytest.approx(1.0)
+    assert table["GW150914"]["far"] == pytest.approx(1e-7)   # still there
+    # a full-name entry GWOSC publishes itself is never overwritten
+    assert table["GW170104_101158"]["far"] == pytest.approx(3.0)

@@ -281,9 +281,57 @@ def _download_url_for(file_entry: dict) -> str:
     raise KeyError(f"Cannot find download URL in file entry: {file_entry.get('key', '?')}")
 
 
-def _checksum_for(file_entry: dict) -> Optional[str]:
-    cs = file_entry.get("checksum", "")
-    return cs[4:] if cs.startswith("md5:") else (cs or None)
+#: hashlib algorithms a Zenodo ``checksum`` entry may name, and the hex length
+#: that identifies each when an entry carries no ``<algo>:`` prefix.
+_CHECKSUM_HEX_LENGTHS = {"md5": 32, "sha1": 40, "sha256": 64, "sha512": 128}
+
+
+def _parse_checksum(file_entry: dict) -> Optional[tuple]:
+    """``(algorithm, hex digest)`` of a Zenodo file entry, or ``None``.
+
+    Zenodo writes ``md5:<hex>``.  Any other prefix used to be passed on
+    verbatim as if it were an md5, so a ``sha256:...`` entry never matched a
+    good file: every call re-downloaded it, and the download was then
+    "corrupt".  Entries are now read as ``<algo>:<hex>`` for any algorithm in
+    :data:`_CHECKSUM_HEX_LENGTHS`; a bare digest is identified by its length
+    (md5 otherwise, the historical reading, so a garbled one still fails the
+    comparison loudly).  An algorithm this module cannot evaluate gives
+    ``None`` with a warning -- the file is then unverified, which a release
+    that requires checksums refuses.
+    """
+    cs = str(file_entry.get("checksum") or "").strip()
+    if not cs:
+        return None
+    algo, sep, digest = cs.partition(":")
+    if sep:
+        algo = algo.strip().lower()
+    else:
+        digest = cs
+        algo = next((a for a, n in _CHECKSUM_HEX_LENGTHS.items()
+                     if n == len(cs)), "md5")
+    if algo not in _CHECKSUM_HEX_LENGTHS:
+        warnings.warn(
+            f"{file_entry.get('key', '?')}: cannot evaluate the checksum "
+            f"{cs!r} (supported: {sorted(_CHECKSUM_HEX_LENGTHS)}); the file "
+            f"is unverified.")
+        return None
+    return algo, digest.strip().lower()
+
+
+def _file_digests(path: str, algos) -> Dict[str, str]:
+    """Hex digests of one file for every algorithm in ``algos``, in ONE read.
+
+    Verifying a cached file against Zenodo's md5 and recording its sha256 for
+    provenance used to read the file twice.
+    """
+    hashers = {a: hashlib.new(a) for a in sorted(set(algos))}
+    if not hashers:
+        return {}
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            for h in hashers.values():
+                h.update(chunk)
+    return {a: h.hexdigest() for a, h in hashers.items()}
 
 
 def _require_checksums(info: "ReleaseInfo") -> bool:
@@ -334,12 +382,21 @@ def _contained_dest(dest_dir, key: str) -> str:
 
 
 def download_file(url: str, dest: str, expected_md5: Optional[str] = None,
-                  show_progress: bool = True) -> str:
+                  show_progress: bool = True,
+                  expected_checksum: Optional[tuple] = None) -> str:
     """Download a single file with progress bar and checksum verification.
-    Skips download if dest exists and checksum matches."""
+    Skips download if dest exists and checksum matches.
+
+    ``expected_checksum`` is an ``(algorithm, hex digest)`` pair (see
+    :func:`_parse_checksum`); ``expected_md5`` is the older md5-only spelling
+    of the same thing.
+    """
     dest = str(dest)
-    if os.path.exists(dest) and expected_md5:
-        if _md5(dest) == expected_md5:
+    if expected_checksum is None and expected_md5:
+        expected_checksum = ("md5", str(expected_md5).lower())
+    if os.path.exists(dest) and expected_checksum:
+        algo, digest = expected_checksum
+        if _file_digests(dest, [algo])[algo] == digest:
             return dest
 
     try:
@@ -385,11 +442,12 @@ def download_file(url: str, dest: str, expected_md5: Optional[str] = None,
                 f"Content-Length={total} but {n_written} byte(s) arrived. "
                 f"Retry the fetch; nothing was written to {dest}.")
 
-        if expected_md5:
-            actual = _md5(tmp)
-            if actual != expected_md5:
+        if expected_checksum:
+            algo, digest = expected_checksum
+            actual = _file_digests(tmp, [algo])[algo]
+            if actual != digest:
                 raise RuntimeError(
-                    f"Checksum mismatch for {dest}: expected {expected_md5}, "
+                    f"Checksum mismatch for {dest}: expected {algo} {digest}, "
                     f"got {actual}. The download was discarded.")
         os.replace(tmp, dest)
     except BaseException:
@@ -402,9 +460,15 @@ def download_file(url: str, dest: str, expected_md5: Optional[str] = None,
 # ---------------------------------------------------------------------------
 # Core: resolve record IDs to their latest versions
 # ---------------------------------------------------------------------------
-def _resolve_record_ids(info: ReleaseInfo, catalog: str) -> List[int]:
+def _resolve_record_ids(info: ReleaseInfo, catalog: str,
+                        failures: Optional[list] = None) -> List[int]:
     """Resolve every concept_id in a ReleaseInfo to its latest record.
-    Falls back to the pinned record_id on failure."""
+    Falls back to the pinned record_id on failure.
+
+    Each concept that could not be resolved is appended to ``failures`` when
+    given: the fallback is part of what the run did, and it used to be cached
+    as a successful resolution.
+    """
     resolved = []
     for rid, cid in zip(info.record_ids, info.concept_ids):
         if cid is None:
@@ -420,6 +484,8 @@ def _resolve_record_ids(info: ReleaseInfo, catalog: str) -> List[int]:
             warnings.warn(f"Could not resolve concept {cid} for {catalog}: {e}; "
                           f"using pinned record {rid}")
             resolved.append(rid)
+            if failures is not None:
+                failures.append(cid)
     return resolved
 
 
@@ -429,6 +495,8 @@ def _cache_record_resolution(
     info: ReleaseInfo,
     rids: Sequence[int],
     resolved: bool,
+    dry_run: bool = False,
+    failed_concept_ids: Sequence[Optional[int]] = (),
 ) -> None:
     """Record which Zenodo records this run actually used (GW-15).
 
@@ -437,14 +505,33 @@ def _cache_record_resolution(
     at *at that moment*, which is not recoverable from the registry pins
     afterwards.  Caching it is what lets an offline replay read the same
     records instead of silently falling back to the pins.
+
+    The record is what an offline ``resolve=True`` replay reads, so only a run
+    that resolved writes it: a ``--no-resolve`` or explicit-``record_ids`` run
+    is reproducible from the pins or its arguments and used to overwrite the
+    resolved record with its own.  A dry run writes it only when no real run
+    has: it downloaded nothing, so the data directory still holds what the
+    last real run fetched.  A concept that failed to resolve (the run fell
+    back to its pin) is recorded as such, with ``resolved_latest=False``.
     """
+    key = fetch_cache.resolution_cache_key(catalog)
+    if dry_run:
+        try:
+            previous = fetch_cache.read_metadata_cache(cache_dir, key)
+        except fetch_cache.OfflineCacheMissError:
+            previous = None
+        if isinstance(previous, dict) and not previous.get("dry_run", False):
+            return
+    failed = [c for c in failed_concept_ids]
     fetch_cache.write_metadata_cache(
         cache_dir,
-        fetch_cache.resolution_cache_key(catalog),
+        key,
         {
             "catalog": catalog,
             "record_ids": [int(r) for r in rids],
-            "resolved_latest": bool(resolved),
+            "resolved_latest": bool(resolved) and not failed,
+            "failed_concept_ids": failed,
+            "dry_run": bool(dry_run),
             "pinned_record_ids": [int(r) for r in info.record_ids],
             "concept_ids": list(info.concept_ids),
         },
@@ -467,10 +554,12 @@ def _cached_resolved_record_ids(
 
     Raises :class:`gwcat.fetch_cache.OfflineCacheMissError` (naming the file)
     when the resolution was never cached or the cache is truncated -- never a
-    silent fallback to the pins.
+    silent fallback to the pins -- and when the record does not say
+    ``resolved_latest``: a record written by a run that did not resolve, or
+    whose resolution failed and fell back to the pins, is not a resolution.
     """
-    payload = fetch_cache.read_metadata_cache(
-        cache_dir, fetch_cache.resolution_cache_key(catalog))
+    key = fetch_cache.resolution_cache_key(catalog)
+    payload = fetch_cache.read_metadata_cache(cache_dir, key)
     rids = payload.get("record_ids") if isinstance(payload, dict) else None
     if not rids:
         raise fetch_cache.OfflineCacheMissError(
@@ -479,7 +568,92 @@ def _cached_resolved_record_ids(
             "online with the same cache_dir, or pass resolve=False to use the "
             "pinned record IDs deliberately."
         )
+    if payload.get("resolved_latest") is not True:
+        failed = payload.get("failed_concept_ids") or []
+        why = (f"the online run could not resolve concept(s) {failed} and "
+               f"fell back to the pinned record(s)" if failed else
+               "it was written by a run that did not resolve the concept DOIs "
+               "(--no-resolve or explicit record IDs)")
+        raise fetch_cache.OfflineCacheMissError(
+            f"Offline mode: the cached record resolution "
+            f"{fetch_cache.metadata_cache_path(cache_dir, key)} for "
+            f"{catalog!r} is not a resolution to the latest records: {why}. "
+            "Re-run the fetch once online with resolve=True, or pass "
+            "resolve=False to use the pinned record IDs deliberately."
+        )
     return [int(r) for r in rids]
+
+
+def _canonical_catalog(catalog: str) -> str:
+    """The release name ``catalog`` is an alias of ("GWTC-4" -> "GWTC-4.1").
+
+    An alias used to get its own download directory and cache keys, so naming
+    both spellings downloaded the release twice and ingested every event of it
+    twice.
+    """
+    manifest = getattr(RELEASES.get(catalog), "manifest", None)
+    if (manifest is not None and catalog in manifest.aliases
+            and manifest.release in RELEASES):
+        return manifest.release
+    return catalog
+
+
+def _catalog_dir_name(catalog: str) -> str:
+    return catalog.replace(".", "p")  # GWTC-4.1 → GWTC-4p1
+
+
+def _local_copy_ok(path: str, checksum: Optional[tuple], size,
+                   extra_algos=()) -> tuple:
+    """``(ok, digests)`` for an existing local copy of one listed file.
+
+    With a published checksum the copy must match it.  Without one -- on a
+    release that does not require checksums -- a copy of the listed size is
+    accepted unverified: downloads are staged and renamed only once complete,
+    so a file at the destination is a finished download.  That used to be
+    re-downloaded on every call, and refused offline.  ``digests`` holds every
+    algorithm in ``extra_algos`` too, from the same read.
+    """
+    if not os.path.isfile(path):
+        return False, {}
+    algos = set(extra_algos) | ({checksum[0]} if checksum else set())
+    digests = _file_digests(path, algos)
+    if checksum is not None:
+        return digests[checksum[0]] == checksum[1], digests
+    if size is not None:
+        try:
+            if os.path.getsize(path) != int(size):
+                return False, digests
+        except (TypeError, ValueError):
+            pass
+    return True, digests
+
+
+#: The file ``fetch_catalog`` writes in each release directory: which records
+#: and files the last run used, so a directory can be told apart from the
+#: superseded files a re-release leaves beside the current ones.
+FETCH_MANIFEST_NAME = "gwcat_fetch_manifest.json"
+
+
+def _write_fetch_manifest(dest_dir: Path, payload: dict) -> Optional[Path]:
+    """Write :data:`FETCH_MANIFEST_NAME` atomically; warn (not raise) on OSError.
+
+    A read-only data directory (a shared copy) must still verify offline.
+    """
+    path = Path(dest_dir) / FETCH_MANIFEST_NAME
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(payload, indent=2, default=str) + "\n")
+        os.replace(tmp, path)
+    except OSError as e:
+        warnings.warn(f"could not write the fetch manifest {path}: {e}")
+        return None
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -502,7 +676,8 @@ def fetch_catalog(
     ----------
     catalog : str
         Key in RELEASES: "GWTC-2.1", "GWTC-3", "GWTC-4.1" (or "GWTC-4"),
-        "GWTC-5".
+        "GWTC-5".  An alias is the release it names: same directory, same
+        cache keys.
     data_dir : str
         Root directory; files go into {data_dir}/{catalog}/.
     record_ids : list of int, optional
@@ -511,8 +686,9 @@ def fetch_catalog(
         If True (default), query Zenodo for the latest version of each
         concept DOI.  Set False to use pinned records without network.
         Offline it selects *which records the earlier online run used*: the
-        resolution is read back from ``cache_dir`` (a missing/truncated one
-        raises :class:`~gwcat.fetch_cache.OfflineCacheMissError`), so an
+        resolution is read back from ``cache_dir`` (a missing/truncated one,
+        or one that records no successful resolution, raises
+        :class:`~gwcat.fetch_cache.OfflineCacheMissError`), so an
         offline replay reproduces the online file set instead of silently
         falling back to the pins.  ``resolve=False`` offline is the deliberate
         opt-in to the pinned records.
@@ -539,6 +715,13 @@ def fetch_catalog(
         store's per-row ``record_id`` / ``file_checksum`` meta columns.  Never
         populated automatically -- opt in only.
 
+    A run that is not a dry run writes :data:`FETCH_MANIFEST_NAME` into the
+    release directory (records, how they were chosen, and every listed file
+    with its size and published checksum), and warns about files there that
+    match the release but are in none of the records used -- what a
+    re-release leaves behind, and what a ``gwcat ingest --glob`` over the
+    directory would ingest beside the current files.  Nothing is deleted.
+
     Returns
     -------
     list of str
@@ -557,7 +740,10 @@ def fetch_catalog(
             "pointing at a previously populated metadata cache."
         )
 
+    requested_as = catalog
+    catalog = _canonical_catalog(catalog)
     info = RELEASES[catalog]
+    failed_concepts: List[Optional[int]] = []
     if offline_mode:
         # Resolving the latest version always requires a network call, so an
         # offline run reads back WHICH RECORDS THE ONLINE RUN RESOLVED (GW-15).
@@ -566,21 +752,36 @@ def fetch_catalog(
         # run cached the moment any release is versioned past its pin.
         # resolve=False is the deliberate opt-in to the pins.
         if record_ids:
-            rids = list(record_ids)
+            rids, record_source = list(record_ids), "explicit"
         elif resolve:
             rids = _cached_resolved_record_ids(catalog, cache_dir)
+            record_source = "offline_replay_of_resolved"
         else:
-            rids = list(info.record_ids)
+            rids, record_source = list(info.record_ids), "pinned"
     else:
-        rids = record_ids or (
-            _resolve_record_ids(info, catalog) if resolve else list(info.record_ids)
-        )
-        if cache_dir is not None:
+        if record_ids:
+            rids, record_source = list(record_ids), "explicit"
+        elif resolve:
+            rids = _resolve_record_ids(info, catalog, failures=failed_concepts)
+            record_source = ("resolved_latest" if not failed_concepts
+                             else "resolved_with_pinned_fallback")
+        else:
+            rids, record_source = list(info.record_ids), "pinned"
+        if cache_dir is not None and resolve and not record_ids:
             _cache_record_resolution(cache_dir, catalog, info, rids,
-                                     resolved=bool(resolve and not record_ids))
+                                     resolved=True, dry_run=dry_run,
+                                     failed_concept_ids=failed_concepts)
 
-    dest_dir = Path(data_dir) / catalog.replace(".", "p")  # GWTC-4.1 → GWTC-4p1
+    dest_dir = Path(data_dir) / _catalog_dir_name(catalog)
+    # Where an alias used to put the same files: reused in place when they
+    # verify, rather than downloaded a second time.
+    legacy_dirs = [Path(data_dir) / _catalog_dir_name(a)
+                   for a in sorted({requested_as, *(
+                       info.manifest.aliases if info.manifest else ())})
+                   if _catalog_dir_name(a) != _catalog_dir_name(catalog)]
     all_paths = []
+    listed_keys: set = set()
+    manifest_files: List[dict] = []
 
     # Only pass the new cache/offline kwargs through when actually requested,
     # so a caller (or test) that monkeypatches list_files with the pre-PR8
@@ -623,8 +824,8 @@ def fetch_catalog(
             fname = f["key"]
             dest = _contained_dest(dest_dir, fname)
             url = _download_url_for(f)
-            md5 = _checksum_for(f)
-            if md5 is None and _require_checksums(info):
+            checksum = _parse_checksum(f)
+            if checksum is None and _require_checksums(info):
                 # The manifests declare `validation.require_checksums: true`,
                 # the loader schema-checks it, and nothing consulted it (GW-37)
                 # -- so a Zenodo entry that shipped no checksum silently
@@ -635,9 +836,22 @@ def fetch_catalog(
                     f"validation.require_checksums: true. An unverified file "
                     f"cannot be distinguished from a corrupted one; refusing to "
                     f"download it.")
-            cached_ok = os.path.exists(dest) and md5 and _md5(dest) == md5
+            extra = ("sha256",) if provenance is not None else ()
+            cached_ok, digests = _local_copy_ok(dest, checksum, f.get("size"),
+                                                extra)
+            where = ""
+            if not cached_ok:
+                for legacy in legacy_dirs:
+                    alt = _contained_dest(legacy, fname)
+                    ok, alt_digests = _local_copy_ok(alt, checksum,
+                                                     f.get("size"), extra)
+                    if ok:
+                        dest, cached_ok, digests = alt, True, alt_digests
+                        where = f", under {legacy.name}/"
+                        break
             if cached_ok:
-                print(f"  [{i}/{len(pe_files)}] {fname} (cached)")
+                note = "" if checksum else ", unverified: no checksum published"
+                print(f"  [{i}/{len(pe_files)}] {fname} (cached{where}{note})")
             elif offline_mode:
                 raise fetch_cache.OfflineCacheMissError(
                     f"Offline mode: {dest} is missing or does not match the "
@@ -647,16 +861,54 @@ def fetch_catalog(
                 )
             else:
                 print(f"  [{i}/{len(pe_files)}] {fname}")
-                download_file(url, dest, expected_md5=md5,
+                download_file(url, dest, expected_checksum=checksum,
                               show_progress=show_progress)
+                digests = {}
             all_paths.append(dest)
+            listed_keys.add(fname)
+            entry = {"key": fname, "record_id": int(rid),
+                     "size": f.get("size"), "checksum": f.get("checksum") or None,
+                     "verified": checksum is not None, "path": dest}
             if provenance is not None:
+                sha256 = (digests.get("sha256")
+                          or _file_digests(dest, ["sha256"])["sha256"])
                 provenance[fname] = {
                     "record_id": str(rid),
-                    "file_checksum": _sha256(dest),
+                    "file_checksum": sha256,
                 }
+                entry["sha256"] = sha256
+            manifest_files.append(entry)
 
     if not dry_run:
+        superseded = sorted(
+            p.name for p in dest_dir.iterdir()
+            if p.name not in listed_keys and p.is_file()
+            and info.file_filter(p.name)) if dest_dir.is_dir() else []
+        if superseded:
+            shown = ", ".join(superseded[:5]) + (
+                f", ... ({len(superseded) - 5} more)" if len(superseded) > 5
+                else "")
+            warnings.warn(
+                f"{catalog}: {len(superseded)} file(s) in {dest_dir} match "
+                f"this release but are in none of the record(s) {list(rids)} "
+                f"just used -- left by an earlier version of the release? A "
+                f"`gwcat ingest --glob` over this directory would ingest them "
+                f"beside the current files. They are listed as "
+                f"superseded_files in {FETCH_MANIFEST_NAME}: {shown}")
+        _write_fetch_manifest(dest_dir, {
+            "catalog": catalog,
+            "requested_as": requested_as,
+            "record_ids": [int(r) for r in rids],
+            "record_source": record_source,
+            "failed_concept_ids": failed_concepts,
+            "pinned_record_ids": [int(r) for r in info.record_ids],
+            "concept_ids": list(info.concept_ids),
+            "offline": bool(offline_mode),
+            "written_at_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                            time.gmtime()),
+            "files": manifest_files,
+            "superseded_files": superseded,
+        })
         print(f"[{catalog}] done: {len(all_paths)} files in {dest_dir}")
     return sorted(all_paths)
 
@@ -678,6 +930,21 @@ def is_injection_catalog(catalog: str) -> bool:
     # injection ReleaseInfo objects (e.g. via some future aliasing path).
     info = RELEASES.get(catalog)
     return info is not None and any(info is i for i in INJECTION_RELEASES.values())
+
+
+def _unique_releases(catalogs: Sequence[str]) -> List[str]:
+    """``catalogs`` with aliases mapped to their release and repeats dropped.
+
+    Naming ``GWTC-4`` and ``GWTC-4.1`` together fetched the release twice and
+    handed every O4a file to ``build_store`` twice.  Unknown names pass
+    through unchanged, for the caller's own error.
+    """
+    out: List[str] = []
+    for c in catalogs:
+        canonical = _canonical_catalog(c) if c in RELEASES else c
+        if canonical not in out:
+            out.append(canonical)
+    return out
 
 
 def split_pe_and_injection_catalogs(
@@ -755,7 +1022,7 @@ def fetch_and_build(
 
     cfg = ingest_cfg or IngestConfig()
     all_paths = []
-    for cat in catalogs:
+    for cat in _unique_releases(catalogs):
         paths = fetch_catalog(cat, data_dir=data_dir, resolve=resolve,
                               show_progress=show_progress, cache_dir=cache_dir,
                               offline=offline, provenance=provenance)
@@ -1385,6 +1652,7 @@ def _cli(
     for c in catalogs:
         if c not in RELEASES:
             ap.error(f"Unknown catalog {c!r}. Available: {_AVAILABLE}")
+    catalogs = _unique_releases(catalogs)
     if args.record_ids and len(catalogs) != 1:
         ap.error("--record-ids requires exactly one --catalog")
 
@@ -1396,6 +1664,10 @@ def _cli(
 
     all_paths = []
     pe_paths = []          # only PE files go to build_store
+    # Which Zenodo record and which bytes each file is: with --out it goes to
+    # build_store, whose per-row record_id / file_checksum columns no CLI path
+    # used to fill.  (Every run also writes the per-release fetch manifest.)
+    provenance = {} if (args.out and not args.dry_run) else None
     for cat in catalogs:
         rids = args.record_ids if (len(catalogs) == 1 and args.record_ids) else None
         paths = fetch_catalog(
@@ -1403,6 +1675,7 @@ def _cli(
             resolve=resolve, show_progress=show_progress,
             dry_run=args.dry_run, cache_dir=args.cache_dir,
             offline=offline,
+            provenance=None if is_injection_catalog(cat) else provenance,
         )
         all_paths.extend(paths)
         if not is_injection_catalog(cat):   # membership, not a name prefix
@@ -1424,7 +1697,7 @@ def _cli(
         write_summary = default_write_summary and not args.no_summary
         build_store(pe_paths, args.out, event_table=event_table,
                     cache_dir=args.cache_dir, offline=offline,
-                    write_summary=write_summary)
+                    write_summary=write_summary, file_provenance=provenance)
     else:
         print(f"\nDownloaded {len(all_paths)} files to {args.data_dir}/")
         if pe_paths:
