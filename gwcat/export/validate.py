@@ -1010,6 +1010,22 @@ def _xcheck_detection_cut(_fail, results, pe_attrs, sel_attrs):
     sel_snr = _num(sel_attrs.get("significance_snr_threshold",
                                  sel_attrs.get("snr_threshold")))
 
+    # An event cut on the POSTERIOR-MEDIAN SNR -- select(snr_min=...), ANDed
+    # with any far_max -- has no injection-side counterpart (review 2026-10-20,
+    # Medium 28): the selection builder's SNR leg is an OR on the INJECTED SNR,
+    # and no gwcat selection mode applies an AND or a posterior median.  Equal
+    # thresholds are therefore not a match: in the review's repro 25 of 40
+    # injections were detected under the OR against 15 under the AND the events
+    # were selected by, so mu was biased high with nothing reported.
+    if not np.isnan(pe_snr):
+        both = "" if np.isnan(pe_far) else f" AND far_max={pe_far}"
+        _fail("xcheck_detection_cut",
+              f"the PE events were cut on the posterior-median SNR "
+              f"(snr_min={pe_snr}{both}), which no injection detection mask "
+              f"reproduces: the selection's SNR leg (significance_snr_"
+              f"threshold={sel_snr}) is an OR on the injected SNR. Select the "
+              f"events by FAR or by a name whitelist only.")
+
     mism, unstated = [], []
     for label, pe_v, sel_v, pe_name, sel_name in (
             ("FAR", pe_far, sel_far, "far_max", "far_threshold"),

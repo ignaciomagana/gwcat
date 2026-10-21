@@ -365,12 +365,24 @@ def _contract_attrs(product, kind):
         "significance_snr_threshold")
     snr_min = (None if snr_min is None or not np.isfinite(float(snr_min))
                else float(snr_min))
-    stat = a.get("significance_type")
-    stat = (str(stat) if stat is not None
-            else (None if thr is None
-                  else ("far_or_snr" if snr_min is not None else "far")))
-    if stat is None and snr_min is not None:
-        stat = "snr"
+    if kind == "pe":
+        # The PE side's cuts are select()'s, so name THEM (review 2026-10-20,
+        # Medium 28): FAR on the catalogue FAR, SNR on the POSTERIOR-MEDIAN SNR,
+        # and the two combined as an AND.  Inferring the name from which attrs
+        # exist made far_max + snr_min read 'far_or_snr' -- the name of the
+        # selection builder's OR-widened INJECTION mask, a strictly looser cut
+        # no PE file can apply -- so the two contracts agreed on statistic,
+        # threshold and snr_min while describing different selections.
+        stat = ("far_and_snr_med" if thr is not None and snr_min is not None
+                else "far" if thr is not None
+                else "snr_med" if snr_min is not None else None)
+    else:
+        stat = a.get("significance_type")
+        stat = (str(stat) if stat is not None
+                else (None if thr is None
+                      else ("far_or_snr" if snr_min is not None else "far")))
+        if stat is None and snr_min is not None:
+            stat = "snr"
 
     _sel_fields = dict(selection_contract_fields(a))
     # z_max is an EXPORT argument, not a select() cut, so it lives in the attrs

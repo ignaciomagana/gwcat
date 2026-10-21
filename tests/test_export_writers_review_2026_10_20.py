@@ -61,6 +61,56 @@ def _summary_paths(out):
 
 
 # ==========================================================================
+# Medium 28. FAR AND posterior-median SNR is not 'far_or_snr'
+# ==========================================================================
+def test_a_far_and_median_snr_event_cut_is_named_for_what_it_is(tmp_path):
+    """select(snr_min) cuts on the posterior-median SNR, ANDed with far_max.
+
+    The writer inferred the statistic from which attrs exist, so far_max plus
+    snr_min came out as 'far_or_snr' -- the name of the selection builder's
+    OR-widened INJECTION mask, a strictly looser cut.
+    """
+    store = _store(tmp_path, snr_med=[12.0, 15.0])
+    out = tmp_path / "pe.h5"
+    product = build_pe_product(GWCatalog(store).select(snr_min=10.0),
+                               spin_basis="chieff", nsamp=8, seed=0,
+                               far_max=1.0)
+    get_exporter("gwcat2.1", kind="pe")(product, str(out))
+    contract = _contract(out)
+    assert contract["detection_statistic"] == "far_and_snr_med"
+    assert contract["detection_threshold"] == 1.0
+    assert contract["snr_min"] == 10.0
+
+    out2 = tmp_path / "pe_snr_only.h5"
+    product = build_pe_product(GWCatalog(store).select(snr_min=10.0),
+                               spin_basis="chieff", nsamp=8, seed=0)
+    get_exporter("gwcat2.1", kind="pe")(product, str(out2))
+    assert _contract(out2)["detection_statistic"] == "snr_med"
+
+
+def test_the_validator_refuses_a_posterior_median_snr_event_cut():
+    """Statistic, threshold and snr_min agreed on both sides, so the pair
+    passed: 25 of 40 injections detected under the OR against 15 under the
+    AND the events were selected by, mu biased high, nothing reported."""
+    from gwcat.export.validate import _xcheck_detection_cut
+
+    def _fail(name, msg):
+        raise ValueError(msg)
+
+    with pytest.raises(ValueError, match="posterior-median SNR"):
+        _xcheck_detection_cut(
+            _fail, {},
+            {"far_max": 1.0, "snr_min": 10.0},
+            {"far_threshold": 1.0, "significance_snr_threshold": 10.0,
+             "significance_type": "far_or_snr"})
+    # A FAR-only event cut against a FAR-only injection cut still passes.
+    results = {}
+    _xcheck_detection_cut(_fail, results,
+                          {"far_max": 1.0, "snr_min": float("nan")},
+                          {"far_threshold": 1.0, "significance_type": "far"})
+
+
+# ==========================================================================
 # Medium 13. A selection product core cannot load says so when written
 # ==========================================================================
 def _sky_marginal_product():
