@@ -43,7 +43,8 @@ _SELECTION_DATASETS = ["m1det", "m2det", "q", "dL", "chieff", "ra", "dec",
                        "a1", "a2", "cost1", "cost2", "chip"]
 
 #: The format versions this module writes.  2.0 is the default everywhere; 2.1
-#: is opt-in (see the note above the 2.1 writers).
+#: is opt-in (see the note above the 2.1 writers for why, and what a 2.0 pair
+#: does not get checked for).
 _PE_FORMAT_20 = "gwcat-pe-2.0"
 _SEL_FORMAT_20 = "gwcat-selection-2.0"
 _PE_FORMAT_21 = "gwcat-pe-2.1"
@@ -282,8 +283,21 @@ def write_selection_gwcat2(product, out_path, *, write_summary: bool = False,
 # It is registered as a SEPARATE format name rather than bumping "gwcat2",
 # because `_require_hdf5_format` in darksirens is a closed literal tuple: a 2.1
 # file is unloadable by any consumer that has not been taught the version, and
-# the plan's rule is that the consumer patch deploys FIRST.  Keeping 2.0 the
-# default means nothing gwcat writes by accident becomes unreadable.
+# the plan's rule is that the consumer patch deploys FIRST.
+#
+# That reason is out of date (review 2026-10-20, Medium 2): darksirens-core has
+# read 2.1 since 2026-09-09.  The reason 2.0 is STILL the default is the cost of
+# keeping it: a 2.0 file carries no contract_hash, and core's
+# require_matching_contract skips any pair in which either file lacks one, so
+# the production pair (chieff PE with chieff_reference selection) is loaded
+# with no pairing check at all.  Switching the default does not fix that yet:
+# the 2.1 hash covers parameter_space and advisory_columns, which always differ
+# for that designed pair (Medium 10), so a 2.1 rebuild of it is refused by
+# `gwcat validate` and by core.  The order is: make the hash accept the
+# reference pair (and carry the PE-ceiling = a_ref equality it needs), then
+# make 2.1 the default and rebuild the pair, then have core refuse a pair with
+# no hash unless explicitly allowed.  Until then 2.0 stays the default so the
+# production pair keeps loading.
 
 
 def _contract_attrs(product, kind):
