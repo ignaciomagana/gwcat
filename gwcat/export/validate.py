@@ -618,10 +618,15 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
         # A campaign that genuinely drew no sky position exempts its NaN rows,
         # but only if the file SAYS so -- the flag exists to be read (GW-20).
         _sky_avail = sel_attrs.get("sky_position_available")
-        _sky_all = (None if _sky_avail is None
-                    else bool(np.all(np.asarray(_sky_avail, dtype=bool))))
+        _sky_flags = (None if _sky_avail is None else
+                      np.atleast_1d(np.asarray(_sky_avail, dtype=bool)))
+        _sky_all = None if _sky_flags is None else bool(np.all(_sky_flags))
         _sky_checks(_check, sel_cols, prefix="sel",
                     sky_available=_sky_all)
+        if _sky_flags is not None and _sky_flags.any() and not _sky_flags.all():
+            # One skyless campaign used to exempt NaN sky rows in EVERY
+            # campaign of the file.
+            _sky_rows_follow_campaigns(_check, sel_cols, _sky_flags)
 
         # ── Cross-file contract checks (ALWAYS raise on mismatch) ────────────
         # (a) spin_basis must match -- name BOTH sides.
@@ -1989,6 +1994,49 @@ def _sky_checks(_check, cols, prefix, sky_available=None):
                f"{name} outside [{lo:.6g}, {hi_:.6g}] radians "
                f"(min={f_.min():.6g}, max={f_.max():.6g}) -- degrees, "
                f"colatitude or a sign convention?")
+
+
+def _sky_rows_follow_campaigns(_check, cols, flags):
+    """NaN-sky rows must be the rows of the campaigns that drew no sky.
+
+    Rows are written campaign by campaign, in campaign order, so with
+    ``sky_position_available`` per campaign the NaN rows must form whole
+    blocks in the places the flags allow -- a skyless campaign's rows are all
+    NaN and a sky campaign's all finite.  The files do not record each
+    campaign's written row count, so this checks the ORDER of the NaN and
+    finite runs against the flags (a campaign with no rows may be skipped),
+    which catches NaN rows inside a sky campaign unless they touch a skyless
+    campaign's block; and it requires ra and dec to be NaN on the same rows.
+    """
+    if "ra" not in cols or "dec" not in cols:
+        return
+    ra = np.asarray(cols["ra"], dtype=float)
+    dec = np.asarray(cols["dec"], dtype=float)
+    if ra.shape != dec.shape or not ra.size:
+        return
+    nan_ra, nan_dec = ~np.isfinite(ra), ~np.isfinite(dec)
+    _check("sel_sky_nan_rows_paired", np.array_equal(nan_ra, nan_dec),
+           f"{int(np.sum(nan_ra != nan_dec))} rows have exactly one of ra/dec "
+           f"non-finite; a campaign without a sky has neither")
+    row_nan = nan_ra | nan_dec
+    starts = np.concatenate(([0], np.flatnonzero(row_nan[1:] != row_nan[:-1])
+                             + 1))
+    runs = row_nan[starts]                 # True = a NaN run
+    skyless = ~np.asarray(flags, dtype=bool)
+    ptr, ok = 0, True
+    for v in runs:
+        while ptr < skyless.size and bool(skyless[ptr]) != bool(v):
+            ptr += 1
+        if ptr == skyless.size:
+            ok = False
+            break
+        ptr += 1
+    _check("sel_sky_nan_rows_follow_campaigns", ok,
+           f"the NaN-sky rows form {int(runs.sum())} block(s) and the finite "
+           f"rows {int((~runs).sum())}, in an order the per-campaign "
+           f"sky_position_available={flags.tolist()} cannot produce: some "
+           f"NaN sky rows lie inside a campaign that drew a sky, and would "
+           f"reach hp.ang2pix as NaN")
 
 
 def _range_checks(_check, cols, amax, prefix):

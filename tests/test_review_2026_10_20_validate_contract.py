@@ -508,3 +508,45 @@ def test_nonpositive_T_obs_fails(tmp_path):
         f.attrs["T_obs_yr"] = float("nan")
     res = validate_export_v2(str(pe), str(sel))
     assert res["sel_T_obs_yr_positive"] is False
+
+
+# ======================================================================
+# One skyless campaign does not exempt NaN sky in the others
+# ======================================================================
+def _two_campaign_sel(tmp_path):
+    from gwcat.selection import CombinedSelectionSet
+
+    a = write_o4_full(tmp_path / "inj_a.hdf", n=30, amax=(0.9, 0.9), seed=3)
+    b = write_o4_full(tmp_path / "inj_b.hdf", n=30, amax=(0.9, 0.9), seed=4)
+    out = tmp_path / "sel_two.h5"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        CombinedSelectionSet([SelectionSet(a), SelectionSet(b)]).export(
+            str(out), spin_basis="component")
+    return out
+
+
+def test_one_skyless_campaign_does_not_exempt_the_other(tmp_path):
+    """sky_position_available=[False, True]: rows of the second campaign with
+    NaN ra/dec passed, exempted by the first campaign's flag."""
+    pe = _pe_component(tmp_path, name="pe_sky.h5")
+    sel = _two_campaign_sel(tmp_path)
+    with h5py.File(sel, "r+") as f:
+        n = int(f.attrs["n_detected"])
+        ra, dec = f["ra"][()], f["dec"][()]
+        k = n // 3                      # rows [0, k) stand for campaign 1
+        ra[:k] = np.nan
+        dec[:k] = np.nan
+        f.attrs["sky_position_available"] = np.array([False, True])
+        f["ra"][...] = ra
+        f["dec"][...] = dec
+    res = validate_export_v2(str(pe), str(sel))
+    assert res["sel_sky_nan_rows_follow_campaigns"] is True   # legal so far
+    with h5py.File(sel, "r+") as f:
+        ra, dec = f["ra"][()], f["dec"][()]
+        ra[-2:] = np.nan                # inside the campaign that drew a sky
+        dec[-2:] = np.nan
+        f["ra"][...] = ra
+        f["dec"][...] = dec
+    res = validate_export_v2(str(pe), str(sel))
+    assert res["sel_sky_nan_rows_follow_campaigns"] is False
