@@ -219,6 +219,10 @@ def event_list_digest(names) -> str:
     what lets a contract state its event selection without carrying (and
     round-tripping) the whole list.
 
+    Because it digests a set, it cannot show that a file holds an event more
+    than once: a file that writes one event twice has the digest of the list
+    that names it once.  The validator checks ``event_names`` for duplicates.
+
     ``None`` -- "no list recorded" -- returns ``""``, which is distinct from the
     digest of the empty list.
     """

@@ -307,6 +307,30 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
             _check(f"pe_{ds}_length", pe_cols[ds].shape[0] == expected,
                    f"{pe_cols[ds].shape[0]} != nobs*nsamp = {expected}")
 
+    # One event, one block (review 2026-10-20).  waveform_policy='all' writes
+    # an event once per sample set (homogeneous_sample_sets=False), and the
+    # event-list digest de-duplicates by design, so such a file matched the
+    # whitelist it was cut from while a consumer multiplied that event's
+    # likelihood once per copy.
+    if pe_attrs.get("event_names") is not None:
+        _names = [_impl_str(x) for x in np.atleast_1d(pe_attrs["event_names"])]
+        _check("pe_event_names_length", len(_names) == nobs,
+               f"{len(_names)} event_names but nobs={nobs}")
+        _seen, _dup = set(), set()
+        for _n in _names:
+            (_dup if _n in _seen else _seen).add(_n)
+        _check("pe_event_names_unique", not _dup,
+               f"{len(_dup)} event(s) appear more than once in event_names "
+               f"(e.g. {sorted(_dup)[:5]}); a consumer counts each copy as a "
+               f"separate detection. Export one sample set per event "
+               f"(waveform_policy other than 'all').")
+    if pe_attrs.get("homogeneous_sample_sets") is not None:
+        _check("pe_homogeneous_sample_sets",
+               bool(pe_attrs["homogeneous_sample_sets"]),
+               "homogeneous_sample_sets=False: the file holds more than one "
+               "sample set for some event (waveform_policy='all'), which is "
+               "not a population-analysis input.")
+
     # p_pe finite & STRICTLY positive.  An exact zero used to be documented as
     # legal ("distance-prior tails"), but that state only ever arose from the
     # truncated distance prior GW-01 removed, and darksirens turns a zero weight

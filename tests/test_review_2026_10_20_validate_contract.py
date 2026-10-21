@@ -238,3 +238,40 @@ def test_event_names_map_to_their_official_runs():
     assert _event_run("GW230529_181500") == "O4a"
     assert _event_run("GW150914") == "O1"          # a whole day inside O1
     assert _event_gps_span("GWv0_000001") is None
+
+
+# ======================================================================
+# One event, one block: duplicate event names fail
+# ======================================================================
+def test_all_policy_export_with_one_event_three_times_fails(tmp_path):
+    """waveform_policy='all' on a store with several sample sets per event
+    writes that event once per set; validate --strict passed, and the event
+    digest equals the de-duplicated whitelist's."""
+    from test_waveform_policy import build_multiset_store, _one_event_three_sets
+    from gwcat.export.contract import event_list_digest
+
+    store = build_multiset_store(tmp_path / "multi.h5",
+                                 _one_event_three_sets(), seed=2)
+    out = tmp_path / "pe_all.h5"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        GWCatalog(store).export(str(out), format="gwcat2", spin_basis="nospin",
+                                waveform_policy="all", nsamp=8, seed=0,
+                                cosmology=_COSMO)
+    a = _attrs(out)
+    assert int(a["nobs"]) == 3 and bool(a["homogeneous_sample_sets"]) is False
+    assert a["event_list_digest"] == event_list_digest(["GW850101_010101"])
+    res = validate_export_v2(str(out))
+    assert res["pe_event_names_unique"] is False
+    assert res["pe_homogeneous_sample_sets"] is False
+    with pytest.raises(AssertionError, match="pe_event_names_unique"):
+        validate_export_v2(str(out), strict=True)
+
+
+def test_event_names_must_match_nobs(tmp_path):
+    pe = _pe_component(tmp_path, name="pe_len.h5")
+    with h5py.File(pe, "r+") as f:
+        names = list(f.attrs["event_names"])
+        f.attrs["event_names"] = np.array(names[:1], dtype=h5py.string_dtype())
+    res = validate_export_v2(str(pe))
+    assert res["pe_event_names_length"] is False
