@@ -23,6 +23,7 @@ call, so a v2 file can never be handed to the v1 contract (or the reverse).
 """
 from __future__ import annotations
 
+import json
 import warnings
 
 import numpy as np
@@ -667,6 +668,28 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
                        f"a campaign records chi_eff_amax_source='detected' but "
                        f"its chi_eff_amax_per_campaign {used.tolist()} is not "
                        f"its injected_spin_amax_detected {det.tolist()}")
+                # A caller-forced ceiling (--amax) REPLACES the campaign's own
+                # in the swap; where the campaign's ceiling is known and
+                # differs, pdraw is the wrong density, chi_eff-dependently
+                # (review 2026-10-20: 0.99 forced on endo3's 0.998 is 0.7% off
+                # in the bulk and 29% above chi_eff 0.9).
+                forced = [(k, used[k].tolist(), det[k].tolist())
+                          for k, s_ in enumerate(sel_src)
+                          if s_ == "caller" and np.all(np.isfinite(det[k]))
+                          and not np.allclose(used[k], det[k], rtol=1e-9,
+                                              atol=1e-12)]
+                if forced:
+                    msg = (f"chieff: {len(forced)} campaign(s) swapped at a "
+                           f"caller-forced ceiling that is not the campaign's "
+                           f"own detected one (campaign, used, detected): "
+                           f"{forced}. The swap replaces the injected spin "
+                           f"density with the marginal at the ceiling it is "
+                           f"given, so pdraw is off chi_eff-dependently; "
+                           f"export without --amax.")
+                    if strict:
+                        _fail("xcheck_chieff_sel_amax_caller_matches_detected",
+                              msg)
+                    warnings.warn(msg)
             for side, srcs in (("PE", [str(x) for x in np.atleast_1d(
                     pe_attrs.get("chi_eff_amax_source_per_event", []))]),
                     ("selection", sel_src)):
@@ -678,17 +701,51 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
                         f"the chi_eff density divided out there rests on a "
                         f"fabricated amax. It is recorded, not verified.")
 
+            # The swap's violation record (GW-06): a campaign whose draw was
+            # MEASURED not uniform-isotropic, or ships a joint spin density
+            # the builder refuses by default, reached the file only through
+            # the builder's strict=False opt-out, and its pdraw is the wrong
+            # density.  The flags were written and never read.
+            try:
+                _viol = json.loads(str(sel_attrs.get(
+                    "spin_basis_assumption_violations", "[]")) or "[]")
+            except ValueError:
+                _viol = []
+            _refused = [v for v in _viol if isinstance(v, dict)
+                        and (v.get("verified") or v.get("reason"))]
+            if (bool(sel_attrs.get("spin_basis_assumption_violated", False))
+                    or _refused):
+                _fail("xcheck_chieff_spin_basis_assumption",
+                      f"the selection file records that the chi_eff swap was "
+                      f"applied to campaign(s) whose spin draw is not (or "
+                      f"cannot be shown to be) uniform-magnitude isotropic: "
+                      f"{[v.get('path') for v in _refused] or _viol}. It was "
+                      f"exported with strict=False; its pdraw is the wrong "
+                      f"density by a chi_eff-dependent factor. Use "
+                      f"spin_basis='chieff_reference' or 'component'.")
+            if bool(sel_attrs.get("spin_basis_assumption_unverified", False)):
+                warnings.warn(
+                    "chieff: the selection file records campaign(s) with no "
+                    "injected spin draw densities, so the uniform-isotropic "
+                    "assumption behind the chi_eff swap was not checked "
+                    "(spin_basis_assumption_unverified=True).")
+            results["xcheck_chieff_spin_basis_assumption"] = True
+
             pe_u = sorted({round(float(x), 6) for x in pe_amax_arr.ravel()
                            if np.isfinite(x)})
             sel_u = sorted({round(float(x), 6) for x in sel_amax_arr.ravel()
                             if np.isfinite(x)})
+            det_u = sorted({round(float(x), 6) for x in det.ravel()
+                            if np.isfinite(x)})
             print(f"  NOTE: chieff amax -- PE prior amax {pe_u} vs selection "
-                  f"injected amax {sel_u}. These are DIFFERENT quantities (the "
-                  f"PE sampling prior's ceiling vs the injected draw's) and are "
-                  f"NOT required to match.")
+                  f"injected (detected) amax {det_u or 'undetectable'}; the "
+                  f"selection's swap used {sel_u}. The PE and selection "
+                  f"ceilings are DIFFERENT quantities (the PE sampling prior's "
+                  f"ceiling vs the injected draw's) and are NOT required to "
+                  f"match.")
             if set(pe_u) != set(sel_u):
                 warnings.warn(
-                    f"chieff: PE prior amax {pe_u} != selection injected amax "
+                    f"chieff: PE prior amax {pe_u} != selection swap amax "
                     f"{sel_u}. This is expected and consistent -- each side "
                     f"divides out its own prior at its own amax (end-O3 injects "
                     f"a ~ U(0, 0.998) while the GWTC PE priors declare 0.99); "

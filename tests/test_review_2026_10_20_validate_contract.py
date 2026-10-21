@@ -397,3 +397,61 @@ def test_unrecorded_out_of_support_rows_fail(tmp_path):
         f.attrs["n_samples_out_of_support"] = 0
     res = validate_export_v2(str(pe))
     assert res["pe_out_of_support_recorded"] is False
+
+
+# ======================================================================
+# chieff: a forced ceiling against the detected one; the violation flags
+# ======================================================================
+def _chieff_pair(tmp_path, tag, **sel_kw):
+    events = [{"name": "GWv1_000001"}, {"name": "GWv1_000002"}]
+    store, _ = _build_spin_store(tmp_path, events, name=f"store_{tag}.h5")
+    pe = tmp_path / f"pe_{tag}.h5"
+    GWCatalog(store).export(str(pe), format="gwcat2", spin_basis="chieff",
+                            nsamp=32, seed=0, cosmology=_COSMO)
+    inj = write_o4_full(tmp_path / f"inj_{tag}.hdf", n=40, amax=(0.9, 0.9),
+                        seed=6)
+    sel = tmp_path / f"sel_{tag}.h5"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        SelectionSet(inj).export(str(sel), spin_basis="chieff", **sel_kw)
+    return pe, sel
+
+
+def test_chieff_forced_ceiling_below_the_detected_one_is_caught(tmp_path):
+    """--amax 0.99 on a campaign whose detected ceiling differs swaps the
+    density at the wrong ceiling; validate gave 85/85, and the NOTE called the
+    forced value the 'selection injected amax'."""
+    pe, sel = _chieff_pair(tmp_path, "forced", amax=0.99)
+    a = _attrs(sel)
+    assert list(a["chi_eff_amax_source_per_campaign"]) == ["caller"]
+    with pytest.raises(ValueError,
+                       match="xcheck_chieff_sel_amax_caller_matches_detected"):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            validate_export_v2(str(pe), str(sel), strict=True)
+    with pytest.warns(UserWarning, match="caller-forced ceiling"):
+        validate_export_v2(str(pe), str(sel))
+
+
+def test_chieff_note_names_the_detected_ceiling(tmp_path, capsys):
+    pe, sel = _chieff_pair(tmp_path, "note", amax=0.99)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        validate_export_v2(str(pe), str(sel))
+    out = capsys.readouterr().out
+    assert "injected (detected) amax [0.9]" in out
+    assert "swap used [0.99]" in out
+
+
+def test_chieff_assumption_violated_flag_is_refused(tmp_path):
+    """strict=False lets a non-uniform-isotropic campaign through and the file
+    says so (spin_basis_assumption_violated); the validator never read it."""
+    pe, sel = _chieff_pair(tmp_path, "viol")
+    with h5py.File(sel, "r+") as f:
+        f.attrs["spin_basis_assumption_violated"] = True
+        f.attrs["spin_basis_assumption_violations"] = json.dumps(
+            [{"path": "o4.hdf", "verified": True, "uniform_isotropic": False}])
+    with pytest.raises(ValueError, match="xcheck_chieff_spin_basis_assumption"):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            validate_export_v2(str(pe), str(sel))
