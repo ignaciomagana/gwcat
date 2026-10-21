@@ -995,14 +995,23 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                 # is wrong.  Raising it to cover them is exact for the COMPONENT
                 # basis, whose density is a flat box: widening the box changes only
                 # the per-event constant 1/(4*amax_1*amax_2), which cancels in the
-                # per-event normalisation the consumer applies.
+                # per-event normalisation the consumer applies -- PROVIDED every
+                # sample of the event was drawn under one box.  A Mixed set whose
+                # constituents declare different ceilings (e.g. 0.99 and ~1.0;
+                # spin_amax_config_per_constituent_per_event) was not: one
+                # widened box describes the higher-ceiling half and misdescribes
+                # the other by the ratio of the two boxes, so there it is an
+                # approximation (review Low 77: about 2%, mostly a per-event
+                # constant).
                 src1 = src2 = ("caller" if forced_amax is not None
                                else "fallback" if used_fallback else "analytic")
                 infl1 = infl2 = 0.0
                 # ONLY for a flat-box (bijection-like) prior.  Widening the box
                 # changes just the per-event constant 1/(4*amax_1*amax_2), which
                 # cancels in the consumer's per-event normalisation -- so it is
-                # exact.  For a PROJECTION (chieff / chieff_chip) the entire density
+                # exact for a sample set drawn under ONE box (approximate for a
+                # Mixed set whose constituents declare different ceilings, see
+                # above).  For a PROJECTION (chieff / chieff_chip) the entire density
                 # p(chi_eff[, chi_p] | amax) depends on the ceiling, so raising it
                 # would silently change the physics rather than fix a bookkeeping
                 # bound.  Those bases keep the declared amax and are refused by the
@@ -1203,11 +1212,14 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                 f"their analytic prior declares, so the ceiling was raised to "
                 f"cover them (spin_amax_source='samples_bound'). Largest "
                 f"inflations: {listed}. For the component basis this is exact "
-                f"-- widening a flat box changes only the per-event constant "
-                f"1/(4*amax_1*amax_2), which cancels in the consumer's "
-                f"per-event normalisation -- which is why it is applied ONLY "
-                f"here. A projection basis keeps its declared ceiling and is "
-                f"refused by the support gate instead.")
+                f"for a sample set drawn under one box -- widening a flat box "
+                f"changes only the per-event constant 1/(4*amax_1*amax_2), "
+                f"which cancels in the consumer's per-event normalisation -- "
+                f"which is why it is applied ONLY here; for a Mixed set whose "
+                f"constituents declare different ceilings "
+                f"(spin_amax_config_per_constituent_per_event) one widened box "
+                f"is an approximation. A projection basis keeps its declared "
+                f"ceiling and is refused by the support gate instead.")
         if chip_no_ingredient_events:
             warnings.warn(
                 f"chi_p_definition='schmidt_recomputed': "
@@ -1820,8 +1832,11 @@ def _population_resolver_attrs(cat, kept):
     the bundled lists -- no GWOSC); when its output equals the exported event
     set, the file records the resolver's qualified name, the sha256 of every
     bundled list it read and the resolved names' digest.  Otherwise (a subset,
-    a different population, a synthetic store) ``population_resolver`` is ""
-    and ``population_resolver_match`` False -- recorded, never guessed.
+    or a different population) ``population_resolver`` is "" and
+    ``population_resolver_match`` False -- recorded, never guessed.  The match
+    is a pure NAME-set equality: a synthetic or mock store whose event names
+    are the bundled population's records True as well (whether the samples
+    are real is ``mock_data``'s business, not this attr's).
 
     What this does NOT prove: it shows the exported set EQUALS the resolver's
     output on the store's names, not that the caller obtained the set by
