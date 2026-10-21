@@ -231,6 +231,9 @@ META_FLOAT_FIELDS += ["spin_sample_max_1", "spin_sample_max_2"]
 # number of prior samples, the declared prior's mass beyond their range and
 # its p-value for correct draws, and the fraction of samples outside the
 # declared bounds.  NaN when the file carries no prior samples.
+# The HEALPix nside sky_area_90 was resolved at (NaN when it could not be;
+# review 2026-10-20, medium-49).  The sample count is nsamp_original.
+META_FLOAT_FIELDS += ["sky_area_90_nside"]
 META_FLOAT_FIELDS += ["dL_prior_ks_threshold", "dL_prior_n_prior_samples",
                       "dL_prior_frac_mass_uncovered",
                       "dL_prior_frac_samples_outside",
@@ -2267,29 +2270,60 @@ def _observing_run_from_name(name: str) -> str:
     return mapping.get(yy, "")
 
 
-def _sky_area_90(ra_samples, dec_samples, nside=64):
-    """Estimate the 90% credible sky area (deg^2) from posterior ra/dec samples.
+#: Fewest posterior samples per pixel, averaged over the 90% region, for the
+#: histogram estimate of ``sky_area_90`` to be resolved rather than limited by
+#: the sample count (review 2026-10-20, medium-49).
+SKY_AREA_MIN_PER_PIXEL = 20
 
-    Uses healpy if available; returns NaN otherwise.  This is computed once at
-    ingest and stored as metadata for fast selection.
+
+def _sky_area_90_info(ra_samples, dec_samples, nside=64,
+                      min_per_pixel=SKY_AREA_MIN_PER_PIXEL):
+    """``(area_deg2, nside_used)`` of the 90% credible sky area.
+
+    Counts samples in HEALPix pixels and takes the fewest pixels holding 90%
+    of them, at the finest ``nside`` (from ``nside`` down to 1) whose selected
+    pixels hold at least ``min_per_pixel`` samples on average.  At a fixed
+    nside-64 grid (0.84 deg^2 pixels) the area of a broad or sparse posterior
+    was capped near 0.9 N x 0.84 deg^2 -- GW200322_091133 (69 samples) was
+    stored at 52.9 deg^2 against 33,562 deg^2 from its LVK sky map -- so a
+    ``sky_area_max`` cut admitted events far larger than the cut.  A
+    well-sampled posterior keeps nside 64 and its previous value.  ``(nan,
+    nan)`` when no nside resolves the region (too few samples) or healpy is
+    unavailable.
     """
     try:
         import healpy as hp
     except ImportError:
-        return np.nan
-    npix = hp.nside2npix(nside)
-    pix_area_deg2 = hp.nside2pixarea(nside, degrees=True)
-    # Convert (ra, dec) → healpy (theta, phi)
+        return np.nan, np.nan
+    # Convert (ra, dec) -> healpy (theta, phi)
     theta = np.pi / 2 - np.asarray(dec_samples)
     phi = np.asarray(ra_samples)
-    pix = hp.ang2pix(nside, theta, phi)
-    counts = np.bincount(pix, minlength=npix)
-    # Sort descending; find smallest set covering 90%
-    sorted_counts = np.sort(counts)[::-1]
-    cumsum = np.cumsum(sorted_counts)
-    threshold = 0.9 * cumsum[-1]
-    n_pix_90 = int(np.searchsorted(cumsum, threshold) + 1)
-    return n_pix_90 * pix_area_deg2
+    ns = int(nside)
+    while ns >= 1:
+        npix = hp.nside2npix(ns)
+        pix = hp.ang2pix(ns, theta, phi)
+        counts = np.bincount(pix, minlength=npix)
+        # Sort descending; find smallest set covering 90%
+        sorted_counts = np.sort(counts)[::-1]
+        cumsum = np.cumsum(sorted_counts)
+        if cumsum[-1] <= 0:
+            break
+        threshold = 0.9 * cumsum[-1]
+        n_pix_90 = int(np.searchsorted(cumsum, threshold) + 1)
+        if cumsum[n_pix_90 - 1] / n_pix_90 >= min_per_pixel:
+            return n_pix_90 * hp.nside2pixarea(ns, degrees=True), float(ns)
+        ns //= 2
+    return np.nan, np.nan
+
+
+def _sky_area_90(ra_samples, dec_samples, nside=64):
+    """Estimate the 90% credible sky area (deg^2) from posterior ra/dec samples.
+
+    Uses healpy if available; returns NaN otherwise, and NaN when the samples
+    are too few to resolve the region (see :func:`_sky_area_90_info`).  This
+    is computed once at ingest and stored as metadata for fast selection.
+    """
+    return _sky_area_90_info(ra_samples, dec_samples, nside)[0]
 
 
 def _resolve_event_table(event_table, cache_dir=None, offline=None):
@@ -2906,10 +2940,12 @@ def build_store(paths, out_path, params=None, extra_params=None,
             meta["derived_params"].append(",".join(derived_names))
             # Sky area (optional; requires healpy)
             if "ra" in s and "dec" in s:
-                meta["sky_area_90"].append(
-                    _sky_area_90(np.asarray(s["ra"]), np.asarray(s["dec"])))
+                area, area_nside = _sky_area_90_info(np.asarray(s["ra"]),
+                                                     np.asarray(s["dec"]))
             else:
-                meta["sky_area_90"].append(np.nan)
+                area, area_nside = np.nan, np.nan
+            meta["sky_area_90"].append(area)
+            meta["sky_area_90_nside"].append(area_nside)
             # ── Sample-set / waveform contract (PR 6) ──────────────────────
             ss = _sample_set_meta(analysis, preferred_label, ranked, path,
                                   sample_sets, provenance=prov,

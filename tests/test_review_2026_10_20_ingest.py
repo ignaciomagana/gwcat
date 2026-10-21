@@ -640,3 +640,38 @@ def test_prior_samples_outside_the_parsed_bounds_fail_the_audited_gate(
                            dL_prior_impl="astropy")
     with pytest.raises(ing.PriorMismatchError, match="do not overlap"):
         _ingest(tmp_path, monkeypatch, {_O4_PL: (data, sd, priors)}, cfg=cfg)
+
+
+# ==========================================================================
+# medium-49: sky_area_90 limited by the sample count
+# ==========================================================================
+def test_sparse_broad_posterior_gets_no_fake_small_sky_area():
+    """GW200322_091133-like: 69 samples spread over the sky were stored at
+    ~0.9 N pixels of 0.84 deg^2 = ~53 deg^2."""
+    rng = np.random.default_rng(17)
+    ra = rng.uniform(0.0, 2 * np.pi, 69)
+    dec = np.arcsin(rng.uniform(-1.0, 1.0, 69))
+    area = ing._sky_area_90(ra, dec)
+    assert not (area < 1000.0)            # NaN, or a genuinely large area
+    a2, ns = ing._sky_area_90_info(ra, dec)
+    assert np.isnan(a2) and np.isnan(ns)
+
+
+def test_well_sampled_posterior_keeps_the_nside_64_value():
+    import healpy as hp
+    rng = np.random.default_rng(18)
+    n = 20000
+    ra = 1.0 + 0.03 * rng.standard_normal(n)
+    dec = 0.3 + 0.03 * rng.standard_normal(n)
+    area, ns = ing._sky_area_90_info(ra, dec)
+    pix = hp.ang2pix(64, np.pi / 2 - dec, ra)
+    c = np.cumsum(np.sort(np.bincount(pix, minlength=hp.nside2npix(64)))[::-1])
+    old = (int(np.searchsorted(c, 0.9 * c[-1]) + 1)
+           * hp.nside2pixarea(64, degrees=True))
+    assert ns == 64.0 and area == old
+
+
+def test_sky_area_nside_is_stored(tmp_path, monkeypatch):
+    store = _ingest(tmp_path, monkeypatch, {O3_NAME: _gw191109_like()})
+    assert np.isnan(float(_meta(store, "sky_area_90_nside")))
+    assert np.isnan(float(_meta(store, "sky_area_90")))
