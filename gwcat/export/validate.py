@@ -1207,10 +1207,13 @@ def _xcheck_detection_cut(_fail, results, pe_attrs, sel_attrs):
         real production configuration, not an error: the shipped BBH product
         selects events by *name whitelist* (``far_policy="none"``, no
         ``far_max``) while the injection set applies FAR < 1/yr.  Whether the
-        whitelist is equivalent to the injection cut is a claim about the data
-        -- for the shipped list it was checked directly, and 0 of 249
-        resolvable events violate FAR < 1/yr -- and no attr in either file can
-        establish it.  Refusing here would reject a pairing that is correct;
+        whitelist is equivalent to the injection cut is a claim about the data,
+        and no attr in either file can establish it.  For the shipped list only
+        one direction was checked: none of its 249 resolvable events has
+        FAR >= 1/yr.  The other direction -- every in-window candidate with
+        FAR < 1/yr is on the list -- was not, and does not hold as stated
+        (GW230630_070659, O4a, FAR 0.47/yr, has no released PE and is not on
+        it).  Refusing here would reject a pairing that may be correct;
         warning says the equivalence has to be established elsewhere.
       * **The PE side applied a FAR cut and kept events whose FAR was unknown**
         (``allow_missing_far``) -> FAIL.  That one *is* self-contradictory
