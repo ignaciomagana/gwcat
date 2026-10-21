@@ -167,12 +167,22 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
         store's provenance) and ``False`` are both valid;
       * physical ranges when spin columns are present: ``a1``/``a2`` in
         ``[0, max(spin_amax)*1.001]``, ``|cost{1,2}| <= 1``, ``chip`` in
-        ``[0, max(spin_amax)*1.001]``, ``chieff`` in ``[-1, 1]``.
+        ``[0, max(spin_amax)*1.001]``, ``chieff`` in ``[-1, 1]``;
+      * masses, ``dL`` and ``redshift`` finite and positive, ``m2 <= m1``,
+        ``q`` in ``(0, 1]`` (both files);
+      * one block per event: ``event_names`` unique and ``nobs`` long, and
+        ``homogeneous_sample_sets`` not False;
+      * a zero ``p_pe`` fails only at an in-support sample; out-of-support
+        samples (``in_support=0``) must be recorded and exactly zero.
 
     Selection file (``gwcat-selection-2.0``):
       * ``format_version == "gwcat-selection-2.0"`` and ``spin_basis`` valid;
       * ``pdraw`` finite and positive, ``pdraw`` length ``== n_detected``,
-        ``ndraw > n_detected``;
+        ``ndraw > n_detected``, ``ndraw == sum(campaign_ndraws)``,
+        ``T_obs_yr`` finite and positive;
+      * ``chieff_reference``: the sentinel ``pdraw`` rows are exactly the rows
+        with ``a1`` or ``a2`` above ``spin_reference_amax``, counted in
+        ``spin_reference_excluded_rows``, and the sentinel is negligible;
       * the per-campaign injected-spin provenance attrs
         (``injected_spin_format`` / ``injected_spin_amax_detected`` /
         ``injected_spin_uniform_isotropic``) are present;
@@ -193,9 +203,12 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
       * ``component`` basis: PE ``component_spin_prior_applied_to_p_pe`` must be
         ``True`` and the selection ``pdraw_state`` must equal the component
         constant.
-      * Cosmology: the selection cosmology must match the PE cosmology (reusing
-        the v1 tolerances ``|dH0| >= 1.0`` / ``|dOm0| >= 0.05``; per-event PE
-        cosmologies are each compared against the single selection cosmology).
+      * Cosmology: each campaign's recorded cosmology
+        (``cosmology_*_per_campaign``; the scalar only on an older file) must
+        match the PE cosmology (the v1 tolerances ``|dH0| >= 1.0`` /
+        ``|dOm0| >= 0.05``, per event when the PE cosmology varies); an equal
+        ``z_max`` must be the same truncation in ``dL``.
+      * A cumulative mixture must detect something in every PE event's run.
       * Source class: the PE and selection ``source_class_filter`` must resolve
         to the same canonical class set, and -- when both sides really do carry
         a class filter -- their ``source_class_cut_estimator`` must agree.  A
