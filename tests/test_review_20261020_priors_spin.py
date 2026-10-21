@@ -529,3 +529,21 @@ def test_hint_omits_opt_in_spaces_and_unsatisfiable_alternatives():
     assert "component" in spaces_supported_by(full)
     hint = _supported_spaces_hint(full)
     assert "chieff_chip" not in hint and "component" in hint
+
+
+def test_nan_amax_fallback_is_refused_on_every_exporter(tmp_path):
+    from gwcat.selection import SelectionSet
+    from test_selection_spin import write_o4_full
+    store = _two_event_store(tmp_path)
+    with pytest.raises(ValueError, match="amax_fallback"):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            GWCatalog(store).to_darksirens(str(tmp_path / "v1.h5"), nsamp=16,
+                                           amax_fallback=float("nan"))
+    path = write_o4_full(tmp_path / "o4.hdf", 50, amax=(0.9, 0.9), seed=5)
+    with pytest.raises(ValueError, match="amax_fallback"):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            SelectionSet(path).export(str(tmp_path / "sel.h5"),
+                                      spin_basis="component",
+                                      amax_fallback=float("nan"))

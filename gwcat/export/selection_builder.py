@@ -171,7 +171,8 @@ import h5py
 from ..params import BLOCKS, DEFAULT_PARAMETER_SPACE, get_space
 from ..source_class import (format_source_class_filter, CUT_ESTIMATOR_ATTR,
                             selection_cut_estimator)
-from ..spin import (AMAX_AUTO, chi_eff_chi_p_prior_logprob_in_support,
+from ..spin import (AMAX_AUTO, check_amax_value,
+                    chi_eff_chi_p_prior_logprob_in_support,
                     chi_eff_prior_logprob_in_support, parse_amax_option)
 from ..selection import (SelectionSet, CombinedSelectionSet,
                          PDRAW_STATE_BY_BASIS, _selection_provenance_dict,
@@ -949,6 +950,9 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             f"are {list(DETECTION_POLICIES)}.")
     # `None` = each campaign's own detected ceiling; a float = one forced ceiling.
     forced_amax = parse_amax_option(amax, what="amax")
+    # A fallback ceiling stands in for an undetectable one, so it must be a
+    # spin ceiling too (review 2026-10-20).
+    amax_fallback = check_amax_value(amax_fallback, what="amax_fallback")
     # `None` for every non-reference basis; a validated float for a reference
     # basis, which never defaults it.
     a_ref = _parse_reference_amax(spin_basis, spin_reference_amax)
