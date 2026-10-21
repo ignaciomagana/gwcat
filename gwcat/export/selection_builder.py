@@ -1358,6 +1358,7 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                 chieff_chip_amax.append(float("nan"))
             continue
 
+        _refuse_nonphysical_rows(s, keep)
         frac = ndraw_per[k] / ndraw_total
         parts["pdraw"].append(s._pdraw[keep] * frac)
         for name, attr in attr_of.items():
@@ -1880,6 +1881,38 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
 
 
 
+
+
+def _refuse_nonphysical_rows(s, keep):
+    """Refuse written rows whose masses, distance or redshift are unusable.
+
+    Only the sky position and pdraw were checked: a NaN, infinite or
+    non-positive detector/source mass or distance, or a non-finite or negative
+    redshift, on a detected row went straight into the file (August review,
+    export-sel 4).  These are the coordinates the population density is
+    evaluated at, so such a row is malformed input, not a small number.  The
+    NaN sky of the semianalytic mixture rows is legitimate and recorded
+    separately (``sky_position_available``).
+    """
+    checks = (("m1det", s._m1det, True), ("m2det", s._m2det, True),
+              ("dL", s._dL, True), ("m1src", s._m1src, True),
+              ("m2src", s._m2src, True), ("redshift", s._z, False))
+    for name, arr, strictly_positive in checks:
+        vals = np.asarray(arr, dtype=float)[keep]
+        bad = ~np.isfinite(vals) | ((vals <= 0.0) if strictly_positive
+                                    else (vals < 0.0))
+        n_bad = int(np.count_nonzero(bad))
+        if n_bad:
+            first = int(np.flatnonzero(bad)[0])
+            raise ValueError(
+                f"{s.path}: {n_bad} of {vals.size} detected injections have an "
+                f"unusable {name!r} (first: {vals[first]!r}); "
+                + ("masses and distances must be finite and positive"
+                   if strictly_positive
+                   else "redshifts must be finite and non-negative")
+                + ". The population density is evaluated at these values, so "
+                  "the row is malformed input and is refused rather than "
+                  "written.")
 
 
 def _sky_availability(set_list):

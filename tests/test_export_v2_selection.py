@@ -1085,3 +1085,22 @@ def test_reference_basis_refuses_a_nan_spin_on_a_detected_row(tmp_path, field):
     with pytest.raises(ValueError, match="detected injections have a non-finite"):
         build_selection_product(s, spin_basis="chieff_reference",
                                 spin_reference_amax=0.9, strict=False)
+
+
+@pytest.mark.parametrize("field,value", [("_dL", np.nan), ("_dL", -1.0),
+                                         ("_m1det", np.inf), ("_m2src", 0.0),
+                                         ("_z", np.nan)])
+def test_unusable_masses_distance_redshift_are_refused(tmp_path, field, value):
+    """Only sky position and pdraw were checked on written rows (August
+    review, export-sel 4): a NaN distance or an infinite mass on a detected
+    injection was exported."""
+    from gwcat.export import build_selection_product
+
+    path = write_o4_full(tmp_path / "o4.hdf", n=20, seed=23)
+    s = SelectionSet(path)
+    s._load()
+    arr = np.array(getattr(s, field), dtype=float)
+    arr[2] = value
+    setattr(s, field, arr)
+    with pytest.raises(ValueError, match="unusable"):
+        build_selection_product(s, spin_basis="component")
