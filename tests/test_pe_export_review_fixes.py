@@ -410,3 +410,35 @@ def test_z_max_is_recorded_as_a_distance_per_event(tmp_path):
                             nsamp=32, seed=0)
     _cols, a2 = _read(out2)
     assert np.all(np.isnan(np.asarray(a2["z_max_dL_per_event"], float)))
+
+
+# ==========================================================================
+# No pooled allowance covers an event with no support (review Low 41)
+# ==========================================================================
+def test_a_pooled_allowance_does_not_cover_an_event_with_no_support(tmp_path):
+    """1 of 20 events has every chi_eff above its ceiling: 5% of the pooled
+    samples, under a raised 10% allowance, so the builder wrote that event
+    with every p_pe = 0."""
+    from gwcat.export.pe_builder import OutOfSupportError
+
+    events = [{"name": f"GWo_{i:06d}", "n": 64} for i in range(20)]
+    store, _ = _build_spin_store(tmp_path, events, name="oos20.h5")
+    with h5py.File(store, "r+") as f:
+        off = f["index/offsets"][:]
+        ce = f["samples/chi_eff"][:]
+        ce[int(off[3]):int(off[4])] = 0.995      # above amax = 0.99
+        f["samples/chi_eff"][...] = ce
+    kw = dict(format="gwcat2", spin_basis="chieff", nsamp=32, seed=0,
+              cosmology=_COSMO, max_out_of_support_frac=0.1)
+    with pytest.raises(OutOfSupportError, match="GWo_000003"):
+        GWCatalog(store).export(str(tmp_path / "x.h5"), **kw)
+    assert not (tmp_path / "x.h5").exists()
+
+    # The deliberate opt-in still writes it, counted.
+    out = tmp_path / "allowed.h5"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        GWCatalog(store).export(str(out), allow_out_of_support=True,
+                                allow_zero_p_pe=True, **kw)
+    _cols, attrs = _read(out)
+    assert int(attrs["n_out_of_support_per_event"][3]) == 32

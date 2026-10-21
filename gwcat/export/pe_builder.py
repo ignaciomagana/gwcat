@@ -1343,6 +1343,26 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                     "widened to cover the samples exactly (a projection's "
                     "whole density depends on the ceiling, so it cannot). ")
             + f"Or pass allow_out_of_support=True to export anyway.")
+    # ── Per-event floor (review Low 41) ─────────────────────────────────────
+    # max_out_of_support_frac is POOLED over the file, so a raised allowance
+    # let one event leave with EVERY p_pe = 0 (1 of 20 events is 5%): the
+    # consumer then gives it ln Z = -inf.  No allowance covers an event with
+    # no support at all; only allow_out_of_support does.
+    if nobs and nsamp and n_out and not allow_out_of_support:
+        no_support = [str(kept[i]) for i in range(nobs)
+                      if int(n_out_per_event[i]) == nsamp]
+        if no_support:
+            raise OutOfSupportError(
+                f"spin_basis={spin_basis!r}: {len(no_support)} event(s) have "
+                f"EVERY one of their {nsamp} samples outside the spin prior's "
+                f"support, so their p_pe is zero everywhere and the "
+                f"consumer's per-event evidence is -inf: {no_support[:10]}"
+                + ("" if len(no_support) <= 10
+                   else f", ... (+{len(no_support) - 10} more)")
+                + f". max_out_of_support_frac={max_out_of_support_frac:g} is "
+                  f"a pooled allowance and does not cover an event with no "
+                  f"support. Exclude the event(s), or pass "
+                  f"allow_out_of_support=True to export anyway.")
     if n_out and allow_out_of_support:
         warnings.warn(
             f"spin_basis={spin_basis!r}: exporting with {n_out} of "
