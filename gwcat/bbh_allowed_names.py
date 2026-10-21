@@ -1,31 +1,33 @@
 """Canonical BBH event whitelist for gwcat — O1 through O4b (GWTC-5.0).
 
-Two modes of operation
-----------------------
-1. **Dynamic** (preferred): call `fetch_bbh_list()` at runtime, which queries
-   the GWOSC v2 API for all events with source-frame secondary mass above the
-   selected threshold, restricted to the LVK GWTC catalogs, then applies the
-   explicit non-BBH exclusion guard.  It falls back to the static list when the
-   network fails; `fetch_bbh_list_with_source()` returns which of the two you
-   got, and `require_live=True` turns a failure into an error instead.
+Two lists, which are NOT the same sample
+-----------------------------------------
+1. **Static, curated** (the population sample): `BBH_ALL`, populated from the
+   GWTC-3/GWTC-4.1/GWTC-5.0 population data-release event lists (FAR < 1/yr),
+   with known BNS/NSBH/non-BBH names removed by `NON_BBH_EXCLUSIONS`.  Use it
+   for any population or cosmology analysis; it is reproducible and offline.
 
-2. **Static fallback**: use `BBH_ALL` directly when offline or for
-   reproducibility. The static list is populated from the GWTC-3/GWTC-4.1/
-   GWTC-5.0 population data-release event lists, with known BNS/NSBH/non-BBH
-   names removed by `NON_BBH_EXCLUSIONS`.
+2. **Live, mass threshold**: `fetch_bbh_list()` queries the GWOSC v2 API for
+   every confident event with source-frame secondary mass above the threshold,
+   restricted to the LVK GWTC catalogs, then applies the exclusion guard.  It
+   applies NO FAR cut (14 confident BBH-mass events have FAR >= 1/yr), so it is
+   a candidate list for refreshing the curated one, not a population sample.
+   It falls back to the static list when the network fails;
+   `fetch_bbh_list_with_source()` returns which of the two you got, and
+   `require_live=True` turns a failure into an error instead.
 
 Usage
 -----
     from gwcat.bbh_allowed_names import BBH_ALL, fetch_bbh_list
 
-    # Dynamic — always up to date:
-    bbh_names = fetch_bbh_list()            # queries GWOSC live
-    cat.select(compact_type="BBH", allowed_names=bbh_names)
-
-    # Static — reproducible / offline:
+    # The population sample -- reproducible / offline:
     cat.select(compact_type="BBH", allowed_names=BBH_ALL)
 
-    # Refresh the static list and print it (run once, paste result back):
+    # Live candidates (no FAR cut; NOT a population sample):
+    candidates = fetch_bbh_list()           # queries GWOSC live
+
+    # Print the live list in the data-file format, to update the curated
+    # lists under gwcat/data/event_lists/ by hand:
     refresh_bbh_list()
 
 GWTC-5.0 context (arxiv:2605.27225, submitted 26 May 2026)
@@ -302,6 +304,7 @@ def get_bbh_allowed_names(
     store_path: Optional[Union[str, Path]] = None,
     prefer_gwosc: bool = True,
     expected: int = EXPECTED_BBH_TOTAL,
+    adopt_live_list: bool = False,
 ) -> list[str]:
     """Return the best available BBH allowed-name list for catalog selection.
 
@@ -313,9 +316,18 @@ def get_bbh_allowed_names(
 
     If ``store_path`` is supplied, names in ``index/event_names`` whose matching
     ``meta/catalog`` entry identifies GWTC-5/O4b are also added.  Finally, when
-    ``prefer_gwosc`` is true, the live GWOSC BBH list replaces the curated
-    combination only when it is a strict superset of it -- i.e. it adds events
-    without dropping any curated population member.
+    ``prefer_gwosc`` is true, the live GWOSC BBH list is consulted: the names
+    it adds to the curated combination are reported, and it REPLACES the
+    curated combination only when ``adopt_live_list=True`` and it is a strict
+    superset of it -- i.e. it adds events without dropping any curated
+    population member.
+
+    ``adopt_live_list`` defaults to False (review 2026-10-20).  The live list
+    is a secondary-mass threshold with no FAR cut, while the curated list is
+    the FAR < 1/yr population sample, so the superset rule alone let a live
+    list holding sub-threshold candidates (GW200322_091133 at 140/yr)
+    redefine the sample, and a later ``select(allowed_names=...)`` applies no
+    FAR cut to make up for it.  Apply your own FAR cut before adopting one.
 
     That condition is the point (GW-15).  It used to be ``len(gwosc) >=
     len(combined)``: a live list merely *as long* as the curated one replaced
@@ -352,9 +364,26 @@ def get_bbh_allowed_names(
             if source == "gwosc":
                 gwosc_names = set(live_names) - NON_BBH_EXCLUSIONS
                 dropped = combined - gwosc_names
-                if not dropped:
+                added = sorted(gwosc_names - combined)
+                if not dropped and adopt_live_list:
                     final = set(gwosc_names)
                     gwosc_used = True
+                    if added:
+                        warnings.warn(
+                            "get_bbh_allowed_names: adopted the live GWOSC "
+                            f"list (adopt_live_list=True), adding {len(added)} "
+                            f"name(s) to the curated population list: "
+                            f"{added[:10]}. The live list applies no FAR cut; "
+                            "these events are not checked against FAR < 1/yr.")
+                elif not dropped:
+                    if added:
+                        warnings.warn(
+                            "get_bbh_allowed_names: keeping the curated BBH "
+                            f"list; the live GWOSC list adds {len(added)} "
+                            f"name(s) not in it ({added[:10]}), but it is a "
+                            "secondary-mass threshold with NO FAR cut, so they "
+                            "are not adopted. Apply a FAR cut yourself and pass "
+                            "adopt_live_list=True to adopt them.")
                 else:
                     warnings.warn(
                         "get_bbh_allowed_names: keeping the curated BBH list; "
@@ -430,6 +459,10 @@ def fetch_bbh_list(m2_min: float = 3.0, verbose: bool = True,
     Queries the GWOSC v2 API for all events with m2_source > m2_min Msun and
     PE measurements present, restricted to the LVK GWTC catalogs. Explicitly
     known non-BBH exclusions are removed from the returned live list.
+
+    This is a mass threshold with NO FAR cut, so it is not the population
+    sample (:data:`BBH_ALL`, FAR < 1/yr): it is the candidate list a refresh
+    of the curated one starts from.
 
     Falls back to the static BBH_ALL (with a warning) if the network is
     unavailable, unless ``require_live=True``.  Callers that must not confuse

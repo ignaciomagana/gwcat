@@ -482,3 +482,23 @@ def test_a_different_policy_cannot_rechoose_a_resolved_view(tmp_path):
     sub = cat.select(waveform_policy="all").select(waveform_policy="mixed-first")
     assert sub._waveform_policy == "mixed-first"
     assert list(sub._selection_reasons) == ["mixed-first:is_mixed"] * 2
+
+
+# ==========================================================================
+# The live GWOSC mass-threshold list does not replace the curated sample
+# ==========================================================================
+def test_a_live_superset_does_not_replace_the_curated_list_by_default(
+        tmp_path, monkeypatch):
+    """The live list keeps every confident m2 > 3 event with no FAR cut
+    (GW200322_091133 at 140/yr); the superset rule let it replace the curated
+    FAR < 1/yr population sample."""
+    from gwcat import bbh_allowed_names as ban
+    from gwcat import fetch
+
+    extended = sorted(set(ban.BBH_ALL) | {"GW200322_091133"})
+    monkeypatch.setattr(fetch, "fetch_bbh_names_gwosc", lambda **kw: extended)
+    with pytest.warns(UserWarning, match="NO FAR cut") as rec:
+        names = ban.get_bbh_allowed_names(data_dir=str(tmp_path),
+                                          prefer_gwosc=True)
+    assert names == sorted(ban.BBH_ALL)
+    assert any("GW200322_091133" in str(r.message) for r in rec)
