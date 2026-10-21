@@ -544,10 +544,13 @@ def _campaign_chieff_chip_lnfactor(s, keep, strict):
     # file -- burying the warning that matters, which is a genuine NSBH prior
     # with a restricted secondary (amax_2 ~ 0.05).
     if not np.isclose(amax_1, amax_2, rtol=1e-9, atol=1e-12):
-        warnings.warn(
+        # Refused, like the PE side (review 2026-10-20 recheck): evaluating
+        # both bodies at amax_1 is the wrong draw density for the secondary.
+        raise SpinBasisError(
             f"{s.path}: injected spin_amax_1={amax_1} != spin_amax_2={amax_2}; "
-            f"the joint (chi_eff, chi_p) prior assumes a single amax and uses "
-            f"amax_1={amax_1} (mirroring the PE builder convention).")
+            f"the joint (chi_eff, chi_p) prior assumes one shared ceiling. Use "
+            f"spin_basis='component', which keeps the campaign's exact "
+            f"per-injection spin draw.")
     lnp, sup = chi_eff_chi_p_prior_logprob_in_support(
         s._chieff[keep], s._chi_p[keep], s._m1src[keep], s._m2src[keep],
         amax=amax_1)

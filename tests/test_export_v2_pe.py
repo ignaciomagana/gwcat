@@ -391,16 +391,23 @@ def test_chieff_chip_ppe_joint_prior(tmp_path):
     store, _ = _build_spin_store(tmp_path, events)
     cat = GWCatalog(store)
     out = tmp_path / "chieffchip.h5"
-    with pytest.warns(UserWarning, match="spin_amax_1 != spin_amax_2"):
+    # Review 2026-10-20: the mismatched event is refused (it used to be
+    # evaluated at amax_1 for both bodies, behind a warning) ...
+    with pytest.raises(ValueError, match="spin_amax_1 != spin_amax_2"):
         cat.export(str(out), format="gwcat2", spin_basis="chieff_chip", allow_projection_basis=True,
                    nsamp=32, seed=0, cosmology=(67.74, 0.3089))
+    # ... and exporting it needs one ceiling stated explicitly.
+    cat.export(str(out), format="gwcat2", spin_basis="chieff_chip",
+               allow_projection_basis=True, amax=0.99, nsamp=32, seed=0,
+               cosmology=(67.74, 0.3089))
 
     cols, attrs = _read(out)
     assert bool(attrs["chi_eff_chi_p_prior_applied_to_p_pe"]) is True
     amax1 = np.asarray(attrs["chi_eff_chi_p_amax_per_event"], float)
+    assert np.all(amax1 == 0.99)
     mism = [s.decode() if isinstance(s, bytes) else s
             for s in attrs["spin_amax_mismatch_events"]]
-    assert mism == ["GWc4_000002"]
+    assert mism == []
     assert "chip" in cols
 
     nsamp = int(attrs["nsamp"])

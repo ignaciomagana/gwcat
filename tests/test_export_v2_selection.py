@@ -270,17 +270,16 @@ def test_chieff_chip_uniform_isotropic_o4(tmp_path):
             pytest.approx(0.9, rel=1e-12)
 
 
-def test_chieff_chip_amax_mismatch_warns(tmp_path):
-    # amax_1 != amax_2 -> joint prior uses amax_1 and warns.
+def test_chieff_chip_amax_mismatch_is_refused(tmp_path):
+    # amax_1 != amax_2: the joint prior has one ceiling, so the campaign is
+    # refused (review 2026-10-20; it used to use amax_1 for both and warn).
+    from gwcat.export.selection_builder import SpinBasisError
     path = write_o4_full(tmp_path / "o4.hdf", n=30, amax=(0.9, 0.7), seed=16)
     out = tmp_path / "cc.h5"
-    with warnings.catch_warnings(record=True) as rec:
-        warnings.simplefilter("always")
-        SelectionSet(path).export(str(out), spin_basis="chieff_chip")
-    assert any("amax_1" in str(w.message) for w in rec)
-    with h5py.File(out, "r") as f:
-        assert f.attrs["chi_eff_chi_p_amax_detected_per_campaign"][0] == \
-            pytest.approx(0.9, rel=1e-12)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pytest.raises(SpinBasisError, match="one shared ceiling"):
+            SelectionSet(path).export(str(out), spin_basis="chieff_chip")
 
 
 def test_chieff_chip_mixture_raises_spin_basis_error(tmp_path):

@@ -73,8 +73,8 @@ Design decisions (PR 6)
   floor since GW-03) where ``joint_lnprob = chi_eff_chi_p_prior_logprob(chieff, chip,
   m1src, m2src, amax=amax_1)`` -- the SAME source-frame mass convention the
   chieff basis uses for its 1-D chi_eff prior.  ``amax`` is the event's
-  ``amax_1``; a per-event ``amax_1 != amax_2`` warns (the joint prior assumes a
-  single amax) and is recorded in ``spin_amax_mismatch_events``.
+  ``amax_1``; a per-event ``amax_1 != amax_2`` is refused (the joint prior
+  assumes a single amax; review 2026-10-20) unless ``amax=`` forces one.
 * **chieff_chip output columns.**  Always ``chip`` on top of the legacy 10; the
   raw ``a1``/``a2``/``cost1``/``cost2`` are added only when available for EVERY
   kept event (so the output stays rectangular).
@@ -1094,15 +1094,20 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             columns = _apply_component_basis(data, amax1_ps, amax2_ps,
                                              chip, extras)
         else:  # chieff_chip
+            # The joint prior has ONE ceiling.  Evaluating an event whose two
+            # bodies have different ones at amax_1 for both gave the secondary
+            # the wrong prior, behind a warning (review 2026-10-20 recheck);
+            # it is refused.  amax=<one value> states one ceiling explicitly.
+            if mismatch_events:
+                raise ValueError(
+                    f"spin_basis='chieff_chip': {len(mismatch_events)} "
+                    f"event(s) have spin_amax_1 != spin_amax_2, and the joint "
+                    f"(chi_eff, chi_p) prior assumes one shared ceiling: "
+                    f"{mismatch_events[:10]}. Exclude them, use "
+                    f"spin_basis='component', or force one ceiling with "
+                    f"amax=<value>.")
             columns = _apply_chieff_chip_basis(data, amax1_ps, chip, extras)
 
-        # Emit warnings once (after the loop).
-        if spin_basis == "chieff_chip" and mismatch_events:
-            warnings.warn(
-                f"spin_basis='chieff_chip': {len(mismatch_events)} event(s) "
-                f"have spin_amax_1 != spin_amax_2; the joint (chi_eff, chi_p) "
-                f"prior assumes a single amax and uses amax_1: "
-                f"{mismatch_events}")
         # ── chi_p definition consistency (GW-08) ────────────────────────────
         if chip_mismatch_events:
             listed = ", ".join(f"{nm}: {d:.4g}" for nm, d in
