@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import warnings
 from dataclasses import dataclass
 from typing import Optional
@@ -431,9 +432,21 @@ class SelectionSpec:
                           separators=(",", ":"))
 
     def digest(self) -> str:
-        """A short digest of the whole effective spec."""
+        """A short digest of the whole effective spec.
+
+        Over WHAT was selected, not how it was spelled (review 2026-10-20):
+        the name filters enter through the content digest of the composed
+        whitelist (``allowed_names_digest``), while ``name_filters`` -- the
+        spellings and file paths, kept in the JSON record as provenance -- is
+        left out.  The same 259 names passed as ``allowed_names=``,
+        ``names=``, a path string, a ``pathlib.Path`` or a sequence used to
+        give five different digests.
+        """
         from .export.contract import stable_digest
-        return stable_digest(self.to_json())
+        d = self.to_dict()
+        d.pop("name_filters", None)
+        return stable_digest(json.dumps(d, sort_keys=True,
+                                        separators=(",", ":")))
 
     def to_attrs(self) -> dict:
         """The provenance attrs both writers stamp on an export.
@@ -1055,8 +1068,9 @@ class GWCatalog:
             listed = load_event_list(event_list)
             listed_arr = np.asarray(listed)
             name_filters.append(
-                ("event_list:" + (str(event_list)
-                                  if isinstance(event_list, (str, bytes))
+                ("event_list:" + (os.fsdecode(event_list)
+                                  if isinstance(event_list,
+                                                (str, bytes, os.PathLike))
                                   else "custom_sequence"),
                  [str(x) for x in listed]))
             missing_ev = set(listed_arr) - set(self.names)

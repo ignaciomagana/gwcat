@@ -533,3 +533,22 @@ def test_v1_refuses_to_write_a_zero_event_file(tmp_path):
             GWCatalog(_three(tmp_path)).to_darksirens(
                 str(out), nsamp=8, seed=0, cosmology=_COSMO, z_max=1e-6)
     assert not out.exists()
+
+
+# ==========================================================================
+# selection_spec_digest is about what was selected, not how it was spelled
+# ==========================================================================
+def test_the_spec_digest_does_not_depend_on_the_whitelist_spelling(tmp_path):
+    import pathlib
+    cat = GWCatalog(_three(tmp_path))
+    names = ["GW900001_000001", "GW900003_000003"]
+    path = tmp_path / "list.txt"
+    path.write_text("\n".join(names) + "\n")
+    views = [cat.select(allowed_names=names), cat.select(names=names),
+             cat.select(event_list=str(path)),
+             cat.select(event_list=pathlib.Path(path)),
+             cat.select(event_list=list(names))]
+    digests = {v.selection_spec.digest() for v in views}
+    assert len(digests) == 1
+    # A Path is recorded as the path it is, not as an in-memory sequence.
+    assert views[3].selection_spec.name_filters == (f"event_list:{path}",)
