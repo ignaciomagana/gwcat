@@ -10,23 +10,37 @@ Design choices (locked):
     the cosmology used to evaluate it. The (m1det, q, dL)-basis mass Jacobian
     is applied only at darksirens export time.
 
-Format heterogeneity handled (verified by probe):
-  * O3 (C01:*):  prefer 'C01:Mixed'. GWTC-3 has priors/analytic; GWTC-2.1 does
-    NOT -> fall back to LVK default UniformSourceFrame/Planck15 and validate
-    against the stored prior 'samples'.
-  * O4 (C00:*):  prefer 'C00:Mixed'. 'C00:Mixed' carries NO priors group, so
-    read the analytic dL prior from a sibling waveform analysis. Some O4b
+Format heterogeneity handled (verified on the local releases):
+  * O1-O3 (GWTC-2.1/3, C01:*): prefer 'C01:Mixed'.  A Mixed set carries no
+    analytic priors of its own, so they are read from a sibling (45 of the 54
+    GWTC-2.1 files and every GWTC-3 file have an analytic group).  The
+    '_cosmo' releases are reweighted by the LVK to a prior uniform in comoving
+    volume and source-frame time, so their effective distance prior is
+    UniformSourceFrame at the cosmology of the release-reweight table
+    (gwcat/data/release_reweight_cosmology*.yaml), whatever the analytic group
+    records -- also for the 9 GWTC-2.1 rows with no analytic group anywhere.
+    A non-reweighted O1-O3 row with no analytic group takes LALInference's
+    dL^2 prior on the bounds its config declares, or is refused.
+  * O4 (GWTC-4.1/5, C00:*): prefer 'C00:Mixed' (any spin variant; extended
+    sets such as 'C00:Mixed+XO4a' rank after it).  Its priors come from a
+    sibling: the constituents its meta_data/combined record names first,
+    and whether those constituents agree is recorded per row.  Some O4b
     (GWTC-5) events have no Mixed set at all -> fall back to a configurable
     waveform priority list and record the choice per event.
+  * The file's own distance prior samples, where it carries any, check the
+    declared sampling class and bounds (KS and range tests judged against
+    sampling noise).  They cannot detect a wrong cosmology, and rows whose
+    file carries no distance prior samples are not checked against any.
 
 This module uses pesummary.io.read for robustness across the above quirks.
 For the very largest files you can swap _read_event_pesummary for an h5py
 reader of f[analysis]['posterior_samples'] (a structured array) -- the rest of
 the pipeline is agnostic to how samples are obtained.
 
-UNTESTED against your local files: run `python -m gwcat.ingest --inspect <file>`
-on one event per catalog first; it prints the chosen analysis, prior source,
-and the prior-validation result before you launch the full batch.
+Before a full batch, run `gwcat ingest --inspect <file>` with the build's
+flags on one event per catalog: it prints the chosen analysis, each prior's
+source, the combined set's constituents and the prior-validation result,
+under the same IngestConfig the build will use.
 """
 from __future__ import annotations
 
