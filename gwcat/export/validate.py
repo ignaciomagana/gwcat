@@ -1094,7 +1094,11 @@ def _check_pe_prior_impl(_fail, results, pe_attrs, *, strict=False,
     * ``require_exact`` -- every ``dL_prior_impl_per_event`` must be
       ``"exact"`` or ``"analytic"`` and, for a basis with a chi_eff factor,
       ``chi_eff_prior_impl`` must be ``"exact"``; an unrecorded implementation
-      is refused as well.  Always raises.
+      is refused as well.  Always raises.  A release-reweighted event whose
+      distance-prior cosmology came from a regression-only table (the legacy
+      astropy table, ``dL_prior_cosmology_source_per_event`` in
+      :data:`~gwcat.release_cosmology.LEGACY_SOURCES`) is refused too; a file
+      that predates that record only warns, since it cannot say.
     """
     basis = _impl_str(pe_attrs.get("spin_basis"))
     chi = pe_attrs.get("chi_eff_prior_impl")
@@ -1139,6 +1143,27 @@ def _check_pe_prior_impl(_fail, results, pe_attrs, *, strict=False,
               f"require_exact_priors: PE spin_basis={basis!r} carries a "
               f"chi_eff prior factor but chi_eff_prior_impl={chi!r} (expected "
               f"'exact'). Re-export without --legacy-grid-priors.")
+    from ..release_cosmology import LEGACY_SOURCES
+    cs = pe_attrs.get("dL_prior_cosmology_source_per_event")
+    if cs is None:
+        warnings.warn(
+            "require_exact_priors: the PE file does not record "
+            "dL_prior_cosmology_source_per_event (written before the review "
+            "2026-10-20 fix), so whether its release-reweighted events used "
+            "the production or the legacy release-reweight cosmology table "
+            "cannot be verified from the file.")
+    else:
+        cs = [_impl_str(x) for x in np.atleast_1d(cs)]
+        legacy = [n for n, x in zip(names, cs) if x in LEGACY_SOURCES]
+        if legacy:
+            _fail("pe_prior_impl_exact",
+                  f"require_exact_priors: {len(legacy)} event(s) evaluated "
+                  f"their release-reweighted distance prior at the cosmology "
+                  f"of a regression-only release-reweight table (source in "
+                  f"{list(LEGACY_SOURCES)}; e.g. {legacy[:3]}; see "
+                  f"release_reweight_cosmology_table_ids). Re-ingest with the "
+                  f"production table, or validate without "
+                  f"--require-exact-priors if the legacy table is intended.")
     results["pe_prior_impl_exact"] = True
 
 

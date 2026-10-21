@@ -81,6 +81,7 @@ Design decisions (PR 6)
 """
 from __future__ import annotations
 
+import json
 import warnings
 
 import numpy as np
@@ -89,6 +90,7 @@ import numpy as np
 # from one place (SelectionSpec.check_pairable raises it).
 from ..catalog import UnpairableSelectionCut  # noqa: F401
 from ..cosmology import make_cosmology, z_of_dL
+from ..release_cosmology import identify_bundled_tables
 from ..params import (DEFAULT_PARAMETER_SPACE, PEContext,
                       block_prior_factor_pe, get_space)
 from ..params.blocks.mass import UNSTATED_MASS_PRIOR, classify_mass_prior
@@ -573,6 +575,16 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     n_cut_by_z_max = []
     kept_H0, kept_Om0 = [], []
     kept_ss_name, kept_ss_approx, kept_ss_reason = [], [], []
+    #: Store-side prior and sample-set provenance strings, per kept event
+    #: (review 2026-10-20): which release-reweight table and source set the
+    #: distance-prior cosmology, the mass prior's source (including a
+    #: constituent mixture's convention), and the INGEST-time rule that made
+    #: the sample set preferred (priority list vs last resort) and its rank.
+    _STORE_PROV = ("dL_prior_cosmology_source",
+                   "dL_prior_cosmology_table_sha256", "mass_prior_source",
+                   "selection_reason")
+    kept_store_prov = {k: [] for k in _STORE_PROV}
+    kept_priority_rank = []
     # Resampling provenance (GW-13), aligned with ``kept``.
     n_unique_per_event, upsampled_events = [], []
 
@@ -846,6 +858,10 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             kept_ss_reason.append(
                 str(reasons_arr[e]) if reasons_arr is not None
                 and e < len(reasons_arr) else "")
+            for _k in _STORE_PROV:
+                kept_store_prov[_k].append(_ss_meta(sub, row, _k))
+            _rank = _ss_meta(sub, row, "priority_rank")
+            kept_priority_rank.append(float(_rank) if _rank else np.nan)
 
             # ── Per-event spin-prior ceiling + (non-chieff) spin columns ────────
             if need_amax:
@@ -1369,6 +1385,13 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             [str(x) for x in kept_ss_approx], dtype=_str),
         "sample_set_selection_reason": np.array(
             [str(x) for x in kept_ss_reason], dtype=_str),
+        # The store's INGEST-time reason and rank behind ``is_preferred``
+        # (preferred_mixed / preferred_priority / preferred_last_resort ...);
+        # the export-time reason above reads the same for all of them.
+        "sample_set_ingest_selection_reason_per_event": np.array(
+            kept_store_prov["selection_reason"], dtype=_str),
+        "sample_set_priority_rank_per_event": np.asarray(
+            kept_priority_rank, dtype=float),
         "event_names": np.array([str(k) for k in kept], dtype=_str),
         # ── Prior-support accounting (GW-03) ─────────────────────────────────
         # Observability at the source: how many samples the prior excludes, and
@@ -1414,6 +1437,22 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         # ── How the two analytic prior factors were evaluated (GW-40i) ──────
         "dL_prior_impl_per_event": np.array(
             [str(x) for x in kept_dL_impl], dtype=_str),
+        # ── Which cosmology the distance prior was evaluated AT (review
+        # 2026-10-20): the release-reweight table's source per event
+        # ("documented" / "inferred_from_z(dL)", the legacy table's
+        # "legacy_gwcat_default", or "analytic_declared" / "catalog_default"
+        # for rows not resolved from a table), the table's sha256, and the
+        # table_id each recorded hash identifies.
+        "dL_prior_cosmology_source_per_event": np.array(
+            kept_store_prov["dL_prior_cosmology_source"], dtype=_str),
+        "dL_prior_cosmology_table_sha256_per_event": np.array(
+            kept_store_prov["dL_prior_cosmology_table_sha256"], dtype=_str),
+        "release_reweight_cosmology_table_ids": json.dumps(
+            identify_bundled_tables(
+                kept_store_prov["dL_prior_cosmology_table_sha256"]),
+            sort_keys=True),
+        "mass_prior_source_per_event": np.array(
+            kept_store_prov["mass_prior_source"], dtype=_str),
     }
     if chi_eff_included:
         from ..spin import CHI_EFF_PRIOR_METHODS, current_chi_eff_prior_impl

@@ -38,8 +38,10 @@ LEGACY_TABLE_FILENAME = "release_reweight_cosmology_legacy_astropy.yaml"
 
 #: ``source`` values a production row may carry.
 PRODUCTION_SOURCES = ("documented", "inferred_from_z(dL)")
+#: ``source`` values only a regression table carries (never production).
+LEGACY_SOURCES = ("legacy_gwcat_default",)
 #: Every ``source`` value the loader accepts (the legacy table's included).
-ALLOWED_SOURCES = PRODUCTION_SOURCES + ("legacy_gwcat_default",)
+ALLOWED_SOURCES = PRODUCTION_SOURCES + LEGACY_SOURCES
 
 
 class ReleaseReweightCosmologyError(ValueError):
@@ -148,3 +150,23 @@ def load_release_cosmology_table(path: Optional[str] = None
                                   table_id=str(doc.get("table_id", "")))
     _CACHE[path] = table
     return table
+
+
+def identify_bundled_tables(sha256s) -> Dict[str, str]:
+    """``{sha256: table_id}`` for table hashes recorded in a store or product.
+
+    A hash equal to a table bundled with this gwcat maps to that table's
+    ``table_id`` (so a reader can tell the production table from the legacy
+    regression table without the file); any other non-empty hash maps to
+    ``"unbundled"``.  Empty hashes (rows not resolved from a table) are
+    skipped.
+    """
+    known = {}
+    for fname in (DEFAULT_TABLE_FILENAME, LEGACY_TABLE_FILENAME):
+        try:
+            t = load_release_cosmology_table(bundled_table_path(fname))
+        except (OSError, ReleaseReweightCosmologyError):
+            continue
+        known[t.sha256] = t.table_id or fname
+    return {str(h): known.get(str(h), "unbundled")
+            for h in sorted(set(str(x) for x in sha256s)) if str(h)}
