@@ -76,11 +76,13 @@ Design decisions (PR 6)
   floor since GW-03) where ``joint_lnprob = chi_eff_chi_p_prior_logprob(chieff, chip,
   m1src, m2src, amax=amax_1)`` -- the SAME source-frame mass convention the
   chieff basis uses for its 1-D chi_eff prior.  ``amax`` is the event's
-  ``amax_1``; a per-event ``amax_1 != amax_2`` warns (the joint prior assumes a
-  single amax) and is recorded in ``spin_amax_mismatch_events``.
+  ``amax_1``; a per-event ``amax_1 != amax_2`` is refused (the joint prior
+  assumes a single amax) unless ``allow_chieff_chip_amax_mismatch=True``, which
+  warns and records it in ``spin_amax_mismatch_events``.
 * **chieff_chip output columns.**  Always ``chip`` on top of the legacy 10; the
   raw ``a1``/``a2``/``cost1``/``cost2`` are added only when available for EVERY
-  kept event (so the output stays rectangular).
+  kept event (so the output stays rectangular); ``component_columns_emitted``
+  and ``component_columns_missing_events`` record which, with a warning.
 """
 from __future__ import annotations
 
