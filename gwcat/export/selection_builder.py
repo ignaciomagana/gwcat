@@ -1119,10 +1119,29 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         using the cumulative-mixture ``semianalytic_observed_phase_maximized_snr_net``
         column.  Default ``None`` reproduces the FAR-only cut exactly.
     strict : bool, default True
-        For ``"chieff_chip"``: raise :class:`SpinBasisError` when a campaign is
-        not verified single-uniform-isotropic.  ``False`` warns and proceeds
-        when a detected amax is nonetheless available (an undetectable amax
-        always raises).
+        Whether a campaign that contradicts the requested basis's assumption is
+        refused (``True``) or exported with a warning and recorded in the attrs
+        (``False``).  It governs:
+
+        * ``"chieff_chip"``: a campaign not verified single-uniform-isotropic
+          raises :class:`SpinBasisError`; ``False`` proceeds when a detected
+          amax is nonetheless available (an undetectable amax always raises);
+        * ``"chieff"``: the uniform-isotropic gate on the chi_eff swap
+          (:func:`_check_chieff_swap_valid`) -- a campaign MEASURED
+          non-uniform-isotropic, or one shipping a joint spin density that
+          cannot be checked, raises :class:`BlockCampaignMismatch`; ``False``
+          records it in ``spin_basis_assumption_violations``.  A spin-less
+          legacy campaign (nothing to check) is never refused, only recorded;
+        * ``"chieff_reference"``: the reference-coverage checks -- magnitudes
+          short of ``spin_reference_amax`` (a detected ceiling, or a drawn
+          maximum too far below it to be sampling noise) and drawn tilts that
+          leave part of ``[-1, 1]`` uncovered raise
+          :class:`BlockCampaignMismatch`; ``False`` writes the file with
+          ``spin_reference_coverage_ok=False``.
+
+        Checks that are not about the basis's assumption -- an out-of-support
+        detected injection, a non-finite pdraw, overlapping campaigns, bad
+        thresholds -- raise whatever ``strict`` says.
     detection_policy : {"far", "lvk-cumulative"}, default "far"
         Recorded in the attrs.  ``"lvk-cumulative"`` (GW-39) requires a
         cumulative-mixture campaign and ``snr_threshold``, and states that the
@@ -1673,8 +1692,16 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         attrs["chi_eff_amax"] = (float(np.nanmax(pairs))
                                  if np.isfinite(pairs).any()
                                  else float(amax_fallback))
-        # GW-06: empty unless strict=False let a non-uniform-isotropic campaign
-        # through, in which case the file says so about itself.
+        # GW-06: every campaign the swap's uniform-isotropic assumption was not
+        # CONFIRMED for, each with a `verified` flag -- measured violations and
+        # unverifiable joint-density campaigns that strict=False let through
+        # (verified=True / False), and spin-less legacy campaigns, which carry
+        # nothing to check and are recorded even under strict=True
+        # (verified=False).  So it is empty only when every campaign was
+        # verified uniform-isotropic; the two booleans below split it.  (It
+        # used to claim "empty unless strict=False let one through", which
+        # the spin-less case contradicts; core's loader refuses any non-empty
+        # value, as it refuses injected_spin_uniform_isotropic=False.)
         attrs["spin_basis_assumption_violations"] = json.dumps(swap_violations)
         attrs["spin_basis_assumption_violated"] = bool(
             [v for v in swap_violations if v.get("verified")])
