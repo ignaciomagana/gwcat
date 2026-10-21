@@ -1152,6 +1152,13 @@ class SpinPriorMismatchError(ValueError):
 _UNIFORM_IN_COMPONENTS = ("UniformInComponentsChirpMass",
                           "UniformInComponentsMassRatio")
 
+#: Analytic keys that declare a mass prior when they are not a ``Constraint``
+#: (a Constraint is a cut, not a prior: the releases record mass_1/mass_2,
+#: and NRSur7dq4 total_mass, that way).
+_MASS_PRIOR_KEYS = ("chirp_mass", "mass_ratio", "symmetric_mass_ratio",
+                    "total_mass", "mass_1", "mass_2", "chirp_mass_source",
+                    "total_mass_source", "mass_1_source", "mass_2_source")
+
 
 @dataclass(frozen=True)
 class ResolvedMassPrior:
@@ -1193,15 +1200,30 @@ def resolve_mass_prior(analysis, analyses, priors, *, siblings=True):
 
     ``siblings=False`` (GW-40f) restricts the search to ``analysis`` itself, for
     a constituent whose OWN prior is required.
+
+    A label that declares a mass prior in any other coordinates (any
+    non-Constraint key of :data:`_MASS_PRIOR_KEYS` besides that pair) is
+    ``"unrecognized"`` on its own declaration and never borrows a sibling's.
     """
     analytic = priors.get("analytic", {}) if isinstance(priors, dict) else {}
 
+    def _is_constraint(v):
+        got = _parse_analytic_spin(v)
+        return got is not None and got[0] == "Constraint"
+
     def _find(an):
+        # A label DECLARES a mass prior when its group has any mass key that
+        # is not a Constraint, in whatever coordinates (review 2026-10-20,
+        # medium-20).  Only the (chirp_mass, mass_ratio) pair used to count,
+        # so (chirp_mass, symmetric_mass_ratio), (total_mass, mass_ratio) or a
+        # non-Constraint mass_1/mass_2 fell through to a sibling's
+        # uniform-in-components prior and was stamped verified.
         node = analytic.get(an) if isinstance(analytic, dict) else None
         if not node:
             return None
-        got = {k: node[k] for k in ("chirp_mass", "mass_ratio") if k in node}
-        if len(got) != 2:
+        got = {k: node[k] for k in _MASS_PRIOR_KEYS
+               if k in node and not _is_constraint(node[k])}
+        if not got:
             return None
         for k in ("mass_1", "mass_2"):
             if k in node:
@@ -1229,10 +1251,14 @@ def resolve_mass_prior(analysis, analyses, priors, *, siblings=True):
         return (None if got[1] is None else float(got[1]),
                 None if got[2] is None else float(got[2]))
 
-    mc = _parse_analytic_spin(found["chirp_mass"])
-    q = _parse_analytic_spin(found["mass_ratio"])
+    declared = sorted(k for k in found if not _is_constraint(found[k]))
+    mc = (_parse_analytic_spin(found["chirp_mass"])
+          if "chirp_mass" in found else None)
+    q = (_parse_analytic_spin(found["mass_ratio"])
+         if "mass_ratio" in found else None)
     kinds = (mc[0] if mc else None, q[0] if q else None)
-    if kinds == _UNIFORM_IN_COMPONENTS:
+    if (kinds == _UNIFORM_IN_COMPONENTS
+            and declared == ["chirp_mass", "mass_ratio"]):
         m1lo, m1hi = _constraint("mass_1")
         m2lo, m2hi = _constraint("mass_2")
         return ResolvedMassPrior(
@@ -1244,8 +1270,7 @@ def resolve_mass_prior(analysis, analyses, priors, *, siblings=True):
             source=f"analytic[{src_an}]",
             source_label=src_an, source_kind=src_kind,
             m1_min=m1lo, m1_max=m1hi, m2_min=m2lo, m2_max=m2hi)
-    raw = "; ".join(f"{k}={str(found[k])[:80]!r}" for k in sorted(found)
-                    if k in ("chirp_mass", "mass_ratio"))
+    raw = "; ".join(f"{k}={str(found[k])[:80]!r}" for k in declared)
     return ResolvedMassPrior(
         kind="unrecognized",
         source=f"analytic[{src_an}]:unrecognized({raw})",

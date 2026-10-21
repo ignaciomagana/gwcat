@@ -339,3 +339,40 @@ def test_constituent_mixture_builds_on_a_file_with_mixed_plus_xo4a(
     assert _meta(store, "mass_prior_kind") == "constituent_mixture"
     assert _meta(store, "constituent_mixture_labels") == f"{XP}+{NR}+{SE}"
     assert _meta(store, "constituent_mixture_counts") == "60,60,60"
+
+
+# ==========================================================================
+# medium-20: a mass prior in other coordinates is not a sibling's UIC prior
+# ==========================================================================
+_ETA = ("bilby.core.prior.Uniform(minimum=0.1, maximum=0.25, "
+        "name='symmetric_mass_ratio')")
+_MTOT = "bilby.core.prior.Uniform(minimum=20, maximum=200, name='total_mass')"
+_M1U = "Uniform(minimum=5, maximum=100, name='mass_1')"
+
+
+@pytest.mark.parametrize("own", [
+    {"chirp_mass": UIC_MC, "symmetric_mass_ratio": _ETA},
+    {"total_mass": _MTOT, "mass_ratio": _uic_q(0.05)},
+    {"mass_1": _M1U, "mass_2": _M1U.replace("mass_1", "mass_2")},
+    {"chirp_mass": UIC_MC, "mass_ratio": _uic_q(0.05), "total_mass": _MTOT},
+])
+def test_mass_prior_in_other_coordinates_is_unrecognized_not_borrowed(own):
+    analyses = ["C00:Odd", "C00:IMRPhenomXPHM-SpinTaylor"]
+    priors = {"analytic": {"C00:Odd": own,
+                           "C00:IMRPhenomXPHM-SpinTaylor": _analytic()}}
+    mp = ing.resolve_mass_prior("C00:Odd", analyses, priors)
+    assert mp.kind == "unrecognized"
+    assert mp.source_kind == "own_analytic" and mp.source_label == "C00:Odd"
+
+
+def test_constraint_only_mass_keys_still_borrow_and_the_real_pair_verifies():
+    analyses = ["C00:Mixed", XP, NR]
+    priors = {"analytic": {XP: _analytic(),
+                           NR: _analytic(qmin=0.16666667, total_mass=True),
+                           "C00:Mixed": {"mass_1": _m_con(1),
+                                         "mass_2": _m_con(2)}}}
+    mp = ing.resolve_mass_prior("C00:Mixed", analyses, priors)
+    assert mp.kind == "uniform_detector_frame"
+    assert mp.source_kind == "sibling_inherited"
+    nr = ing.resolve_mass_prior(NR, analyses, priors)
+    assert nr.kind == "uniform_detector_frame" and nr.q_min == 0.16666667
