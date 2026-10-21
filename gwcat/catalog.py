@@ -1304,7 +1304,8 @@ class GWCatalog:
                 kept, reasons, homogeneous = resolve_policy(
                     self.names, sel, self.meta, policy=waveform_policy,
                     approximant=approximant, sample_set_map=sample_set_map,
-                    nrsur_q_rule=nrsur_q_rule)
+                    nrsur_q_rule=nrsur_q_rule,
+                    nrsur_q_rule_substitute=nrsur_q_rule_substitute)
         kept = np.asarray(kept, dtype=int)
         kept_chosen = kept.copy()
         chosen_ok = m_row[kept] if kept.size else np.zeros(0, dtype=bool)
@@ -1938,8 +1939,9 @@ class GWCatalog:
         # One scalar amax forced on every event is wrong the moment a store
         # mixes spin priors (a LowSpin analysis ingests at amax=0.05), and the
         # store has carried meta/spin_amax_1/2 since GW-04.  "auto" reads them.
-        from .spin import parse_amax_option
+        from .spin import check_amax_value, parse_amax_option
         forced_amax = parse_amax_option(amax, what="amax")
+        amax_fallback = check_amax_value(amax_fallback, what="amax_fallback")
 
         def _event_amax(e):
             """``(amax_1, amax_2, source)`` for selected event ``e``."""

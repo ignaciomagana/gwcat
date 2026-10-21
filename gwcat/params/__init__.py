@@ -16,9 +16,11 @@ from .block import (KINDS, MAP_KINDS, CampaignRequirement, ParameterBlock,
 from .compose import block_prior_factor_pe
 from .context import InjContext, PEContext
 from .registry import (BLOCKS, DEFAULT_PARAMETER_SPACE, LEGACY_SPIN_BASES,
-                       SPACES, ParameterSpace, get_space, list_spaces)
+                       OPT_IN_SPACES, SPACES, CampaignRequirementError,
+                       ParameterSpace, get_space, list_spaces)
 
 __all__ = ["ParameterBlock", "Range", "CampaignRequirement", "KINDS",
            "MAP_KINDS", "PEContext", "InjContext", "BLOCKS", "SPACES",
            "ParameterSpace", "get_space", "list_spaces", "LEGACY_SPIN_BASES",
+           "OPT_IN_SPACES", "CampaignRequirementError",
            "DEFAULT_PARAMETER_SPACE", "block_prior_factor_pe"]

@@ -776,13 +776,18 @@ def test_mixed_plus_xo4a_row_carries_its_constituent_record(tmp_path,
 # ==========================================================================
 _USF_ODD = ("bilby.gw.prior.UniformSourceFrame(minimum=100.0, maximum=10000.0, "
             "cosmology='Planck99_XYZ', name='luminosity_distance')")
+# A cosmology-dependent prior that names no cosmology at all: the only case
+# still evaluated at the catalog default (an unknown token is refused at
+# parse time by the priors/spin package of the same review).
+_USF_NONE = ("bilby.gw.prior.UniformSourceFrame(minimum=100.0, "
+             "maximum=10000.0, name='luminosity_distance')")
 
 
-def _odd_cosmology_file():
+def _odd_cosmology_file(dl=_USF_ODD):
     rng = np.random.default_rng(19)
     sd = {XP: _samples(rng, 80)}
     return _Data(sd), sd, {"analytic": {
-        XP: dict(_analytic(), luminosity_distance=_USF_ODD)}}
+        XP: dict(_analytic(), luminosity_distance=dl)}}
 
 
 def test_defaulted_cosmology_is_refused_in_an_audited_build(tmp_path,
@@ -791,16 +796,25 @@ def test_defaulted_cosmology_is_refused_in_an_audited_build(tmp_path,
     with pytest.raises(ing.PriorMismatchError, match="catalog default"):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            _ingest(tmp_path, monkeypatch, {_O4_PL: _odd_cosmology_file()},
-                    cfg=cfg)
+            _ingest(tmp_path, monkeypatch,
+                    {_O4_PL: _odd_cosmology_file(_USF_NONE)}, cfg=cfg)
 
 
-def test_defaulted_cosmology_warning_does_not_overclaim_the_ks(tmp_path,
-                                                               monkeypatch):
-    with pytest.warns(UserWarning, match="cannot detect a wrong cosmology"):
+def test_defaulted_cosmology_is_recorded_by_default(tmp_path, monkeypatch):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
         store = _ingest(tmp_path, monkeypatch,
-                        {_O4_PL: _odd_cosmology_file()})
+                        {_O4_PL: _odd_cosmology_file(_USF_NONE)})
     assert _meta(store, "dL_prior_cosmology_source") == "catalog_default"
+
+
+def test_unknown_cosmology_token_is_refused_not_defaulted(tmp_path,
+                                                         monkeypatch):
+    from gwcat.cosmology import UnrecognisedCosmologyError
+    with pytest.raises(UnrecognisedCosmologyError, match="Planck99_XYZ"):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            _ingest(tmp_path, monkeypatch, {_O4_PL: _odd_cosmology_file()})
 
 
 # ==========================================================================

@@ -236,8 +236,30 @@ def load_sample_set_map(spec) -> SampleSetMap:
             {"events": dict(zip(ev, ids)), "format": "popsummary"},
             source=path, sha256=sha)
     with open(path) as f:
-        doc = json.load(f)
+        doc = json.load(f, object_pairs_hook=_refuse_duplicate_keys(path))
     return sample_set_map_from_mapping(doc, source=path, sha256=sha)
+
+
+def _refuse_duplicate_keys(path):
+    """A ``json`` object hook that refuses a repeated key at any depth.
+
+    ``json.load`` keeps the LAST of two equal keys, so a hand-edited map that
+    lists an event twice silently exported whichever label came second; the
+    popsummary route already refuses duplicate event names.
+    """
+    def hook(pairs):
+        seen, dup = {}, []
+        for k, v in pairs:
+            if k in seen:
+                dup.append(k)
+            seen[k] = v
+        if dup:
+            raise SampleSetMapError(
+                f"{path}: duplicate key(s) {sorted(set(dup))} in the sample-set "
+                f"map; JSON would silently keep the last one. List each event "
+                f"(and each substitute) once.")
+        return seen
+    return hook
 
 
 def _decode(x) -> str:
@@ -308,10 +330,11 @@ def resolve_policy(event_names: Sequence, sel, meta: dict,
             nrsur_q_rule=nrsur_q_rule,
             nrsur_q_rule_substitute=nrsur_q_rule_substitute)
         return kept, reasons, homogeneous
-    if sample_set_map is not None or nrsur_q_rule is not None:
+    if (sample_set_map is not None or nrsur_q_rule is not None
+            or nrsur_q_rule_substitute):
         raise ValueError(
-            f"sample_set_map / nrsur_q_rule apply only to "
-            f"waveform_policy='event-map', not {policy!r}.")
+            f"sample_set_map / nrsur_q_rule / nrsur_q_rule_substitute apply "
+            f"only to waveform_policy='event-map', not {policy!r}.")
 
     sel = np.asarray(sel, dtype=int)
     names = np.asarray(event_names)
@@ -463,6 +486,11 @@ def resolve_event_map(event_names: Sequence, sel, meta: dict, sample_set_map,
             "waveform_policy='event-map' requires sample_set_map= (a JSON "
             "file, a popsummary file, a mapping, or a SampleSetMap).")
     smap = load_sample_set_map(sample_set_map)
+    if nrsur_q_rule_substitute and nrsur_q_rule is None:
+        raise ValueError(
+            "nrsur_q_rule_substitute=True needs nrsur_q_rule=<fraction>: "
+            "without a rule nothing is substituted, and the product would "
+            "record substitution as on.")
     if nrsur_q_rule is not None:
         thr = float(nrsur_q_rule)
         if not (0.0 <= thr < 1.0):
@@ -480,18 +508,38 @@ def resolve_event_map(event_names: Sequence, sel, meta: dict, sample_set_map,
             "column; this store has none (re-ingest with sample-set metadata).")
     ss = np.asarray(ss)
 
+    def _key(nm):
+        nm = nm.item() if hasattr(nm, "item") else nm
+        return nm.decode() if isinstance(nm, (bytes, bytearray)) else str(nm)
+
     order: List = []
     groups: dict = {}
     for r in sel:
-        nm = names[r]
-        key = nm.item() if hasattr(nm, "item") else nm
-        key = key.decode() if isinstance(key, (bytes, bytearray)) else str(key)
+        key = _key(names[r])
         if key not in groups:
             groups[key] = {}
             order.append(key)
-        groups[key][_decode(ss[r])] = int(r)
+        groups[key].setdefault(_decode(ss[r]), int(r))
 
-    unmapped, missing = [], []
+    # A label names a sample set only if ONE row holds it.  Two (event, label)
+    # rows -- two releases of one analysis -- made the map keep the LAST
+    # selected row while the q-rule measured the store's FIRST, so the verdict
+    # and the exported samples could come from different releases.  A label
+    # only exported is counted over the SELECTED rows, which are all the
+    # export reads.  Under the q-rule, the labels it measures (an NRSur
+    # label's reference, a declared q-rule substitute) and the NRSur label it
+    # rules on are counted over the whole STORE, because q_frac_fn reads the
+    # store's first matching row whatever the selection holds.
+    def _count(rows_):
+        out: Dict[tuple, int] = {}
+        for r in rows_:
+            k = (_key(names[r]), _decode(ss[r]))
+            out[k] = out.get(k, 0) + 1
+        return out
+    n_sel = _count(sel)
+    n_store = _count(range(len(names)))
+
+    unmapped, missing, dup_sel, dup_store = [], [], [], []
     q_viol, q_unjust, q_noref = [], [], []
     chosen: Dict[str, Tuple[int, str]] = {}
     substitutes: Dict[str, dict] = {}
@@ -528,6 +576,22 @@ def resolve_event_map(event_names: Sequence, sel, meta: dict, sample_set_map,
         else:
             missing.append((ev, want, sorted(rows)))
             continue
+        ruled = []
+        if nrsur_q_rule is not None:
+            if is_nrsur_label(label):
+                ruled = [label, nrsur_reference_label(label)]
+            elif substitutes.get(ev, {}).get("reason", "").startswith(
+                    NRSUR_Q_RULE_REASON):
+                ruled = [label]
+        amb_store = [lab for lab in ruled if n_store.get((ev, lab), 0) > 1]
+        amb_sel = ([label] if label not in ruled
+                   and n_sel.get((ev, label), 0) > 1 else [])
+        if amb_store or amb_sel:
+            if amb_sel:
+                dup_sel.append((ev, amb_sel))
+            if amb_store:
+                dup_store.append((ev, amb_store))
+            continue
 
         if nrsur_q_rule is not None:
             reason = substitutes.get(ev, {}).get("reason", "")
@@ -542,9 +606,23 @@ def resolve_event_map(event_names: Sequence, sel, meta: dict, sample_set_map,
                 q_frac[ev] = float(frac)
                 if is_nrsur_label(label) and frac > thr:
                     if nrsur_q_rule_substitute and ref in rows:
-                        substitutes[ev] = {
-                            "label": ref, "reason": NRSUR_Q_RULE_REASON,
-                            "original_label": label}
+                        prev = substitutes.get(ev)
+                        if prev is None:
+                            substitutes[ev] = {
+                                "label": ref, "reason": NRSUR_Q_RULE_REASON,
+                                "original_label": label}
+                        else:
+                            # The rule replaces a DECLARED substitute: keep
+                            # the chain -- the map's own label as the
+                            # original, the declared label and reason in the
+                            # reason -- rather than overwrite it.
+                            substitutes[ev] = {
+                                "label": ref,
+                                "reason": (f"{NRSUR_Q_RULE_REASON};replaced="
+                                           f"{prev['label']}"
+                                           f"({prev['reason']})"),
+                                "original_label": (prev.get("original_label")
+                                                   or want)}
                         label = ref
                     else:
                         q_viol.append((ev, label, frac))
@@ -572,6 +650,19 @@ def resolve_event_map(event_names: Sequence, sel, meta: dict, sample_set_map,
             + ("" if len(missing) <= 10 else f" (+{len(missing) - 10} more)")
             + ". Add a substitutes entry {event: {'label': ..., 'reason': ...}}"
               " to the map, or re-ingest with --sample-sets all.")
+    if dup_sel or dup_store:
+        raise SampleSetMapError(
+            f"waveform_policy='event-map': a label does not say which release "
+            f"to export when more than one row holds it."
+            + (f" {len(dup_sel)} event(s) have more than one SELECTED row for "
+               f"the label the map resolves: {dup_sel[:10]}." if dup_sel
+               else "")
+            + (f" {len(dup_store)} event(s) have more than one STORE row for "
+               f"a label the q-rule rules on or measures, which it reads from "
+               f"the whole store whatever the selection holds: "
+               f"{dup_store[:10]}." if dup_store else "")
+            + " De-duplicate the store: merge_stores with on_duplicate_key="
+              "'skip' or 'refresh' keeps one row per (event, label).")
     if q_noref:
         raise NRSurQRuleError(
             f"nrsur_q_rule: cannot evaluate the rule for {len(q_noref)} "

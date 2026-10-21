@@ -77,8 +77,9 @@ Design decisions (PR 6)
   m1src, m2src, amax=amax_1)`` -- the SAME source-frame mass convention the
   chieff basis uses for its 1-D chi_eff prior.  ``amax`` is the event's
   ``amax_1``; a per-event ``amax_1 != amax_2`` is refused (the joint prior
-  assumes a single amax) unless ``allow_chieff_chip_amax_mismatch=True``, which
-  warns and records it in ``spin_amax_mismatch_events``.
+  assumes a single amax; review 2026-10-20) unless ``amax=`` forces one or
+  ``allow_chieff_chip_amax_mismatch=True``, which warns and records it in
+  ``spin_amax_mismatch_events``.
 * **chieff_chip output columns.**  Always ``chip`` on top of the legacy 10; the
   raw ``a1``/``a2``/``cost1``/``cost2`` are added only when available for EVERY
   kept event (so the output stays rectangular); ``component_columns_emitted``
@@ -86,6 +87,7 @@ Design decisions (PR 6)
 """
 from __future__ import annotations
 
+import json
 import warnings
 
 import numpy as np
@@ -94,11 +96,12 @@ import numpy as np
 # from one place (SelectionSpec.check_pairable raises it).
 from ..catalog import UnpairableSelectionCut  # noqa: F401
 from ..cosmology import make_cosmology, z_of_dL
+from ..release_cosmology import identify_bundled_tables
 from ..params import (DEFAULT_PARAMETER_SPACE, PEContext,
                       block_prior_factor_pe, get_space)
 from ..params.blocks.mass import UNSTATED_MASS_PRIOR, classify_mass_prior
 from ..source_class import CUT_ESTIMATOR_ATTR, PE_MEDIAN_CUT_WARNING
-from ..spin import AMAX_AUTO, parse_amax_option
+from ..spin import AMAX_AUTO, check_amax_value, parse_amax_option
 from .contract import event_list_digest, mixed_prior_impl_events
 from .product import ExportProduct, resolve_mock_data
 
@@ -406,6 +409,9 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     # chi_eff density depends on that ceiling in a chi_eff-DEPENDENT way, so the
     # error does not cancel in any per-event normalisation.
     forced_amax = parse_amax_option(amax, what="amax")
+    # The fallback is substituted for a missing stored ceiling, so it must be a
+    # ceiling too (a NaN one matched no row of the chieff grouping below).
+    amax_fallback = check_amax_value(amax_fallback, what="amax_fallback")
     # Every basis that divides out a SPIN prior needs a ceiling; nospin does not.
     need_amax = need_extras or spin_basis == "chieff"
     if drop_spin_above_ceiling and not need_amax:
@@ -630,6 +636,16 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     z_max_dL = []
     kept_H0, kept_Om0 = [], []
     kept_ss_name, kept_ss_approx, kept_ss_reason = [], [], []
+    #: Store-side prior and sample-set provenance strings, per kept event
+    #: (review 2026-10-20): which release-reweight table and source set the
+    #: distance-prior cosmology, the mass prior's source (including a
+    #: constituent mixture's convention), and the INGEST-time rule that made
+    #: the sample set preferred (priority list vs last resort) and its rank.
+    _STORE_PROV = ("dL_prior_cosmology_source",
+                   "dL_prior_cosmology_table_sha256", "mass_prior_source",
+                   "selection_reason")
+    kept_store_prov = {k: [] for k in _STORE_PROV}
+    kept_priority_rank = []
     # Resampling provenance (GW-13), aligned with ``kept``.
     n_unique_per_event, upsampled_events = [], []
     #: The store rows behind each kept event's nsamp exported rows (the ESS
@@ -969,6 +985,10 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             kept_ss_reason.append(
                 str(reasons_arr[e]) if reasons_arr is not None
                 and e < len(reasons_arr) else "")
+            for _k in _STORE_PROV:
+                kept_store_prov[_k].append(_ss_meta(sub, row, _k))
+            _rank = _ss_meta(sub, row, "priority_rank")
+            kept_priority_rank.append(float(_rank) if _rank else np.nan)
 
             # ── Per-event spin-prior ceiling + (non-chieff) spin columns ────────
             if need_amax:
@@ -1168,6 +1188,18 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     import h5py
     _str = h5py.string_dtype()
 
+    # ── Per-sample finiteness of the coordinates (review 2026-10-20) ────────
+    # The availability mask only says a column is PRESENT; a NaN sample inside
+    # it would otherwise reach the spin step and read as "out of support".
+    from ..schema import check_columns_finite
+    _coords = ("ra", "dec", "m1det", "m2det", "q", "dL", "redshift", "m1src",
+               "m2src") + (("chieff",) if "chieff" in space.fit_columns
+                           else ())
+    check_columns_finite({c: data[c] for c in _coords if c in data},
+                         event_names=kept, nsamp=nsamp,
+                         context=f"gwcat-pe-2.0 export (spin_basis="
+                                 f"{spin_basis!r})")
+
     # ── Spin-basis-specific step (columns + p_pe spin factor) ───────────────
     spin_attrs: dict = {}
     # Per-event ceilings, resolved above, broadcast to one value per sample.
@@ -1200,6 +1232,12 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             }
         elif emit_extras:  # nobs == 0
             extras = {k: np.array([]) for k in ("a1", "a2", "cost1", "cost2")}
+        # The spin coordinates the basis's density and support read.
+        check_columns_finite(
+            dict(extras or {}, **({"chip": chip} if spin_basis == "chieff_chip"
+                                  else {})),
+            event_names=kept, nsamp=nsamp,
+            context=f"gwcat-pe-2.0 export (spin_basis={spin_basis!r})")
 
         # ── chieff_chip with two ceilings (August export-pe 3) ──────────────
         # The joint (chi_eff, chi_p) prior admits ONE amax and is evaluated at
@@ -1217,7 +1255,8 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                 + ("" if len(mismatch_events) <= 10
                    else f", ... (+{len(mismatch_events) - 10} more)")
                 + ". Use spin_basis='component' (exact for any pair of "
-                  "ceilings), exclude the events, or pass "
+                  "ceilings), exclude the events, force one ceiling with "
+                  "amax=<value>, or pass "
                   "allow_chieff_chip_amax_mismatch=True to export them at "
                   "amax_1 anyway.")
 
@@ -1225,15 +1264,20 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             columns = _apply_component_basis(data, amax1_ps, amax2_ps,
                                              chip, extras)
         else:  # chieff_chip
+            # The joint prior has ONE ceiling.  Evaluating an event whose two
+            # bodies have different ones at amax_1 for both gave the secondary
+            # the wrong prior, behind a warning (review 2026-10-20 recheck);
+            # it is refused above.  amax=<one value> states one ceiling
+            # explicitly; allow_chieff_chip_amax_mismatch=True keeps the old
+            # amax_1 evaluation, warned and recorded.
             columns = _apply_chieff_chip_basis(data, amax1_ps, chip, extras)
+            if mismatch_events:
+                warnings.warn(
+                    f"spin_basis='chieff_chip': {len(mismatch_events)} event(s) "
+                    f"have spin_amax_1 != spin_amax_2; the joint (chi_eff, chi_p) "
+                    f"prior assumes a single amax and uses amax_1: "
+                    f"{mismatch_events}")
 
-        # Emit warnings once (after the loop).
-        if spin_basis == "chieff_chip" and mismatch_events:
-            warnings.warn(
-                f"spin_basis='chieff_chip': {len(mismatch_events)} event(s) "
-                f"have spin_amax_1 != spin_amax_2; the joint (chi_eff, chi_p) "
-                f"prior assumes a single amax and uses amax_1: "
-                f"{mismatch_events}")
         # ── chi_p definition consistency (GW-08) ────────────────────────────
         if chip_mismatch_events:
             listed = ", ".join(f"{nm}: {d:.4g}" for nm, d in
@@ -1449,7 +1493,9 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
 
     # ── Exported-weight support contract (GW-01) ────────────────────────────
     from ..schema import check_p_pe_positive
-    check_p_pe_positive(
+    # With allow_zero_p_pe, the count of exact zeros written is recorded on
+    # the product (review 2026-10-20: the bypass left no trace).
+    n_zero_p_pe_allowed = check_p_pe_positive(
         columns["p_pe"], event_names=kept, nsamp=nsamp,
         allow_zero=allow_zero_p_pe, expected_zero=~in_support,
         context=f"gwcat-pe-2.0 export (spin_basis={spin_basis!r})",
@@ -1687,6 +1733,13 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             [str(x) for x in kept_ss_approx], dtype=_str),
         "sample_set_selection_reason": np.array(
             [str(x) for x in kept_ss_reason], dtype=_str),
+        # The store's INGEST-time reason and rank behind ``is_preferred``
+        # (preferred_mixed / preferred_priority / preferred_last_resort ...);
+        # the export-time reason above reads the same for all of them.
+        "sample_set_ingest_selection_reason_per_event": np.array(
+            kept_store_prov["selection_reason"], dtype=_str),
+        "sample_set_priority_rank_per_event": np.asarray(
+            kept_priority_rank, dtype=float),
         "event_names": np.array([str(k) for k in kept], dtype=_str),
         # ── Prior-support accounting (GW-03) ─────────────────────────────────
         # Observability at the source: how many samples the prior excludes, and
@@ -1696,6 +1749,8 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         "n_samples_out_of_support": int(n_out),
         "frac_samples_out_of_support": float(frac_out),
         "n_out_of_support_per_event": n_out_per_event,
+        "allow_zero_p_pe": bool(allow_zero_p_pe),
+        "n_zero_p_pe_allowed": int(n_zero_p_pe_allowed),
         # Over the nsamp ROWS (a repeated row counts again) ...
         "prior_reweight_ess_per_event": ess_per_event,
         # ... and over the DISTINCT samples behind them, each counted once:
@@ -1753,6 +1808,22 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         "f_ref_source_per_event": np.array(
             [str(x) for x in kept_f_ref_src], dtype=_str),
         **_dL_prior_class_attrs(kept_dL_class),
+        # ── Which cosmology the distance prior was evaluated AT (review
+        # 2026-10-20): the release-reweight table's source per event
+        # ("documented" / "inferred_from_z(dL)", the legacy table's
+        # "legacy_gwcat_default", or "analytic_declared" / "catalog_default"
+        # for rows not resolved from a table), the table's sha256, and the
+        # table_id each recorded hash identifies.
+        "dL_prior_cosmology_source_per_event": np.array(
+            kept_store_prov["dL_prior_cosmology_source"], dtype=_str),
+        "dL_prior_cosmology_table_sha256_per_event": np.array(
+            kept_store_prov["dL_prior_cosmology_table_sha256"], dtype=_str),
+        "release_reweight_cosmology_table_ids": json.dumps(
+            identify_bundled_tables(
+                kept_store_prov["dL_prior_cosmology_table_sha256"]),
+            sort_keys=True),
+        "mass_prior_source_per_event": np.array(
+            kept_store_prov["mass_prior_source"], dtype=_str),
     }
     if chi_eff_included:
         from ..spin import CHI_EFF_PRIOR_METHODS, current_chi_eff_prior_impl
@@ -2087,17 +2158,24 @@ def _apply_chieff_basis(data, amax1_ps, amax2_ps):
     in_support = np.ones(p_pe.shape, dtype=bool)
     if data["chieff"].size > 0:
         from ..spin import chi_eff_prior_logprob_in_support
-        logp_chi = np.empty(p_pe.shape, dtype=float)
-        pairs = np.unique(np.stack([np.asarray(amax1_ps, dtype=float),
-                                    np.asarray(amax2_ps, dtype=float)],
-                                   axis=1), axis=0)
-        for a1, a2 in pairs:
-            m = (amax1_ps == a1) & (amax2_ps == a2)
+        # NaN-initialised and grouped by np.unique's inverse index, not by
+        # float equality: a NaN ceiling matched no group and left np.empty's
+        # leftover memory in p_pe (review 2026-10-20).
+        logp_chi = np.full(p_pe.shape, np.nan, dtype=float)
+        pairs, which = np.unique(np.stack([np.asarray(amax1_ps, dtype=float),
+                                           np.asarray(amax2_ps, dtype=float)],
+                                          axis=1), axis=0, return_inverse=True)
+        which = np.asarray(which).reshape(-1)
+        for k, (a1, a2) in enumerate(pairs):
+            m = which == k
             lp, sup = chi_eff_prior_logprob_in_support(
                 data["chieff"][m], data["m1src"][m], data["m2src"][m],
                 amax=float(a1), amax_2=float(a2))
             logp_chi[m] = lp
             in_support[m] = sup
+        if np.isnan(logp_chi).any():
+            raise RuntimeError("internal error: a chieff row was assigned no "
+                               "chi_eff prior ceiling.")
         with np.errstate(over="ignore"):
             p_pe = p_pe * np.exp(logp_chi)
         p_pe = np.where(in_support, p_pe, 0.0)
@@ -2212,14 +2290,20 @@ def _apply_chieff_chip_basis(data, amax1_ps, chip, extras):
     in_support = np.ones(p_pe.shape, dtype=bool)
     if p_pe.size > 0:
         from ..spin import chi_eff_chi_p_prior_logprob_in_support
-        logp = np.empty(p_pe.shape, dtype=float)
-        for a in np.unique(amax1_ps):
-            m = amax1_ps == a
+        logp = np.full(p_pe.shape, np.nan, dtype=float)
+        uniq, which = np.unique(np.asarray(amax1_ps, dtype=float),
+                                return_inverse=True)
+        which = np.asarray(which).reshape(-1)
+        for k, a in enumerate(uniq):
+            m = which == k
             lp, sup = chi_eff_chi_p_prior_logprob_in_support(
                 data["chieff"][m], chip[m], data["m1src"][m], data["m2src"][m],
                 amax=float(a))
             logp[m] = lp
             in_support[m] = sup
+        if np.isnan(logp).any():
+            raise RuntimeError("internal error: a chieff_chip row was "
+                               "assigned no spin prior ceiling.")
         with np.errstate(over="ignore"):
             p_pe = p_pe * np.exp(logp)
         p_pe = np.where(in_support, p_pe, 0.0)

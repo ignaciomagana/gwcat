@@ -434,23 +434,33 @@ def test_chieff_chip_ppe_joint_prior(tmp_path):
     store, _ = _build_spin_store(tmp_path, events)
     cat = GWCatalog(store)
     out = tmp_path / "chieffchip.h5"
-    # The mismatched event is refused by default (August export-pe 3): the
-    # joint prior has one amax and would be evaluated at amax_1.
-    with pytest.raises(ValueError, match="GWc4_000002"):
+    # The mismatched event is refused by default (August export-pe 3; review
+    # 2026-10-20): it used to be evaluated at amax_1 for both bodies, behind a
+    # warning, but the joint prior has one amax.
+    with pytest.raises(ValueError, match="spin_amax_1 != spin_amax_2"):
         cat.export(str(out), format="gwcat2", spin_basis="chieff_chip",
                    allow_projection_basis=True, nsamp=32, seed=0,
                    cosmology=(67.74, 0.3089))
+    # The opt-in keeps the amax_1 evaluation, warned and recorded ...
     with pytest.warns(UserWarning, match="spin_amax_1 != spin_amax_2"):
         cat.export(str(out), format="gwcat2", spin_basis="chieff_chip", allow_projection_basis=True,
                    nsamp=32, seed=0, cosmology=(67.74, 0.3089),
                    allow_chieff_chip_amax_mismatch=True)
+    _, attrs = _read(out)
+    assert [s.decode() if isinstance(s, bytes) else s
+            for s in attrs["spin_amax_mismatch_events"]] == ["GWc4_000002"]
+    # ... and stating one ceiling explicitly exports it without a mismatch.
+    cat.export(str(out), format="gwcat2", spin_basis="chieff_chip",
+               allow_projection_basis=True, amax=0.99, nsamp=32, seed=0,
+               cosmology=(67.74, 0.3089))
 
     cols, attrs = _read(out)
     assert bool(attrs["chi_eff_chi_p_prior_applied_to_p_pe"]) is True
     amax1 = np.asarray(attrs["chi_eff_chi_p_amax_per_event"], float)
+    assert np.all(amax1 == 0.99)
     mism = [s.decode() if isinstance(s, bytes) else s
             for s in attrs["spin_amax_mismatch_events"]]
-    assert mism == ["GWc4_000002"]
+    assert mism == []
     assert "chip" in cols
 
     nsamp = int(attrs["nsamp"])

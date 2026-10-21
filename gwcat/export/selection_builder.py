@@ -181,7 +181,8 @@ import h5py
 from ..params import BLOCKS, DEFAULT_PARAMETER_SPACE, get_space
 from ..source_class import (format_source_class_filter, CUT_ESTIMATOR_ATTR,
                             selection_cut_estimator)
-from ..spin import (AMAX_AUTO, chi_eff_chi_p_prior_logprob_in_support,
+from ..spin import (AMAX_AUTO, check_amax_value,
+                    chi_eff_chi_p_prior_logprob_in_support,
                     chi_eff_prior_logprob_in_support, parse_amax_option)
 from ..selection import (SelectionSet, CombinedSelectionSet,
                          PDRAW_STATE_BY_BASIS, _selection_provenance_dict,
@@ -639,10 +640,13 @@ def _campaign_chieff_chip_lnfactor(s, keep, strict):
     # file -- burying the warning that matters, which is a genuine NSBH prior
     # with a restricted secondary (amax_2 ~ 0.05).
     if not np.isclose(amax_1, amax_2, rtol=1e-9, atol=1e-12):
-        warnings.warn(
+        # Refused, like the PE side (review 2026-10-20 recheck): evaluating
+        # both bodies at amax_1 is the wrong draw density for the secondary.
+        raise SpinBasisError(
             f"{s.path}: injected spin_amax_1={amax_1} != spin_amax_2={amax_2}; "
-            f"the joint (chi_eff, chi_p) prior assumes a single amax and uses "
-            f"amax_1={amax_1} (mirroring the PE builder convention).")
+            f"the joint (chi_eff, chi_p) prior assumes one shared ceiling. Use "
+            f"spin_basis='component', which keeps the campaign's exact "
+            f"per-injection spin draw.")
     lnp, sup = chi_eff_chi_p_prior_logprob_in_support(
         s._chieff[keep], s._chi_p[keep], s._m1src[keep], s._m2src[keep],
         amax=amax_1)
@@ -1228,6 +1232,9 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                    if name == "snr_threshold" else ""))
     # `None` = each campaign's own detected ceiling; a float = one forced ceiling.
     forced_amax = parse_amax_option(amax, what="amax")
+    # A fallback ceiling stands in for an undetectable one, so it must be a
+    # spin ceiling too (review 2026-10-20).
+    amax_fallback = check_amax_value(amax_fallback, what="amax_fallback")
     # `None` for every non-reference basis; a validated float for a reference
     # basis, which never defaults it.
     a_ref = _parse_reference_amax(spin_basis, spin_reference_amax)
@@ -1664,6 +1671,11 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             dtype=bool),
         "injected_spin_checks": json.dumps(
             [_json_checks(s.spin_meta.get("checks", {})) for s in set_list]),
+        # How each campaign's 4-D component spin density treats the azimuths
+        # (review 2026-10-20): exact for a factored file, verified or ASSUMED
+        # uniform for a joint density.  Recorded, not required.
+        "injected_spin_azimuths_per_campaign": np.array(
+            [_injected_spin_azimuths(s) for s in set_list], dtype=_str),
         # False for campaigns whose rows carry no drawn sky position (the
         # semianalytic O1/O2 entries of the cumulative mixtures); their
         # exported ra/dec are NaN.
@@ -2135,3 +2147,39 @@ def _json_checks(checks):
         else:
             out[k] = float(v)
     return out
+
+
+#: The tolerance :func:`gwcat.selection_spin.check_factored_vs_joint` passes at.
+_FACTORED_VS_JOINT_RTOL = 1e-6
+
+
+def _injected_spin_azimuths(s):
+    """How campaign ``s``'s 4-D component spin density treats the azimuths.
+
+    * ``"factored"`` -- the file gives each azimuth's density as its own
+      factor (o4_factored), so the 4-D (a, cos tilt) density marginalises it
+      exactly, whatever that factor is.
+    * ``"checked_isotropic"`` -- a joint cartesian density (O3 endo3) divided
+      out as uniform in azimuth, where the file's per-spin cartesian pdfs
+      check isotropic on every row (a uniform direction, so a uniform
+      azimuth) and the joint pdf, when given, equals their product.
+    * ``"assumed_uniform"`` -- a joint density (joint_cartesian, joint_polar,
+      or an endo3 file whose isotropy check does not pass) reduced to 4-D by
+      dividing each azimuth out as U[0, 2 pi).  One density evaluated at the
+      drawn points cannot show an azimuth dependence, so this is not checked.
+    * ``"none"`` -- the campaign has no component spin density.
+    """
+    if getattr(s, "_ln_spin_component", None) is None:
+        return "none"
+    meta = s.spin_meta or {}
+    fmt = meta.get("spin_format")
+    if fmt == "o4_factored":
+        return "factored"
+    if fmt == "endo3_factored":
+        checks = meta.get("checks") or {}
+        uni = checks.get("max_spin_uniform")
+        dev = checks.get("factored_vs_joint_dev")
+        if (uni is not None and all(bool(x) for x in uni)
+                and (dev is None or float(dev) <= _FACTORED_VS_JOINT_RTOL)):
+            return "checked_isotropic"
+    return "assumed_uniform"

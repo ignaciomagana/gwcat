@@ -37,29 +37,54 @@ _PROJECTION_PARENT = CampaignRequirement(
 
 
 # ── projections ─────────────────────────────────────────────────────────────
+def _amax_2_of(ctx):
+    """The context's secondary ceiling, or None (= the primary's) if unset."""
+    a2 = float(ctx.amax_2)
+    return a2 if np.isfinite(a2) else None
+
+
 def _ln_chieff_pe(cols, ctx):
-    from ...spin import chi_eff_prior_logprob
-    return np.asarray(chi_eff_prior_logprob(
-        cols["chieff"], ctx.m1src, ctx.m2src, amax=ctx.amax_1), dtype=float)
+    """ln p(chi_eff | m1src, m2src) with BOTH per-body ceilings and the support
+    applied -- the density the builders evaluate (review 2026-10-20: this
+    declaration dropped amax_2 and the support gate)."""
+    from ...spin import chi_eff_prior_logprob_in_support
+    lnp, _sup = chi_eff_prior_logprob_in_support(
+        cols["chieff"], ctx.m1src, ctx.m2src, amax=ctx.amax_1,
+        amax_2=_amax_2_of(ctx))
+    return np.asarray(lnp, dtype=float)
 
 
 def _ln_chieff_chip_pe(cols, ctx):
-    from ...spin import chi_eff_chi_p_prior_logprob
-    return np.asarray(chi_eff_chi_p_prior_logprob(
+    """The joint prior takes ONE ceiling; an event with two different ones is
+    refused rather than evaluated at amax_1 for both bodies."""
+    from ...spin import chi_eff_chi_p_prior_logprob_in_support
+    a2 = _amax_2_of(ctx)
+    if a2 is not None and a2 != float(ctx.amax_1):
+        raise ValueError(
+            f"spin.chieff_chip: {ctx.event_name or 'event'} has amax_1="
+            f"{ctx.amax_1} != amax_2={a2}; the joint (chi_eff, chi_p) prior "
+            f"assumes one shared ceiling.")
+    lnp, _sup = chi_eff_chi_p_prior_logprob_in_support(
         cols["chieff"], cols["chip"], ctx.m1src, ctx.m2src,
-        amax=ctx.amax_1), dtype=float)
+        amax=ctx.amax_1)
+    return np.asarray(lnp, dtype=float)
 
 
 SPIN_CHIEFF = ParameterBlock(
     name="spin.chieff",
     kind="spin",
     columns=("chieff",),
+    # A chieff SELECTION file also writes the injected components when the
+    # campaign has them; no density covers them (review 2026-10-20).
+    advisory_columns=("a1", "a2", "cost1", "cost2", "chip"),
     map_kind="projection",
     exact_draw_density=False,
     requires_campaign=_PROJECTION_PARENT,
     store_required=("chi_eff",),
     ln_prior_pe=_ln_chieff_pe,
-    ranges={"chieff": Range(-1.0, 1.0)},
+    ranges={"chieff": Range(-1.0, 1.0), "a1": Range(0.0, 1.0),
+            "a2": Range(0.0, 1.0), "cost1": Range(-1.0, 1.0),
+            "cost2": Range(-1.0, 1.0), "chip": Range(0.0, 1.0)},
     notes=("The analytic swap replaces the campaign's real spin-draw density "
            "with the uniform-isotropic chi_eff marginal. Measurably false for "
            "O4ab (isotropy_dev = 0.642), which is what GW-06 gates."),
@@ -69,6 +94,9 @@ SPIN_CHIEFF_CHIP = ParameterBlock(
     name="spin.chieff_chip",
     kind="spin",
     columns=("chieff", "chip"),
+    # Written when every event carries them; the joint prior covers only
+    # (chieff, chip) (review 2026-10-20).
+    advisory_columns=("a1", "a2", "cost1", "cost2"),
     map_kind="projection",
     exact_draw_density=False,
     requires_campaign=_PROJECTION_PARENT,
@@ -79,7 +107,9 @@ SPIN_CHIEFF_CHIP = ParameterBlock(
     store_params_fetched=("a_1", "a_2", "cos_tilt_1", "cos_tilt_2",
                           "tilt_1", "tilt_2", "chi_p"),
     ln_prior_pe=_ln_chieff_chip_pe,
-    ranges={"chieff": Range(-1.0, 1.0), "chip": Range(0.0, 1.0)},
+    ranges={"chieff": Range(-1.0, 1.0), "chip": Range(0.0, 1.0),
+            "a1": Range(0.0, 1.0), "a2": Range(0.0, 1.0),
+            "cost1": Range(-1.0, 1.0), "cost2": Range(-1.0, 1.0)},
     estimated_cost_per_point=1e-6,
     notes=("chi_p reaches the assumed ceiling on real data where chi_eff does "
            "not, which is why the -50 floor concentrated its damage here. "
@@ -110,14 +140,18 @@ SPIN_CHIEFF_REFERENCE = ParameterBlock(
     # anywhere) -- there is an assumed density, it is just the DECLARED one
     # rather than a claim about the campaign.
     exact_draw_density=False,
-    # Deliberately EMPTY, and this is the whole point of the block.  A
-    # substituting projection (spin.chieff) needs the parent draw to BE
-    # uniform-isotropic, because it throws that draw away.  A reweighting
-    # projection keeps the parent draw in the numerator and divides by the
-    # reference in the denominator, so it assumes nothing about the parent --
-    # it only needs the parent to COVER the reference support, which is a
-    # coverage check on the injected magnitudes (enforced in the builder), not
-    # a distributional requirement expressible here.
+    # Nothing about the magnitude/tilt distribution, and this is the whole
+    # point of the block.  A substituting projection (spin.chieff) needs the
+    # parent draw to BE uniform-isotropic, because it throws that draw away.
+    # A reweighting projection keeps the parent draw in the numerator and
+    # divides by the reference in the denominator, so it assumes nothing
+    # about the parent's magnitudes and tilts -- it only needs the parent to
+    # COVER the reference support, which is a coverage check on the injected
+    # magnitudes (enforced in the builder).  What it shares with
+    # spin.component_polar is the 4-D component density it starts from, and
+    # so that density's one assumption on a JOINT-density campaign (uniform
+    # azimuths; see spin.component_polar), which is recorded per campaign
+    # rather than required (review 2026-10-20).
     requires_campaign=CampaignRequirement(),
     store_required=("a_1", "a_2", "chi_eff"),
     store_alternatives=(("cos_tilt_1", "tilt_1"), ("cos_tilt_2", "tilt_2")),
@@ -159,6 +193,15 @@ SPIN_COMPONENT_POLAR = ParameterBlock(
     map_kind="bijective",
     exact_draw_density=True,
     prior_is_per_event_constant=True,
+    # No campaign requirement, but one recorded assumption (review
+    # 2026-10-20).  A FACTORED campaign (o4_factored) gives the azimuth density
+    # as its own factor, so the 4-D (a, cos tilt) density is exact whatever
+    # that factor is.  A JOINT-density campaign (joint_cartesian, joint_polar,
+    # the O3 endo3 sampling_pdf) is reduced to 4-D by dividing each azimuth
+    # out as U[0, 2pi): one density evaluated at the drawn points cannot show
+    # an azimuth dependence, so this is assumed unless the file's per-spin
+    # cartesian pdfs check isotropic (endo3).  The selection product records
+    # which, per campaign: injected_spin_azimuths_per_campaign.
     # chi_eff is required even though it is ADVISORY here: the component export
     # still writes the legacy 10 columns, so the store must carry it. A
     # deliberate, documented simplification -- the alternative is making chi_eff
@@ -174,7 +217,11 @@ SPIN_COMPONENT_POLAR = ParameterBlock(
             "chieff": Range(-1.0, 1.0), "chip": Range(0.0, 1.0)},
     notes=("The default and the recommended space. Its injection density is "
            "read NUMERICALLY off the file, so it requires nothing of the "
-           "campaign and is exact for any of them. chieff/chip are emitted but "
+           "campaign's magnitudes or tilts. It is exact for a factored "
+           "campaign, whose azimuth density is its own factor; a joint-density "
+           "campaign's reduction to 4-D assumes uniform azimuths, which the "
+           "selection product records per campaign "
+           "(injected_spin_azimuths_per_campaign). chieff/chip are emitted but "
            "ADVISORY: pdraw carries no term for them, so fitting on them here "
            "would be wrong -- the hole sel_v2_component.h5 shipped with."),
 )

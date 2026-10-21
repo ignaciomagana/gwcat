@@ -59,7 +59,8 @@ from .cosmology import (make_cosmology, uniform_source_frame_prob,
                         dL_prior_prob, DL_PRIOR_KINDS, DL_PRIOR_NEEDS_ALPHA,
                         DL_PRIOR_NEEDS_COSMOLOGY,
                         DistancePriorKindError, NAMED_COSMOLOGIES,
-                        PLANCK15, O4_FALLBACK)
+                        PLANCK15, O4_FALLBACK, UnrecognisedCosmologyError,
+                        is_radiation_free_flat_lcdm, resolve_named_cosmology)
 from .source_class import (normalize_source_class, classify_by_mass,
                           DEFAULT_NSBH_MASS_THRESHOLD)
 from .spin import chi_p_from_components
@@ -293,6 +294,12 @@ class IngestConfig:
     #: options b/c).  Off by default so existing stores and the v1 exporter
     #: are unchanged; a row whose mixture cannot be verified is refused.
     constituent_mixture_prior: bool = False
+    #: Which reading of the mixture prior ``constituent_mixture_prior`` builds
+    #: (:data:`gwcat.constituent_mixture.MIXTURE_CONVENTIONS`; review
+    #: 2026-10-20).  "equal_weight" is the original form; "own_prior" divides
+    #: each row by its own constituent's prior.  An owner decision: recorded
+    #: in every mixture row's mass/dL prior source, default unchanged.
+    constituent_mixture_convention: str = "equal_weight"
     validate_prior: bool = True
     compression: str = "gzip"
     #: Which UniformSourceFrame implementation evaluates p_dL_pe (GW-01).
@@ -935,7 +942,9 @@ def _parse_analytic_dL(prior_string: str) -> AnalyticDLPrior:
     The class name is taken from the first ``Name(`` in the string, so a dotted
     module path is stripped and a nested cosmology repr cannot be mistaken for
     it.  Cosmology resolution is by EXACT token match against
-    :data:`gwcat.cosmology.NAMED_COSMOLOGIES`: the old ``"Planck15" in tok``
+    :data:`gwcat.cosmology.NAMED_COSMOLOGIES` (plus bilby's case-insensitive
+    ``planck15_lal``, :func:`gwcat.cosmology.resolve_named_cosmology`; a
+    cosmology with radiation is left unresolved): the old ``"Planck15" in tok``
     substring test also matched ``'Planck15_LAL'``, silently giving 190 O4 rows
     astropy's (67.74, 0.3075) instead of LAL's (67.90, 0.3065).
     """
@@ -974,14 +983,15 @@ def _parse_analytic_dL(prior_string: str) -> AnalyticDLPrior:
             else:
                 cosmology_name = bare.split("(", 1)[0].strip()
                 cosmology_recognized = False
-        elif bare in NAMED_COSMOLOGIES:
-            cosmo = NAMED_COSMOLOGIES[bare]
+        elif is_radiation_free_flat_lcdm(resolve_named_cosmology(bare)):
+            cosmo = resolve_named_cosmology(bare)
             H0, Om0 = cosmo.H0.value, cosmo.Om0
             cosmology_name = bare
             cosmology_recognized = True
         else:
-            # A named cosmology gwcat does not know.  Do NOT guess: record the
-            # token and leave H0/Om0 unresolved so the caller can be loud.
+            # A named cosmology gwcat does not know -- or one (H0, Om0) cannot
+            # describe, like astropy's Planck15 with radiation.  Do NOT guess:
+            # record the token and leave H0/Om0 unresolved; the caller refuses.
             cosmology_name = bare
             cosmology_recognized = False
 
@@ -1269,20 +1279,20 @@ def resolve_dL_prior(catalog, analysis, analyses, priors, dL_samples,
     H0, Om0 = parsed.H0, parsed.Om0
     cosmology_source = "analytic_declared"
     if H0 is None:
+        if parsed.cosmology_recognized is False:
+            known = resolve_named_cosmology(parsed.cosmology_name)
+            why = ("is a cosmology with radiation, which the (H0, Om0) a "
+                   "store records cannot represent exactly"
+                   if known is not None else "is not one gwcat knows")
+            raise UnrecognisedCosmologyError(
+                f"{analysis}: analytic distance prior names cosmology "
+                f"{parsed.cosmology_name!r}, which {why}. Refusing to evaluate "
+                f"it at the catalog default {default_cosmo} instead. Add it "
+                f"to gwcat.cosmology.NAMED_COSMOLOGIES if it is a real flat, "
+                f"radiation-free cosmology.")
         H0, Om0 = default_cosmo
         src += "+default_cosmo"
         cosmology_source = "catalog_default"
-        if parsed.cosmology_recognized is False:
-            warnings.warn(
-                f"{analysis}: analytic distance prior names an unrecognised "
-                f"cosmology {parsed.cosmology_name!r}; falling back to "
-                f"(H0={H0}, Om0={Om0}). Add it to "
-                f"gwcat.cosmology.NAMED_COSMOLOGIES if it is real. The KS "
-                f"check against the file's own prior samples tests the "
-                f"distribution class and bounds only: it cannot detect a "
-                f"wrong cosmology (H0 anywhere from 50 to 90 passes), so "
-                f"set IngestConfig.defaulted_cosmology_fatal=True for an "
-                f"audited build.")
 
     kind = sampling_kind or "UniformSourceFrame"
     alpha = parsed.alpha
@@ -2466,7 +2476,10 @@ def _resolve_event_table(event_table, cache_dir=None, offline=None):
 
 def _constituent_mixture_prior(catalog, analysis, analyses, samples_dict,
                                priors, cfg, flavour):
-    """The equal-weight constituent-mixture prior of a ``C00:Mixed`` row.
+    """The constituent-mixture prior of a ``C00:Mixed`` row.
+
+    ``cfg.constituent_mixture_convention`` picks the reading (equal-weight
+    mixture at every row, or each row's own constituent prior).
 
     See :mod:`gwcat.constituent_mixture`.  Every contributing constituent must
     carry its OWN analytic mass (uniform in components), distance and spin
@@ -2475,7 +2488,9 @@ def _constituent_mixture_prior(catalog, analysis, analyses, samples_dict,
     constituent must supply exactly ``n_Mixed / K`` rows.  Anything else is
     refused (:class:`~gwcat.constituent_mixture.ConstituentMixtureError`).
     """
-    from .constituent_mixture import (ConstituentMixtureError,
+    from .constituent_mixture import (MIXTURE_CONVENTIONS,
+                                      ConstituentMixtureError,
+                                      mass_constraint_bounds,
                                       match_constituent_rows,
                                       mixture_prior_densities,
                                       truncated_dL_density, uic_normalisation)
@@ -2489,7 +2504,13 @@ def _constituent_mixture_prior(catalog, analysis, analyses, samples_dict,
              if a != analysis and _label_parts(a)[0] == pfx
              and not _is_combined_base(_label_parts(a)[1])
              and _spin_variant_token(_label_parts(a)[2]) == want}
-    labels, counts = match_constituent_rows(samples_dict[analysis], cands)
+    conv = cfg.constituent_mixture_convention
+    if conv not in MIXTURE_CONVENTIONS:
+        raise ConstituentMixtureError(
+            f"constituent_mixture_convention={conv!r}; choose one of "
+            f"{MIXTURE_CONVENTIONS}.")
+    labels, counts, row_comp = match_constituent_rows(
+        samples_dict[analysis], cands, return_rows=True)
 
     comps, amaxes, cosmos, dl_kinds, bad = [], set(), set(), set(), []
     alphas, cosmo_sources = set(), set()
@@ -2513,14 +2534,22 @@ def _constituent_mixture_prior(catalog, analysis, analyses, samples_dict,
                 or sp.source_kind != "own_analytic"):
             bad.append(f"{lab}: spin prior {sp.kind}/{sp.source_kind}")
             continue
+        # EVERY Constraint of the constituent's own group (total_mass
+        # included); one the support does not implement is refused.
+        try:
+            cons = mass_constraint_bounds(
+                (priors.get("analytic") or {}).get(lab) or {},
+                _parse_analytic_spin)
+        except ConstituentMixtureError as exc:
+            bad.append(f"{lab}: {exc}")
+            continue
         amaxes.add((sp.amax_1, sp.amax_2))
         cosmos.add((rd.H0, rd.Om0, rd.cosmology_name))
         dl_kinds.add(rd.kind)
         alphas.add(rd.alpha)
         cosmo_sources.add(rd.cosmology_source)
         bounds = dict(mc_min=mp.chirp_min, mc_max=mp.chirp_max,
-                      q_min=mp.q_min, q_max=mp.q_max, m1_min=mp.m1_min,
-                      m1_max=mp.m1_max, m2_min=mp.m2_min, m2_max=mp.m2_max)
+                      q_min=mp.q_min, q_max=mp.q_max, **cons)
         comps.append(dict(
             bounds, label=lab, Z=uic_normalisation(**bounds),
             dmin=rd.dmin, dmax=rd.dmax, dl_kind=rd.kind,
@@ -2544,7 +2573,8 @@ def _constituent_mixture_prior(catalog, analysis, analyses, samples_dict,
     m1 = np.asarray(mixed["mass_1"], float)
     q = np.asarray(mixed["mass_2"], float) / m1
     dL = np.asarray(mixed["luminosity_distance"], float)
-    joint, marg = mixture_prior_densities(m1, q, dL, comps)
+    joint, marg = mixture_prior_densities(m1, q, dL, comps, convention=conv,
+                                          row_component=row_comp)
     n_zero = int(np.sum(~(joint > 0)))
     if n_zero:
         raise ConstituentMixtureError(
@@ -2554,6 +2584,7 @@ def _constituent_mixture_prior(catalog, analysis, analyses, samples_dict,
     (a1, a2), = amaxes
     (H0, Om0, cname), = cosmos
     return dict(labels=labels, counts=counts, p_mass_dL=joint, p_dL=marg,
+                convention=conv,
                 amax_1=a1, amax_2=a2, H0=H0, Om0=Om0, cosmology_name=cname,
                 dl_kind=(dl_kinds.pop() if len(dl_kinds) == 1 else "mixture"),
                 alpha=(next(iter(alphas)) if len(alphas) == 1 else None),
@@ -3092,14 +3123,16 @@ def build_store(paths, out_path, params=None, extra_params=None,
                     "constituent_mixture_counts": ",".join(
                         str(cmix["counts"][lab]) for lab in cmix["labels"]),
                     "mass_prior_kind": "constituent_mixture",
-                    "mass_prior_source": f"constituent_mixture[{joined}]",
+                    "mass_prior_source": (f"constituent_mixture:"
+                                          f"{cmix['convention']}[{joined}]"),
                     "mass_prior_chirp_min": cmix["chirp_min"],
                     "mass_prior_chirp_max": cmix["chirp_max"],
                     "mass_prior_q_min": cmix["q_min"],
                     "mass_prior_q_max": cmix["q_max"],
                     "dL_prior_kind": cmix["dl_kind"],
                     "dL_prior_basis": "constituent_mixture",
-                    "dL_prior_source": f"constituent_mixture[{joined}]",
+                    "dL_prior_source": (f"constituent_mixture:"
+                                        f"{cmix['convention']}[{joined}]"),
                     "dL_prior_min": cmix["dmin"],
                     "dL_prior_max": cmix["dmax"],
                     "dL_prior_H0": float(cmix["H0"]),
@@ -3141,7 +3174,7 @@ def build_store(paths, out_path, params=None, extra_params=None,
                 # sibling-borrowed resolution; the mixture REPLACES it.
                 for k, val in over.items():
                     meta[k][-1] = val
-                src = f"constituent_mixture[{joined}]"
+                src = f"constituent_mixture:{cmix['convention']}[{joined}]"
             print(f"[{catalog}] {name}: {n} samp, sample_set={analysis}, "
                   f"prior={src}")
 
@@ -4168,6 +4201,15 @@ def _cli(
                          "prior declares no recognised cosmology (it would be "
                          "evaluated at the catalog default). Default: use the "
                          "default and record it.")
+    from .constituent_mixture import MIXTURE_CONVENTIONS
+    ap.add_argument("--constituent-mixture-convention",
+                    choices=MIXTURE_CONVENTIONS,
+                    default="equal_weight",
+                    help="With --constituent-mixture-prior: 'equal_weight' "
+                         "(default) evaluates (1/K) sum_k pi_k at every row; "
+                         "'own_prior' divides each row by its own "
+                         "constituent's prior. A modelling choice, recorded in "
+                         "each row's mass/dL prior source.")
     a = ap.parse_args(argv)
     # The config is built BEFORE --inspect, so the smoke test reports the
     # prior the build will use (review 2026-10-20, medium-47): inspect used
@@ -4176,6 +4218,7 @@ def _cli(
     cfg = IngestConfig(
         release_reweight_cosmology_table=a.release_reweight_cosmology_table,
         constituent_mixture_prior=a.constituent_mixture_prior,
+        constituent_mixture_convention=a.constituent_mixture_convention,
         dL_prior_impl="auto" if a.legacy_grid_priors else "exact",
         mixed_prior_mismatch=("raise" if a.refuse_mixed_prior_mismatch
                               else "warn"),

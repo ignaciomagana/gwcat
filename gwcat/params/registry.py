@@ -24,6 +24,15 @@ from .blocks import (DISTANCE_DL, MASS_DET_PAIR, SKY_RADEC, SPIN_ALIGNED_Z,
 #: Always present, in this order.
 _CORE: Tuple[ParameterBlock, ...] = (MASS_DET_PAIR, DISTANCE_DL, SKY_RADEC)
 
+class CampaignRequirementError(ValueError):
+    """An injection campaign contradicts a block's declared requirement."""
+
+
+#: Datasets that are not coordinates: the weights and the support mask.  Every
+#: OTHER dataset a product writes must be a declared fit or advisory column.
+WEIGHT_DATASETS = ("p_pe", "pdraw", "in_support")
+
+
 #: Every registered block, by name.
 BLOCKS: Dict[str, ParameterBlock] = {
     b.name: b for b in (MASS_DET_PAIR, DISTANCE_DL, SKY_RADEC, SPIN_NONE,
@@ -74,6 +83,17 @@ class ParameterSpace:
     @property
     def all_columns(self) -> Tuple[str, ...]:
         return self.fit_columns + self.advisory_columns
+
+    def undeclared_datasets(self, names) -> Tuple[str, ...]:
+        """Written datasets that are neither fit nor advisory columns.
+
+        Review 2026-10-20: ``m1src``/``m2src`` (always written) and the spin
+        components of a chieff selection or chieff_chip PE file were in
+        neither list, so a generic consumer could not tell they must not be
+        fitted.  The writers refuse a product with any such dataset.
+        """
+        known = set(self.all_columns) | set(WEIGHT_DATASETS)
+        return tuple(sorted(n for n in names if n not in known))
 
     # ── store contract ──────────────────────────────────────────────────────
     @property
@@ -146,6 +166,39 @@ class ParameterSpace:
                 out[b.name] = bad
         return out
 
+    def refuse_nonfinite_fit_columns(self, columns, *, context="export"):
+        """Refuse a product whose FIT column holds a non-finite row.
+
+        A fit column is one the density covers, so every row of it must be a
+        point a consumer can evaluate.  ``ra``/``dec`` of a campaign that drew
+        no sky position (a semianalytic O1/O2 mixture's rows, or a sky-less
+        file combined with sky-bearing ones) are NaN, and a 2.1 file declares
+        them fittable: it was written and validated, whether every row or only
+        some were NaN (review 2026-10-20; core refuses such a file at load).
+        This is the per-row form of the sky block's ``needs_sky_draw``
+        requirement, which the per-campaign spin metadata cannot carry.  A
+        column the product omits (``sky_marginal``) is not checked.
+        """
+        import numpy as np
+
+        bad = {}
+        for c in self.fit_columns:
+            if c in columns and np.size(columns[c]):
+                n = int(np.count_nonzero(
+                    ~np.isfinite(np.asarray(columns[c], dtype=float))))
+                if n:
+                    bad[c] = n
+        if bad:
+            n_rows = int(np.size(columns[next(iter(bad))]))
+            raise CampaignRequirementError(
+                f"{context}: fit column(s) of parameter space {self.name!r} "
+                f"have non-finite rows {bad} (of {n_rows})"
+                + (" -- a campaign drew no sky position (see "
+                   "sky_position_available); export with sky_marginal=True "
+                   "(--sky-marginal)"
+                   if {"ra", "dec"} & set(bad) else "")
+                + ".")
+
     def describe(self) -> dict:
         return {
             "space": self.name,
@@ -206,6 +259,10 @@ SPACES: Dict[str, ParameterSpace] = {
 
 #: The three spaces that correspond to an existing ``spin_basis`` value.
 LEGACY_SPIN_BASES = ("chieff", "chieff_chip", "component")
+
+#: Spaces a builder refuses without an explicit opt-in flag (chieff_chip:
+#: ``allow_projection_basis``), so never offered as a remedy in an error.
+OPT_IN_SPACES = ("chieff_chip",)
 
 
 def get_space(name: str) -> ParameterSpace:

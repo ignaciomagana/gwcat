@@ -104,7 +104,11 @@ MASS_DET_PAIR = ParameterBlock(
     name="mass.det_pair",
     kind="mass",
     columns=("m1det", "q"),
-    advisory_columns=("m2det",),
+    # m1src/m2src are written by every export but are DERIVED through the
+    # file's own z(dL) -- H0-dependent, with no density of their own -- so
+    # they are declared advisory rather than left undeclared (review
+    # 2026-10-20).
+    advisory_columns=("m2det", "m1src", "m2src"),
     map_kind="bijective",
     exact_draw_density=True,
     store_required=("mass_1", "mass_2"),
@@ -118,7 +122,13 @@ MASS_DET_PAIR = ParameterBlock(
                             "the m1det factor in p_pe is its Jacobian"),
             "m2det": Range(0.0, np.inf, closed="neither",
                            note="detector-frame secondary mass, Msun; DERIVED "
-                                "(m2det = q * m1det) and advisory")},
+                                "(m2det = q * m1det) and advisory"),
+            "m1src": Range(0.0, np.inf, closed="neither",
+                           note="source-frame primary mass; DERIVED through "
+                                "the file's z(dL), advisory"),
+            "m2src": Range(0.0, np.inf, closed="neither",
+                           note="source-frame secondary mass; DERIVED through "
+                                "the file's z(dL), advisory")},
     notes=("The m1det factor is the (m1det, q) Jacobian, NOT a prior. It is "
            "valid only for a mass prior uniform in detector-frame component "
            "masses, which is why this block gates on mass_prior_kind -- and why "
