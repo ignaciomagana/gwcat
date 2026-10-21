@@ -278,6 +278,21 @@ def test_the_chieff_chip_summary_matches_the_file_flag(tmp_path):
 
 
 # ==========================================================================
+# Low 67. sky_prior_in_density states what the densities contain
+# ==========================================================================
+def test_the_contract_does_not_claim_a_sky_factor(tmp_path):
+    """gwcat.params.compose: -ln 4pi is in neither p_pe nor pdraw."""
+    pe_out, sel_out = tmp_path / "pe.h5", tmp_path / "sel.h5"
+    pe = build_pe_product(GWCatalog(_store(tmp_path)), spin_basis="chieff",
+                          nsamp=8, seed=0)
+    get_exporter("gwcat2.1", kind="pe")(pe, str(pe_out))
+    get_exporter("gwcat2.1", kind="selection")(_selection_product(),
+                                               str(sel_out))
+    assert _contract(pe_out)["sky_prior_in_density"] is False
+    assert _contract(sel_out)["sky_prior_in_density"] is False
+
+
+# ==========================================================================
 # Medium 13. A selection product core cannot load says so when written
 # ==========================================================================
 def _sky_marginal_product():

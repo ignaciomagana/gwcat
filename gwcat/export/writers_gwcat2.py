@@ -506,7 +506,12 @@ def _contract_attrs(product, kind):
         # 2026-10-20, Medium 43); None on the selection side and for a store
         # that records no class.
         dL_prior_kind=a.get("dL_prior_kind"),
-        sky_prior_in_density=True,      # sky.radec declares -ln4pi both sides
+        # What the densities CONTAIN (review 2026-10-20, Low 67).  sky.radec
+        # declares -ln 4pi on both sides precisely so it cancels, and neither
+        # builder multiplies it into p_pe or pdraw (gwcat.params.compose: the
+        # sky is "in neither"), so the hard-coded True stated a factor neither
+        # file carries.  A builder that ever applies it must stamp the attr.
+        sky_prior_in_density=bool(a.get("sky_prior_in_density", False)),
         source_class=a.get("source_class_filter") or None,
         detection_statistic=stat,
         detection_threshold=thr,
