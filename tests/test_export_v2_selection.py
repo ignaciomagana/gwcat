@@ -1128,3 +1128,91 @@ def test_p_astro_columns_are_recorded_per_campaign(tmp_path):
     assert bool(prod.attrs["p_astro_available"]) is False      # unchanged
     assert prod.summary["p_astro_columns_per_campaign"] == [
         [], ["gstlal_p_astro"]]
+
+
+# --------------------------------------------------------------------------
+# August review, test-gaps 5: the combination loop with campaigns that are
+# not 100% detected, one that contributes nothing, and mixed spin content.
+# --------------------------------------------------------------------------
+def test_combination_with_partial_detection_in_both_campaigns(tmp_path):
+    """Per-campaign rows are the detected ones, ndraw and campaign_ndraws are
+    the files' totals (the cut is subsetting), and pdraw is each campaign's
+    from-file component density times N_k/N_total -- with N_k read from the
+    file attrs, not from the builder."""
+    from gwcat.export import build_selection_product
+
+    pa = write_o4_full(tmp_path / "a.hdf", n=40, amax=(0.8, 0.6), seed=26,
+                       total_generated=1500)
+    pb = write_o4_full(tmp_path / "b.hdf", n=30, amax=(0.9, 0.7), seed=27,
+                       total_generated=700)
+    rng = np.random.default_rng(28)
+    fars = {}
+    for p, n in ((pa, 40), (pb, 30)):
+        far = 10 ** rng.uniform(-2.0, 1.0, n)
+        far[rng.uniform(size=n) < 0.2] = np.inf
+        with h5py.File(p, "r+") as f:
+            f["events"]["pycbc_far"][:] = far
+        fars[p] = far
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        prod = build_selection_product([SelectionSet(pa), SelectionSet(pb)],
+                                       spin_basis="component",
+                                       far_threshold=1.0)
+    n_tot = 0
+    expected = []
+    for p in (pa, pb):
+        with h5py.File(p, "r") as f:
+            n_tot += int(f.attrs["total_generated"])
+    for p in (pa, pb):
+        with h5py.File(p, "r") as f:
+            n_k = int(f.attrs["total_generated"])
+        keep = fars[p] < 1.0
+        assert 0 < keep.sum() < keep.size                  # partial, really
+        expected.append(_o4_component_pdraw(p)[keep] * (n_k / n_tot))
+    expected = np.concatenate(expected)
+    np.testing.assert_allclose(prod.columns["pdraw"], expected, rtol=1e-12)
+    assert int(prod.attrs["n_detected"]) == expected.size
+    assert int(prod.attrs["ndraw"]) == n_tot
+    assert list(prod.attrs["campaign_ndraws"]) == [1500, 700]
+
+
+def test_an_empty_campaign_still_counts_in_ndraw(tmp_path):
+    """A campaign with no detections is skipped (and warned about), but its
+    draws stay in N_total: the surviving campaign's fraction is N_a/(N_a+N_b),
+    not 1 -- dropping it would rescale every surviving pdraw."""
+    from gwcat.export import build_selection_product
+
+    pa = write_o4_full(tmp_path / "a.hdf", n=25, seed=29, total_generated=800)
+    pb = write_o4_full(tmp_path / "b.hdf", n=25, seed=30, total_generated=1200,
+                       detected=False)
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        prod = build_selection_product([SelectionSet(pa), SelectionSet(pb)],
+                                       spin_basis="component")
+    assert any("no detected injections" in str(w.message) for w in rec)
+    np.testing.assert_allclose(prod.columns["pdraw"],
+                               _o4_component_pdraw(pa) * (800 / 2000),
+                               rtol=1e-12)
+    assert int(prod.attrs["ndraw"]) == 2000
+    assert int(prod.attrs["n_detected"]) == 25
+
+
+def test_a_spinless_campaign_drops_the_spin_columns_whole(tmp_path):
+    """Combining a campaign with spin columns and one without (a legacy
+    spin-less file) drops a1/a2/cost1/cost2 and chip from the combined file,
+    says so, and writes no partial-length column."""
+    from gwcat.export import build_selection_product
+    from test_selection_cbc import write_o3
+
+    e3 = write_endo3_full(tmp_path / "e3.hdf", n=20, seed=31)
+    o3 = write_o3(tmp_path / "o3.hdf", {"BBH": 6})
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        prod = build_selection_product([SelectionSet(e3), SelectionSet(o3)],
+                                       spin_basis="chieff", strict=False)
+    assert prod.attrs["component_columns_emitted"] is False
+    for c in ("a1", "a2", "cost1", "cost2", "chip"):
+        assert c not in prod.columns
+    lengths = {k: np.asarray(v).shape[0] for k, v in prod.columns.items()}
+    assert len(set(lengths.values())) == 1, lengths
+    assert lengths["pdraw"] == int(prod.attrs["n_detected"])
