@@ -74,12 +74,17 @@ SPIN_CHIEFF = ParameterBlock(
     name="spin.chieff",
     kind="spin",
     columns=("chieff",),
+    # A chieff SELECTION file also writes the injected components when the
+    # campaign has them; no density covers them (review 2026-10-20).
+    advisory_columns=("a1", "a2", "cost1", "cost2", "chip"),
     map_kind="projection",
     exact_draw_density=False,
     requires_campaign=_PROJECTION_PARENT,
     store_required=("chi_eff",),
     ln_prior_pe=_ln_chieff_pe,
-    ranges={"chieff": Range(-1.0, 1.0)},
+    ranges={"chieff": Range(-1.0, 1.0), "a1": Range(0.0, 1.0),
+            "a2": Range(0.0, 1.0), "cost1": Range(-1.0, 1.0),
+            "cost2": Range(-1.0, 1.0), "chip": Range(0.0, 1.0)},
     notes=("The analytic swap replaces the campaign's real spin-draw density "
            "with the uniform-isotropic chi_eff marginal. Measurably false for "
            "O4ab (isotropy_dev = 0.642), which is what GW-06 gates."),
@@ -89,6 +94,9 @@ SPIN_CHIEFF_CHIP = ParameterBlock(
     name="spin.chieff_chip",
     kind="spin",
     columns=("chieff", "chip"),
+    # Written when every event carries them; the joint prior covers only
+    # (chieff, chip) (review 2026-10-20).
+    advisory_columns=("a1", "a2", "cost1", "cost2"),
     map_kind="projection",
     exact_draw_density=False,
     requires_campaign=_PROJECTION_PARENT,
@@ -99,7 +107,9 @@ SPIN_CHIEFF_CHIP = ParameterBlock(
     store_params_fetched=("a_1", "a_2", "cos_tilt_1", "cos_tilt_2",
                           "tilt_1", "tilt_2", "chi_p"),
     ln_prior_pe=_ln_chieff_chip_pe,
-    ranges={"chieff": Range(-1.0, 1.0), "chip": Range(0.0, 1.0)},
+    ranges={"chieff": Range(-1.0, 1.0), "chip": Range(0.0, 1.0),
+            "a1": Range(0.0, 1.0), "a2": Range(0.0, 1.0),
+            "cost1": Range(-1.0, 1.0), "cost2": Range(-1.0, 1.0)},
     estimated_cost_per_point=1e-6,
     notes=("chi_p reaches the assumed ceiling on real data where chi_eff does "
            "not, which is why the -50 floor concentrated its damage here. "

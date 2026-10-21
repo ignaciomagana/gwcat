@@ -28,6 +28,11 @@ class CampaignRequirementError(ValueError):
     """An injection campaign contradicts a block's declared requirement."""
 
 
+#: Datasets that are not coordinates: the weights and the support mask.  Every
+#: OTHER dataset a product writes must be a declared fit or advisory column.
+WEIGHT_DATASETS = ("p_pe", "pdraw", "in_support")
+
+
 #: Every registered block, by name.
 BLOCKS: Dict[str, ParameterBlock] = {
     b.name: b for b in (MASS_DET_PAIR, DISTANCE_DL, SKY_RADEC, SPIN_NONE,
@@ -78,6 +83,17 @@ class ParameterSpace:
     @property
     def all_columns(self) -> Tuple[str, ...]:
         return self.fit_columns + self.advisory_columns
+
+    def undeclared_datasets(self, names) -> Tuple[str, ...]:
+        """Written datasets that are neither fit nor advisory columns.
+
+        Review 2026-10-20: ``m1src``/``m2src`` (always written) and the spin
+        components of a chieff selection or chieff_chip PE file were in
+        neither list, so a generic consumer could not tell they must not be
+        fitted.  The writers refuse a product with any such dataset.
+        """
+        known = set(self.all_columns) | set(WEIGHT_DATASETS)
+        return tuple(sorted(n for n in names if n not in known))
 
     # ── store contract ──────────────────────────────────────────────────────
     @property

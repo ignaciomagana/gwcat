@@ -136,6 +136,19 @@ def _write_summary(product, out_path, format_version, summary_context):
     write_validation_summary(out_path, summary)
 
 
+def _refuse_undeclared_datasets(product):
+    """Every dataset is a declared fit/advisory column or a weight (review
+    2026-10-20); an undeclared one is a coordinate a consumer cannot place."""
+    from ..params import get_space
+    extra = get_space(product.spin_basis).undeclared_datasets(product.columns)
+    if extra:
+        raise ValueError(
+            f"{product.kind} product (spin_basis={product.spin_basis!r}) would "
+            f"write dataset(s) {list(extra)} that parameter space "
+            f"{product.spin_basis!r} declares neither as fit nor as advisory "
+            f"columns. Declare them in the block registry (gwcat/params).")
+
+
 def _write_pe(product, out_path, format_version, *, with_contract=False,
               write_summary=False, summary_context=None):
     """Serialize a PE product at ``format_version`` (2.0 or 2.1)."""
@@ -143,6 +156,7 @@ def _write_pe(product, out_path, format_version, *, with_contract=False,
         raise ValueError(
             f"write_pe_gwcat2 expects a kind='pe' product, got "
             f"kind={product.kind!r}.")
+    _refuse_undeclared_datasets(product)
 
     extra_attrs = _contract_attrs(product, "pe") if with_contract else {}
 
@@ -169,6 +183,7 @@ def _write_selection(product, out_path, format_version, *, with_contract=False,
         raise ValueError(
             f"write_selection_gwcat2 expects a kind='selection' product, got "
             f"kind={product.kind!r}.")
+    _refuse_undeclared_datasets(product)
 
     if with_contract and bool(product.attrs.get("sky_marginalized", False)):
         # GW-39.  The 2.1 contract declares the space's fit_columns, which put

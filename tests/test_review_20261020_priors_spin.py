@@ -433,3 +433,52 @@ def test_chieff_chip_block_refuses_two_ceilings():
         BLOCKS["spin.chieff_chip"].ln_prior_pe(
             {"chieff": np.array([0.1]), "chip": np.array([0.3])},
             _ctx(0.99, 0.05, m1, m2))
+
+
+# ==========================================================================
+# Every written dataset is a declared fit or advisory column
+# ==========================================================================
+_WEIGHTS = {"p_pe", "pdraw", "in_support"}
+
+
+def _declared(space_name):
+    from gwcat.params import get_space
+    sp = get_space(space_name)
+    return set(sp.fit_columns) | set(sp.advisory_columns) | _WEIGHTS
+
+
+@pytest.mark.parametrize("basis", ["chieff", "component", "nospin"])
+def test_pe_datasets_are_all_declared(tmp_path, basis):
+    store = _two_event_store(tmp_path)
+    out = tmp_path / f"pe_{basis}.h5"
+    _export(store, out, spin_basis=basis)
+    with h5py.File(out, "r") as f:
+        written = set(f.keys())
+    assert written - _declared(basis) == set()
+
+
+def test_chieff_selection_datasets_are_all_declared(tmp_path):
+    from gwcat.selection import SelectionSet
+    from test_selection_spin import write_o4_full
+    path = write_o4_full(tmp_path / "o4.hdf", 200, amax=(0.9, 0.9), seed=4)
+    out = tmp_path / "sel.h5"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        SelectionSet(path).export(str(out), spin_basis="chieff")
+    with h5py.File(out, "r") as f:
+        written = set(f.keys())
+    assert {"a1", "chip"} <= written
+    assert written - _declared("chieff") == set()
+
+
+def test_writer_refuses_an_undeclared_dataset(tmp_path):
+    from gwcat.export.pe_builder import build_pe_product
+    from gwcat.export.writers_gwcat2 import write_pe_gwcat2
+    store = _two_event_store(tmp_path)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        prod = build_pe_product(GWCatalog(store), spin_basis="chieff",
+                                nsamp=16, seed=0, cosmology=_COSMO)
+    prod.columns["mystery"] = np.zeros_like(prod.columns["p_pe"])
+    with pytest.raises(ValueError, match="mystery"):
+        write_pe_gwcat2(prod, str(tmp_path / "x.h5"))
