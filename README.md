@@ -21,14 +21,15 @@ For sky-area computation at ingest (optional): `pip install healpy`
 
 ## End-to-end: PE samples + selection function → darksirens
 
-The full pipeline for a GWTC-5 dark-siren BBH analysis. Steps 1–3 are
-one-time setup; steps 4–8 are the working loop.
+The pipeline for an O3+O4 dark-siren BBH analysis: a gwcat-2.0 `chieff` PE
+file and a `chieff_reference` selection file, the pair darksirens-core reads.
+Steps 1–3 are one-time setup; steps 4–8 are the working loop.
 
 ```python
 from gwcat import GWCatalog, SelectionSet, CombinedSelectionSet
 from gwcat import build_store, validate_export
 from gwcat.fetch import fetch_catalog
-from gwcat.bbh_allowed_names import fetch_bbh_list, BBH_ALL
+from gwcat.bbh_allowed_names import BBH_ALL, BBH_O1O2
 
 # ── 1. Download PE files from Zenodo ─────────────────────────
 paths_21 = fetch_catalog("GWTC-2.1")
@@ -37,52 +38,55 @@ paths_41 = fetch_catalog("GWTC-4.1")
 paths_5  = fetch_catalog("GWTC-5")       # fetches Part 1 + Part 2
 
 # ── 2. Download injection files ──────────────────────────────
-fetch_catalog("injections-O3-BBH", data_dir="./injections")   # O1+O2+O3 BBH
+fetch_catalog("injections-O3-BBH", data_dir="./injections")   # O3a+O3b BBH (endo3_bbhpop)
 fetch_catalog("injections-O4ab",   data_dir="./injections")   # O4a+O4b
 
 # ── 3. Ingest PE files into the store ────────────────────────
 all_pe = paths_21 + paths_3 + paths_41 + paths_5
 build_store(all_pe, "store.h5")           # FAR/p_astro auto-fetched from GWOSC
 
-# ── 4. Build the BBH event list ──────────────────────────────
-# Queries GWOSC for all events with m2_source > 3 Msun (= BBH threshold).
-# Falls back to a static list of 126 confirmed O1–O4a events if offline.
-# Once GWOSC indexes GWTC-5.0, this returns all 259 BBH automatically.
-bbh_names = fetch_bbh_list()              # live from GWOSC
-# bbh_names = BBH_ALL                    # offline / reproducible fallback
+# ── 4. The BBH event list ────────────────────────────────────
+# BBH_ALL is the curated GWTC-5.0 population sample: 259 BBH from O1-O4b with
+# FAR < 1/yr and the non-BBH exclusions applied, bundled (no network).  The
+# O3+O4 injections of step 7 hold no O1/O2 exposure, so the 10 O1/O2 events
+# are left out; gwcat validate does not catch that mismatch for this pair.
+o1o2 = set(BBH_O1O2)
+bbh_names = [n for n in BBH_ALL if n not in o1o2]        # 249 O3+O4 BBH
 
 # ── 5. Explore the catalog ───────────────────────────────────
 cat = GWCatalog("store.h5")
 cat.summary()                             # compact event table
-bbh = cat.select(
-    allowed_names=bbh_names,              # authoritative GWTC-5 BBH list
-)
+bbh = cat.select(allowed_names=bbh_names) # the whitelist is authoritative
 print(f"Selected {bbh.n_events} events")
 
-# ── 6. Export PE samples for darksirens ──────────────────────
-cat.to_darksirens(
-    "gw_bbh.h5",
-    compact_type=None,                    # no derived gate; whitelist is authoritative
-    allowed_names=bbh_names,
-    nsamp=4096,
-    z_max=10.0,                           # per-sample redshift cut
-    cosmology=(67.74, 0.3089),
-    seed=0,
-)
+# ── 6. Export PE samples (gwcat-pe-2.0, chieff basis) ────────
+bbh.export("gw_bbh.h5", format="gwcat2", spin_basis="chieff",
+           waveform_policy="mixed-first", nsamp=4096, seed=0)
 
-# ── 7. Export combined selection function ────────────────────
+# ── 7. Export the O3+O4 selection function ───────────────────
+# chieff_reference keeps each campaign's exact component spin draw and divides
+# in the isotropic reference prior the PE side assumes (magnitudes uniform on
+# [0, 0.99]).  The legacy chi_eff swap (to_darksirens) refuses rpo4ab, whose
+# spins are not drawn uniform-isotropic.
 sel_o3 = SelectionSet("injections/injections-O3-BBH/endo3_bbhpop-LIGO-T2100113-v12.hdf5")
-sel_o4 = SelectionSet("injections/injections-O4ab/mixture-real_o4a_o4b-cartesian_spins.hdf")
+sel_o4 = SelectionSet("injections/injections-O4ab/samples-rpo4ab-1366933504-55469568-clipped.hdf")
 combined = CombinedSelectionSet([sel_o3, sel_o4])
-combined.to_darksirens("selection_bbh.h5", far_threshold=1.0)
+combined.export("selection_bbh.h5", format="gwcat2",
+                spin_basis="chieff_reference", spin_reference_amax=0.99,
+                far_threshold=1.0)
 
 # ── 8. Validate before running darksirens ────────────────────
-validate_export("gw_bbh.h5", "selection_bbh.h5")
+# strict=True raises on every failed check; without it some cross-file checks
+# only warn and record the failure in the returned dict.  On this pair strict
+# mode refuses the posterior rows above the 0.99 spin ceiling unless step 6
+# drops them (drop_spin_above_ceiling=True), and the Mixed-label events that
+# divide out a borrowed spin prior unless they are on a spin-prior allow-list
+# (spin_prior_allow_list=...).
+results = validate_export("gw_bbh.h5", "selection_bbh.h5", strict=True)
 
 # ── 9. Run darksirens ────────────────────────────────────────
-# from darksirens.gw.utils import load_gw_samples, load_selection_samples
-# m1, m2, dL, chieff, ra, dec, p_pe, nEvents, nsamp = load_gw_samples("gw_bbh.h5")
-# m1s, m2s, dLs, chis, ras, decs, pdraw, ndraw = load_selection_samples("selection_bbh.h5")
+# darksirens-core reads this gwcat-2.0 pair.  The legacy darksirens reads the
+# gwcat-1.0 files of GWCatalog.to_darksirens and SelectionSet.to_darksirens.
 ```
 
 ## BBH event selection
@@ -94,34 +98,52 @@ and can be hard to fetch in bulk).
 ```python
 from gwcat.bbh_allowed_names import fetch_bbh_list, refresh_bbh_list, BBH_ALL
 
-# Live query — returns 259 events once GWOSC indexes GWTC-5.0:
-bbh_names = fetch_bbh_list()
-
-# Offline / reproducible — 126 confirmed O1–O4a events:
+# The population sample: the curated, bundled GWTC-5.0 list -- 259 BBH from
+# O1-O4b with FAR < 1/yr, non-BBH exclusions applied.  No network.
 bbh_names = BBH_ALL
 
-# One-time refresh: run this when GWOSC has indexed GWTC-5.0 to print
-# the O4b event list you can paste into BBH_O4B in bbh_allowed_names.py:
+# A live GWOSC candidate list (network): a mass cut with NO FAR cut, so it is
+# not the population sample (about 272 names expected from the 2026-09-24
+# cumulative table).
+candidates = fetch_bbh_list()
+
+# Maintenance: print, per observing run, the live names the bundled event-list
+# files do not hold yet.  Check each against the population Event_list first.
 refresh_bbh_list()
 ```
 
-`fetch_bbh_list()` queries `gwosc.org/api/v2/event-versions` with a
-`min-mass-2-source=3.0` filter, which is the exact threshold the LVK uses to
-classify events as BBH in the GWTC-5 populations paper. It follows pagination
-automatically and excludes NSBH/BNS by construction. No manual exclusion list
-needed.
+`fetch_bbh_list()` queries `gwosc.org/api/v2/event-versions` for every version
+of every event, without `lastver` and without a server-side mass filter. Only
+versions from an LVK GWTC catalog count, and the highest of them decides: the
+event is kept when that version is in a confident list and its
+`mass_2_source` exceeds `m2_min` (3 M⊙). An event LVK later moved to a
+marginal or auxiliary list (GW190424_180648, GW190909_114149) stays out, and
+the curated non-BBH exclusions are removed. Offline it falls back to `BBH_ALL`
+with a warning; `require_live=True` refuses instead, and
+`fetch_bbh_list_with_source()` says which list you got.
+`get_bbh_allowed_names()` replaces the curated list with a live one only when
+`adopt_live_list=True`.
 
-`allowed_names` can be combined with any other `select()` cuts:
+A name whitelist is not automatically reproducible on the injection side. The
+259-event list coincides with a posterior-median m2 >= 3 M⊙ cut, which an
+uncut selection file does not apply; `gwcat validate` warns when a
+whitelisted PE file meets a selection with no class cut.
+
+`allowed_names` composes with the other `select()` cuts, but a cut on a
+per-event point estimate has no injection-side counterpart:
+
+* `m1_src_range` / `m2_src_range` / `sky_area_max` are refused at export
+  unless declared (`allow_unpaired_point_estimate_cuts=True` on `select()` or
+  the export), and a declared cut is recorded as `point_estimate_cuts`;
+* `snr_min` cuts on the posterior-median SNR: it warns about, and records as
+  `n_events_missing_snr`, events dropped only because their SNR is unknown,
+  and `gwcat validate` refuses any PE file cut on it;
+* the FAR cut is inclusive (`far <= far_max`, recorded as `far_cut_operator`)
+  while the injection mask is strict, and events sitting on the rounded
+  threshold are named.
 
 ```python
-# Allowed list + additional mass cut
-bbh = cat.select(
-    allowed_names=bbh_names,
-    m1_src_range=(5, 100),
-    snr_min=8.0,
-)
-
-# Or pass directly to the exporter (skips a separate select() call).
+# The whitelist passed directly to the exporter (skips a separate select()).
 # compact_type=None avoids adding a derived compact-type gate on top of the
 # authoritative whitelist.
 cat.to_darksirens(
@@ -142,7 +164,7 @@ from gwcat import merge_store
 from gwcat.fetch import fetch_catalog
 
 new_paths = fetch_catalog("GWTC-5", data_dir="./GWTC")
-merge_store("store.h5", new_paths)   # duplicates auto-skipped, FAR auto-fetched
+merge_store("store.h5", new_paths)   # rows already stored are skipped, FAR auto-fetched
 ```
 
 ## Quick start (CLI)
@@ -166,17 +188,33 @@ gwcat inspect store.h5                                # events, sample sets, par
                                                        # availability, source classes
 gwcat inspect store.h5 --json                         # same, machine-readable
 
-gwcat export-darksirens store.h5 --out gw_bbh.h5 \
-    --source-class bbh --spin-prior-mode include \
-    --waveform-policy mixed-first --cosmology 67.74,0.3089 \
-    --far-max 1.0 --allow-missing-far --nsamp 4096 --seed 0
+# gwcat-2.0 pair for O3 + O4ab (population.txt: full event names, one per line)
+gwcat export pe store.h5 --out gw_bbh.h5 --format gwcat2 --parameter-space chieff \
+    --event-list population.txt --waveform-policy mixed-first --nsamp 4096 --seed 0
+gwcat export selection endo3_bbhpop-LIGO-T2100113-v12.hdf5 \
+    samples-rpo4ab-1366933504-55469568-clipped.hdf --out selection_bbh.h5 \
+    --format gwcat2 --parameter-space chieff_reference --spin-reference-amax 0.99 \
+    --far-threshold 1.0
 
-gwcat selection --injections inj_o3.hdf inj_o4.hdf \
-    --out selection_bbh.h5 --source-class bbh --far-threshold 1.0 \
-    --H0 67.74 --Om0 0.3089
+gwcat validate --strict gw_bbh.h5 selection_bbh.h5    # exit 0 iff every check passes
 
-gwcat validate gw_bbh.h5 selection_bbh.h5             # exit 0 iff every check passes
+# gwcat-1.0 files for the legacy darksirens.  `gwcat selection` is the v1
+# chi_eff swap: it needs uniform-isotropic spin draws and refuses O4ab.
+gwcat export-darksirens store.h5 --out gw_v1.h5 --event-list population.txt \
+    --waveform-policy mixed-first --cosmology 67.74,0.3089 --nsamp 4096 --seed 0
+gwcat selection --injections endo3_bbhpop-LIGO-T2100113-v12.hdf5 \
+    --out selection_v1.h5 --far-threshold 1.0
 ```
+
+`--event-list` refuses names the store does not hold (and suggests the store's
+spelling for a date-only name); `--allow-missing-events` restores the old skip
+and records `event_list_missing_names` in the validation summary. Date-only
+names (`GW150914`) resolve only for the 23 historical discovery names in
+`gwcat.population_samples.HISTORICAL_DATE_ONLY_NAMES`. No selection command
+needs `--H0`/`--Om0`: each campaign's Jacobian uses its own cosmology (the
+shipped `dluminosity_distance_dredshift`, else its detected generation
+cosmology), and an override that differs from a detectable generation
+cosmology warns, since the result is not a valid draw density.
 
 Run `gwcat --help` / `gwcat <subcommand> --help` for the full flag reference.
 See `examples/bbh_workflow.md` and `examples/all_cbc_workflow.md` for the
@@ -216,11 +254,17 @@ gwcat validate --strict pe.h5 sel.h5 --spin-prior-allow-list allow.txt
   table's sha256.  `meta_data/cosmology` is never read.  A `_cosmo` file of a
   catalog the table lacks is refused.  The pre-GW-40 astropy default is bundled
   as `release_reweight_cosmology_legacy_astropy.yaml`, for regressions only.
+  PE exports carry the choice per event (`dL_prior_cosmology_source_per_event`,
+  `dL_prior_cosmology_table_sha256_per_event`, and
+  `release_reweight_cosmology_table_ids` naming each table), and
+  `gwcat validate --require-exact-priors` refuses events evaluated with the
+  legacy table (files written before this record pass with a warning).
 * **Per-prior provenance.** Each row records `prior_source_{label,kind}_{mass,
   spin,dL}`; kinds are `own_analytic`, `sibling_inherited`,
   `config_file_declared` (LALInference `engine/a_spin{1,2}-max`),
-  `assumed_default`, `release_reweighted`, `constituent_mixture`.  PE exports
-  carry them as `prior_source_kind_*_per_event`.  **Changed meaning:**
+  `assumed_default`, `release_reweighted`, `constituent_mixture`.  gwcat-2.x
+  PE exports carry them as `prior_source_kind_*_per_event`; the v1
+  `to_darksirens` carries the spin one (`prior_source_kind_spin_per_event`).  **Changed meaning:**
   `chi_eff_amax_source_per_event` now holds the spin prior's source KIND
   (`own_analytic`, `sibling_inherited`, ...) whenever the ceiling came from
   the store; the pre-GW-40 value (`analytic` / `fallback` / `caller`) moved to
@@ -252,10 +296,38 @@ gwcat validate --strict pe.h5 sel.h5 --spin-prior-allow-list allow.txt
   resampling (exact rejection to U(0, amax)).  It runs after any `--z-max`
   cut: `n_dropped_spin_above_ceiling_per_event` counts the samples removed
   from the z <= z_max pool, `n_above_spin_ceiling_raw_per_event` the whole raw
-  label (equal when no z_max), and `spin_ceiling_cut_order` says which.
+  label (counted with or without the cut; -1 where it cannot be counted), and
+  `spin_ceiling_cut_order` says which.  `n_exported_above_spin_ceiling_per_event`
+  counts the exported rows above the declared ceiling (0 under the cut).  The
+  cut is off by default.  Without it a `chieff` PE file keeps rows that a
+  `chieff_reference` selection gives zero weight: the PE builder warns, and
+  `gwcat validate --strict` refuses the pair (`xcheck_reference_spin_support`).
 * **`--constituent-mixture-prior`** (ingest; only for policies that use
-  `C00:Mixed`): the equal-weight mixture of the constituents' own priors, with
-  the mixing fractions verified row by row.
+  `C00:Mixed`): a mixture of the constituents' own priors, with the mixing
+  fractions verified row by row.  Every `Constraint` of a constituent enters
+  the support (NRSur7dq4's total-mass cut used to be dropped), and a
+  `Constraint` the support cannot implement refuses the mixture.
+  `--constituent-mixture-convention {equal_weight,own_prior}` chooses equal
+  weights (the default) or each row's own constituent prior, recorded in the
+  row's prior sources.  Without the option a Mixed row borrows one
+  constituent's prior (the constituents its `meta_data/combined` record names
+  first, then its siblings) and records `mixed_constituent_labels` /
+  `mixed_constituent_priors`; a mismatch between them warns.
+* **Ingest guards (all off by default).**
+  `--refuse-mixed-prior-mismatch` (`IngestConfig(mixed_prior_mismatch="raise")`)
+  refuses a Mixed row whose constituents declare different analytic priors;
+  `--refuse-spin-above-amax` (`spin_exceeds_amax="raise"`) a row whose spin
+  samples exceed its resolved ceiling (recorded as `spin_sample_max_1/2`);
+  `--refuse-defaulted-cosmology` (`defaulted_cosmology_fatal=True`) a
+  cosmology-dependent distance prior that names no cosmology.  The distance-
+  prior KS threshold is `max(prior_ks_max, ` the Kolmogorov critical value at
+  `prior_ks_alpha` (1e-3) for the row's N`)`, with `dL_prior_ks_threshold`,
+  `dL_prior_n_prior_samples`, `dL_prior_frac_mass_uncovered`,
+  `dL_prior_frac_samples_outside` and `dL_prior_bounds_pvalue` recorded per
+  row (`prior_bounds_pvalue_min`, 1e-3).  An (event, sample set) repeated in one
+  build raises `DuplicateSampleSetError`.  The store records its writer
+  version and commit, the `IngestConfig`, the release-table sha256 and its
+  inputs (`gwcat.ingest.read_store_provenance`).
 * **Exact priors (GW-40i).** Both analytic factors of `p_pe` and of a
   chieff-type `pdraw` are evaluated exactly, not interpolated:
   * the isotropic uniform-magnitude `p_iso(chi_eff | q, amax)` by the
@@ -296,8 +368,10 @@ inputs, not by the exporter, so the label travels with the data:
 * **Store.** `build_store(..., mock_data=True)` (or the record writer
   `ingest._write_store_from_records(..., mock_data=True)` a mock bridge calls)
   writes a file-level `mock_data=True` attr. `GWCatalog(...).mock_data` reads
-  it, every view inherits it, and a merge holding any mock row is mock (with
-  a warning when a mock and a real store are merged).
+  it, and every view inherits it.  A merge is mock when a row it writes came
+  from a mock store (with a warning when a mock and a real store are merged);
+  `merge_store(..., mock_data=None)` inherits the existing store's flag, and
+  `mock_data=True` marks appended synthetic PE.
 * **Injections.** An injection file whose root attrs carry `mock_data=True`
   is synthetic; `SelectionSet(...).mock_data` reads it, and a
   `CombinedSelectionSet` is mock when any campaign is.
@@ -311,9 +385,10 @@ inputs, not by the exporter, so the label travels with the data:
   and selection exports (absent means real), and a PE export from a real
   store still writes `mock_data=False`, so real-data stores and exports are
   byte-identical to before.
-* **Validation.** `gwcat validate` accepts `mock_data=True`, requires a boolean
-  on the PE side, and warns (does not fail) when only one side of a pair is
-  mock. The flag is provenance, not a pairing declaration, so it is not in
+* **Validation.** For gwcat-2.x pairs `gwcat validate` accepts
+  `mock_data=True`, requires a boolean on the PE side, and warns (does not
+  fail) when only one side of a pair is mock.  The format 1.0 validator does
+  not check `mock_data`. The flag is provenance, not a pairing declaration, so it is not in
   the 2.1 `contract` or `contract_hash`.
 
 ### Validation summaries
@@ -325,7 +400,10 @@ level this is opt-in via `write_summary=True` on `build_store`,
 `GWCatalog.to_darksirens`, and `SelectionSet`/`CombinedSelectionSet.to_darksirens`
 (default `False`, so existing calls are unaffected). The `.md` is a
 human-rendering of the exact same dict written to `.json` -- never a separate
-computation.
+computation.  The `.json` is strict JSON (a NaN is written as `null`); both
+are written atomically, a gwcat-2.x summary carries the `output_sha256` of the
+file it describes, and a re-export removes the previous summary before the
+new file is published.
 
 Fields actually reported (never fabricated -- a value not available from the
 store/export is simply omitted): `package_version`, `schema_version`,
@@ -447,17 +525,28 @@ injections by source class — BBH / NSBH / BNS / MassGap / `cbc` (all
 compact-binary classes).  Injections are classified by their *injected*
 source-frame component masses using the **same shared mass-threshold classifier**
 (`gwcat.source_class.classify_by_mass`, NS/BH split at 3 M⊙) that labels PE
-events, so a `bbh` selection of injections is consistent with a `bbh` selection
-of PE events by construction.  `source_class=None` (the default) applies no
-restriction and is byte-identical to the pre-existing export.
+events.  The same threshold is applied to different quantities, though: PE
+events are classified from posterior-median masses and injections from their
+injected true masses, so a `bbh`/`bbh` pair does not describe one cut, and
+`gwcat validate` refuses it (`xcheck_source_class_estimator`).  Prefer no
+class cut on either side, with the classes modelled in the population.
+`source_class=None` (the default) applies no restriction and is
+byte-identical to the pre-existing export.
 
 ```python
-sel = SelectionSet("injection_file.hdf", H0=67.74, Om0=0.3089)
+sel = SelectionSet("injection_file.hdf")          # each campaign's own cosmology
 sel.n_injections                                  # total in file
 sel.detection_efficiency(far_threshold=1.0)       # fraction detected
 sel.source_class_mask("nsbh")                     # boolean mask by injected mass
-sel.to_darksirens("selection_bbh.h5", far_threshold=1.0, source_class="bbh")
+sel.export("selection.h5", spin_basis="component", far_threshold=1.0)
 ```
+
+The Jacobian cosmology needs no `H0=`/`Om0=`: a file that ships
+`dluminosity_distance_dredshift` uses it, any other uses the generation
+cosmology detected from its (z, dL) pairs (a named astropy cosmology with
+radiation gets that object's Jacobian).  An override that differs from a
+detectable generation cosmology warns, because the draw density is fixed by
+the file and the result is not a valid density.
 
 **Source-class filtering is subsetting, not reweighting.** `ndraw`
 (`total_generated`) is left unchanged, following the Essick et al. (2023)
@@ -475,7 +564,18 @@ explicit provenance in its attrs:
   columns were thresholded), `significance_type`, `significance_far_threshold`,
   `significance_available`, and `p_astro_available=False` (explicit absence —
   no per-injection `p_astro` is used for thresholding), mirroring the FAR
-  contract.
+  contract;
+- per campaign: the GPS span and its source, the observing runs covered,
+  `T_obs_yr`, the injection file's path, size and sha256, the p_astro columns
+  carried (`p_astro_used_for_detection=False`), the generation cosmology and
+  model, `pdraw_normalisation`, and `injection_draw_domain_per_campaign` (the
+  mass and redshift box each campaign declares, with `_mismatch`,
+  `_mismatch_detail`, `_policy` and `_applied`).  A campaign drawn past
+  another's declared domain (rpo4ab against endo3's mass and redshift bounds)
+  warns.  `export(..., draw_domain="intersection")` (Python only) keeps only
+  the detected injections inside the domain every campaign declares; `ndraw`
+  is unchanged, so the population model and the PE samples must be truncated
+  to the same domain.
 
 ### `CombinedSelectionSet` — multi-campaign combination
 
@@ -486,32 +586,42 @@ unchanged):
 
 ```python
 sel_o3 = SelectionSet("endo3_bbhpop-LIGO-T2100113-v12.hdf5")
-sel_o4 = SelectionSet("injections-O4ab/...-cartesian_spins_*.hdf")
+sel_o4 = SelectionSet("samples-rpo4ab-1366933504-55469568-clipped.hdf")
 combined = CombinedSelectionSet([sel_o3, sel_o4])
-combined.to_darksirens("selection_bbh.h5", far_threshold=1.0, source_class="bbh")
+combined.export("selection_bbh.h5", spin_basis="chieff_reference",
+                spin_reference_amax=0.99, far_threshold=1.0)
 ```
+
+The same campaign twice (by path or by content) and two campaigns over
+overlapping GPS time are refused.  The scalar `cosmology_H0` / `cosmology_Om0`
+is the cosmology every campaign's `pdraw` used, and NaN when they differ or
+none was used (as for O3 + O4ab); read `cosmology_*_per_campaign`.
 
 ### `validate_export` — pre-flight checks & cross-validation
 
 ```python
 from gwcat import validate_export
-results = validate_export("gw_bbh.h5", "selection_bbh.h5")
+results = validate_export("gw_bbh.h5", "selection_bbh.h5", strict=True)
 # Internal checks: array lengths, p_pe/pdraw finite+positive, source≤detector
 # masses, format versions.
 ```
 
 When a selection file is supplied, `validate_export` **cross-validates the PE
-export against the selection export** and raises a clear `ValueError` on any
-contract mismatch (the point is to stop a file that looks valid while carrying
-the wrong prior/cosmology/source class):
+export against the selection export** (the point is to stop a file that looks
+valid while carrying the wrong prior/cosmology/source class).  With
+`strict=True` every failed check raises `ValueError`; without it most
+contract mismatches still raise, but some only warn and record the failure in
+the returned dict, so read it.  Use `strict=True` whenever the pair gates an
+analysis:
 
 - **spin-prior contract** — `spin_prior_mode` must match and the
   `chi_eff_prior_applied_to_p_pe` / `chi_eff_prior_applied_to_pdraw` flags must
   agree, so the chi_eff prior is applied exactly once end-to-end;
 - **cosmology** — the selection cosmology must match the PE cosmology; when the
   PE export carries per-event cosmologies (`cosmology_per_event_varies=True`),
-  every per-event value is compared against the single selection cosmology
-  rather than a legacy scalar;
+  every per-event value is compared against the selection's cosmology.  For
+  gwcat-2.x files that is each campaign's recorded cosmology, not the scalar,
+  and a varying PE cosmology without per-event arrays is refused;
 - **source-class compatibility** — the PE and selection `source_class_filter`
   attrs must resolve to the same canonical class set (the injections must cover
   the same source class(es) as the PE events).
@@ -525,8 +635,12 @@ merge_store("store.h5", new_paths, out_path="store_v2.h5")  # or to a new file
 merge_stores("a.h5", "b.h5", "merged.h5")         # merge two existing stores
 ```
 
-Skips duplicate event names automatically.  Both merges are
-**schema-preserving**: the output holds the *union* of parameters across the
+Row identity is `(event_name, sample_set_name)`: a row of a new sample set
+for a known event is added, and a duplicate is skipped with a warning
+(`on_duplicate_key="refresh"` replaces it instead).  An event's preferred row
+is one key whatever its label, so a re-release whose preferred label changed
+replaces, or is skipped against, the old preferred row instead of adding a
+second one.  Both merges are **schema-preserving**: the output holds the *union* of parameters across the
 inputs.  A parameter present in only some events (e.g. BNS tidal columns absent
 from BBH events) is kept as a full column, NaN-filled for the events that lack
 it and marked unavailable in the availability mask — never silently dropped by
@@ -599,14 +713,15 @@ filters, metadata/validation blocks).
 ```python
 from gwcat.bbh_allowed_names import fetch_bbh_list, refresh_bbh_list, BBH_ALL
 
-fetch_bbh_list()           # live GWOSC query; returns 259 events once GWTC-5.0 indexed
-BBH_ALL                    # static fallback: 126 confirmed O1–O4a BBH
-refresh_bbh_list()         # print O4b event names to populate BBH_O4B
+BBH_ALL                    # curated population sample: 259 BBH, O1-O4b, FAR < 1/yr
+fetch_bbh_list()           # live GWOSC candidates: mass cut, no FAR cut (~272)
+refresh_bbh_list()         # print live names the bundled per-run files lack
 ```
 
-`fetch_bbh_list()` uses the GWOSC v2 API filter `min-mass-2-source=3.0`, which
-is the LVK's standard BBH classification boundary. NSBH/BNS events are
-excluded automatically without any manual exclusion list.
+`BBH_ALL` is the union of the bundled per-run files under
+`gwcat/data/event_lists/` minus the curated non-BBH exclusions.
+`fetch_bbh_list()` is described under "BBH event selection" above; it is a
+candidate list for refreshing the curated one, not a population sample.
 
 ### Offline mode & metadata provenance
 
@@ -708,11 +823,18 @@ Two consistent selection recipes:
 - **O1–O4b (events from all runs):** the cumulative mixture ALONE, exported
   with `--detection-policy lvk-cumulative --snr-threshold 10 --sky-marginal`
   (see `SelectionSet` above).  Its O3 rows are the endo3 multi-population
-  mixture, not `endo3_bbhpop`.
+  mixture, not `endo3_bbhpop`.  The release ships no sky positions, so this
+  product is sky-marginal, and darksirens-core cannot load a sky-marginal or
+  NaN-sky selection file (the writer warns); it serves only a sky-independent
+  fit in another consumer.  `gwcat validate` refuses a PE event from a run in
+  which the mixture detects nothing.
 - **O3+O4 only (no O1/O2 events):** `injections-O3-BBH` + `injections-O4ab`
   combined via `CombinedSelectionSet`, or the cumulative mixture with its O1/O2
   rows excluded (`--acknowledge-semianalytic-excluded`; each row's weight
-  carries its own run's T_k/N_k, so this is exact).
+  carries its own run's T_k/N_k, so this is exact).  The PE file must then
+  hold no O1/O2 event: the selection records its campaigns' GPS spans and
+  runs, but `gwcat validate` does not yet compare them with the PE events for
+  the endo3 + rpo4ab pair.
 
 Never combine the cumulative mixture with `injections-O3-BBH` or
 `injections-O4ab`: it already holds their exposure, and the export refuses it
@@ -753,7 +875,13 @@ darksirens never hardcodes a cosmology for the dL→z conversion.
 
 **Mode A is the default.** gwcat includes the 1-D isotropic chi_eff prior in
 *both* exported weights: `p_pe` (PE export) and `pdraw` (selection export).
-This is the historical behavior and is byte-for-byte unchanged.
+The convention is the historical one, but the numbers are not byte-for-byte
+the old ones: the chi_eff prior is evaluated exactly by default (GW-40i;
+the old 200 x 2000 table was off by up to ~1e-2 in ln p), each campaign's
+`pdraw` uses its own detected spin ceiling, and the chi_eff swap refuses a
+campaign whose spins are measurably not uniform-isotropic.
+`--legacy-grid-priors` (with the legacy release-reweight table at ingest)
+restores the interpolated priors for regressions against older products.
 
 - **What downstream (darksirens) must do in the default (`include`) mode:**
   read `p_pe` / `pdraw` as-is. **Do NOT** multiply the chi_eff prior again —
@@ -844,10 +972,25 @@ the same 259 events:
 
 `format="gwcat2.1"` writes `gwcat-pe-2.1` / `gwcat-selection-2.1`, adding
 `parameter_space`, `fit_columns`, `advisory_columns`, `block_provenance` and a
-16-hex `contract_hash` that makes a mismatched PE/selection pairing one
-comparison. **2.0 remains the default**: a consumer's `format_version` allowlist
+16-hex `contract_hash` over the pairing declaration (parameter space and
+columns, spin-basis kind and exactness, the sky convention, the canonical
+source class and, when set, the source-class cut estimator and threshold and
+`z_max`). A hash match is
+necessary, not sufficient: the hash leaves out the detection cut, the
+cosmology, the spin ceilings, `chi_eff_prior_impl` and `mock_data`, so a
+consumer that compares hashes only must also run `gwcat validate`. The 2.1
+hash does not yet accept the `chieff` PE plus `chieff_reference` selection
+pair. **2.0 remains the default**: a consumer's `format_version` allowlist
 is a closed literal tuple, so a 2.1 file is unloadable until that consumer is
-patched.
+patched, and 2.0 carries no `contract_hash` at all.
+
+The 2026-10-20 review changed every 2.1 `contract_hash` (`sky_prior_in_density`
+is now `False`, since neither `p_pe` nor `pdraw` contains the `-ln 4π`; the
+advisory columns of every space changed; the class-cut and `z_max` keys were
+added), so 2.1 files written before it do not pair with files written after:
+re-export both halves together. A 2.1 selection with any non-finite row in a
+fit column (ra/dec of a campaign that drew no sky) is refused; use
+`--sky-marginal`.
 
 ## Spin bases and gwcat-2.0 exports
 
@@ -856,13 +999,15 @@ files and `format_version="gwcat-selection-2.0"` selection files in one of three
 **spin bases**. A basis fixes *which spin coordinates are exported* and *which
 spin prior is divided out of the exported weights* (`p_pe` on the PE side,
 `pdraw` on the selection side). Pick a PE basis and its matching selection basis
-— they must agree, and `gwcat validate` refuses a mismatched pair.
+— they must agree (a `chieff` PE file pairs with a `chieff` or a
+`chieff_reference` selection), and `gwcat validate` refuses a mismatched pair.
 
 | Basis | Exported spin columns | Prior divided out | Use when |
 |---|---|---|---|
 | `chieff` | `chieff` | 1-D isotropic `chi_eff` prior (the legacy swap) | You want a **legacy-compatible** file: `p_pe`/`pdraw` are byte-for-byte identical to `to_darksirens` for the same arguments. |
 | `component` | `chieff`, `a1`, `a2`, `cost1`, `cost2`, `chip` | flat component-spin prior `1/(4·amax₁·amax₂)` | You want the **exact** per-injection component spin draw retained for **any** injection format, including cumulative **mixtures**. |
-| `chieff_chip` | `chieff`, `chip` (+ `a1`,`a2`,`cost1`,`cost2` when available) | joint analytic `(chi_eff, chi_p)` prior | You want the **2-D analytic** joint prior. Valid **only** for a single uniform-magnitude / isotropic injection draw; a cumulative mixture is refused with `SpinBasisError`. |
+| `chieff_chip` | `chieff`, `chip` (+ `a1`,`a2`,`cost1`,`cost2` when available) | joint analytic `(chi_eff, chi_p)` prior | You want the **2-D analytic** joint prior. Valid **only** for a single uniform-magnitude / isotropic injection draw; a cumulative mixture is refused with `SpinBasisError`. Opt-in (`--allow-projection-basis`). |
+| `chieff_reference` (selection only) | `chieff` (fit), `a1`,`a2`,`cost1`,`cost2`,`chip` (advisory) | the campaign's exact component spin draw, then the isotropic reference `p_ref = 1/(4 a_ref²)` divided in | Pairs with a `chieff` PE file on **any** campaign, including those the `chieff` swap refuses (the production O3 + O4ab selection): `pdraw = pdraw_component · p_iso(chieff \| q, a_ref) · 4 a_ref²`, with `a_ref` stated explicitly (`--spin-reference-amax`). Rows with `a1` or `a2` above `a_ref` have zero reference density and are written with `pdraw = spin_reference_excluded_pdraw` (1e300; at least 1e100 is required), i.e. weight zero, counted in `spin_reference_excluded_rows`. The drawn tilts and magnitudes must cover the reference (`spin_reference_coverage_*`). |
 
 ### Component-basis draw conversion per injection format
 
@@ -894,8 +1039,9 @@ them.
   evaluated exactly since GW-40i) at `--amax` (default `auto`), applied exactly
   as in `to_darksirens`.
 - **`chieff_chip`** — the joint `(chi_eff, chi_p)` analytic prior at the event's
-  `amax₁`; a per-event `amax₁ ≠ amax₂` warns and uses `amax₁`
-  (`spin_amax_mismatch_events`).
+  `amax₁`; a per-event `amax₁ ≠ amax₂` is refused unless `amax=` states one
+  ceiling or (Python only) `allow_chieff_chip_amax_mismatch=True` keeps the
+  `amax₁` evaluation, warned and recorded in `spin_amax_mismatch_events`.
 
 ### Example commands
 
@@ -907,9 +1053,9 @@ gwcat export pe store.h5 --out gw_bbh.h5 --spin-basis component --source-class b
 gwcat export selection O3.hdf O4.hdf --out selection_bbh.h5 \
       --spin-basis component --source-class bbh --far-threshold 1.0
 
-# chieff_chip needs a single uniform-isotropic draw per campaign; a mixture
-# is refused with SpinBasisError (use --spin-basis component instead).
-gwcat export pe store.h5 --out gw_cc.h5 --spin-basis chieff_chip
+# chieff_chip is opt-in and needs a single uniform-isotropic draw per campaign;
+# a mixture is refused with SpinBasisError (use --spin-basis component instead).
+gwcat export pe store.h5 --out gw_cc.h5 --spin-basis chieff_chip --allow-projection-basis
 
 # Validate — auto-detects the format_version and dispatches to the right
 # validator (gwcat-2.0 files -> validate_export_v2; gwcat-1.0 files -> the v1
@@ -927,11 +1073,14 @@ source-class filters must agree (same tolerances as the v1 validator), and — f
 quantities: the PE side divides out its posterior's spin prior, the selection
 side swaps the injected draw density; forcing them to match would be wrong).
 
-> **The 1.0 formats are frozen.** `GWCatalog.to_darksirens()`, the
-> `SelectionSet`/`CombinedSelectionSet` `to_darksirens()` exporters, and their
-> `gwcat-1.0` / `gwcat-selection-1.0` outputs are unchanged and remain the
-> supported path for current darksirens runs. The gwcat-2.0 exports live
-> alongside them; the darksirens migration to the 2.0 formats comes later.
+> **The 1.0 formats keep their layout, not their old numbers.**
+> `GWCatalog.to_darksirens()`, the `SelectionSet`/`CombinedSelectionSet`
+> `to_darksirens()` exporters, and their `gwcat-1.0` / `gwcat-selection-1.0`
+> outputs remain the path for the legacy darksirens. Their values changed
+> with the exact chi_eff prior default, the per-campaign spin ceilings and the
+> isotropy gate (see "Prior convention" above); `--legacy-grid-priors`
+> restores the interpolated priors of older products. darksirens-core reads
+> the gwcat-2.0 exports.
 
 ### Cosmology convention (per-event cosmology contract)
 
@@ -1009,7 +1158,7 @@ exactly one sample set per event.
 | `preferred` (default) | Pick by `is_preferred`, then smallest `priority_rank`. |
 | `mixed-first` | Prefer an `is_mixed` set; else fall back to `preferred`. |
 | `strict-approximant` | Require `approximant=...` for **every** event; **fail loudly** naming events that lack it. |
-| `all` | Keep every sample set; the output is explicitly **not** homogeneous. |
+| `all` | Keep every sample set; the output is explicitly **not** homogeneous, and `gwcat validate` refuses it. |
 
 ```python
 cat.to_darksirens("gw.h5")                                   # preferred (default)
@@ -1072,18 +1221,28 @@ Two things this makes explicit that used to be implicit:
   the original `PowerLaw(alpha=2)` *sampling* prior — verified on the real files,
   where the prior samples follow dL² (KS 0.012) and not `UniformSourceFrame`
   (KS 0.271). The effective prior is therefore `UniformSourceFrame` and the
-  basis is recorded as `release_reweighted`. Point the same code at a `nocosmo`
-  sibling and it dispatches on the declared `PowerLaw` instead. Nothing in gwcat
+  basis is recorded as `release_reweighted`. A `nocosmo` sibling is not
+  reweighted: when its label declares an analytic prior, that class is used;
+  when no label has one (the GWTC-2.1 `_nocosmo` LALInference events), gwcat
+  takes LALInference's dL² prior on the bounds its `config_file/engine`
+  declares, or refuses the row.  It used to assume `UniformSourceFrame` there,
+  which is the wrong density for those files.  Nothing in gwcat
   read this distinction before 1.3: the correctness of 81 rows rested on an
   undeclared property of the input *filename*.
 - **`Planck15_LAL` is not astropy's `Planck15`.** LAL's is (67.90, 0.3065),
   astropy's is (67.74, 0.3075). Cosmology tokens are matched **exactly**; a
   substring test for `"Planck15"` matches both and silently gave 190 O4 rows the
-  wrong values. An unrecognised token is recorded and warned about, never guessed.
+  wrong values. An unrecognised token, or a named cosmology with radiation
+  (astropy's `Planck15`), is refused at ingest, never guessed. A
+  cosmology-dependent prior that names no cosmology takes the per-catalog
+  default, recorded as `dL_prior_cosmology_source = "catalog_default"`
+  (`--refuse-defaulted-cosmology` refuses it).
 
 The KS check compares the **declared sampling** class against the file's own
 prior samples, so a failure means the parse, the bounds or the cosmology mapping
-is wrong. `IngestConfig(prior_ks_fatal=True)` makes that a hard error.
+is wrong. `IngestConfig(prior_ks_fatal=True)` makes that a hard error (a NaN KS
+with prior samples present fails too). It tests the class and the bounds
+only, and is insensitive to the cosmology, so it cannot catch a wrong one.
 - **Union parameter schema** (schema 1.1): ingest and merge store the *union*
   of parameters across events, not the intersection. A parameter present for
   only some events is kept as a full column, NaN-filled for the events that lack
@@ -1102,24 +1261,40 @@ is wrong. `IngestConfig(prior_ks_fatal=True)` makes that a hard error.
   parameter **and** the offending event(s), if a required column is absent from
   the store or NaN-filled for a selected event.
 - **Mass-prior-agnostic store**: keeps `p_dL_pe` + its cosmology.
-  The mass Jacobian is applied only in `to_darksirens`
-  (`_to_darksirens_format` is a deprecated alias kept for compatibility).
+  The mass Jacobian is applied at export, by `to_darksirens` and by the
+  gwcat-2.x PE builder (`_to_darksirens_format` is a deprecated alias kept
+  for compatibility).
 - **BBH selection via `allowed_names`**: the recommended way to select BBH
-  events is via `fetch_bbh_list()` (GWOSC live) or the static `BBH_ALL`,
-  rather than FAR/p_astro cuts that require a separately fetched event table.
+  events is the curated `BBH_ALL` (the population sample; `fetch_bbh_list()`
+  is a live, mass-only candidate list), rather than FAR/p_astro cuts that
+  require a separately fetched event table.
   `allowed_names` is treated as authoritative by default, so a derived
   `compact_type="BBH"` metadata cut is not required. If both are supplied,
   gwcat warns about whitelist events that the compact-type cut would exclude.
 - **Sky area at ingest** (optional): 90% credible area computed via HEALPix
-  and stored as `sky_area_90` metadata, enabling `select(sky_area_max=...)`.
-  Requires `healpy`; NaN if absent.
+  at an adaptive `nside` (at least 20 samples per pixel on average, recorded
+  as `sky_area_90_nside`; NaN when no `nside` qualifies) and stored as
+  `sky_area_90` metadata, enabling `select(sky_area_max=...)`, a point-estimate
+  cut that must be declared at export.  Requires `healpy`; NaN if absent.
+  `observing_run` comes from the median GPS time and gwcat's run windows
+  (`observing_run_source`).
 - **Incremental updates**: `merge_store` appends new events without
   re-ingesting the full catalog.
 
 ## Configuration (`IngestConfig`)
 
 - `o4_waveform_priority`: fallback order when a GWTC-5 event has no `C00:Mixed`.
-- `o3_default_cosmo`: assumed for GWTC-2.1 (no analytic prior); KS-validated.
+- `o3_default_cosmo`: the O1-O3 fallback cosmology for a cosmology-dependent
+  distance prior that declares none.  The release-reweighted GWTC-2.1/3
+  `_cosmo` rows take theirs from the release-reweight table instead
+  (`release_reweight_cosmology_table`), so this has no effect on them.
+- `mixed_prior_mismatch` (`"warn"` / `"raise"`), `spin_exceeds_amax`
+  (`"warn"` / `"raise"`), `defaulted_cosmology_fatal`, `prior_ks_fatal`: the
+  ingest guards above, all off by default.
+- `prior_ks_alpha` (1e-3) and `prior_bounds_pvalue_min` (1e-3): the
+  distance-prior KS and bounds thresholds.
+- `constituent_mixture_prior`, `constituent_mixture_convention`: the opt-in
+  Mixed-row prior above.
 - `nsbh_mass_threshold`: source-frame mass cut for BBH/NSBH/BNS classification.
 - `dL_prior_impl`: `exact` (default, GW-40i); `auto` / `bilby` / `astropy` are
   the legacy interpolated distance priors (`ingest --legacy-grid-priors`).
@@ -1141,10 +1316,10 @@ is wrong. `IngestConfig(prior_ks_fatal=True)` makes that a hard error.
   > `far_available=False` an honest state rather than a fabricated value.
   > **A store ingested before this fix has no usable FAR** — re-ingest before
   > relying on a FAR cut.
-- **GWTC-5.0 GWOSC indexing**: the GWOSC v2 API was not yet updated to include
-  GWTC-5.0 events at the time of the May 2026 paper release. `fetch_bbh_list()`
-  will return the full 259-event list once the API is updated (expected within
-  weeks). Until then, `BBH_ALL` covers the 126 confirmed O1–O4a BBH.
+- **The live BBH list is not the population sample**: `fetch_bbh_list()`
+  applies a mass cut and no FAR cut (about 272 names expected; not re-measured
+  against the live endpoint since the 2026-10-20 fix). The population sample is
+  the bundled `BBH_ALL` (259 BBH, O1-O4b, FAR < 1/yr), which needs no network.
 - ~~**`mass_prior_kind`** is assumed `uniform_detector_frame`.~~  **Parsed since
   GW-07.**  The real releases put the prior on `(chirp_mass, mass_ratio)` and
   record `mass_1`/`mass_2` only as `Constraint(1, 1000)`; the classes are
