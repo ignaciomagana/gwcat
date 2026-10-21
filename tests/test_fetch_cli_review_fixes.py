@@ -3,7 +3,9 @@
   1. The GWOSC BBH query asks for every event version and keeps the highest
      LVK version of each event: under ``lastver=true`` the IAS-O3a version
      superseded ~30 genuine LVK O3a events, which the LVK-catalog filter then
-     dropped.  A cache written by the old query is not replayed.
+     dropped.  A GWTC release's non-confident list takes part in the
+     ordering, so an event LVK demoted in a later release stays out.  A cache
+     written by the old query is not replayed.
   2. Cached GWOSC pages are checked before they are indexed.
   3. ``writer_commit`` names gwcat's own commit or says "unknown": an install
      inside another repository's checkout was stamped with that repository's
@@ -127,6 +129,63 @@ def test_the_highest_lvk_version_decides_the_mass_cut(monkeypatch,
                ("IAS-O3a", "GW190521_030229", 3, 40.0)]
     names = _query(monkeypatch, entries)
     assert ("GW190521_030229" in names) is kept
+
+
+@pytest.mark.parametrize("demoting_list", ["GWTC-2.1-marginal",
+                                           "GWTC-2.1-auxiliary"])
+def test_an_event_demoted_in_a_later_release_stays_out(monkeypatch,
+                                                       demoting_list):
+    """GW190424_180648 and GW190909_114149 were confident in GWTC-2 and are
+    not in GWTC-2.1-confident.  With the non-confident lists ignored, the
+    GWTC-2 version decided and both came back: neither is in the cumulative
+    GWTC table the expected count was measured on, nor in any curated list."""
+    entries = [("GWTC-2", "GW190909_114149", 1, 10.0),
+               (demoting_list, "GW190909_114149", 2, 10.0),
+               ("GWTC-2", "GW190424_180648", 1, 30.0),
+               (demoting_list, "GW190424_180648", 2, None),
+               ("IAS-O3a", "GW190424_180648", 3, 30.0),
+               ("GWTC-3-confident", "GW200129_065458", 1, 29.0)]
+    assert _query(monkeypatch, entries) == ["GW200129_065458"]
+
+
+def test_an_event_only_in_gwtc2_is_kept(monkeypatch):
+    """No later LVK version: the confident GWTC-2 one is current, so the
+    demotion rule does not touch it."""
+    entries = [("GWTC-2", "GW190909_114149", 1, 10.0),
+               ("GWTC-3-confident", "GW200129_065458", 1, 29.0)]
+    assert _query(monkeypatch, entries) == ["GW190909_114149",
+                                            "GW200129_065458"]
+
+
+def test_a_later_confident_version_outranks_an_older_marginal_one(monkeypatch):
+    entries = [("GWTC-3-marginal", "GW200129_065458", 1, None),
+               ("GWTC-4.0", "GW200129_065458", 2, 29.0)]
+    assert _query(monkeypatch, entries) == ["GW200129_065458"]
+
+
+def test_a_marginal_and_a_confident_entry_of_one_version_are_an_error(
+        monkeypatch):
+    entries = [("GWTC-2", "GW190909_114149", 1, 10.0),
+               ("GWTC-2.1-marginal", "GW190909_114149", 1, 10.0)]
+    monkeypatch.setattr(fetch, "_gwosc_json", _fake_gwosc_server(entries))
+    with pytest.raises(RuntimeError, match="cannot be ordered"):
+        fetch.fetch_bbh_names_gwosc(verbose=False)
+
+
+@pytest.mark.parametrize("label,expected", [
+    ("GWTC-2.1-marginal", True),
+    ("GWTC-3-marginal", True),
+    ("GWTC-2.1-auxiliary", True),
+    ("GWTC-1-marginal", True),
+    ("GWTC-2.1-confident", False),
+    ("GWTC-2", False),
+    ("GWTC-5.0", False),
+    ("O3_IMBH_marginal", False),
+    ("IAS-O3a", False),
+    (None, False),
+])
+def test_non_confident_gwtc_list_predicate(label, expected):
+    assert fetch._is_lvk_gwtc_nonconfident_catalog(label) is expected
 
 
 def test_the_version_is_read_from_the_name_suffix_too(monkeypatch):

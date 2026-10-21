@@ -1061,14 +1061,19 @@ def fetch_and_build(
 #: version and keeps the highest LVK version of each event.
 #:
 #: 272 is the same selection measured offline on the GWOSC cumulative GWTC
-#: event table -- the latest LVK version of every event -- as cached on
-#: 2026-09-24: GWTC-5.0 104, GWTC-4.1 86, GWTC-2.1-confident 50,
-#: GWTC-3-confident 32 (the O1/O2 events counted under GWOSC's date-only
-#: names).  It has not been re-measured against the live event-versions
-#: endpoint.  The guard is two-sided against this number: *fewer* means an
-#: incomplete live index, *more* means entries the LVK-catalog filter did not
-#: expect to admit.  It is a warning, not an assertion: it exists to be noticed
-#: and re-baselined by whoever re-runs the query.
+#: event table -- the latest LVK version of every event that LVK's latest
+#: release still lists as confident -- as cached on 2026-09-24: GWTC-5.0 104,
+#: GWTC-4.1 86, GWTC-2.1-confident 50, GWTC-3-confident 32 (the O1/O2 events
+#: counted under GWOSC's date-only names).  The table leaves out the events
+#: LVK demoted in a later release (GW190424_180648 and GW190909_114149), and
+#: so does the query, which lets a GWTC release's non-confident list take part
+#: in the version ordering; one live run that ignored those lists returned
+#: these two on top of 272.  It has not been re-measured against the live
+#: event-versions endpoint since.  The guard is two-sided against this
+#: number: *fewer* means an incomplete live index, *more* means entries the
+#: LVK-catalog filter did not expect to admit.  It is a warning, not an
+#: assertion: it exists to be noticed and re-baselined by whoever re-runs the
+#: query.
 _GWOSC_BBH_EXPECTED_NAMES = 272
 
 #: Cache key stem of the all-versions BBH query.  Deliberately not the stem
@@ -1086,6 +1091,16 @@ _GWOSC_BBH_CACHE_STEM = "bbh_names_allversions_m2min"
 #: discovery-paper collections (O4_Discovery_Papers) stay out.
 _GWOSC_LVK_CATALOG_RE = re.compile(r"GWTC-\d+(?:\.\d+)?(?:-CONFIDENT)?")
 
+#: The LVK GWTC releases' *non-confident* lists ("GWTC-2.1-marginal",
+#: "GWTC-3-marginal", "GWTC-2.1-auxiliary", ...): any GWTC release label with
+#: a qualifier other than "confident".  They never admit an event, but they do
+#: take part in the version ordering.  An event LVK demoted in a later release
+#: (GW190424_180648 and GW190909_114149 were confident in GWTC-2 and are not in
+#: GWTC-2.1-confident) has its newest LVK version in one of these lists; with
+#: them ignored, the older confident version decided and the event came back.
+_GWOSC_LVK_NONCONFIDENT_CATALOG_RE = re.compile(
+    r"GWTC-\d+(?:\.\d+)?-(?!CONFIDENT$)[A-Z0-9_.-]+")
+
 #: A GWOSC name is only usable as an LVK event name in this package's canonical
 #: form (``GW230529`` / ``GW230529_181500``).  Anything else -- e.g. the IMBH
 #: marginal candidate ``200114_020818`` -- is not a GWTC event name and must
@@ -1099,6 +1114,14 @@ def _is_lvk_gwtc_catalog(label: object) -> bool:
         return False
     normalized = re.sub(r"\s+", "", str(label)).upper()
     return bool(_GWOSC_LVK_CATALOG_RE.fullmatch(normalized))
+
+
+def _is_lvk_gwtc_nonconfident_catalog(label: object) -> bool:
+    """True when a GWOSC catalog label is a GWTC release's non-confident list."""
+    if label is None:
+        return False
+    normalized = re.sub(r"\s+", "", str(label)).upper()
+    return bool(_GWOSC_LVK_NONCONFIDENT_CATALOG_RE.fullmatch(normalized))
 
 
 def _gwosc_event_catalog(event: dict) -> Optional[str]:
@@ -1256,9 +1279,15 @@ def fetch_bbh_names_gwosc(
     The GWOSC endpoint is queried for **every version** of every event, with
     default parameters included.  Of each event's versions only those from an
     **LVK GWTC catalog** count, and the highest of them decides: the event is
-    kept when it carries a canonical GWTC event name, is not a curated non-BBH
-    event under any spelling, and that version's default PE parameters contain
+    kept when that version is in a confident list, the event carries a
+    canonical GWTC event name, is not a curated non-BBH event under any
+    spelling, and that version's default PE parameters contain
     ``mass_2_source`` (or the legacy alias ``m2_source``) above ``m2_min``.
+    A GWTC release's non-confident list (``GWTC-2.1-marginal``,
+    ``GWTC-3-marginal``, ...) takes part in that ordering but never admits an
+    event: when an event's highest LVK version is in one, LVK demoted it in
+    that release (GW190424_180648 and GW190909_114149, confident in GWTC-2, are
+    not in GWTC-2.1-confident) and it is dropped.
 
     The catalog restriction is the point (GW-15).  GWOSC indexes third-party
     catalogs beside GWTC, and under ``lastver=true`` a non-LVK version
@@ -1330,7 +1359,10 @@ def fetch_bbh_names_gwosc(
     n_with_catalog = 0
     dropped_catalogs: Dict[str, int] = {}
     dropped_names: set[str] = set()
-    # name -> (version, m2_source) of the highest LVK version seen so far
+    # name -> (version, confident, m2_source, catalog) of the highest LVK
+    # version seen so far.  A non-confident list's version takes part in the
+    # ordering, so an event LVK demoted in a later release is decided by that
+    # release and dropped, not by the older confident version.
     lvk_versions: Dict[str, tuple] = {}
     for data in pages:
         for event in data.get("results", []):
@@ -1341,7 +1373,8 @@ def fetch_bbh_names_gwosc(
             catalog = _gwosc_event_catalog(event)
             if catalog is not None:
                 n_with_catalog += 1
-            if not _is_lvk_gwtc_catalog(catalog):
+            confident = _is_lvk_gwtc_catalog(catalog)
+            if not confident and not _is_lvk_gwtc_nonconfident_catalog(catalog):
                 label = catalog or "<no catalog field>"
                 dropped_catalogs[label] = dropped_catalogs.get(label, 0) + 1
                 continue
@@ -1356,28 +1389,36 @@ def fetch_bbh_names_gwosc(
 
             version = _gwosc_event_version(event)
             params = event.get("default_parameters")
-            m2_source = _gwosc_best_parameter(params, "mass_2_source", "m2_source")
+            m2_source = (_gwosc_best_parameter(params, "mass_2_source",
+                                               "m2_source")
+                         if confident else None)
+            entry = (version, confident, m2_source, catalog)
             prev = lvk_versions.get(name)
             if prev is not None:
                 if prev[0] is None or version is None or prev[0] == version:
-                    if prev == (version, m2_source):
+                    if prev[:3] == entry[:3]:
                         continue            # the same entry twice
                     # Two LVK entries for one event that cannot be ordered: no
                     # rule says which one is current, and they disagree.
                     raise RuntimeError(
                         f"GWOSC returned two LVK entries for {name} that "
                         f"cannot be ordered (versions {prev[0]!r} and "
-                        f"{version!r}, mass_2_source {prev[1]!r} and "
-                        f"{m2_source!r}), so which one is current is unknown. "
-                        "The event-versions API shape may have changed; update "
+                        f"{version!r}, catalogs {prev[3]!r} and {catalog!r}, "
+                        f"mass_2_source {prev[2]!r} and {m2_source!r}), so "
+                        "which one is current is unknown. The event-versions "
+                        "API shape may have changed; update "
                         "gwcat.fetch._gwosc_event_version before trusting this "
                         "list.")
                 if version < prev[0]:
                     continue
-            lvk_versions[name] = (version, m2_source)
+            lvk_versions[name] = entry
 
     names: set[str] = set()
-    for name, (_version, m2_source) in lvk_versions.items():
+    demoted: Dict[str, str] = {}
+    for name, (_version, confident, m2_source, catalog) in lvk_versions.items():
+        if not confident:
+            demoted[name] = catalog
+            continue
         if _is_non_bbh_name(name):
             continue
         if m2_source is None or m2_source <= m2_min:
@@ -1409,6 +1450,11 @@ def fetch_bbh_names_gwosc(
         if dropped_names:
             print("fetch_bbh_names_gwosc: dropped non-GWTC event names "
                   f"({sorted(dropped_names)})")
+        if demoted:
+            listed = ", ".join(f"{n} [{c}]" for n, c in sorted(demoted.items()))
+            print(f"fetch_bbh_names_gwosc: dropped {len(demoted)} event(s) "
+                  "whose latest LVK version is in a non-confident list "
+                  f"({listed})")
     if len(result) != _GWOSC_BBH_EXPECTED_NAMES:
         direction = ("only " if len(result) < _GWOSC_BBH_EXPECTED_NAMES
                      else "as many as ")
