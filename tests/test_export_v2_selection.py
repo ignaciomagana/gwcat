@@ -1211,6 +1211,7 @@ def test_a_spinless_campaign_drops_the_spin_columns_whole(tmp_path):
         prod = build_selection_product([SelectionSet(e3), SelectionSet(o3)],
                                        spin_basis="chieff", strict=False)
     assert prod.attrs["component_columns_emitted"] is False
+    assert prod.attrs["chip_column_emitted"] is False
     for c in ("a1", "a2", "cost1", "cost2", "chip"):
         assert c not in prod.columns
     lengths = {k: np.asarray(v).shape[0] for k, v in prod.columns.items()}

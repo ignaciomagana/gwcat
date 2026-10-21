@@ -1643,6 +1643,10 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         # exported ra/dec are NaN.
         "sky_position_available": _sky_availability(set_list),
         "component_columns_emitted": bool(extras_available),
+        # chi_p is dropped on its own condition (a campaign without chi_p),
+        # which component_columns_emitted does not cover (August review,
+        # test-gaps 5).
+        "chip_column_emitted": bool(chip_available),
         # ── Spin-removal amax provenance (GW-19) ─────────────────────────────
         # The cartesian/polar prior-REMOVAL step has to assume a ceiling before
         # the campaign's own is known.  Its amax dependence is the constant
