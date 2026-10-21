@@ -838,7 +838,7 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                             detection_policy="far",
                             acknowledge_semianalytic_excluded=False,
                             sky_marginal=False, mixture_anchors=None,
-                            mock_data=None):
+                            mock_data=None, draw_domain=None):
     """Build a selection :class:`ExportProduct` from one or more SelectionSets.
 
     Parameters
@@ -930,6 +930,20 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         :func:`gwcat.export.product.resolve_mock_data`).  The attr is written
         only when True, so a real-data selection export is byte-identical to
         one written before the flag existed; absent means real.
+    draw_domain : {None, "intersection"}, default None
+        The injection campaigns' DECLARED draw domains (endo3: source-frame
+        ``m1, m2 <= 100`` Msun, ``z <= 1.9``; the O4-era files declare none)
+        are always recorded, per campaign, in
+        ``injection_draw_domain_per_campaign``, and a campaign whose draws
+        reach past another's declared bound sets
+        ``injection_draw_domain_mismatch`` and warns: the combined mu then has
+        no contribution from the first campaign beyond its bound.  ``None``
+        changes nothing else (the default, byte-identical datasets).
+        ``"intersection"`` SUBSETS every campaign's detected injections to the
+        domain all campaigns declare (``ndraw`` untouched, as for
+        ``source_class``/``z_max``), recorded in
+        ``injection_draw_domain_applied``; the population model and the PE
+        samples must then be truncated to the same domain.
 
     Returns
     -------
@@ -1032,6 +1046,13 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     ndraw_per = [int(s._ndraw) for s in set_list]
     ndraw_total = sum(ndraw_per)
 
+    # Declared draw domains (review 2026-10-20, high-4): always recorded; a
+    # crossed bound warns; "intersection" subsets to the common domain.
+    from ..selection import (resolve_draw_domain, draw_domain_mask,
+                             campaign_provenance_attrs)
+    domain_applied, domain_mismatch = resolve_draw_domain(set_list,
+                                                          draw_domain)
+
     # Per-injection column names (the legacy 9 + the frac-scaled pdraw).
     base_cols = ["m1det", "m2det", "dL", "chieff", "ra", "dec",
                  "m1src", "m2src", "z", "pdraw"]
@@ -1062,6 +1083,9 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         keep, det, sc_mask = _detect_keep(
             s, far_threshold, source_class, snr_threshold, z_max=z_max,
             acknowledge_semianalytic_excluded=acknowledge_semianalytic_excluded)
+        if domain_applied is not None:
+            in_domain = draw_domain_mask(s, domain_applied)
+            keep, sc_mask = keep & in_domain, sc_mask & in_domain
         if is_mixture[k]:
             mixture_attrs = _mixture_run_attrs(
                 s, keep, det, far_threshold, snr_threshold, mixture_anchors)
@@ -1338,6 +1362,10 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         "spin_removal_amax_cancels": bool(
             spin_basis == "component" or spin_basis in _REFERENCE_BASES),
     })
+
+    attrs.update(campaign_provenance_attrs(
+        set_list, draw_domain=draw_domain, draw_domain_applied=domain_applied,
+        draw_domain_mismatch=domain_mismatch))
 
     # WHICH chi_eff density every chi_eff factor of this pdraw is (GW-40i):
     # the exact closed form by default, the legacy interpolated table only

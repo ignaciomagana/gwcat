@@ -46,6 +46,8 @@ Usage:
 """
 from __future__ import annotations
 
+import json
+import os
 import warnings
 from typing import Optional
 
@@ -761,6 +763,195 @@ def _write_chieff_amax_attrs(f, amax_pairs, amax_sources, mode):
     f.attrs["chi_eff_prior_method"] = CHI_EFF_PRIOR_METHODS[impl]
 
 
+# ── Declared injection draw domains (review 2026-10-20, high-4) ──────────────
+#: The root attrs an injection file declares the domain of its draws with, per
+#: source-frame quantity: ``(name, lower-bound attrs, upper-bound attrs)``, the
+#: first attr present winning.  endo3 (Zenodo 7890437) declares
+#: ``min_mass1 = min_mass2 = 2``, ``max_mass1 = max_mass2 = 100`` and
+#: ``max_redshift = max_z = 1.9``; the O4-era ``events`` files declare none.
+DRAW_DOMAIN_ATTRS = (
+    ("mass1_source", ("min_mass1",), ("max_mass1",)),
+    ("mass2_source", ("min_mass2",), ("max_mass2",)),
+    ("redshift", ("min_redshift", "min_z"), ("max_redshift", "max_z")),
+)
+
+#: ``draw_domain=`` values of the selection builder.  ``None`` records each
+#: campaign's declared domain and changes nothing else (the default, and what
+#: every product before the record was); ``"intersection"`` SUBSETS every
+#: campaign's detected injections to the domain all of them declare.
+DRAW_DOMAIN_POLICIES = (None, "intersection")
+
+
+def _first_attr(attr_sets, keys):
+    """The first of ``keys`` found in ``attr_sets`` (in order), as a float."""
+    for attrs in attr_sets:
+        for k in keys:
+            if k in attrs:
+                return float(attrs[k])
+    return None
+
+
+def _domain_name(s, k):
+    """A short campaign label for messages: index + file name."""
+    return f"campaign {k} ({os.path.basename(str(s.path))})"
+
+
+def draw_domain_mismatches(set_list):
+    """Where one campaign's draws reach past another campaign's DECLARED domain.
+
+    Each campaign's Monte-Carlo term in the combined selection integral covers
+    only the domain that campaign drew from, so wherever another campaign drew
+    (and could detect) beyond it, the summed integral has no contribution from
+    the first one there.  endo3 against rpo4ab is the live case: O3 declares
+    ``m1, m2 <= 100 Msun`` and ``z <= 1.9`` while O4ab draws to ``m1 ~ 990`` and
+    ``z = 3``, so mu has no O3 sensitivity above 100 Msun or 1.9 although O3's
+    detected fraction there is not small.  Returns one dict per (campaign,
+    bound, other campaign) that is crossed; empty when none is.
+    """
+    out = []
+    for k, s in enumerate(set_list):
+        declared = getattr(s, "_declared_draw_domain", None) or {}
+        for name, (lo, hi) in declared.items():
+            for j, o in enumerate(set_list):
+                if j == k:
+                    continue
+                elo, ehi = (getattr(o, "_draw_extent", None) or {}).get(
+                    name, (None, None))
+                if hi is not None and ehi is not None and ehi > hi:
+                    out.append({"campaign": k, "quantity": name,
+                                "bound": "max", "declared": hi,
+                                "other_campaign": j, "other_drawn": ehi})
+                if lo is not None and elo is not None and elo < lo:
+                    out.append({"campaign": k, "quantity": name,
+                                "bound": "min", "declared": lo,
+                                "other_campaign": j, "other_drawn": elo})
+    return out
+
+
+def intersect_draw_domains(set_list):
+    """The domain every campaign declares: ``{name: [lo, hi]}``, ``None`` = open.
+
+    Only DECLARED bounds enter; a campaign that declares nothing (every O4-era
+    file) constrains nothing.  Raises when no campaign declares any bound, since
+    there is then no domain to restrict to.
+    """
+    out = {}
+    for name, _, _ in DRAW_DOMAIN_ATTRS:
+        los = [s._declared_draw_domain[name][0] for s in set_list
+               if s._declared_draw_domain[name][0] is not None]
+        his = [s._declared_draw_domain[name][1] for s in set_list
+               if s._declared_draw_domain[name][1] is not None]
+        if los or his:
+            out[name] = [max(los) if los else None, min(his) if his else None]
+    if not out:
+        raise ValueError(
+            "draw_domain='intersection' was requested but none of the "
+            "campaigns declares a draw domain (no min/max_mass1, min/max_mass2 "
+            "or max_redshift attrs): there is no common domain to restrict "
+            "to. " + "; ".join(str(s.path) for s in set_list))
+    for name, (lo, hi) in out.items():
+        if lo is not None and hi is not None and lo > hi:
+            raise ValueError(
+                f"draw_domain='intersection': the campaigns' declared "
+                f"{name} ranges do not overlap ({lo} > {hi}), so no injection "
+                f"lies in every campaign's domain.")
+    return out
+
+
+def draw_domain_mask(s, domain):
+    """Rows of campaign ``s`` inside ``domain`` (closed bounds, ``None`` open)."""
+    cols = {"mass1_source": s._m1src, "mass2_source": s._m2src,
+            "redshift": s._z}
+    mask = np.ones(len(s._m1src), dtype=bool)
+    for name, (lo, hi) in (domain or {}).items():
+        x = np.asarray(cols[name], dtype=float)
+        if lo is not None:
+            mask &= x >= lo
+        if hi is not None:
+            mask &= x <= hi
+    return mask
+
+
+def resolve_draw_domain(set_list, draw_domain=None):
+    """``(applied_domain_or_None, mismatches)`` for a product, warning on gaps.
+
+    ``draw_domain=None`` (default) applies nothing: the record is written and a
+    crossed bound WARNS, because the combined mu then lacks that campaign's
+    sensitivity beyond its domain (low for any population with support there).
+    ``"intersection"`` returns the common declared domain for the caller to
+    subset every campaign to -- subsetting, not reweighting, so ``ndraw`` and
+    the Essick fractions are unchanged, and the population model and the PE
+    samples must then be truncated to the same domain.
+    """
+    if draw_domain not in DRAW_DOMAIN_POLICIES:
+        raise ValueError(
+            f"unknown draw_domain={draw_domain!r}; known values are "
+            f"{list(DRAW_DOMAIN_POLICIES)}.")
+    mismatches = draw_domain_mismatches(set_list)
+    if draw_domain == "intersection":
+        applied = intersect_draw_domains(set_list)
+        warnings.warn(
+            f"draw_domain='intersection': every campaign's detected injections "
+            f"are restricted to the domain all of them declare, {applied} "
+            f"(source-frame Msun / redshift; None = open). This is subsetting, "
+            f"so ndraw is unchanged, and mu is the selection integral OF THAT "
+            f"DOMAIN: the population model and the PE samples must be "
+            f"truncated to it too. Recorded in injection_draw_domain_applied.")
+        return applied, mismatches
+    if mismatches:
+        rows = "; ".join(
+            f"{_domain_name(set_list[m['campaign']], m['campaign'])} declares "
+            f"{m['quantity']} {m['bound']} {m['declared']:g} while "
+            f"{_domain_name(set_list[m['other_campaign']], m['other_campaign'])}"
+            f" drew to {m['other_drawn']:.6g}" for m in mismatches)
+        warnings.warn(
+            f"the campaigns' declared injection draw domains differ: {rows}. "
+            f"Each campaign's term in the combined selection integral covers "
+            f"only its own domain, so mu has no contribution from the first "
+            f"campaign beyond its bound -- low by that campaign's missing "
+            f"sensitivity for any population with support there, and PE "
+            f"samples beyond the bound are compared with a selection that "
+            f"lacks it. Recorded in injection_draw_domain_per_campaign and "
+            f"injection_draw_domain_mismatch; draw_domain='intersection' "
+            f"restricts every campaign to the common declared domain instead.")
+    return None, mismatches
+
+
+def campaign_provenance_attrs(set_list, *, draw_domain=None,
+                              draw_domain_applied=None,
+                              draw_domain_mismatch=None):
+    """Per-campaign provenance attrs shared by every selection exporter.
+
+    Records only: nothing here changes a number in the product.  Starts with
+    the declared injection draw domain (review 2026-10-20, high-4): each
+    campaign's declared bounds (``None`` = undeclared), the extent its rows
+    actually span, whether some campaign drew past another's declared bound,
+    and which ``draw_domain`` policy the export applied.
+    """
+    if draw_domain_mismatch is None:
+        draw_domain_mismatch = draw_domain_mismatches(set_list)
+    domain_rows = []
+    for s in set_list:
+        declared = getattr(s, "_declared_draw_domain", None) or {}
+        domain_rows.append({
+            "declared": declared,
+            "declared_source": ("file_attrs" if any(
+                v is not None for b in declared.values() for v in b)
+                else "undeclared"),
+            "drawn_extent": getattr(s, "_draw_extent", None) or {},
+        })
+    return {
+        "injection_draw_domain_per_campaign": json.dumps(domain_rows),
+        "injection_draw_domain_mismatch": bool(draw_domain_mismatch),
+        "injection_draw_domain_mismatch_detail": json.dumps(
+            draw_domain_mismatch),
+        "injection_draw_domain_policy": (
+            "not_applied" if draw_domain is None else str(draw_domain)),
+        "injection_draw_domain_applied": json.dumps(
+            draw_domain_applied if draw_domain_applied is not None else {}),
+    }
+
+
 def _ddL_dz(z, dL_mpc, H0, Om0):
     """d(dL)/dz evaluated at z.  dL in Mpc."""
     c_kms = 299792.458
@@ -854,6 +1045,11 @@ class SelectionSet:
         self._gps_range = None
         self._gps_range_source = None
         self._total_analysis_time_s = None
+        # The draw domain the file DECLARES (``{name: [lo, hi]}``, ``None`` per
+        # undeclared bound) and the extent its rows actually span; set on load
+        # by _set_draw_domain (review 2026-10-20, high-4).
+        self._declared_draw_domain = None
+        self._draw_extent = None
         # Mock-data provenance: True when the injection file's root attrs say
         # mock_data=True (a synthetic campaign). Read in _load().
         self._mock_data = False
@@ -1277,6 +1473,7 @@ class SelectionSet:
         self._ndraw = ndraw
         self._T_yr = T_yr
         self._weights = weights
+        self._set_draw_domain(f.attrs)
 
         # ── Additive component-basis spin state (PR4) ──────────────────────
         self._compute_events_spin_state(
@@ -1582,6 +1779,7 @@ class SelectionSet:
         self._ndraw = ndraw
         self._T_yr = T_yr
         self._weights = weights
+        self._set_draw_domain(f.attrs, inj.attrs)
 
         # ── Additive component-basis spin state (PR4, Format A / endo3) ────
         self._compute_injections_spin_state(inj, ln_pdraw_no_spin, p_mass, p_z,
@@ -1696,6 +1894,45 @@ class SelectionSet:
                 return
         self._gps_range = None
         self._gps_range_source = "unknown"
+
+    def _set_draw_domain(self, *attr_sets):
+        """Record the draw domain the file declares and the one its rows span.
+
+        Declared bounds come from :data:`DRAW_DOMAIN_ATTRS` (first attr set
+        that carries one wins); ``None`` where the file declares nothing, which
+        is NOT a statement that the draws are unbounded.  The extent is the
+        min/max over the file's rows (finite values), i.e. over what the file
+        retained.  Nothing here touches pdraw or any mask.
+        """
+        cols = {"mass1_source": self._m1src, "mass2_source": self._m2src,
+                "redshift": self._z}
+        declared, extent = {}, {}
+        for name, lo_keys, hi_keys in DRAW_DOMAIN_ATTRS:
+            declared[name] = [_first_attr(attr_sets, lo_keys),
+                              _first_attr(attr_sets, hi_keys)]
+            x = np.asarray(cols[name], dtype=float)
+            x = x[np.isfinite(x)]
+            extent[name] = ([float(x.min()), float(x.max())] if x.size
+                            else [None, None])
+        self._declared_draw_domain = declared
+        self._draw_extent = extent
+
+    @property
+    def declared_draw_domain(self) -> dict:
+        """``{quantity: [lo, hi]}`` the file declares its draws on (None = undeclared).
+
+        Source-frame ``mass1_source``/``mass2_source`` in Msun and
+        ``redshift``.  endo3 declares ``[2, 100]``, ``[2, 100]`` and
+        ``[None, 1.9]``; the O4-era files declare nothing.
+        """
+        self._load()
+        return {k: list(v) for k, v in self._declared_draw_domain.items()}
+
+    @property
+    def draw_extent(self) -> dict:
+        """``{quantity: [min, max]}`` over the rows the file carries."""
+        self._load()
+        return {k: list(v) for k, v in self._draw_extent.items()}
 
     def _assign_mixture_runs(self):
         """Label every mixture row with its run, from ``time_geocenter`` alone.
@@ -2251,6 +2488,8 @@ class SelectionSet:
                 nsbh_mass_threshold=self._nsbh_mass_threshold,
                 n_before=n_before, n_after=n_after,
                 far_columns=self._far_columns, far_threshold=far_threshold)
+            for k, v in campaign_provenance_attrs([self]).items():
+                f.attrs[k] = v
 
             for name, arr in [
                 ("m1det", self._m1det[keep]), ("m2det", self._m2det[keep]),
@@ -2580,6 +2819,10 @@ class CombinedSelectionSet:
         # pdraw exactly as it does on the v2 path (GW-09); this exporter has
         # every campaign in view too, so it refuses identically.
         _refuse_mixed_cosmology(self._sets)
+        # Declared draw domains: recorded, and a crossed bound warns, exactly
+        # as on the v2 path (review 2026-10-20, high-4).  This legacy writer
+        # applies no domain restriction.
+        _, domain_mismatch = resolve_draw_domain(self._sets)
 
         # Write
         with h5py.File(out_path, "w") as f:
@@ -2658,6 +2901,10 @@ class CombinedSelectionSet:
                 nsbh_mass_threshold=self._sets[0]._nsbh_mass_threshold,
                 n_before=n_before_total, n_after=n_after_total,
                 far_columns=far_columns_union, far_threshold=far_threshold)
+            for k, v in campaign_provenance_attrs(
+                    self._sets,
+                    draw_domain_mismatch=domain_mismatch).items():
+                f.attrs[k] = v
 
             for name, arr in [
                 ("m1det", data["m1det"]), ("m2det", data["m2det"]),
