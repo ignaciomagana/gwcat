@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import warnings
 from dataclasses import dataclass
 from typing import Optional
@@ -28,6 +29,18 @@ from .source_class import (normalize_source_class, resolve_filter_classes,
                            SOURCE_CLASSES, CUT_ESTIMATOR_ATTR,
                            pe_cut_estimator, assess_cut_estimator_pair,
                            PE_MEDIAN_CUT_WARNING)
+
+
+#: The attr a PE export carries when it was written with event cuts on point
+#: estimates that no injection campaign reproduces (see
+#: :attr:`SelectionSpec.point_estimate_cuts`).  Absent when there are none.
+POINT_ESTIMATE_CUTS_ATTR = "point_estimate_cuts"
+
+
+#: How the PE-side ``far_max`` cut compares (``far <= far_max``).  Every
+#: injection detection mask is strict (``far < threshold``); recorded with the
+#: cut so a consumer can see the two differ at the threshold itself.
+FAR_CUT_OPERATOR = "<="
 
 
 class UnpairableSelectionCut(ValueError):
@@ -60,6 +73,34 @@ def _intersect_range(a, b):
     if b is None:
         return (float(a[0]), float(a[1]))
     return (max(float(a[0]), float(b[0])), min(float(a[1]), float(b[1])))
+
+
+def _compact_class_set(compact_type):
+    """The canonical classes every ``compact_type`` gate admits (each gate is
+    one class, and gates AND), or ``None`` when there is no gate."""
+    if not compact_type:
+        return None
+    out = None
+    for c in compact_type:
+        one = {normalize_source_class(c)}
+        out = one if out is None else (out & one)
+    return out
+
+
+def sample_set_map_digest(smap) -> str:
+    """A content digest of a sample-set map: its labels and substitutes.
+
+    The same map gives the same digest however it was handed over -- a JSON
+    file, a mapping, a :class:`gwcat.waveform_policy.SampleSetMap` built in
+    code -- which neither the file's byte hash (``map_sha256``) nor the empty
+    hash of an in-code map did (review 2026-10-20).  It is the formula
+    :func:`gwcat.waveform_policy.sample_set_map_from_mapping` already used for
+    a mapping.
+    """
+    import hashlib
+    return hashlib.sha256(json.dumps(
+        {"events": dict(smap.labels), "substitutes": dict(smap.substitutes)},
+        sort_keys=True).encode()).hexdigest()
 
 
 def _round(x):
@@ -124,6 +165,19 @@ class SelectionSpec:
     require_far: bool = False
     waveform_policy: str = "preferred"
     approximant: Optional[str] = None
+    #: Whether the caller declared that the point-estimate cuts below may be
+    #: written although no injection campaign reproduces them (see
+    #: :meth:`check_pairable`).  Sticky across a chain of views.
+    point_estimate_cuts_allowed: bool = False
+    #: Events the ``snr_min`` cut dropped because their posterior-median SNR
+    #: is unknown (NaN), counted by the call that applied the cut.
+    n_missing_snr: int = 0
+    #: ``waveform_policy="event-map"`` only: the content digest of the map
+    #: (:func:`sample_set_map_digest`) and the NRSur q-rule settings, so the
+    #: spec -- and its digest -- say WHICH map chose the sample sets.
+    sample_set_map_digest: Optional[str] = None
+    nrsur_q_rule: Optional[float] = None
+    nrsur_q_rule_substitute: bool = False
 
     # ---- composition ----------------------------------------------------
     def refine(self, *, compact_type=None, source_class=None, far_max=None,
@@ -131,7 +185,10 @@ class SelectionSpec:
                m1_src_range=None, m2_src_range=None, name_filters=(),
                allowed_names_authoritative=True, far_policy="none",
                n_missing_far=0, allow_missing_far=False, require_far=False,
-               waveform_policy="preferred", approximant=None):
+               waveform_policy="preferred", approximant=None,
+               allow_point_estimate_cuts=False, n_missing_snr=0,
+               sample_set_map_digest=None, nrsur_q_rule=None,
+               nrsur_q_rule_substitute=False):
         """This spec intersected with one further ``select()`` call.
 
         ``name_filters`` is a sequence of ``(label, names)`` pairs -- one per
@@ -170,6 +227,20 @@ class SelectionSpec:
         compact = self.compact_type
         if compact_type is not None and str(compact_type) not in compact:
             compact = compact + (str(compact_type),)
+        # compact_type and source_class restrict the same class, so the view
+        # holds their INTERSECTION (review 2026-10-20).  An empty one would
+        # serialise as "no restriction" over a file of zero events -- the same
+        # trap the source_class composition above refuses.
+        ct_set = _compact_class_set(compact)
+        if ct_set is not None and (
+                not ct_set or (requested and classes is not None
+                               and not (set(classes) & ct_set))):
+            raise ValueError(
+                f"compact_type gate(s) {list(compact)} and source_class "
+                f"{list(classes) if requested and classes else None} share no "
+                f"class, so the selection is empty. An empty class restriction "
+                f"serialises identically to 'no restriction'; refusing "
+                f"instead. Select the class you mean once.")
 
         # The FAR policy, the missing-FAR count and the two policy flags belong
         # to the call that actually applied a FAR cut; a later, FAR-less
@@ -204,9 +275,39 @@ class SelectionSpec:
             require_far=req_far,
             waveform_policy=str(waveform_policy),
             approximant=None if approximant is None else str(approximant),
+            point_estimate_cuts_allowed=bool(
+                self.point_estimate_cuts_allowed or allow_point_estimate_cuts),
+            # A later SNR cut sees only rows with a finite SNR, so the counts
+            # of chained calls add up to the events the cuts dropped for it.
+            n_missing_snr=int(self.n_missing_snr) + int(n_missing_snr),
+            # The map identity follows the policy, which the caller passes as
+            # the view's effective one (inherited or new).
+            sample_set_map_digest=(None if sample_set_map_digest is None
+                                   else str(sample_set_map_digest)),
+            nrsur_q_rule=(None if nrsur_q_rule is None
+                          else float(nrsur_q_rule)),
+            nrsur_q_rule_substitute=bool(nrsur_q_rule_substitute),
         )
 
     # ---- derived views --------------------------------------------------
+    @property
+    def point_estimate_cuts(self) -> tuple:
+        """The cuts on per-event POINT ESTIMATES no injection set reproduces.
+
+        ``m1_src_range`` / ``m2_src_range`` cut on the posterior-median
+        source-frame masses and ``sky_area_max`` on the 90% sky area of the
+        posterior.  An injection has no posterior, so no injection-side cut
+        reproduces either: the injections' true masses scatter across a
+        median-mass boundary differently from the events', and an injection has
+        no sky area at all.  Exported against an uncut selection function, the
+        pair describes two different selections (Essick & Fishbach).  These
+        are the cuts :meth:`check_pairable` refuses unless declared.
+        """
+        return tuple(k for k, v in (("m1_src_range", self.m1_src_range),
+                                    ("m2_src_range", self.m2_src_range),
+                                    ("sky_area_max", self.sky_area_max))
+                     if v is not None)
+
     @property
     def is_filtered(self) -> bool:
         """Whether ANY event cut is in effect (policies alone do not count)."""
@@ -226,13 +327,20 @@ class SelectionSpec:
         given (GW-37): both restrict the same posterior-median class column, so
         a file cut by one must not describe itself as unfiltered because the
         caller reached for the other spelling.
+
+        With both, it is their INTERSECTION (review 2026-10-20): it used to be
+        the source_class request alone, so ``compact_type="BBH"`` plus
+        ``source_class="cbc"`` wrote BBH events under an empty filter and the
+        unfiltered contract hash.
         """
+        ct_set = _compact_class_set(self.compact_type)
         if not self.source_class_requested or not self.source_class:
-            if self.compact_type:
+            if ct_set:
                 return format_source_class_filter(
-                    [normalize_source_class(c) for c in self.compact_type])
+                    [c for c in SOURCE_CLASSES if c in ct_set])
             return ""
-        return format_source_class_filter(list(self.source_class))
+        return format_source_class_filter(
+            [c for c in self.source_class if ct_set is None or c in ct_set])
 
     @property
     def event_list_filter(self) -> str:
@@ -269,10 +377,19 @@ class SelectionSpec:
         every guard GW-12/GW-33 built -- the file recorded
         ``cut_estimator="none"`` and paired clean against an all-class
         selection function.
+
+        ``m1_src_range`` / ``m2_src_range`` count for the same reason (review
+        2026-10-20): they cut on the same posterior-median source-frame masses
+        the class column is computed from, so ``m2_src_range=(3, inf)`` is the
+        BBH class cut under a third spelling, and it used to be recorded as
+        ``"none"`` (or ``"name_whitelist"`` next to a list).
         """
+        median_mass_cut = (self.m1_src_range is not None
+                           or self.m2_src_range is not None)
         return pe_cut_estimator(
             (self.source_class if self.source_class_requested
-             else (self.compact_type or None)),
+             else (self.compact_type or
+                   (("median_mass_range",) if median_mass_cut else None))),
             self.allowed_names if self.name_filters else None)
 
     # ---- serialisation --------------------------------------------------
@@ -282,8 +399,12 @@ class SelectionSpec:
         The whitelist itself is summarised by count + digest rather than
         written out: the events actually exported are already listed in
         ``event_names``, and a 259-name list in an HDF5 attr helps nobody.
+
+        Keys added by the 2026-10-20 review are written only when they carry
+        something (a cut that is in effect), so the record of a selection that
+        uses none of them is unchanged.
         """
-        return {
+        out = {
             "compact_type": list(self.compact_type),
             "source_class": (list(self.source_class)
                              if self.source_class_requested else None),
@@ -310,15 +431,43 @@ class SelectionSpec:
                             else str(self.approximant)),
             "cut_estimator": self.cut_estimator,
         }
+        if self.far_max is not None:
+            out["far_cut_operator"] = FAR_CUT_OPERATOR
+        if self.waveform_policy == "event-map":
+            # The map identity (review 2026-10-20): it was absent from the
+            # spec, so two exports chosen by different maps shared a digest.
+            out["sample_set_map_digest"] = self.sample_set_map_digest or ""
+            out["nrsur_q_rule"] = _round(self.nrsur_q_rule)
+            out["nrsur_q_rule_substitute"] = bool(self.nrsur_q_rule_substitute)
+        if self.snr_min is not None:
+            out["n_events_missing_snr"] = int(self.n_missing_snr)
+        pe_cuts = self.point_estimate_cuts
+        if pe_cuts:
+            out["point_estimate_cuts"] = list(pe_cuts)
+            out["point_estimate_cuts_allowed"] = bool(
+                self.point_estimate_cuts_allowed)
+        return out
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), sort_keys=True,
                           separators=(",", ":"))
 
     def digest(self) -> str:
-        """A short digest of the whole effective spec."""
+        """A short digest of the whole effective spec.
+
+        Over WHAT was selected, not how it was spelled (review 2026-10-20):
+        the name filters enter through the content digest of the composed
+        whitelist (``allowed_names_digest``), while ``name_filters`` -- the
+        spellings and file paths, kept in the JSON record as provenance -- is
+        left out.  The same 259 names passed as ``allowed_names=``,
+        ``names=``, a path string, a ``pathlib.Path`` or a sequence used to
+        give five different digests.
+        """
         from .export.contract import stable_digest
-        return stable_digest(self.to_json())
+        d = self.to_dict()
+        d.pop("name_filters", None)
+        return stable_digest(json.dumps(d, sort_keys=True,
+                                        separators=(",", ":")))
 
     def to_attrs(self) -> dict:
         """The provenance attrs both writers stamp on an export.
@@ -332,7 +481,7 @@ class SelectionSpec:
         def _cut(x):
             return float("nan") if x is None else float(x)
 
-        return {
+        out = {
             "selection_spec": self.to_json(),
             "selection_spec_digest": self.digest(),
             "selection_filtered": bool(self.is_filtered),
@@ -356,19 +505,59 @@ class SelectionSpec:
             "approximant": "" if self.approximant is None else str(
                 self.approximant),
         }
+        if self.far_max is not None:
+            out["far_cut_operator"] = FAR_CUT_OPERATOR
+        pe_cuts = self.point_estimate_cuts
+        if pe_cuts:
+            # Written only when such a cut is in effect: the paired-file
+            # validator refuses a file that carries it.
+            out[POINT_ESTIMATE_CUTS_ATTR] = ",".join(pe_cuts)
+        return out
 
     # ---- pairing ---------------------------------------------------------
-    def check_pairable(self, *, allow_unpaired_pastro_min: bool = False):
+    def check_pairable(self, *, allow_unpaired_pastro_min: bool = False,
+                       allow_unpaired_point_estimate_cuts=None):
         """Refuse the cuts no injection campaign can reproduce.
 
-        ``pastro_min`` is the one that exists today.  Every selection export
-        records ``p_astro_available=False``, because the campaigns carry no
+        ``pastro_min``: every selection export records
+        ``p_astro_available=False``, because the campaigns carry no
         per-injection p_astro at all: there is no injection-side threshold that
         reproduces an event-side p_astro cut, so beta would describe a
         different selection than the one that produced the event list -- the
         Essick & Fishbach failure, and invisible in the files until the cut
         started being recorded.
+
+        ``m1_src_range`` / ``m2_src_range`` / ``sky_area_max`` (review
+        2026-10-20): cuts on per-event point estimates (see
+        :attr:`point_estimate_cuts`).  They used to pass every guard -- the
+        contract records them but neither hashes nor compares them -- so a
+        file cut to ``m1_src_range=(20, 70)`` paired cleanly with an uncut
+        selection.  Refused unless ``allow_unpaired_point_estimate_cuts`` is
+        true here or was declared on the view
+        (``select(..., allow_unpaired_point_estimate_cuts=True)``); a file
+        written anyway records them in ``point_estimate_cuts`` and the v1
+        paired validator refuses it.
         """
+        if allow_unpaired_point_estimate_cuts is None:
+            allow_unpaired_point_estimate_cuts = self.point_estimate_cuts_allowed
+        pe_cuts = self.point_estimate_cuts
+        if pe_cuts and not allow_unpaired_point_estimate_cuts:
+            raise UnpairableSelectionCut(
+                f"{', '.join(pe_cuts)} cut(s) on per-event POINT ESTIMATES "
+                f"(posterior-median source-frame masses, the posterior's 90% "
+                f"sky area) were applied to the events, but no injection "
+                f"campaign reproduces them: an injection has true masses, not "
+                f"a posterior median that scatters across the boundary, and no "
+                f"sky area at all. The exported beta would describe a "
+                f"different selection than the event list it is paired with "
+                f"(Essick & Fishbach), and nothing in the pairing contract "
+                f"would show it.\n"
+                f"\n"
+                f"Model the mass range in the population instead of cutting on "
+                f"it, or pass allow_unpaired_point_estimate_cuts=True to "
+                f"select() (or to to_darksirens) to write the file anyway -- it "
+                f"then records point_estimate_cuts and is NOT usable with a "
+                f"selection function.")
         if self.pastro_min is None or allow_unpaired_pastro_min:
             return
         raise UnpairableSelectionCut(
@@ -381,8 +570,9 @@ class SelectionSpec:
             f"\n"
             f"Cut on FAR instead (far_max=, CLI --far-max: the statistic the "
             f"campaigns threshold on directly), or select the events by name "
-            f"(event_list= / allowed_names=, which is membership rather than a "
-            f"cut on a statistic). Pass allow_unpaired_pastro_min=True to write "
+            f"(event_list= / allowed_names=) from a list that was not itself "
+            f"built by thresholding p_astro -- such a list is this same cut "
+            f"under another spelling. Pass allow_unpaired_pastro_min=True to write "
             f"the file anyway -- it is then NOT usable with a selection "
             f"function.")
 
@@ -540,6 +730,9 @@ class GWCatalog:
         self._selection_reasons = None
         self._homogeneous_sample_sets = True
         self._sample_set_map_report = None
+        #: Content digest of the event-map that chose this view's sample sets
+        #: (:func:`sample_set_map_digest`), or None.
+        self._sample_set_map_digest = None
 
     # ---- selection (operates on metadata only; cheap) --------------------
     @property
@@ -611,7 +804,8 @@ class GWCatalog:
                event_list=None, allow_missing_far=False, require_far=False,
                waveform_policy="preferred", approximant=None,
                sample_set_map=None, nrsur_q_rule=None,
-               nrsur_q_rule_substitute=False):
+               nrsur_q_rule_substitute=False,
+               allow_unpaired_point_estimate_cuts=False):
         """Return a filtered view of the catalog (no sample copy).
 
         Source-class / event-list / FAR options (PR 2)
@@ -637,6 +831,13 @@ class GWCatalog:
             them; a store where NO candidate event has either raises, because a
             threshold crossed with an all-absent column is a configuration
             error, not a selection (GW-14).
+        m1_src_range, m2_src_range, sky_area_max
+            Cuts on per-event point estimates (posterior-median source-frame
+            masses, the 90% sky area).  Cutting a view is always legal, but no
+            injection campaign reproduces these, so the exporters refuse a view
+            that carries one (:meth:`SelectionSpec.check_pairable`) unless
+            ``allow_unpaired_point_estimate_cuts=True`` declares it here; the
+            declaration is recorded and survives chained views.
 
         Waveform / sample-set policy (PR 6)
         -----------------------------------
@@ -694,19 +895,57 @@ class GWCatalog:
                 "campaign can reproduce.")
 
         m = np.ones(len(self.names), dtype=bool)
+        # The cuts on quantities stored PER SAMPLE SET (class, posterior-median
+        # SNR and masses, sky area), kept apart from the event-level ones
+        # (names, FAR, p_astro) so that they can be applied to the sample set
+        # the waveform policy chooses rather than to every row before it
+        # chooses (review 2026-10-20; see the policy resolution below).  `m`
+        # stays the AND of everything, for the in-scope bookkeeping.
+        m_row = np.ones(len(self.names), dtype=bool)
+        m_evt = np.ones(len(self.names), dtype=bool)
+        # The per-sample-set cuts other than snr_min, so that the missing-SNR
+        # accounting below counts only rows every OTHER cut keeps.
+        m_row_nosnr = np.ones(len(self.names), dtype=bool)
         # What this call actually applies, for the effective spec below: a
         # compact_type that allowed_names overrules is NOT a cut this view made.
         applied_compact_type = None
         name_filters = []
+        ct_column = None
         if compact_type is not None:
+            # One canonical class, matched against the normalised column
+            # (review 2026-10-20).  The match used to be exact and
+            # case-sensitive: compact_type="bbh" selected nothing while the
+            # provenance recorded "BBH", and the v1 exporter wrote an empty
+            # file.  A token that names no single class, and a store without
+            # the column, are configuration errors.
+            ct_classes = resolve_filter_classes(compact_type)
+            if len(ct_classes) != 1:
+                raise ValueError(
+                    f"compact_type={compact_type!r} names {sorted(ct_classes)}; "
+                    f"compact_type is ONE class (BBH, NSBH, BNS, MassGap or "
+                    f"Unknown). Use source_class= for a set of classes.")
+            compact_type = next(iter(ct_classes))
+            if "compact_type" not in self.meta:
+                raise ValueError(
+                    f"select(compact_type={compact_type!r}) needs the "
+                    f"'compact_type' meta column and this store has none "
+                    f"(columns: {sorted(self.meta)}); use source_class=.")
+            ct_column = np.array([normalize_source_class(x)
+                                  for x in self.meta["compact_type"]])
             apply_compact_type = (allowed_names is None or
                                   not allowed_names_authoritative)
             if apply_compact_type:
-                m &= (self.meta["compact_type"] == compact_type)
+                c = (ct_column == compact_type)
+                m &= c
+                m_row &= c
+                m_row_nosnr &= c
                 applied_compact_type = compact_type
         if source_class is not None:
             allowed_classes = resolve_filter_classes(source_class)
-            m &= np.isin(self.source_class, list(allowed_classes))
+            c = np.isin(self.source_class, list(allowed_classes))
+            m &= c
+            m_row &= c
+            m_row_nosnr &= c
         if pastro_min is not None:
             # Read the RESOLVED value, not one spelling of it: a store whose
             # event table used `p_astro` (the documented override key) holds a
@@ -734,16 +973,48 @@ class GWCatalog:
                     f"{sorted(self.names[in_scope & nan_pa].tolist())}. "
                     f"Populate p_astro via event_table at ingest to use this "
                     f"cut on them.")
-            m &= np.where(nan_pa, False, pa >= pastro_min)
+            c = np.where(nan_pa, False, pa >= pastro_min)
+            m &= c
+            m_evt &= c
+        n_missing_snr = 0
+        snr_nan_rows = None
         if snr_min is not None:
-            m &= np.where(np.isnan(self.meta["snr_med"]), False,
-                          self.meta["snr_med"] >= snr_min)
+            # The same rules as pastro_min / sky_area_max (review 2026-10-20).
+            # snr_med is the median of network_optimal_snr, which no
+            # GWTC-2.1/3 C01:Mixed set carries, so 57 of the 259 production BBH
+            # events (GW150914 among them) are NaN -- and the cut dropped them
+            # without a word, even at snr_min=0.
+            if "snr_med" not in self.meta:
+                raise ValueError(
+                    f"select(snr_min={snr_min}) needs the 'snr_med' meta "
+                    f"column and this store has none (columns: "
+                    f"{sorted(self.meta)}).")
+            snr = np.asarray(self.meta["snr_med"], dtype=float)
+            nan_snr = np.isnan(snr)
+            # The all-NaN refusal and the names are decided once EVERY other
+            # cut has run (below): the name-list and FAR cuts come after this
+            # one, and counting here blamed events an event_list, allowed_names
+            # or far_max in the same call removed anyway -- 73 named instead of
+            # 57 for the population list on the production store.  They are
+            # also named after the waveform policy has chosen: on a store
+            # holding several sample sets per event, an event whose CHOSEN set
+            # has an SNR is not dropped for a sibling set that lacks one.
+            snr_nan_rows = nan_snr
+            c = np.where(nan_snr, False, snr >= snr_min)
+            m &= c
+            m_row &= c
         if m1_src_range is not None:
             lo, hi = m1_src_range
-            m &= (self.meta["m1_src_med"] >= lo) & (self.meta["m1_src_med"] <= hi)
+            c = (self.meta["m1_src_med"] >= lo) & (self.meta["m1_src_med"] <= hi)
+            m &= c
+            m_row &= c
+            m_row_nosnr &= c
         if m2_src_range is not None:
             lo, hi = m2_src_range
-            m &= (self.meta["m2_src_med"] >= lo) & (self.meta["m2_src_med"] <= hi)
+            c = (self.meta["m2_src_med"] >= lo) & (self.meta["m2_src_med"] <= hi)
+            m &= c
+            m_row &= c
+            m_row_nosnr &= c
         if sky_area_max is not None:
             # No presence guard (GW-37).  It used to skip the cut when the store
             # carried no sky_area_90 while `refine()` recorded the threshold
@@ -777,7 +1048,10 @@ class GWCatalog:
                     f"sky_area_max={sky_area_max} drops {n_nan} event(s) with "
                     f"no sky_area_90: "
                     f"{sorted(self.names[in_scope & nan_sa].tolist())}.")
-            m &= np.where(nan_sa, False, sa <= sky_area_max)
+            c = np.where(nan_sa, False, sa <= sky_area_max)
+            m &= c
+            m_row &= c
+            m_row_nosnr &= c
         _whitelist = allowed_names if allowed_names is not None else names
         if _whitelist is not None:
             _whitelist_arr = np.asarray(_whitelist)
@@ -790,7 +1064,7 @@ class GWCatalog:
             if compact_type is not None and allowed_names is not None:
                 present = np.isin(self.names, _whitelist_arr)
                 dropped = self.names[present &
-                                     (self.meta["compact_type"] != compact_type)]
+                                     (ct_column != compact_type)]
                 if len(dropped):
                     action = ("will not be dropped because allowed_names is "
                               "authoritative" if allowed_names_authoritative
@@ -800,7 +1074,9 @@ class GWCatalog:
                         f"allowed_names event(s); they {action}: "
                         f"{sorted(dropped.tolist())}"
                     )
-            m &= np.isin(self.names, _whitelist_arr)
+            c = np.isin(self.names, _whitelist_arr)
+            m &= c
+            m_evt &= c
             # Both spellings are the same filter -- membership in a fixed list
             # of names -- and normalise into the one whitelist the spec keeps.
             name_filters.append(
@@ -812,8 +1088,9 @@ class GWCatalog:
             listed = load_event_list(event_list)
             listed_arr = np.asarray(listed)
             name_filters.append(
-                ("event_list:" + (str(event_list)
-                                  if isinstance(event_list, (str, bytes))
+                ("event_list:" + (os.fsdecode(event_list)
+                                  if isinstance(event_list,
+                                                (str, bytes, os.PathLike))
                                   else "custom_sequence"),
                  [str(x) for x in listed]))
             missing_ev = set(listed_arr) - set(self.names)
@@ -822,7 +1099,9 @@ class GWCatalog:
                     f"event_list: {len(missing_ev)} name(s) not found in store "
                     f"and will be skipped: {sorted(missing_ev)}"
                 )
-            m &= np.isin(self.names, listed_arr)
+            c = np.isin(self.names, listed_arr)
+            m &= c
+            m_evt &= c
 
         # ── FAR handling with explicit missing-FAR policy ─────────────────
         far_policy = "none"
@@ -838,6 +1117,30 @@ class GWCatalog:
             n_missing_far = int(missing_mask.sum())
             below = np.zeros(len(self.names), dtype=bool)
             below[fa] = far[fa] <= far_max
+            # The PE cut is inclusive while every injection mask is strict
+            # (far < threshold), and the catalog FAR is GWOSC's value rounded to
+            # two significant figures, so real events sit exactly on round
+            # thresholds (0.25, 0.5; GW231002_143916 is published at 1.0).
+            # The operator is recorded (far_cut_operator) and the events whose
+            # published FAR equals far_max to that precision -- whose true FAR
+            # may lie on either side -- are named (review 2026-10-20).  The
+            # cut itself is unchanged.
+            at_thr = np.zeros(len(self.names), dtype=bool)
+            pos = fa & (far > 0) & np.isfinite(far)
+            unit = np.zeros(len(self.names))
+            unit[pos] = 10.0 ** (np.floor(np.log10(far[pos])) - 1)
+            at_thr[pos] = np.abs(far[pos] - far_max) <= 0.5 * unit[pos]
+            at_thr &= candidates
+            if at_thr.any():
+                warnings.warn(
+                    f"far_max={far_max}: {int(at_thr.sum())} event(s) have a "
+                    f"catalog FAR equal to the threshold at the two significant "
+                    f"figures GWOSC publishes, so their true FAR may lie on "
+                    f"either side of it: "
+                    f"{sorted(set(self.names[at_thr].tolist()))}. This cut "
+                    f"keeps them (far <= far_max) while every injection mask "
+                    f"is strict (far < threshold); recorded as "
+                    f"far_cut_operator='<='.")
             if require_far:
                 if n_missing_far > 0:
                     raise ValueError(
@@ -846,6 +1149,7 @@ class GWCatalog:
                         f"{sorted(self.names[missing_mask].tolist())}. "
                         f"Pass allow_missing_far=True to keep them instead.")
                 m &= below
+                m_evt &= below
                 far_policy = "require"
             elif allow_missing_far:
                 if n_missing_far > 0:
@@ -854,6 +1158,7 @@ class GWCatalog:
                         f"event(s) with missing FAR through the far_max cut: "
                         f"{sorted(self.names[missing_mask].tolist())}")
                 m &= (below | ~fa)
+                m_evt &= (below | ~fa)
                 far_policy = "allow_missing"
             else:
                 if n_missing_far > 0:
@@ -863,29 +1168,186 @@ class GWCatalog:
                         f"allow_missing_far=True to keep them or require_far=True "
                         f"to fail loudly: {sorted(self.names[missing_mask].tolist())}")
                 m &= below
+                m_evt &= below
                 far_policy = "drop_missing"
 
         # (The p_astro-absence warning used to live here, after the cut it was
         # meant to describe had already removed every NaN row from `m` -- so it
         # could never fire.  It is issued at the cut itself now.)
-        sel = np.nonzero(m & np.isin(np.arange(len(self.names)), self._sel))[0]
+        in_view = np.isin(np.arange(len(self.names)), self._sel)
+
+        if snr_nan_rows is not None:
+            # The rows snr_min decides: in the view and kept by every other
+            # cut, event-level (names, FAR, p_astro) and per-sample-set alike.
+            snr_scope = m_evt & m_row_nosnr & in_view
+            if snr_scope.any() and snr_nan_rows[snr_scope].all():
+                raise ValueError(
+                    f"select(snr_min={snr_min}) would exclude all "
+                    f"{int(snr_scope.sum())} candidate event(s) because "
+                    f"'snr_med' is NaN for every one of them (it is the median "
+                    f"of network_optimal_snr, which many releases do not "
+                    f"carry). A threshold crossed with an all-absent column is "
+                    f"a configuration error, not a selection; drop snr_min.")
+            snr_nan_rows = snr_nan_rows & snr_scope
 
         # ── Waveform / sample-set policy resolution (PR 6) ────────────────────
         # Collapse the metadata-selected rows to one sample set per event
         # (unless waveform_policy="all").  A no-op for single-sample-set stores.
-        from .waveform_policy import resolve_policy, resolve_event_map
+        #
+        # The policy chooses FIRST and the per-sample-set cuts then apply to the
+        # set it chose (review 2026-10-20).  They used to run before it, so on a
+        # store holding every sample set an event cut meant "keep the event if
+        # ANY of its sets passes" and the policy then picked whichever survived:
+        # snr_min=8 with mixed-first quietly switched 54 O3 events from
+        # C01:Mixed (no SNR recorded) to C01:IMRPhenomXPHM with its own priors,
+        # the reason claimed a fallback, the event-map route said the store did
+        # not hold C01:Mixed, and a one-row-per-event store dropped the same
+        # events under the same selection_spec_digest.  The candidates are every
+        # row of each event that has at least one row passing every cut, so an
+        # event no set of which passes never reaches the policy (and cannot make
+        # strict-approximant fail); an event whose CHOSEN set fails a cut is
+        # dropped -- a cut never substitutes a different waveform.
+        passing = m & in_view
+        pass_names = set(self.names[passing].tolist())
+        cand = m_evt & in_view
+        cand &= np.isin(self.names, list(pass_names))
+        sel = np.nonzero(cand)[0]
+        from .waveform_policy import (resolve_policy, resolve_event_map,
+                                      load_sample_set_map, WAVEFORM_POLICIES)
         map_report = None
-        if waveform_policy == "event-map":
-            kept, reasons, homogeneous, map_report = resolve_event_map(
-                self.names, sel, self.meta, sample_set_map,
-                q_frac_fn=self._q_below_nrsur_floor_frac,
-                nrsur_q_rule=nrsur_q_rule,
-                nrsur_q_rule_substitute=nrsur_q_rule_substitute)
+        map_digest = None
+        if sample_set_map is not None and waveform_policy == "event-map":
+            sample_set_map = load_sample_set_map(sample_set_map)
+            map_digest = sample_set_map_digest(sample_set_map)
+
+        # ── A chained view keeps the sample sets its policy chose ────────────
+        # (review 2026-10-20).  The exporters re-select with their own default
+        # waveform_policy="preferred", and a second select() used to overwrite
+        # the view's policy with whatever it was passed: the rows stayed the
+        # ones the first policy chose, while the file recorded
+        # waveform_policy='preferred', an empty map hash, no substitutions and
+        # reasons 'preferred:single_sample_set'.  Now a call that asks for no
+        # policy of its own (or for the view's own) inherits the view's
+        # choice, reasons and event-map report; a call asking for a DIFFERENT
+        # policy is refused when the view's events have other sample sets in
+        # the store, because those sets are no longer in the view to choose
+        # from.  A view under "all" still holds every set, so any policy may
+        # choose among them.
+        # A request resolve_policy itself rejects (an unknown policy, a map or
+        # q-rule without event-map) goes straight to it, for its own error.
+        well_formed = (waveform_policy in WAVEFORM_POLICIES and (
+            waveform_policy == "event-map"
+            or (sample_set_map is None and nrsur_q_rule is None)))
+        view_resolved = (self._selection_reasons is not None) and well_formed
+        view_policy = self._waveform_policy
+        default_call = (waveform_policy == "preferred" and approximant is None
+                        and sample_set_map is None and nrsur_q_rule is None
+                        and not nrsur_q_rule_substitute)
+        same_as_view = (
+            waveform_policy == view_policy
+            # resolve_policy reads approximant under strict-approximant only
+            and (waveform_policy != "strict-approximant"
+                 or approximant in (None, self._waveform_approximant))
+            and (map_digest is None
+                 or map_digest == self._sample_set_map_digest)
+            and (nrsur_q_rule is None
+                 or self._sample_set_map_report is not None
+                 and nrsur_q_rule == self._sample_set_map_report.get(
+                     "nrsur_q_rule"))
+            and (not nrsur_q_rule_substitute
+                 or self._sample_set_map_report is not None
+                 and self._sample_set_map_report.get(
+                     "nrsur_q_rule_substitute")))
+        if view_resolved and (default_call or same_as_view):
+            eff_policy = view_policy
+            eff_approximant = self._waveform_approximant
+            map_report = self._sample_set_map_report
+            map_digest = self._sample_set_map_digest
+            view_reason = dict(zip(np.asarray(self._sel).tolist(),
+                                   list(self._selection_reasons)))
+            kept = np.asarray(sel, dtype=int)
+            reasons = [str(view_reason.get(int(r), "")) for r in kept]
+            kept_names_all = self.names[kept] if kept.size else self.names[:0]
+            homogeneous = len(set(kept_names_all.tolist())) == kept.size
         else:
-            kept, reasons, homogeneous = resolve_policy(
-                self.names, sel, self.meta, policy=waveform_policy,
-                approximant=approximant, sample_set_map=sample_set_map,
-                nrsur_q_rule=nrsur_q_rule)
+            if view_resolved and view_policy != "all":
+                counts = {}
+                for nm in self.names.tolist():
+                    counts[nm] = counts.get(nm, 0) + 1
+                multi = sorted({str(nm) for nm in self.names[sel].tolist()
+                                if counts.get(nm, 0) > 1})
+                if multi:
+                    raise ValueError(
+                        f"this view's sample sets were already chosen by "
+                        f"waveform_policy={view_policy!r}, and {len(multi)} of "
+                        f"its events have other sample sets in the store that "
+                        f"are no longer in the view (e.g. {multi[:5]}), so "
+                        f"waveform_policy={waveform_policy!r} cannot re-choose "
+                        f"them; the file would record a policy that did not "
+                        f"make the choice. Pass the policy to the FIRST "
+                        f"select() (or export from the unfiltered catalog).")
+            eff_policy = waveform_policy
+            eff_approximant = approximant
+            if waveform_policy == "event-map":
+                kept, reasons, homogeneous, map_report = resolve_event_map(
+                    self.names, sel, self.meta, sample_set_map,
+                    q_frac_fn=self._q_below_nrsur_floor_frac,
+                    nrsur_q_rule=nrsur_q_rule,
+                    nrsur_q_rule_substitute=nrsur_q_rule_substitute)
+                # A map built in code carries no file hash; record its content
+                # digest rather than an empty identity (review 2026-10-20).
+                map_report = dict(map_report)
+                map_report["map_content_sha256"] = map_digest
+                if not map_report.get("map_sha256"):
+                    map_report["map_sha256"] = map_digest
+            else:
+                kept, reasons, homogeneous = resolve_policy(
+                    self.names, sel, self.meta, policy=waveform_policy,
+                    approximant=approximant, sample_set_map=sample_set_map,
+                    nrsur_q_rule=nrsur_q_rule)
+        kept = np.asarray(kept, dtype=int)
+        kept_chosen = kept.copy()
+        chosen_ok = m_row[kept] if kept.size else np.zeros(0, dtype=bool)
+        if not chosen_ok.all():
+            lost = sorted({str(self.names[r]) for r in kept[~chosen_ok]})
+            kept_names_ok = {str(self.names[r]) for r in kept[chosen_ok]}
+            lost = [n for n in lost if n not in kept_names_ok]
+            if lost and eff_policy != "all":
+                warnings.warn(
+                    f"{len(lost)} event(s) dropped because the sample set "
+                    f"waveform_policy={eff_policy!r} chose for them fails "
+                    f"a per-sample-set cut (source_class/compact_type/snr_min/"
+                    f"m1_src_range/m2_src_range/sky_area_max), although another "
+                    f"of their sample sets passes: {lost[:10]}"
+                    + ("" if len(lost) <= 10 else f" (+{len(lost) - 10} more)")
+                    + ". The cuts apply to the chosen sample set; a cut never "
+                      "switches an event to a different waveform.")
+            reasons = [r for r, ok in zip(reasons, chosen_ok) if ok]
+            kept = kept[chosen_ok]
+            kept_names = self.names[kept] if kept.size else self.names[:0]
+            homogeneous = bool(homogeneous) or (
+                len(set(kept_names.tolist())) == kept.size)
+
+        if snr_nan_rows is not None and snr_nan_rows.any():
+            # Events the SNR cut dropped because the SNR of the set that
+            # decides them is unknown: the chosen set when the event reached
+            # the policy, any of its sets when none of them passed.
+            final = set(self.names[kept].tolist()) if kept.size else set()
+            chosen_nan = {str(self.names[r]) for r in kept_chosen
+                          if snr_nan_rows[r]}
+            missing = sorted(
+                str(n) for n in set(self.names[snr_nan_rows].tolist())
+                if n not in final
+                and (n not in pass_names or n in chosen_nan))
+            n_missing_snr = len(missing)
+            if missing:
+                warnings.warn(
+                    f"snr_min={snr_min} drops {n_missing_snr} event(s) whose "
+                    f"posterior-median SNR is unknown (snr_med NaN: the sample "
+                    f"set carries no network_optimal_snr) -- not because their "
+                    f"SNR is low: {missing}. No injection cut reproduces "
+                    f"dropping events for missing metadata; recorded as "
+                    f"n_events_missing_snr.")
 
         # ── The EFFECTIVE selection (GW-33) ───────────────────────────────────
         # Composed with the spec of the view this call was made on, because the
@@ -903,7 +1365,13 @@ class GWCatalog:
             allowed_names_authoritative=allowed_names_authoritative,
             far_policy=far_policy, n_missing_far=n_missing_far,
             allow_missing_far=allow_missing_far, require_far=require_far,
-            waveform_policy=waveform_policy, approximant=approximant)
+            waveform_policy=eff_policy, approximant=eff_approximant,
+            allow_point_estimate_cuts=allow_unpaired_point_estimate_cuts,
+            n_missing_snr=n_missing_snr,
+            sample_set_map_digest=map_digest,
+            nrsur_q_rule=(map_report or {}).get("nrsur_q_rule"),
+            nrsur_q_rule_substitute=bool(
+                (map_report or {}).get("nrsur_q_rule_substitute", False)))
 
         result = GWCatalog(self.path, _sel=kept)
         result._selection_spec = spec
@@ -917,11 +1385,12 @@ class GWCatalog:
         result._snr_min = snr_min
         result._selection_source_class = source_class
         result._selection_event_list = event_list
-        result._waveform_policy = waveform_policy
-        result._waveform_approximant = approximant
+        result._waveform_policy = eff_policy
+        result._waveform_approximant = eff_approximant
         result._selection_reasons = np.asarray(reasons, dtype=object)
         result._homogeneous_sample_sets = bool(homogeneous)
         result._sample_set_map_report = map_report
+        result._sample_set_map_digest = map_digest
         return result
 
     def _q_below_nrsur_floor_frac(self, event, label):
@@ -1131,10 +1600,15 @@ class GWCatalog:
                       source_class=None, event_list=None,
                       allow_missing_far=False, require_far=False,
                       waveform_policy="preferred", approximant=None,
+                      sample_set_map=None, nrsur_q_rule=None,
+                      nrsur_q_rule_substitute=False,
                       write_summary: bool = False,
                       summary_context: Optional[dict] = None,
                       allow_zero_p_pe: bool = False,
-                      allow_unpaired_pastro_min: bool = False):
+                      allow_unpaired_pastro_min: bool = False,
+                      allow_unpaired_point_estimate_cuts: bool = False,
+                      max_out_of_support_frac: float = 0.0,
+                      allow_out_of_support: bool = False):
         """Write an HDF5 consumable by darksirens.gw.utils.load_gw_samples.
 
         p_pe convention (spin-prior contract)
@@ -1248,6 +1722,12 @@ class GWCatalog:
             homogeneous.
         approximant : str or None
             Required approximant for ``waveform_policy="strict-approximant"``.
+        sample_set_map, nrsur_q_rule, nrsur_q_rule_substitute
+            ``waveform_policy="event-map"`` only, as in :meth:`select`.  This
+            path used to offer the policy without taking a map, so it could
+            never succeed (review 2026-10-20).  The ``gwcat export-darksirens``
+            command still has no option for a map: use ``gwcat export pe
+            --waveform-policy event-map --sample-set-map MAP`` there.
         write_summary : bool, default False
             (PR 10) When True, write ``<out_path>.validation_summary.json`` and
             ``.md`` next to ``out_path`` (see :mod:`gwcat.validation_summary`).
@@ -1262,6 +1742,19 @@ class GWCatalog:
             records ``p_astro_available=False``), so no injection-side cut
             reproduces it and the pair is not usable; see
             :meth:`SelectionSpec.check_pairable`.
+        allow_unpaired_point_estimate_cuts : bool, default False
+            Write the file even though the exported view carries a cut on
+            per-event point estimates (``m1_src_range`` / ``m2_src_range`` /
+            ``sky_area_max``), which no injection campaign reproduces.  The
+            file then records ``point_estimate_cuts`` and the paired
+            validator refuses it; see :meth:`SelectionSpec.check_pairable`.
+        max_out_of_support_frac, allow_out_of_support
+            The 2.0 builder's spin-support gate: a sample outside the chi_eff
+            prior's support (a forced ``amax`` below the samples) gets an
+            exactly-zero p_pe, and the export refuses when the fraction of such
+            samples exceeds ``max_out_of_support_frac`` (default 0) unless
+            ``allow_out_of_support=True``.  The counts are recorded either way
+            (``n_samples_out_of_support``, ``n_out_of_support_per_event``).
 
         Provenance (GW-33)
         ------------------
@@ -1279,6 +1772,16 @@ class GWCatalog:
                 f"of {valid_spin_modes}. 'passthrough' is not offered because "
                 f"the store keeps a spin-prior-agnostic p_dL_pe, so 'exclude' "
                 f"already means 'no chi_eff prior applied'.")
+        if (waveform_policy == "event-map" and sample_set_map is None
+                and self._waveform_policy != "event-map"):
+            from .waveform_policy import SampleSetMapError
+            raise SampleSetMapError(
+                "waveform_policy='event-map' needs a sample-set map: pass "
+                "sample_set_map= to to_darksirens (a JSON file, a popsummary "
+                "file, a mapping or a SampleSetMap), or export a view already "
+                "selected with one. The `gwcat export-darksirens` command has "
+                "no option for a map; use `gwcat export pe --waveform-policy "
+                "event-map --sample-set-map MAP` instead.")
         sub = self.select(compact_type=compact_type, far_max=far_max,
                           pastro_min=pastro_min, allowed_names=allowed_names,
                           allowed_names_authoritative=allowed_names_authoritative,
@@ -1286,7 +1789,12 @@ class GWCatalog:
                           allow_missing_far=allow_missing_far,
                           require_far=require_far,
                           waveform_policy=waveform_policy,
-                          approximant=approximant)
+                          approximant=approximant,
+                          sample_set_map=sample_set_map,
+                          nrsur_q_rule=nrsur_q_rule,
+                          nrsur_q_rule_substitute=nrsur_q_rule_substitute,
+                          allow_unpaired_point_estimate_cuts=(
+                              allow_unpaired_point_estimate_cuts))
         # The EFFECTIVE selection: this call's filters composed with those the
         # exported view already carried (GW-33).  Everything this exporter
         # records about the selection comes from here, and the cut no injection
@@ -1370,6 +1878,12 @@ class GWCatalog:
         kept_ss_name, kept_ss_approx, kept_ss_reason = [], [], []
         # Resampling provenance (GW-13), aligned with ``kept``.
         n_unique_per_event, upsampled_events = [], []
+        #: Posterior samples available to each kept event's draw (after the
+        #: z_max cut).  A bootstrapped event's per-event Monte Carlo variance
+        #: is understated by about 1 + nsamp / n_available when its repeated
+        #: rows are treated as independent (review 2026-10-20); recorded so a
+        #: consumer can correct it.
+        n_available_per_event = []
 
         def _ss_meta(row, field):
             v = sub.meta.get(field)
@@ -1441,7 +1955,33 @@ class GWCatalog:
             return out[0], out[1], src
 
         kept_amax1, kept_amax2, kept_amax_src = [], [], []
+        # WHERE each event's spin prior came from (the store's GW-40b
+        # provenance), carried onto the v1 file under the 2.0 builder's names
+        # and with its legacy fallback (review 2026-10-20).  The v1 file
+        # labels a store-resolved ceiling "analytic" by design, so without
+        # this it could not show that an event's ceiling was ASSUMED (an event
+        # with no spin prior of its own, such as GW190425, gets 0.99).
+        def _meta_strs(name):
+            v = sub.meta.get(name)
+            if v is None:
+                return None
+            return [x.decode() if isinstance(x, (bytes, bytearray)) else str(x)
+                    for x in np.asarray(v)[sel_rows]]
+        spin_kinds = _meta_strs("prior_source_kind_spin")
+        if spin_kinds is None or not any(spin_kinds):
+            legacy = _meta_strs("spin_prior_kind")
+            spin_kinds = ["assumed_default" if k == "assumed_default"
+                          else "release_reweighted" if k == "release_reweighted"
+                          else "unrecorded"
+                          for k in (legacy or [""] * sub.n_events)]
+        spin_kinds = [k or "unrecorded" for k in spin_kinds]
+        kept_spin_kind = []
         amax_fallback_events = []
+        # The z_max truncation, recorded (review 2026-10-20) as the 2.0
+        # builder records it: per kept event, the samples the cut removed, and
+        # the events it removed entirely.  It used to leave no trace, so a
+        # truncated v1 file paired with an untruncated selection.
+        n_cut_by_z_max, z_max_dropped_events = [], []
 
         for e in range(sub.n_events):
             n = len(per["luminosity_distance"][e])
@@ -1456,10 +1996,13 @@ class GWCatalog:
             m2_e = per["mass_2"][e]
 
             # Per-sample z_max cut
+            n_cut_e = 0
             if z_max is not None:
                 z_e = z_of_dL(dL_e, cosmo_e)
                 keep = z_e <= z_max
+                n_cut_e = int(np.sum(~keep))
                 if not keep.any():
+                    z_max_dropped_events.append(str(sub.event_names[e]))
                     continue
                 dL_e = dL_e[keep]
                 m1_e = m1_e[keep]
@@ -1483,6 +2026,7 @@ class GWCatalog:
             # by the duplication factor -- which is precisely the diagnostic
             # meant to flag the event as unusable.
             n_unique_per_event.append(int(np.unique(idx_orig).size))
+            n_available_per_event.append(int(n_kept))
             if rep and n_kept < nsamp:
                 upsampled_events.append(str(sub.event_names[e]))
 
@@ -1520,10 +2064,12 @@ class GWCatalog:
             cols["m2src"].append(m2 / (1 + z))
             kept.append(sub.event_names[e])
             kept_mass_kind.append(mass_kind_e)
+            n_cut_by_z_max.append(n_cut_e)
             a1_e, a2_e, asrc_e = _event_amax(e)
             kept_amax1.append(a1_e)
             kept_amax2.append(a2_e)
             kept_amax_src.append(asrc_e)
+            kept_spin_kind.append(spin_kinds[e])
             if asrc_e == "fallback":
                 amax_fallback_events.append(str(sub.event_names[e]))
             kept_H0.append(float(per_event_H0[e]))
@@ -1536,6 +2082,16 @@ class GWCatalog:
                 and e < len(reasons_arr) else "")
 
         nobs = len(kept)
+        if nobs == 0:
+            # The 2.0 builder's guard (review 2026-10-20): a zero-event file
+            # passes every length check (0 == 0 * nsamp) and validated, so an
+            # empty selection -- a mistyped class, a FAR outage -- exported
+            # "successfully".  Core refuses nobs = 0 anyway.
+            raise ValueError(
+                f"the export's cuts left 0 of {sub.n_events} selected "
+                f"event(s), so there is no PE file to write. Effective "
+                f"selection: {spec.to_json()}. Check the class, FAR and z_max "
+                f"cuts, and whether the store's FARs were populated at ingest.")
         data = {k: np.concatenate(v) if v else np.array([])
                 for k, v in cols.items()}
 
@@ -1573,17 +2129,51 @@ class GWCatalog:
             # density, so the finiteness test admitted excluded samples with a
             # p_pe ~1e12 too small -- an inverse weight ~1e12 too LARGE (GW-31).
             in_support_v1 = np.concatenate(sup_parts) & np.isfinite(logp_chi)
-            n_unsupported = int(np.sum(~in_support_v1))
-            if n_unsupported:
-                warnings.warn(
-                    f"to_darksirens: {n_unsupported} of {logp_chi.size} samples "
-                    f"fall outside the chi_eff prior's support (per-event amax "
-                    f"in [{min(kept_amax1):g}, {max(kept_amax1):g}]); their "
-                    f"p_pe is exactly zero, which the consumer masks while "
-                    f"still counting them in n for the per-event MC variance.")
             with np.errstate(over="ignore"):
                 data["p_pe"] = data["p_pe"] * np.where(
                     in_support_v1, np.exp(logp_chi), 0.0)
+
+        # ── The out-of-support gate (review 2026-10-20) ─────────────────────
+        # The 2.0 builder's gate, under its names.  This writer used to warn
+        # and write the zeros for ANY fraction of out-of-support samples, with
+        # no record, and its validator then failed the file and blamed the
+        # distance prior: `--amax 0.3` wrote 19% zero-weight samples that the
+        # consumer masks, truncating the posterior.
+        n_out_v1 = int(np.sum(~in_support_v1))
+        frac_out_v1 = (n_out_v1 / in_support_v1.size
+                       if in_support_v1.size else 0.0)
+        n_out_per_event_v1 = (
+            (~in_support_v1.reshape(nobs, nsamp)).sum(axis=1).astype(np.int64)
+            if nobs and nsamp and in_support_v1.size == nobs * nsamp
+            else np.zeros(nobs, dtype=np.int64))
+        if (n_out_v1 and frac_out_v1 > max_out_of_support_frac
+                and not allow_out_of_support):
+            from .export.pe_builder import OutOfSupportError
+            hit = np.nonzero(n_out_per_event_v1)[0]
+            listed = ", ".join(f"{kept[i]}: {int(n_out_per_event_v1[i])}/{nsamp}"
+                               for i in hit[:10])
+            more = "" if hit.size <= 10 else f", ... (+{hit.size - 10} more)"
+            raise OutOfSupportError(
+                f"to_darksirens: {n_out_v1} of {in_support_v1.size} samples "
+                f"({100 * frac_out_v1:.3f}%) fall outside the chi_eff prior's "
+                f"support (per-event amax_1 in [{min(kept_amax1):g}, "
+                f"{max(kept_amax1):g}]), above max_out_of_support_frac="
+                f"{max_out_of_support_frac:g}. Affected event(s) [{hit.size} "
+                f"of {nobs}]: {listed}{more}. Their p_pe would be exactly zero "
+                f"-- the prior assigns them no density -- which means the "
+                f"ceiling does not cover the samples; the consumer would mask "
+                f"them, truncating the posterior. Use the events' own ceilings "
+                f"(amax='auto'), or pass allow_out_of_support=True to export "
+                f"anyway (recorded).")
+        if n_out_v1:
+            warnings.warn(
+                f"to_darksirens: exporting with {n_out_v1} of "
+                f"{in_support_v1.size} samples ({100 * frac_out_v1:.3f}%) "
+                f"outside the chi_eff prior's support (allow_out_of_support="
+                f"{bool(allow_out_of_support)}); their p_pe is exactly zero, "
+                f"which the consumer masks while still counting them in n for "
+                f"the per-event MC variance. Recorded as "
+                f"n_samples_out_of_support.")
 
         # ── Mass-prior basis, from the rows written (GW-34/GW-37) ───────────
         mass_kinds = [str(k) for k in kept_mass_kind]
@@ -1612,6 +2202,15 @@ class GWCatalog:
                 f"spin amax (meta/spin_amax_1/2 NaN); the chi_eff prior used "
                 f"amax_fallback={amax_fallback} for them, recorded in "
                 f"chi_eff_amax_source_per_event: {amax_fallback_events[:10]}")
+        spin_assumed_events = [str(n) for n, k in zip(kept, kept_spin_kind)
+                               if k == "assumed_default"]
+        if spin_assumed_events and forced_amax is None:
+            warnings.warn(
+                f"{len(spin_assumed_events)} exported event(s) carry no spin "
+                f"prior of their own; the store ASSUMED one at ingest, so the "
+                f"chi_eff prior was evaluated at an assumed ceiling, not a "
+                f"released one: {spin_assumed_events[:10]}. Recorded in "
+                f"spin_prior_assumed_events.")
 
         # ── Exported-weight support contract (GW-01) ────────────────────────
         from .schema import check_p_pe_positive
@@ -1643,6 +2242,20 @@ class GWCatalog:
                   "rows is overestimated by the duplication factor -- read "
                   "n_unique_samples_per_event, which records how many distinct "
                   "posterior samples actually back each event.")
+
+        if z_max is not None and (any(n_cut_by_z_max) or z_max_dropped_events):
+            warnings.warn(
+                f"z_max={z_max} dropped {sum(n_cut_by_z_max)} posterior "
+                f"sample(s) across {sum(1 for n in n_cut_by_z_max if n)} of "
+                f"{nobs} exported event(s)"
+                + (f", and removed {len(z_max_dropped_events)} event(s) whose "
+                   f"every sample lies above it: {z_max_dropped_events[:10]}"
+                   if z_max_dropped_events else "")
+                + ". The paired selection must be truncated at the SAME z_max "
+                  "or mu integrates over redshifts the events do not cover; a "
+                  "gwcat-selection-1.0 file cannot state one, so validate_export "
+                  "refuses this file against it. Recorded as z_max, "
+                  "n_samples_cut_by_z_max and events_dropped_by_z_max.")
 
         with h5py.File(out_path, "w") as f:
             # --- Attributes darksirens reads ---
@@ -1706,10 +2319,27 @@ class GWCatalog:
             # letting one event's ceiling stand for the file's.
             _a1 = np.asarray(kept_amax1, dtype=float)
             _a2 = np.asarray(kept_amax2, dtype=float)
+            # One scalar names ONE ceiling for BOTH spins (review 2026-10-20):
+            # in "exclude" mode the consumer evaluates the chi_eff prior at
+            # this value for both components, so writing amax_1 when amax_2
+            # differs (a (0.99, 0.05) event evaluated at (0.99, 0.99)) was a
+            # silently wrong prior.  NaN unless every event has the same
+            # ceiling on both spins.
             _uniform_amax = (_a1.size > 0 and np.ptp(_a1) == 0
-                             and np.ptp(_a2) == 0)
+                             and np.ptp(_a2) == 0
+                             and float(_a1[0]) == float(_a2[0]))
             f.attrs["chi_eff_amax"] = (float(_a1[0]) if _uniform_amax
                                        else float("nan"))
+            if not chi_eff_included and not _uniform_amax and _a1.size:
+                warnings.warn(
+                    f"spin_prior_mode='exclude': the exported events do not "
+                    f"share one spin ceiling on both spins (amax_1 in "
+                    f"[{_a1.min():g}, {_a1.max():g}], amax_2 in "
+                    f"[{_a2.min():g}, {_a2.max():g}]), so chi_eff_amax is NaN. "
+                    f"A consumer that applies the chi_eff prior from that one "
+                    f"scalar cannot evaluate it for this file; it must read "
+                    f"chi_eff_amax_1_per_event / chi_eff_amax_2_per_event, or "
+                    f"export with spin_prior_mode='include'.")
             f.attrs["chi_eff_amax_1_per_event"] = _a1
             f.attrs["chi_eff_amax_2_per_event"] = _a2
             f.attrs["chi_eff_amax_source_per_event"] = np.array(
@@ -1719,6 +2349,18 @@ class GWCatalog:
             f.attrs["spin_amax_fallback"] = float(amax_fallback)
             f.attrs["spin_amax_fallback_events"] = np.array(
                 amax_fallback_events, dtype=h5py.string_dtype())
+            f.attrs["prior_source_kind_spin_per_event"] = np.array(
+                kept_spin_kind, dtype=h5py.string_dtype())
+            f.attrs["spin_prior_assumed_events"] = np.array(
+                spin_assumed_events, dtype=h5py.string_dtype())
+            # Spin-support accounting (review 2026-10-20), under the 2.0
+            # builder's names; the v1 validator reads it to tell recorded
+            # spin-support zeros from a truncated distance prior.
+            f.attrs["n_samples_out_of_support"] = int(n_out_v1)
+            f.attrs["frac_samples_out_of_support"] = float(frac_out_v1)
+            f.attrs["n_out_of_support_per_event"] = n_out_per_event_v1
+            f.attrs["max_out_of_support_frac"] = float(max_out_of_support_frac)
+            f.attrs["out_of_support_allowed"] = bool(allow_out_of_support)
             # Scalar PE cosmology: the override, or the first kept event's
             # cosmology in per-event mode (authoritative record is the
             # per-event array above when cosmology_per_event_varies=True).
@@ -1749,8 +2391,12 @@ class GWCatalog:
             # advertised as homogeneous, even if a duplicate row was later
             # skipped by z_max/undersampling and the written file happens to be
             # one-row-per-event.
-            f.attrs["waveform_policy"] = str(waveform_policy)
-            f.attrs["approximant"] = "" if approximant is None else str(approximant)
+            # The view's EFFECTIVE policy (review 2026-10-20), as the spec
+            # attrs above already state it -- not this call's keyword, which
+            # is "preferred" for an export of an already-resolved view.
+            f.attrs["waveform_policy"] = str(sub._waveform_policy)
+            f.attrs["approximant"] = ("" if sub._waveform_approximant is None
+                                      else str(sub._waveform_approximant))
             # Derived from the policy resolution, not re-inferred from name
             # uniqueness: `kept` holds store ROW indices, so two sample sets of
             # one event are two distinct rows and the old test called that
@@ -1766,6 +2412,22 @@ class GWCatalog:
             f.attrs["resampled_with_replacement"] = bool(upsampled_events)
             f.attrs["n_events_resampled_with_replacement"] = int(
                 len(upsampled_events))
+            if upsampled_events:
+                # Only when an event was bootstrapped (the case it corrects);
+                # the 2.0 builder does not write it yet.
+                f.attrs["n_samples_available_per_event"] = np.asarray(
+                    n_available_per_event, dtype=np.int64)
+            # The per-sample redshift truncation (review 2026-10-20), under the
+            # 2.0 builder's names: NaN = no truncation.
+            f.attrs["z_max"] = (float("nan") if z_max is None
+                                else float(z_max))
+            f.attrs["n_samples_cut_by_z_max"] = np.asarray(
+                n_cut_by_z_max, dtype=np.int64)
+            if z_max is not None:
+                # Only under a truncation: the 2.0 builder does not write this
+                # attr yet, and the v2 file must stay a superset of the v1 one.
+                f.attrs["events_dropped_by_z_max"] = np.array(
+                    z_max_dropped_events, dtype=h5py.string_dtype())
             f.attrs.create("sample_set_name_per_event",
                            np.array([str(x) for x in kept_ss_name],
                                     dtype=h5py.string_dtype()))
@@ -1778,6 +2440,14 @@ class GWCatalog:
             f.attrs.create("event_names",
                            np.array([str(k) for k in kept],
                                     dtype=h5py.string_dtype()))
+            # The event-map provenance, as the 2.0 builder writes it -- only
+            # when a map chose the sample sets, so other v1 files are
+            # unchanged.
+            if getattr(sub, "_sample_set_map_report", None) is not None:
+                from .export.pe_builder import _sample_set_map_attrs
+                for _k, _v in _sample_set_map_attrs(
+                        sub._sample_set_map_report, kept).items():
+                    f.attrs[_k] = _v
             # --- Datasets ---
             for k in ["ra", "dec", "m1det", "m2det", "chieff", "dL", "p_pe",
                        "redshift", "m1src", "m2src"]:
@@ -1803,6 +2473,8 @@ class GWCatalog:
                 "n_events_skipped_after_selection": int(sub.n_events - nobs),
                 "event_names_exported": [str(k) for k in kept],
                 "nsamp_per_event": int(nsamp),
+                "z_max": None if z_max is None else float(z_max),
+                "events_dropped_by_z_max": list(z_max_dropped_events),
                 # The EFFECTIVE selection (GW-33), the same record the file's
                 # attrs carry.
                 "selection_spec": spec.to_dict(),
@@ -1820,8 +2492,9 @@ class GWCatalog:
                 "cosmology_mode": cosmology_mode,
                 "cosmology_override_used": bool(cosmology is not None),
                 "cosmology_per_event_varies": bool(cosmology_per_event_varies),
-                "waveform_policy": str(waveform_policy),
-                "approximant": None if approximant is None else str(approximant),
+                "waveform_policy": str(sub._waveform_policy),
+                "approximant": (None if sub._waveform_approximant is None
+                                else str(sub._waveform_approximant)),
                 # The SAME policy-derived value the HDF5 attr carries (GW-37),
                 # not a re-inference from name uniqueness: the two disagreed
                 # whenever a duplicate row was later dropped by z_max or by
@@ -1945,6 +2618,29 @@ class GWCatalog:
 V1_PE_REQUIRED = ("ra", "dec", "m1det", "m2det", "chieff", "dL", "p_pe",
                   "redshift", "m1src", "m2src")
 
+def _recorded_point_estimate_cuts(attrs) -> list:
+    """The point-estimate cuts a PE file records (see
+    :attr:`SelectionSpec.point_estimate_cuts`), from its
+    ``point_estimate_cuts`` attr or, for a file written before that attr, from
+    the ``selection_spec`` JSON it carries.  ``[]`` when there are none."""
+    raw = attrs.get(POINT_ESTIMATE_CUTS_ATTR)
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode()
+    cuts = [c for c in str(raw or "").split(",") if c.strip()]
+    spec_raw = attrs.get("selection_spec")
+    if isinstance(spec_raw, (bytes, bytearray)):
+        spec_raw = spec_raw.decode()
+    try:
+        spec = json.loads(spec_raw) if spec_raw else {}
+    except (TypeError, ValueError):
+        spec = {}
+    for k in ("m1_src_range", "m2_src_range", "sky_area_max"):
+        if isinstance(spec, dict) and spec.get(k) is not None \
+                and k not in cuts:
+            cuts.append(k)
+    return cuts
+
+
 #: Datasets the ``gwcat-selection-1.0`` schema MANDATES (what
 #: ``SelectionSet``/``CombinedSelectionSet.to_darksirens`` write).
 V1_SELECTION_REQUIRED = ("m1det", "m2det", "dL", "chieff", "ra", "dec",
@@ -2052,13 +2748,45 @@ def validate_export(gw_path: str, selection_path: str = None, strict: bool = Fal
                 # zero weight into a -inf log-weight that still counts in n.
                 n_zero = int(np.sum(p == 0))
                 n_neg = int(np.sum(p < 0))
-                _check("pe_p_pe_positive", n_zero == 0 and n_neg == 0,
+                # Zeros the writer RECORDED as spin-support zeros (written on
+                # purpose under allow_out_of_support) are not the distance-
+                # prior failure this check exists for, and blaming the distance
+                # prior for them sent the user to re-ingest a correct store
+                # (review 2026-10-20).  They are counted against the record;
+                # any zero beyond it still fails.
+                n_oos = 0
+                if bool(f.attrs.get("out_of_support_allowed", False)):
+                    try:
+                        n_oos = int(f.attrs.get("n_samples_out_of_support", 0))
+                    except (TypeError, ValueError):
+                        n_oos = 0
+                n_unexplained = max(n_zero - n_oos, 0)
+                if n_oos and n_zero >= n_oos:
+                    cause = (f"{n_oos} of the zeros are recorded spin-support "
+                             f"zeros (n_samples_out_of_support, written under "
+                             f"allow_out_of_support=True); the other "
+                             f"{n_unexplained} are not, and a zero at an "
+                             f"in-support sample means the store's p_dL_pe was "
+                             f"truncated at the recorded distance-prior bounds "
+                             f"-- re-ingest so the distance prior is evaluated "
+                             f"over the full sample range.")
+                elif n_oos:
+                    cause = (f"the file records {n_oos} spin-support zeros but "
+                             f"holds only {n_zero}; the record does not "
+                             f"describe the data.")
+                else:
+                    cause = ("A zero p_pe means the store's p_dL_pe was "
+                             "truncated at the recorded distance-prior bounds "
+                             "-- re-ingest so the distance prior is evaluated "
+                             "over the full sample range -- or the samples lie "
+                             "outside the spin prior's support (a forced amax "
+                             "below them), which the writer refuses unless "
+                             "allow_out_of_support=True.")
+                _check("pe_p_pe_positive",
+                       n_unexplained == 0 and n_neg == 0 and n_zero >= n_oos,
                        f"{n_zero} zero ({100 * n_zero / p.size:.2f}%) and "
                        f"{n_neg} negative of {p.size} samples; "
-                       f"min={np.nanmin(p):.3e}. A zero p_pe means the store's "
-                       f"p_dL_pe was truncated at the recorded distance-prior "
-                       f"bounds -- re-ingest so the distance prior is evaluated "
-                       f"over the full sample range.")
+                       f"min={np.nanmin(p):.3e}. " + cause)
                 # Check no event is entirely zero-weight.  A ragged file is the
                 # exact condition this function exists to report, so record it
                 # as a failed check -- reshape would raise and take the whole
@@ -2075,6 +2803,55 @@ def validate_export(gw_path: str, selection_path: str = None, strict: bool = Fal
                            f"{int(all_zero_events.sum())} event(s) have ALL p_pe=0")
             else:
                 _check("pe_p_pe_nonempty", False, "p_pe is empty")
+
+        # One row per event.  waveform_policy="all" writes one physical event
+        # as several blocks, which the consumer counts as independent
+        # detections; the writer flags it (homogeneous_sample_sets=False) but
+        # nothing checked the flag (review 2026-10-20; the August finding on
+        # "all" exports).
+        ev_names = [x.decode() if isinstance(x, (bytes, bytearray)) else str(x)
+                    for x in np.atleast_1d(f.attrs.get("event_names", []))]
+        dup = sorted({n for n in ev_names if ev_names.count(n) > 1})
+        homog = bool(f.attrs.get("homogeneous_sample_sets", True))
+        _check("pe_one_row_per_event", not dup and homog,
+               f"the file holds {len(dup)} event(s) more than once "
+               f"({dup[:5]}) or records homogeneous_sample_sets=False "
+               f"(waveform_policy={f.attrs.get('waveform_policy', '?')!r}); "
+               f"a consumer counts every block as an independent detection. "
+               f"Re-export with a policy that keeps one sample set per event.")
+
+        # One spin ceiling in "exclude" mode.  The consumer applies the
+        # chi_eff prior at the single chi_eff_amax for both spins, so the file
+        # is only usable when that scalar is finite and is every event's
+        # ceiling on both spins.  The writer writes NaN (and warns) when the
+        # events' ceilings differ or are asymmetric, and a consumer reading
+        # the NaN masks every sample (ln Z = -inf); a file written before
+        # that fix states amax_1 for a (0.99, 0.05) event (review 2026-10-20).
+        spin_mode = f.attrs.get("spin_prior_mode")
+        spin_mode = (spin_mode.decode()
+                     if isinstance(spin_mode, (bytes, bytearray))
+                     else spin_mode)
+        if spin_mode == "exclude":
+            try:
+                amax = float(f.attrs.get("chi_eff_amax", np.nan))
+            except (TypeError, ValueError):
+                amax = float("nan")
+            per_event = [np.asarray(f.attrs[k], dtype=float).ravel()
+                         for k in ("chi_eff_amax_1_per_event",
+                                   "chi_eff_amax_2_per_event")
+                         if k in f.attrs]
+            ok = np.isfinite(amax) and all(np.all(a == amax)
+                                           for a in per_event)
+            _check("pe_exclude_one_spin_ceiling", ok,
+                   f"spin_prior_mode='exclude' with chi_eff_amax={amax!r}, "
+                   f"but the per-event ceilings are "
+                   + ", ".join(f"[{a.min():g}, {a.max():g}]" if a.size
+                               else "[]" for a in per_event)
+                   + " (amax_1, amax_2). A consumer that applies the chi_eff "
+                     "prior from the one scalar evaluates a wrong prior, or "
+                     "none at all when it is NaN. Re-export with "
+                     "spin_prior_mode='include', or read the per-event "
+                     "arrays in the consumer.")
 
         if "m1src" in f and "m1det" in f:
             _check("pe_m1src_le_m1det",
@@ -2259,6 +3036,47 @@ def validate_export(gw_path: str, selection_path: str = None, strict: bool = Fal
             from .export.validate import _xcheck_detection_cut
             _xcheck_detection_cut(_fail, results, dict(fg.attrs),
                                   dict(fs.attrs))
+
+            # (d2) The redshift truncation (review 2026-10-20).  The shared
+            # check above warns when only one side states a z_max, because a
+            # 2.x file without the attr may predate it.  A gwcat-selection-1.0
+            # file can never state one -- no v1 selection writer truncates --
+            # so a truncated v1 PE file against it is a known mismatch: the
+            # events cover z <= z_max while mu covers every redshift.
+            def _zmax(attrs):
+                try:
+                    v = float(attrs.get("z_max", float("nan")))
+                except (TypeError, ValueError):
+                    return float("nan")
+                return v
+            pe_zmax, sel_zmax = _zmax(fg.attrs), _zmax(fs.attrs)
+            if np.isfinite(pe_zmax) and not (
+                    np.isfinite(sel_zmax) and sel_zmax == pe_zmax):
+                _fail("xcheck_z_max",
+                      f"the PE file truncates its posteriors at z_max="
+                      f"{pe_zmax:g} but the selection file states "
+                      f"z_max={sel_zmax:g}; a gwcat-selection-1.0 file covers "
+                      f"every redshift, so mu would integrate over a range the "
+                      f"events do not cover. Re-export the PE file without "
+                      f"z_max, or build a 2.x pair with the same z_max on both "
+                      f"sides (gwcat export pe/selection --z-max).")
+            results["xcheck_z_max"] = True
+
+            # (e) Cuts on per-event point estimates (review 2026-10-20).  A
+            # file cut on posterior-median masses or on sky area describes an
+            # event list no injection set reproduces; the exporters refuse to
+            # write one unless told to, and a file written anyway must not
+            # pass as a valid pair.  Read from the recorded spec as well as
+            # the attr, so a file written before the attr existed is caught.
+            pe_cuts = _recorded_point_estimate_cuts(fg.attrs)
+            if pe_cuts:
+                _fail("xcheck_point_estimate_cuts",
+                      f"the PE file was cut on per-event point estimates "
+                      f"({', '.join(pe_cuts)}), which no injection campaign "
+                      f"reproduces, so this selection file cannot describe "
+                      f"its event list. Re-export the PE file without them "
+                      f"and model the range in the population instead.")
+            results["xcheck_point_estimate_cuts"] = True
 
     n_pass = sum(results.values())
     n_total = len(results)

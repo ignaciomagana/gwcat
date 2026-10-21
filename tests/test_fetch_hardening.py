@@ -726,6 +726,8 @@ def test_an_equally_long_live_list_does_not_replace_the_curated_one(tmp_path,
 
 
 def test_a_live_list_that_extends_the_sample_is_adopted(tmp_path, monkeypatch):
+    """Only on request since the 2026-10-20 review: the live list has no FAR
+    cut, so adopting it is the caller's decision (adopt_live_list=True)."""
     from gwcat import bbh_allowed_names as ban
 
     extended = sorted(set(ban.BBH_ALL) | {"GW260101_000000"})
@@ -733,7 +735,8 @@ def test_a_live_list_that_extends_the_sample_is_adopted(tmp_path, monkeypatch):
 
     with pytest.warns(UserWarning, match="GWOSC_used=True"):
         names = ban.get_bbh_allowed_names(data_dir=str(tmp_path),
-                                          prefer_gwosc=True)
+                                          prefer_gwosc=True,
+                                          adopt_live_list=True)
     assert names == extended
 
 

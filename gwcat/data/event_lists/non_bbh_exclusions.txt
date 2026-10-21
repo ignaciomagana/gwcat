@@ -8,7 +8,7 @@
 # Format: event_name  # optional note
 GW170817  # BNS (GWTC-1)
 GW190425  # BNS short-form, if seen in filenames
-GW190425_232155  # BNS (GWTC-2.1)
+GW190425_081805  # BNS (GWTC-2.1)
 GW190426_152155  # NSBH candidate (GWTC-2.1)
 GW190814_211039  # lower-mass-gap system excluded from the BBH population sample
 GW190917_114630  # NSBH candidate (GWTC-2.1)
