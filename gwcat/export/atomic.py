@@ -64,6 +64,8 @@ def atomic_output_path(out_path):
     out_path : str or path-like
         The final destination.  Its directory must exist (the temp file is
         created there, so the publishing rename never crosses a filesystem).
+        A symlink is resolved first: the new content replaces the link's
+        target and the link is kept.
 
     Yields
     ------
@@ -78,6 +80,13 @@ def atomic_output_path(out_path):
     ...         f.attrs["format_version"] = "gwcat-pe-2.1"
     """
     final = os.fspath(out_path)
+    if os.path.islink(final):
+        # Write THROUGH a per-file symlink (review 2026-10-20, Low 19).
+        # os.replace onto the link swapped the link itself for a regular file,
+        # leaving its target -- the file everything else points at -- stale.
+        # The temp file goes beside the target, so the rename stays on one
+        # filesystem.
+        final = os.path.realpath(final)
     directory = os.path.dirname(os.path.abspath(final))
     # Hidden, pid-tagged sibling: two processes writing the same output do not
     # collide on the temp file, and a leftover (SIGKILL, node death) is visibly

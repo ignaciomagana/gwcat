@@ -24,6 +24,9 @@ Two properties every writer here holds (GW-30):
 """
 from __future__ import annotations
 
+import hashlib
+import os
+import warnings
 from typing import Optional
 
 import h5py
@@ -43,7 +46,8 @@ _SELECTION_DATASETS = ["m1det", "m2det", "q", "dL", "chieff", "ra", "dec",
                        "a1", "a2", "cost1", "cost2", "chip"]
 
 #: The format versions this module writes.  2.0 is the default everywhere; 2.1
-#: is opt-in (see the note above the 2.1 writers).
+#: is opt-in (see the note above the 2.1 writers for why, and what a 2.0 pair
+#: does not get checked for).
 _PE_FORMAT_20 = "gwcat-pe-2.0"
 _SEL_FORMAT_20 = "gwcat-selection-2.0"
 _PE_FORMAT_21 = "gwcat-pe-2.1"
@@ -70,6 +74,51 @@ def _stamp_attrs(f, product, format_version):
     from ..validation_summary import gwcat_commit, package_version
     f.attrs["writer_commit"] = gwcat_commit()
     f.attrs["writer_version"] = package_version()
+    f.attrs["writer_environment"] = _writer_environment()
+
+
+def _writer_environment():
+    """The run environment that sets an export's last bits, as a JSON string.
+
+    Review 2026-10-20, Low 4: a Haswell rebuild of the production PE file
+    differs from the AVX-512 build in about 378k p_pe values at the 1e-17
+    level, so a bitwise rebuild check cannot tell environment from code unless
+    the file says which environment wrote it: the library versions, numpy's
+    BLAS, its compiled-in SIMD baseline and the dispatch targets this CPU runs.
+    Never raises; a field that cannot be read is "unknown".
+    """
+    import json as _json
+    import platform
+    import sys
+
+    env = {"python": sys.version.split()[0], "machine": platform.machine(),
+           "numpy": np.__version__, "h5py": h5py.__version__,
+           "hdf5": h5py.version.hdf5_version}
+    for mod in ("scipy", "astropy"):
+        try:
+            env[mod] = str(__import__(mod).__version__)
+        except Exception:
+            env[mod] = "unknown"
+    try:
+        try:
+            from numpy._core import _multiarray_umath as _mu
+        except ImportError:                      # numpy < 2
+            from numpy.core import _multiarray_umath as _mu
+        feats = _mu.__cpu_features__
+        env["numpy_cpu_baseline"] = list(_mu.__cpu_baseline__)
+        env["numpy_cpu_dispatch_active"] = [
+            t for t in _mu.__cpu_dispatch__ if feats.get(t)]
+    except Exception:
+        env["numpy_cpu_baseline"] = "unknown"
+        env["numpy_cpu_dispatch_active"] = "unknown"
+    try:
+        blas = np.show_config(mode="dicts")["Build Dependencies"]["blas"]
+        env["numpy_blas"] = " ".join(
+            str(blas.get(k, "")) for k in ("name", "version",
+                                           "openblas configuration")).strip()
+    except Exception:
+        env["numpy_blas"] = "unknown"
+    return _json.dumps(env, sort_keys=True)
 
 
 def _stamp_legacy_spin_attrs(f, product):
@@ -87,22 +136,32 @@ def _stamp_legacy_spin_attrs(f, product):
         distinguish "no chi_eff prior was applied" from "this file does not
         say", and only the first is a statement it can act on.
     """
-    if product.spin_basis == "chieff":
-        f.attrs["spin_prior_mode"] = "include"
-        f.attrs["chi_eff_prior_applied_to_p_pe"] = True
-        f.attrs["chi_eff_in_p_pe"] = True
-    else:
-        mode = {"component": "component_flat",
-                "chieff_chip": "chieff_chip_joint",
-                "nospin": "none"}.get(product.spin_basis, "unknown")
-        f.attrs["spin_prior_mode"] = mode
-        # The 1-D chi_eff prior specifically is NOT in p_pe for any of
-        # these: component carries a flat box, chieff_chip a JOINT
-        # (chi_eff, chi_p) density, nospin nothing at all.  So the legacy
-        # scalar flag is False in every case, and the basis-specific attrs
-        # written by the builder are what say what WAS applied.
-        f.attrs["chi_eff_prior_applied_to_p_pe"] = False
-        f.attrs["chi_eff_in_p_pe"] = False
+    for k, v in _legacy_spin_flags(product.spin_basis).items():
+        f.attrs[k] = v
+
+
+def _legacy_spin_flags(spin_basis):
+    """The gwcat-1.0 spin attrs :func:`_stamp_legacy_spin_attrs` writes.
+
+    One definition, so the PE summary can state the same values as the file
+    (review 2026-10-20, Low 42: a chieff_chip summary said
+    chi_eff_prior_applied_to_p_pe=True beside a file that says False).
+    """
+    if spin_basis == "chieff":
+        return {"spin_prior_mode": "include",
+                "chi_eff_prior_applied_to_p_pe": True,
+                "chi_eff_in_p_pe": True}
+    mode = {"component": "component_flat",
+            "chieff_chip": "chieff_chip_joint",
+            "nospin": "none"}.get(spin_basis, "unknown")
+    # The 1-D chi_eff prior specifically is NOT in p_pe for any of
+    # these: component carries a flat box, chieff_chip a JOINT
+    # (chi_eff, chi_p) density, nospin nothing at all.  So the legacy
+    # scalar flag is False in every case, and the basis-specific attrs
+    # written by the builder are what say what WAS applied.
+    return {"spin_prior_mode": mode,
+            "chi_eff_prior_applied_to_p_pe": False,
+            "chi_eff_in_p_pe": False}
 
 
 def _write_columns(f, columns, order, **create_kwargs):
@@ -117,20 +176,59 @@ def _write_columns(f, columns, order, **create_kwargs):
             f.create_dataset(k, data=arr, **create_kwargs)
 
 
+#: The sidecars :func:`gwcat.validation_summary.write_validation_summary` writes
+#: next to an export.
+_SUMMARY_SUFFIXES = (".validation_summary.json", ".validation_summary.md")
+
+
+def _remove_stale_summary(out_path):
+    """Remove a previous export's summary before the new file is published.
+
+    Review 2026-10-20, Medium 53: a summary is written only when asked for (the
+    Python default is not to), and nothing removed an old one, so a re-export
+    to the same path -- from Python, or with ``--no-summary`` -- sat beside a
+    summary listing the previous product's events and nsamp under the same
+    output_path.  Called before the publishing rename, so at no moment does the
+    new file sit beside the old summary; no summary is better than a wrong one.
+    """
+    for suffix in _SUMMARY_SUFFIXES:
+        p = os.fspath(out_path) + suffix
+        if os.path.lexists(p):
+            os.remove(p)
+
+
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def _write_summary(product, out_path, format_version, summary_context):
     """Write the validation summary next to the FINISHED file at ``out_path``.
 
     Called only after the atomic rename, so everything that reads the file back
     (:func:`gwcat.validation_summary.v2_export_summary_additions`) sees the file
-    the consumer will see -- final version, final attrs.
+    the consumer will see -- final version, final attrs.  The summary carries
+    the sha256 of that file, so a summary can be checked against the file
+    beside it rather than trusted by its name.
     """
     from ..validation_summary import write_validation_summary
     summary = dict(product.summary)
     summary["output_path"] = str(out_path)
+    summary["output_sha256"] = _sha256(out_path)
     # The version the summary actually describes.  A 2.1 export's summary used
     # to be indistinguishable from a 2.0 one because it was generated while the
     # file still said 2.0.
     summary["format_version"] = format_version
+    if product.kind == "pe":
+        # The legacy spin flags as the FILE states them (Low 42), not the
+        # builder's chi_eff_included, which is True for chieff_chip's joint
+        # (chi_eff, chi_p) density.
+        flags = _legacy_spin_flags(product.spin_basis)
+        for k in ("spin_prior_mode", "chi_eff_prior_applied_to_p_pe"):
+            summary[k] = flags[k]
     if summary_context:
         summary.update(summary_context)
     write_validation_summary(out_path, summary)
@@ -155,11 +253,42 @@ def _write_pe(product, out_path, format_version, *, with_contract=False,
             # Datasets (gzip, like the legacy exporter).
             _write_columns(f, product.columns, _PE_DATASETS,
                            compression="gzip", shuffle=False)
+        _remove_stale_summary(out_path)
 
     if write_summary:
         _write_summary(product, out_path, format_version, summary_context)
 
     return str(out_path)
+
+
+def _warn_if_core_cannot_load(product):
+    """Say at write time that darksirens-core will refuse this selection file.
+
+    Review 2026-10-20, Medium 13.  The cumulative mixtures ship no sky position
+    for their semianalytic O1/O2 rows, so every route out of them reaches core
+    without one: ``sky_marginal=True`` drops ra/dec (core's selection contract
+    requires both datasets), and the default writes NaN ra/dec that core
+    refuses through ``sky_position_available``.  No wrong number reaches core --
+    the refusal is loud -- but it comes at load time, after an export and a
+    ``gwcat validate --strict`` that both passed.  A sky-marginal file can serve
+    only a sky-independent (spectral-siren) fit in a consumer that accepts one;
+    a galaxy-catalogue selection integral needs every injection's sky position.
+    Making such a file loadable needs a sky-marginal contract agreed with core.
+    """
+    sky = np.asarray(product.attrs.get("sky_position_available", True),
+                     dtype=bool).ravel()
+    marginal = bool(product.attrs.get("sky_marginalized", False))
+    if not marginal and sky.all():
+        return
+    why = ("sky_marginalized=True: no ra/dec columns" if marginal else
+           f"sky_position_available per campaign = {sky.tolist()}: NaN ra/dec "
+           f"rows")
+    warnings.warn(
+        f"this selection product has no sky position for every injection "
+        f"({why}). darksirens-core requires finite ra/dec on every injection "
+        f"and will refuse to load it; no gwcat format makes it loadable there "
+        f"today. It can serve only a sky-independent fit in a consumer that "
+        f"accepts a sky-marginal selection.")
 
 
 def _write_selection(product, out_path, format_version, *, with_contract=False,
@@ -180,6 +309,7 @@ def _write_selection(product, out_path, format_version, *, with_contract=False,
             "ra/dec columns) cannot be written as gwcat-selection-2.1: the 2.1 "
             "contract's fit_columns include ra/dec. Write it with the default "
             "'gwcat2' (2.0) format.")
+    _warn_if_core_cannot_load(product)
     extra_attrs = _contract_attrs(product, "selection") if with_contract else {}
 
     with atomic_output_path(out_path) as tmp_path:
@@ -190,6 +320,7 @@ def _write_selection(product, out_path, format_version, *, with_contract=False,
             # Datasets (gzip, like the legacy selection exporter).
             _write_columns(f, product.columns, _SELECTION_DATASETS,
                            compression="gzip")
+        _remove_stale_summary(out_path)
 
     if write_summary:
         _write_summary(product, out_path, format_version, summary_context)
@@ -282,8 +413,21 @@ def write_selection_gwcat2(product, out_path, *, write_summary: bool = False,
 # It is registered as a SEPARATE format name rather than bumping "gwcat2",
 # because `_require_hdf5_format` in darksirens is a closed literal tuple: a 2.1
 # file is unloadable by any consumer that has not been taught the version, and
-# the plan's rule is that the consumer patch deploys FIRST.  Keeping 2.0 the
-# default means nothing gwcat writes by accident becomes unreadable.
+# the plan's rule is that the consumer patch deploys FIRST.
+#
+# That reason is out of date (review 2026-10-20, Medium 2): darksirens-core has
+# read 2.1 since 2026-09-09.  The reason 2.0 is STILL the default is the cost of
+# keeping it: a 2.0 file carries no contract_hash, and core's
+# require_matching_contract skips any pair in which either file lacks one, so
+# the production pair (chieff PE with chieff_reference selection) is loaded
+# with no pairing check at all.  Switching the default does not fix that yet:
+# the 2.1 hash covers parameter_space and advisory_columns, which always differ
+# for that designed pair (Medium 10), so a 2.1 rebuild of it is refused by
+# `gwcat validate` and by core.  The order is: make the hash accept the
+# reference pair (and carry the PE-ceiling = a_ref equality it needs), then
+# make 2.1 the default and rebuild the pair, then have core refuse a pair with
+# no hash unless explicitly allowed.  Until then 2.0 stays the default so the
+# production pair keeps loading.
 
 
 def _contract_attrs(product, kind):
@@ -319,12 +463,24 @@ def _contract_attrs(product, kind):
         "significance_snr_threshold")
     snr_min = (None if snr_min is None or not np.isfinite(float(snr_min))
                else float(snr_min))
-    stat = a.get("significance_type")
-    stat = (str(stat) if stat is not None
-            else (None if thr is None
-                  else ("far_or_snr" if snr_min is not None else "far")))
-    if stat is None and snr_min is not None:
-        stat = "snr"
+    if kind == "pe":
+        # The PE side's cuts are select()'s, so name THEM (review 2026-10-20,
+        # Medium 28): FAR on the catalogue FAR, SNR on the POSTERIOR-MEDIAN SNR,
+        # and the two combined as an AND.  Inferring the name from which attrs
+        # exist made far_max + snr_min read 'far_or_snr' -- the name of the
+        # selection builder's OR-widened INJECTION mask, a strictly looser cut
+        # no PE file can apply -- so the two contracts agreed on statistic,
+        # threshold and snr_min while describing different selections.
+        stat = ("far_and_snr_med" if thr is not None and snr_min is not None
+                else "far" if thr is not None
+                else "snr_med" if snr_min is not None else None)
+    else:
+        stat = a.get("significance_type")
+        stat = (str(stat) if stat is not None
+                else (None if thr is None
+                      else ("far_or_snr" if snr_min is not None else "far")))
+        if stat is None and snr_min is not None:
+            stat = "snr"
 
     _sel_fields = dict(selection_contract_fields(a))
     # z_max is an EXPORT argument, not a select() cut, so it lives in the attrs
@@ -346,8 +502,16 @@ def _contract_attrs(product, kind):
         spin_basis_kind=spin.map_kind,
         spin_density_exact=bool(space.is_exact),
         mass_prior_kind=a.get("mass_prior_basis") or a.get("mass_prior_kind"),
+        # The PE builder's label over the store's per-row class (review
+        # 2026-10-20, Medium 43); None on the selection side and for a store
+        # that records no class.
         dL_prior_kind=a.get("dL_prior_kind"),
-        sky_prior_in_density=True,      # sky.radec declares -ln4pi both sides
+        # What the densities CONTAIN (review 2026-10-20, Low 67).  sky.radec
+        # declares -ln 4pi on both sides precisely so it cancels, and neither
+        # builder multiplies it into p_pe or pdraw (gwcat.params.compose: the
+        # sky is "in neither"), so the hard-coded True stated a factor neither
+        # file carries.  A builder that ever applies it must stamp the attr.
+        sky_prior_in_density=bool(a.get("sky_prior_in_density", False)),
         source_class=a.get("source_class_filter") or None,
         detection_statistic=stat,
         detection_threshold=thr,
