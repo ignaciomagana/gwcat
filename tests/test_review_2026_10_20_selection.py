@@ -561,3 +561,27 @@ def test_far_cut_ors_every_pipeline_injections_format(tmp_path):
     assert s._far_columns == ["far_gstlal", "far_pycbc_bbh",
                               "far_pycbc_hyperbank", "far_mbta", "far_cwb"]
     assert mask.tolist() == [True, True, True, True, False, False]
+
+
+# ======================================================================
+# low-5: the exact pdraw normalisation is stated, with each campaign's T_k
+# ======================================================================
+def test_pdraw_normalisation_and_campaign_times_are_recorded(tmp_path):
+    a = _set_time(write_o4_full(tmp_path / "a.hdf", n=40, seed=71), 0.5,
+                  "events")
+    b = _set_time(write_endo3_full(tmp_path / "b.hdf", n=40, seed=72), 1.25,
+                  "injections")
+    out = tmp_path / "sel.h5"
+    v1 = tmp_path / "v1.h5"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        comb = CombinedSelectionSet([SelectionSet(a), SelectionSet(b)])
+        comb.export(str(out), spin_basis="component")
+        comb.to_darksirens(str(v1))
+    for path in (out, v1):
+        with h5py.File(path, "r") as f:
+            text = f.attrs["pdraw_normalisation"]
+            assert "N_k / N_total" in text and "ITS OWN analysis time" in text
+            np.testing.assert_allclose(f.attrs["campaign_T_obs_yr"],
+                                       [0.5, 1.25], rtol=1e-12)
+            assert np.isclose(float(f.attrs["T_obs_yr"]), 1.75, rtol=1e-12)

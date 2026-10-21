@@ -108,6 +108,26 @@ PDRAW_STATE_CHIEFF_REFERENCE = (
     "weights. Detector-frame masses in Msun, dL in Mpc."
 )
 
+#: The exact normalisation behind every exported ``pdraw`` (review 2026-10-20,
+#: low-5).  The ``pdraw_state`` strings above say "normalised by T_obs and
+#: injection weights", which a reader rebuilding pdraw takes as the summed
+#: T_obs_yr and is then off by 0.22 (O3) and 1.42 (O4ab): each campaign is
+#: divided by its OWN T_k and multiplied by N_k/N_total.  Those strings are
+#: kept verbatim -- the validator compares them exactly and every published
+#: product carries them -- and this attr states the arithmetic.
+PDRAW_NORMALISATION = (
+    "pdraw_i = p_draw,k(theta_i) * m1det_i / ((1 + z_i)^2 * ddL/dz_i) "
+    "* (spin factor of pdraw_state) / (T_k * w_i) * (N_k / N_total), for "
+    "injection i of campaign k: p_draw,k is the campaign's source-frame "
+    "(m1src, m2src, z) draw density, T_k ITS OWN analysis time in years "
+    "(total_analysis_time or analysis_time_s over 365.25 d; per campaign in "
+    "campaign_T_obs_yr), w_i the file's per-row weights (events format) or "
+    "mixture_weight (injections format; 1 when absent), N_k its "
+    "total_generated (campaign_ndraws) and N_total = sum_k N_k = ndraw; "
+    "N_k / N_total = 1 for a single-campaign export. T_obs_yr is sum_k T_k "
+    "and divides no row. The selection integral is "
+    "mu = (1/ndraw) * sum_detected p_pop / pdraw.")
+
 # pdraw_state keyed by spin basis (used by gwcat.export.selection_builder).
 PDRAW_STATE_BY_BASIS = {
     "chieff": PDRAW_STATE_CHIEFF,
@@ -526,6 +546,8 @@ def _selection_provenance_dict(source_class, nsbh_mass_threshold,
     d = {}
     # ── pdraw state (v1 default; the v2 builder overrides per spin basis) ───
     d["pdraw_state"] = PDRAW_STATE
+    # The exact per-campaign normalisation pdraw_state only summarises.
+    d["pdraw_normalisation"] = PDRAW_NORMALISATION
 
     # ── Source-class filter provenance ─────────────────────────────────────
     d["source_class_filter"] = format_source_class_filter(source_class)
@@ -1019,8 +1041,9 @@ def campaign_provenance_attrs(set_list, *, draw_domain=None,
     campaign's declared bounds (``None`` = undeclared), the extent its rows
     actually span, whether some campaign drew past another's declared bound,
     and which ``draw_domain`` policy the export applied; the FAR-column
-    discovery record (medium-31); and the detected generation cosmology,
-    which an override does not erase (medium-33).
+    discovery record (medium-31); the detected generation cosmology, which
+    an override does not erase (medium-33); and each campaign's own observing
+    time, the T_k of ``pdraw_normalisation`` (low-5).
     """
     if draw_domain_mismatch is None:
         draw_domain_mismatch = draw_domain_mismatches(set_list)
@@ -1035,6 +1058,9 @@ def campaign_provenance_attrs(set_list, *, draw_domain=None,
             "drawn_extent": getattr(s, "_draw_extent", None) or {},
         })
     return {
+        # Each campaign's own T_k, the divisor of its rows (low-5).
+        "campaign_T_obs_yr": np.array([float(s._T_yr) for s in set_list],
+                                      dtype=float),
         "injection_draw_domain_per_campaign": json.dumps(domain_rows),
         "injection_draw_domain_mismatch": bool(draw_domain_mismatch),
         "injection_draw_domain_mismatch_detail": json.dumps(
