@@ -721,6 +721,10 @@ def fetch_catalog(
     match the release but are in none of the records used -- what a
     re-release leaves behind, and what a ``gwcat ingest --glob`` over the
     directory would ingest beside the current files.  Nothing is deleted.
+    With explicit ``record_ids`` the run may have used only some of the
+    release's records, so such files are listed as
+    ``files_outside_records_used`` without the warning, and
+    ``superseded_files`` is ``null`` (not determined).
 
     Returns
     -------
@@ -880,21 +884,34 @@ def fetch_catalog(
             manifest_files.append(entry)
 
     if not dry_run:
-        superseded = sorted(
+        outside = sorted(
             p.name for p in dest_dir.iterdir()
             if p.name not in listed_keys and p.is_file()
             and info.file_filter(p.name)) if dest_dir.is_dir() else []
-        if superseded:
-            shown = ", ".join(superseded[:5]) + (
-                f", ... ({len(superseded) - 5} more)" if len(superseded) > 5
-                else "")
+        # Only a run that chose its records itself used one record per concept
+        # of the release, so only then is a file outside them superseded.  A
+        # run given explicit record IDs may have fetched some of a multi-record
+        # release (GWTC-5 has two), and the other records' current files would
+        # be named superseded; there it is recorded, not judged.
+        whole_release = record_source != "explicit"
+        superseded = outside if whole_release else None
+        shown = ", ".join(outside[:5]) + (
+            f", ... ({len(outside) - 5} more)" if len(outside) > 5 else "")
+        if outside and whole_release:
             warnings.warn(
-                f"{catalog}: {len(superseded)} file(s) in {dest_dir} match "
+                f"{catalog}: {len(outside)} file(s) in {dest_dir} match "
                 f"this release but are in none of the record(s) {list(rids)} "
                 f"just used -- left by an earlier version of the release? A "
                 f"`gwcat ingest --glob` over this directory would ingest them "
                 f"beside the current files. They are listed as "
                 f"superseded_files in {FETCH_MANIFEST_NAME}: {shown}")
+        elif outside:
+            print(f"[{catalog}] {len(outside)} file(s) in {dest_dir} match "
+                  f"this release but are in none of the explicitly requested "
+                  f"record(s) {list(rids)}; they may belong to another record "
+                  f"of the release or to an earlier version of it, so they "
+                  f"are listed as files_outside_records_used in "
+                  f"{FETCH_MANIFEST_NAME}, not as superseded: {shown}")
         _write_fetch_manifest(dest_dir, {
             "catalog": catalog,
             "requested_as": requested_as,
@@ -907,7 +924,9 @@ def fetch_catalog(
             "written_at_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                             time.gmtime()),
             "files": manifest_files,
+            # None: not determined (an explicit-record run, see above)
             "superseded_files": superseded,
+            "files_outside_records_used": outside,
         })
         print(f"[{catalog}] done: {len(all_paths)} files in {dest_dir}")
     return sorted(all_paths)

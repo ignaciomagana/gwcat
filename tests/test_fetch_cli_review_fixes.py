@@ -862,7 +862,30 @@ def test_superseded_files_are_reported_and_a_manifest_is_written(
     assert [f["key"] for f in manifest["files"]] == [_GWTC21_FILE]
     assert manifest["files"][0]["checksum"].startswith("md5:")
     assert manifest["superseded_files"] == [old_name]
+    assert manifest["files_outside_records_used"] == [old_name]
     assert (rel / old_name).exists()          # reported, never deleted
+
+
+def test_explicit_records_of_a_multi_record_release_are_not_judged(
+        tmp_path, monkeypatch):
+    """GWTC-5 has two records.  Fetching one of them by --record-ids named the
+    other record's current files superseded, in the warning and the manifest."""
+    mine = "IGWN-GWTC5p0-29ebe06b7_25-GW250114_082203-combined_PEDataRelease.hdf5"
+    other = "IGWN-GWTC5p0-29ebe06b7_25-GW241011_233834-combined_PEDataRelease.hdf5"
+    rel = tmp_path / "GWTC-5"
+    rel.mkdir()
+    (rel / mine).write_bytes(b"record one")
+    (rel / other).write_bytes(b"record two")
+    _listing(monkeypatch, [_entry(mine, b"record one")])
+    _no_download(monkeypatch)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")         # no superseded warning
+        fetch.fetch_catalog("GWTC-5", data_dir=str(tmp_path),
+                            record_ids=[20348005], show_progress=False)
+    manifest = json.loads((rel / fetch.FETCH_MANIFEST_NAME).read_text())
+    assert manifest["record_source"] == "explicit"
+    assert manifest["superseded_files"] is None
+    assert manifest["files_outside_records_used"] == [other]
 
 
 def test_naming_an_alias_and_its_release_fetches_it_once(tmp_path,
