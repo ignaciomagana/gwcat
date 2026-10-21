@@ -153,7 +153,11 @@ class ParameterBlock:
     the 2.1 selection writer, row by row
     (:meth:`gwcat.params.registry.ParameterSpace.refuse_nonfinite_fit_columns`).
     The spin blocks' ``ln_prior_pe`` are the same densities the builders
-    evaluate directly; they are kept equal to them, not called by them.
+    evaluate directly; they are kept equal to them, not called by them.  No
+    builder calls a block's ``ln_draw_inj`` either: the selection builder
+    reads each campaign's draw density off its file
+    (:class:`gwcat.selection.SelectionSet`), so those callables are
+    declarations of the same densities, not the code that writes ``pdraw``.
     """
     name: str
     kind: str
