@@ -240,3 +240,50 @@ def test_pe_cosmology_scalar_says_when_it_describes_only_some_events(tmp_path):
     assert int(attrs["pe_cosmology_scalar_n_events"]) == 1
     # The scalar itself is unchanged when event 0 is exported.
     assert float(attrs["pe_cosmology_H0"]) == 67.74
+
+
+# ==========================================================================
+# f_ref is recorded, and a tilt fit across reference frequencies warns
+# (review Medium 19)
+# ==========================================================================
+def _store_f_ref(tmp_path, f_refs, name="fref.h5"):
+    events = [{"name": f"GWf_00000{i + 1}"} for i in range(len(f_refs))]
+    store, _ = _build_spin_store(tmp_path, events, name=name)
+    with h5py.File(store, "r+") as f:
+        f["meta"].create_dataset("f_ref", data=np.asarray(f_refs, float))
+        f["meta"].create_dataset(
+            "f_ref_source", data=np.array(["meta_data"] * len(f_refs),
+                                          dtype=h5py.string_dtype()))
+    return store
+
+
+def test_component_export_records_f_ref_and_warns_on_mixed_frequencies(
+        tmp_path):
+    store = _store_f_ref(tmp_path, [10.0, 20.0])
+    out = tmp_path / "comp.h5"
+    with pytest.warns(UserWarning, match="reference frequency"):
+        GWCatalog(store).export(str(out), format="gwcat2",
+                                spin_basis="component", nsamp=32, seed=0,
+                                cosmology=_COSMO)
+    _cols, attrs = _read(out)
+    np.testing.assert_array_equal(attrs["f_ref_per_event"], [10.0, 20.0])
+    assert _names(attrs["f_ref_source_per_event"]) == ["meta_data"] * 2
+
+
+def test_one_f_ref_does_not_warn_and_chieff_never_does(tmp_path):
+    store = _store_f_ref(tmp_path, [20.0, 20.0], name="fref_one.h5")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        GWCatalog(store).export(str(tmp_path / "c.h5"), format="gwcat2",
+                                spin_basis="component", nsamp=32, seed=0,
+                                cosmology=_COSMO)
+    mixed = _store_f_ref(tmp_path, [10.0, np.nan], name="fref_mixed.h5")
+    out = tmp_path / "x.h5"
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        GWCatalog(mixed).export(str(out), format="gwcat2",
+                                spin_basis="chieff", nsamp=32, seed=0,
+                                cosmology=_COSMO)
+    _cols, attrs = _read(out)
+    f_ref = np.asarray(attrs["f_ref_per_event"], float)
+    assert f_ref[0] == 10.0 and np.isnan(f_ref[1])

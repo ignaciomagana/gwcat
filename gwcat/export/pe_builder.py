@@ -701,6 +701,17 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     # --legacy-grid-priors).  A meta read, like the provenance above.
     sel_dL_impl = _meta_str_sel("dL_prior_impl") or [""] * sub.n_events
     kept_dL_impl = []
+    # The reference frequency each event's spins are defined at (review
+    # Medium 19).  Tilts and chi_p evolve with frequency for a precessing
+    # binary, so a fit of tilts across events -- and against injections --
+    # is meaningful only at one f_ref.  The store records it per row; the file
+    # now does too (NaN = unknown).  A meta read, like the provenance above.
+    _f_ref_raw = sub.meta.get("f_ref")
+    sel_f_ref = (np.asarray(_f_ref_raw, dtype=float)[sel_idx]
+                 if _f_ref_raw is not None
+                 else np.full(sub.n_events, np.nan))
+    sel_f_ref_src = _meta_str_sel("f_ref_source") or [""] * sub.n_events
+    kept_f_ref, kept_f_ref_src = [], []
     kept_prior_kind = {p: [] for p in ("mass", "spin", "dL")}
     kept_prior_label = {p: [] for p in ("mass", "spin", "dL")}
     #: Raw samples removed by the GW-40c spin-support cut, per kept event --
@@ -898,6 +909,8 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                 kept_prior_label[_p].append(sel_prior_label[_p][e])
             kept_cfg_amax.append(sel_cfg_amax[e])
             kept_dL_impl.append(sel_dL_impl[e])
+            kept_f_ref.append(float(sel_f_ref[e]))
+            kept_f_ref_src.append(sel_f_ref_src[e])
             kept_H0.append(float(per_event_H0[e]))
             kept_Om0.append(float(per_event_Om0[e]))
             row = sel_rows[e]
@@ -1398,6 +1411,30 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
               "removes them before the draw (exact rejection to U(0, amax)); "
               "the counts are in n_exported_above_spin_ceiling_per_event.")
 
+    # ── Mixed reference frequencies in a tilt fit (review Medium 19) ────────
+    # chi_eff is conserved under precession; tilts and chi_p are not, so a
+    # basis that fits them (component: cost1/cost2; chieff_chip: chip) is
+    # coherent only at one f_ref -- across events and against the campaign,
+    # whose f_ref this file cannot see.  Recorded per event; said here.
+    f_ref_arr = np.asarray(kept_f_ref, dtype=float)
+    f_ref_values = sorted({float(x) for x in f_ref_arr[np.isfinite(f_ref_arr)]})
+    n_f_ref_unknown = int(np.sum(~np.isfinite(f_ref_arr)))
+    fits_tilts = bool({"cost1", "cost2", "chip"} & set(space.fit_columns))
+    # A store with no f_ref column at all predates the record; it reads NaN
+    # everywhere and is not warned about event by event.
+    if (fits_tilts and _f_ref_raw is not None
+            and (len(f_ref_values) > 1 or n_f_ref_unknown)):
+        warnings.warn(
+            f"spin_basis={spin_basis!r} fits spin TILTS (or chi_p), which "
+            f"are defined only at a reference frequency, but the exported "
+            f"events' spins are defined at f_ref = {f_ref_values} Hz"
+            + (f" ({n_f_ref_unknown} event(s) unknown)" if n_f_ref_unknown
+               else "")
+            + ". One tilt distribution fitted across them -- and against an "
+              "injection campaign defined at its own f_ref -- mixes "
+              "frequencies; f_ref_per_event records each event's. No "
+              "pairing check compares f_ref yet.")
+
     if z_max is not None and any(n > 0 for n in n_cut_by_z_max):
         warnings.warn(
             f"z_max={z_max} dropped {sum(n_cut_by_z_max)} posterior sample(s) "
@@ -1535,6 +1572,12 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         # ── How the two analytic prior factors were evaluated (GW-40i) ──────
         "dL_prior_impl_per_event": np.array(
             [str(x) for x in kept_dL_impl], dtype=_str),
+        # ── The reference frequency of each event's spins (review Med 19) ───
+        # NaN = the store does not know it.  Tilts and chi_p are defined at
+        # it; chi_eff is not affected.
+        "f_ref_per_event": f_ref_arr,
+        "f_ref_source_per_event": np.array(
+            [str(x) for x in kept_f_ref_src], dtype=_str),
     }
     if chi_eff_included:
         from ..spin import CHI_EFF_PRIOR_METHODS, current_chi_eff_prior_impl
@@ -1608,6 +1651,8 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         "cosmology_per_event_varies": bool(cosmology_per_event_varies),
         "pe_cosmology_scalar_source": pe_cosmology_scalar_source,
         "pe_cosmology_scalar_n_events": pe_cosmology_scalar_n_events,
+        "f_ref_values": f_ref_values,
+        "n_events_f_ref_unknown": n_f_ref_unknown,
         "waveform_policy": str(waveform_policy),
         "approximant": None if approximant is None else str(approximant),
         "homogeneous_sample_sets": homogeneous,
