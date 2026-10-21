@@ -888,3 +888,29 @@ def test_a_sample_maximum_hole_is_refused_once_it_is_not_noise(tmp_path):
                                        spin_reference_amax=0.99, strict=False)
     assert prod.attrs["spin_reference_coverage_ok"] is False
     assert list(prod.attrs["spin_reference_coverage_per_campaign"]) == [False]
+
+
+@pytest.mark.parametrize("snr", [np.inf, np.nan, 0.0, -5.0])
+def test_non_finite_snr_threshold_is_refused_on_a_mixture(tmp_path, snr):
+    """`--snr-threshold inf` (an attempt to switch the SNR leg off) or a NaN
+    from a config passed every FAR-only guard -- they test only `is None` --
+    and detected no O1/O2 row while the file said 'lvk-cumulative'."""
+    from gwcat.export import build_selection_product
+    from test_selection_cumulative_mixture import (write_cumulative_mixture,
+                                                   _ANCHORS)
+
+    path, _, _ = write_cumulative_mixture(tmp_path / "mix.hdf")
+    with pytest.raises(ValueError, match="snr_threshold"):
+        build_selection_product(SelectionSet(path), spin_basis="component",
+                                snr_threshold=snr, mixture_anchors=_ANCHORS,
+                                sky_marginal=True)
+
+
+@pytest.mark.parametrize("far", [np.nan, np.inf, 0.0, -1.0])
+def test_non_finite_far_threshold_is_refused(tmp_path, far):
+    from gwcat.export import build_selection_product
+
+    path = write_o4_full(tmp_path / "o4.hdf", n=20, seed=14)
+    with pytest.raises(ValueError, match="far_threshold"):
+        build_selection_product(SelectionSet(path), spin_basis="component",
+                                far_threshold=far)

@@ -1130,6 +1130,31 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         raise ValueError(
             f"unknown detection_policy={detection_policy!r}; known policies "
             f"are {list(DETECTION_POLICIES)}.")
+    # Detection thresholds must be finite and positive (review fix).  Every
+    # FAR-only guard tests `snr_threshold is None`, so a NaN or inf SNR
+    # threshold got past the mixture refusal while detecting no semianalytic
+    # row (`snr > nan` and `snr > inf` are False everywhere), and a NaN or
+    # non-positive FAR threshold detected no O3/O4 row -- with their draws and
+    # exposure still in ndraw and T_obs, which is exactly what that refusal
+    # exists to prevent.
+    for name, value in (("far_threshold", far_threshold),
+                        ("snr_threshold", snr_threshold)):
+        if value is None and name == "snr_threshold":
+            continue
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            v = float("nan")
+        if not (np.isfinite(v) and v > 0.0):
+            raise ValueError(
+                f"{name}={value!r}: a detection threshold must be finite and "
+                f"positive. A NaN threshold (or an infinite SNR, or a "
+                f"non-positive FAR threshold) detects nothing on the rows it "
+                f"governs while their draws and exposure stay in ndraw and "
+                f"T_obs, which biases the detection probability low; an "
+                f"infinite FAR threshold is no detection cut at all. "
+                + ("Omit snr_threshold (None) for a FAR-only cut."
+                   if name == "snr_threshold" else ""))
     # `None` = each campaign's own detected ceiling; a float = one forced ceiling.
     forced_amax = parse_amax_option(amax, what="amax")
     # `None` for every non-reference basis; a validated float for a reference
