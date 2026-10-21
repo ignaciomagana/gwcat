@@ -625,3 +625,18 @@ def test_a_genuine_bounds_mismatch_still_warns(tmp_path, monkeypatch):
                         {_O4_PL: _prior_sample_file(5000, 14, hi=5000.0)},
                         cfg=cfg)
     assert float(_meta(store, "dL_prior_bounds_pvalue")) < 1e-3
+
+
+# ==========================================================================
+# low-28: a NaN KS (bounds miss the prior samples) bypassed prior_ks_fatal
+# ==========================================================================
+def test_prior_samples_outside_the_parsed_bounds_fail_the_audited_gate(
+        tmp_path, monkeypatch):
+    data, sd, priors = _prior_sample_file(500, 15)
+    rng = np.random.default_rng(16)
+    priors["samples"][XP]["luminosity_distance"] = rng.uniform(
+        20000.0, 30000.0, 500)
+    cfg = ing.IngestConfig(validate_prior=True, prior_ks_fatal=True,
+                           dL_prior_impl="astropy")
+    with pytest.raises(ing.PriorMismatchError, match="do not overlap"):
+        _ingest(tmp_path, monkeypatch, {_O4_PL: (data, sd, priors)}, cfg=cfg)

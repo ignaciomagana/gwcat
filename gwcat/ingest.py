@@ -2589,7 +2589,24 @@ def build_store(paths, out_path, params=None, extra_params=None,
                     # assumed cosmology may be wrong", which is what the
                     # pre-GW-02 message said while comparing two different
                     # distributions on every GWTC-2.1/3 event.
-                    if np.isfinite(ks_val) and ks_val > ks_thr:
+                    if not np.isfinite(ks_val):
+                        # Prior samples ARE present but the parsed bounds
+                        # miss them, so no KS can be computed.  That used to
+                        # read like "no prior samples" and bypassed
+                        # prior_ks_fatal (review 2026-10-20, low-28).
+                        msg = (
+                            f"{name} [{analysis}]: the file's own "
+                            f"{v['n_prior_samples']} distance prior samples "
+                            f"from {v['analysis']} do not overlap the parsed "
+                            f"prior {v['sampling_kind']} on [{dmin:.4g}, "
+                            f"{dmax:.4g}] Mpc "
+                            f"({100 * v['frac_prior_samples_outside_bounds']:.1f}% "
+                            f"outside), so the KS check cannot be computed. "
+                            f"The parse or the bounds are wrong.")
+                        if cfg.prior_ks_fatal:
+                            raise PriorMismatchError(msg)
+                        warnings.warn(msg)
+                    elif ks_val > ks_thr:
                         msg = (
                             f"{name} [{analysis}]: the file's own prior samples "
                             f"reject the parsed distance prior "
