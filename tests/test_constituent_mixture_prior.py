@@ -427,3 +427,55 @@ def test_a_constraint_the_support_does_not_implement_is_refused(tmp_path,
         "Constraint(minimum=10, maximum=5000, name='comoving_distance')"))
     with pytest.raises(ConstituentMixtureError, match="does not implement"):
         _ingest_with(tmp_path, monkeypatch, nr, xp, nr_an, _analytic(QXP))
+
+
+# --------------------------------------------------------------------------
+# Review 2026-10-20: the mixture convention is an explicit, recorded choice
+# --------------------------------------------------------------------------
+def test_default_convention_is_equal_weight_and_recorded(tmp_path,
+                                                         monkeypatch):
+    store, _ = _ingest(tmp_path, monkeypatch)
+    for col in ("mass_prior_source", "dL_prior_source"):
+        assert _meta0(store, col) == f"constituent_mixture:equal_weight[{XP}+{NR}]"
+
+
+def test_own_prior_convention_divides_each_row_by_its_own_prior(tmp_path,
+                                                                monkeypatch):
+    """Waveform-model averaging: a row from constituent k gets pi_k alone --
+    unlike the equal-weight form, which gives an NRSur row above q = 1/6 the
+    average of both constituents' densities."""
+    nr, xp = _nr_xp_samples_around_the_cut()
+    store, an = _ingest_with(
+        tmp_path, monkeypatch, nr, xp, _analytic(QNR), _analytic(QXP),
+        cfg_kw={"constituent_mixture_convention": "own_prior"})
+    with h5py.File(store, "r") as f:
+        pmd = f["samples/p_mass_dL_pe"][:]
+        pdl = f["samples/p_dL_pe"][:]
+    assert _meta0(store, "mass_prior_source") == \
+        f"constituent_mixture:own_prior[{XP}+{NR}]"
+    mixed = an[MX]
+    m1 = mixed["mass_1"]
+    q = mixed["mass_2"] / m1
+    bx, bn = _bounds(QXP), _bounds(QNR)
+    pd = truncated_dL_density("UniformSourceFrame", LAL_PLANCK15, 100.0,
+                              6000.0, impl="astropy")
+    own_nr = uic_density_m1q(m1, q, Z=uic_normalisation(**bn), **bn)
+    own_xp = uic_density_m1q(m1, q, Z=uic_normalisation(**bx), **bx)
+    from_nr = np.arange(m1.size) < len(nr["mass_1"])     # _concat(nr, xp)
+    expected = np.where(from_nr, own_nr, own_xp) * pd(
+        mixed["luminosity_distance"])
+    np.testing.assert_allclose(pmd, expected, rtol=1e-10)
+    np.testing.assert_allclose(pdl, pd(mixed["luminosity_distance"]),
+                               rtol=1e-10)
+    # differs from the equal-weight value on the rows both supports cover
+    both = (own_nr > 0) & (own_xp > 0)
+    eq = 0.5 * (own_nr + own_xp) * pd(mixed["luminosity_distance"])
+    assert both.any() and not np.allclose(pmd[both], eq[both], rtol=1e-6)
+
+
+def test_unknown_convention_is_refused():
+    with pytest.raises(ConstituentMixtureError, match="convention"):
+        mixture_prior_densities(np.array([60.0]), np.array([0.5]),
+                                np.array([1000.0]), [dict(_bounds(QXP), Z=1.0,
+                                                          p_dL=lambda d: d)],
+                                convention="inverse_evidence")

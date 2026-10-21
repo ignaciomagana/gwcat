@@ -248,6 +248,12 @@ class IngestConfig:
     #: options b/c).  Off by default so existing stores and the v1 exporter
     #: are unchanged; a row whose mixture cannot be verified is refused.
     constituent_mixture_prior: bool = False
+    #: Which reading of the mixture prior ``constituent_mixture_prior`` builds
+    #: (:data:`gwcat.constituent_mixture.MIXTURE_CONVENTIONS`; review
+    #: 2026-10-20).  "equal_weight" is the original form; "own_prior" divides
+    #: each row by its own constituent's prior.  An owner decision: recorded
+    #: in every mixture row's mass/dL prior source, default unchanged.
+    constituent_mixture_convention: str = "equal_weight"
     validate_prior: bool = True
     compression: str = "gzip"
     #: Which UniformSourceFrame implementation evaluates p_dL_pe (GW-01).
@@ -1778,7 +1784,10 @@ def _resolve_event_table(event_table, cache_dir=None, offline=None):
 
 def _constituent_mixture_prior(catalog, analysis, analyses, samples_dict,
                                priors, cfg, flavour):
-    """The equal-weight constituent-mixture prior of a ``C00:Mixed`` row.
+    """The constituent-mixture prior of a ``C00:Mixed`` row.
+
+    ``cfg.constituent_mixture_convention`` picks the reading (equal-weight
+    mixture at every row, or each row's own constituent prior).
 
     See :mod:`gwcat.constituent_mixture`.  Every contributing constituent must
     carry its OWN analytic mass (uniform in components), distance and spin
@@ -1787,7 +1796,8 @@ def _constituent_mixture_prior(catalog, analysis, analyses, samples_dict,
     constituent must supply exactly ``n_Mixed / K`` rows.  Anything else is
     refused (:class:`~gwcat.constituent_mixture.ConstituentMixtureError`).
     """
-    from .constituent_mixture import (ConstituentMixtureError,
+    from .constituent_mixture import (MIXTURE_CONVENTIONS,
+                                      ConstituentMixtureError,
                                       mass_constraint_bounds,
                                       match_constituent_rows,
                                       mixture_prior_densities,
@@ -1798,7 +1808,13 @@ def _constituent_mixture_prior(catalog, analysis, analyses, samples_dict,
              if a != analysis and _label_parts(a)[0] == pfx
              and _label_parts(a)[1] != "Mixed"
              and _spin_variant_token(_label_parts(a)[2]) == want}
-    labels, counts = match_constituent_rows(samples_dict[analysis], cands)
+    conv = cfg.constituent_mixture_convention
+    if conv not in MIXTURE_CONVENTIONS:
+        raise ConstituentMixtureError(
+            f"constituent_mixture_convention={conv!r}; choose one of "
+            f"{MIXTURE_CONVENTIONS}.")
+    labels, counts, row_comp = match_constituent_rows(
+        samples_dict[analysis], cands, return_rows=True)
 
     comps, amaxes, cosmos, dl_kinds, bad = [], set(), set(), set(), []
     for lab in labels:
@@ -1858,7 +1874,8 @@ def _constituent_mixture_prior(catalog, analysis, analyses, samples_dict,
     m1 = np.asarray(mixed["mass_1"], float)
     q = np.asarray(mixed["mass_2"], float) / m1
     dL = np.asarray(mixed["luminosity_distance"], float)
-    joint, marg = mixture_prior_densities(m1, q, dL, comps)
+    joint, marg = mixture_prior_densities(m1, q, dL, comps, convention=conv,
+                                          row_component=row_comp)
     n_zero = int(np.sum(~(joint > 0)))
     if n_zero:
         raise ConstituentMixtureError(
@@ -1868,6 +1885,7 @@ def _constituent_mixture_prior(catalog, analysis, analyses, samples_dict,
     (a1, a2), = amaxes
     (H0, Om0, cname), = cosmos
     return dict(labels=labels, counts=counts, p_mass_dL=joint, p_dL=marg,
+                convention=conv,
                 amax_1=a1, amax_2=a2, H0=H0, Om0=Om0, cosmology_name=cname,
                 dl_kind=(dl_kinds.pop() if len(dl_kinds) == 1 else "mixture"),
                 dmin=min(c["dmin"] for c in comps),
@@ -2278,14 +2296,16 @@ def build_store(paths, out_path, params=None, extra_params=None,
                     "constituent_mixture_counts": ",".join(
                         str(cmix["counts"][lab]) for lab in cmix["labels"]),
                     "mass_prior_kind": "constituent_mixture",
-                    "mass_prior_source": f"constituent_mixture[{joined}]",
+                    "mass_prior_source": (f"constituent_mixture:"
+                                          f"{cmix['convention']}[{joined}]"),
                     "mass_prior_chirp_min": cmix["chirp_min"],
                     "mass_prior_chirp_max": cmix["chirp_max"],
                     "mass_prior_q_min": cmix["q_min"],
                     "mass_prior_q_max": cmix["q_max"],
                     "dL_prior_kind": cmix["dl_kind"],
                     "dL_prior_basis": "constituent_mixture",
-                    "dL_prior_source": f"constituent_mixture[{joined}]",
+                    "dL_prior_source": (f"constituent_mixture:"
+                                        f"{cmix['convention']}[{joined}]"),
                     "dL_prior_min": cmix["dmin"],
                     "dL_prior_max": cmix["dmax"],
                     "dL_prior_H0": float(cmix["H0"]),
@@ -2307,7 +2327,7 @@ def build_store(paths, out_path, params=None, extra_params=None,
                 # sibling-borrowed resolution; the mixture REPLACES it.
                 for k, val in over.items():
                     meta[k][-1] = val
-                src = f"constituent_mixture[{joined}]"
+                src = f"constituent_mixture:{cmix['convention']}[{joined}]"
             print(f"[{catalog}] {name}: {n} samp, sample_set={analysis}, "
                   f"prior={src}")
 
@@ -3177,6 +3197,15 @@ def _cli(
                          "with the mixing fractions verified row by row "
                          "(GW-40f; needed only for label policies that use "
                          "C00:Mixed). Default: off.")
+    from .constituent_mixture import MIXTURE_CONVENTIONS
+    ap.add_argument("--constituent-mixture-convention",
+                    choices=MIXTURE_CONVENTIONS,
+                    default="equal_weight",
+                    help="With --constituent-mixture-prior: 'equal_weight' "
+                         "(default) evaluates (1/K) sum_k pi_k at every row; "
+                         "'own_prior' divides each row by its own "
+                         "constituent's prior. A modelling choice, recorded in "
+                         "each row's mass/dL prior source.")
     a = ap.parse_args(argv)
     if a.inspect:
         inspect(a.inspect)
@@ -3203,6 +3232,7 @@ def _cli(
     cfg = IngestConfig(
         release_reweight_cosmology_table=a.release_reweight_cosmology_table,
         constituent_mixture_prior=a.constituent_mixture_prior,
+        constituent_mixture_convention=a.constituent_mixture_convention,
         dL_prior_impl="auto" if a.legacy_grid_priors else "exact")
     build_store(paths, a.out, event_table=event_table, sample_sets=sample_sets,
                 cache_dir=a.cache_dir, offline=offline, cfg=cfg,

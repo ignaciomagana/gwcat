@@ -8,13 +8,26 @@ analyses (e.g. GW230606_004305: 41919 = 3 x 13973 rows), and it carries no
 does for a ``Mixed`` set by default) therefore misses the step at ``q = 1/6``
 and the per-analysis normalisation.
 
-The prior of an equal-weight mixture of K posteriors, each sampled under its own
-normalised prior ``pi_k``, is the equal-weight mixture of those priors::
+WHICH prior describes an equal-count mixture is a modelling choice, not a
+consequence of the equal counts (review 2026-10-20).  Each constituent k is a
+posterior ``L_k pi_k / E_k`` with its own likelihood ``L_k`` (its waveform) and
+evidence ``E_k``, so the concatenation does not have the form ``L x pi`` for
+one ``pi``.  Two readings are implemented, selected by ``convention``
+(:data:`MIXTURE_CONVENTIONS`) and recorded in the store's prior sources:
 
-    pi_Mixed(theta) = (1/K) sum_k pi_k(theta)
+* ``"equal_weight"`` (the default, unchanged): ``pi_Mixed = (1/K) sum_k pi_k``
+  evaluated at EVERY sample.  It is NOT the prior implied by a common
+  likelihood -- that is proportional to ``sum_k pi_k / E_k`` (inverse-evidence
+  weights; not implemented, since it needs every constituent's evidence under
+  ONE likelihood, which the release does not provide) -- and it sets the
+  ``q = 1/6`` step height from prior areas.
+* ``"own_prior"``: each row divided by the prior of the constituent it came
+  from, ``pi_{k(row)}`` (waveform-model averaging: every row stays a sample of
+  its own constituent's posterior).
 
-evaluated at EVERY sample (not per assigned row).  This module computes it for
-the mass and distance priors, in the export's coordinates ``(m1det, q, dL)``:
+Choosing between them is the owner's decision; neither is the default by
+derivation.  This module computes them for the mass and distance priors, in
+the export's coordinates ``(m1det, q, dL)``:
 
 * mass -- ``UniformInComponentsChirpMass`` x ``UniformInComponentsMassRatio``
   (flat in the detector-frame components) restricted to its chirp-mass and
@@ -47,6 +60,10 @@ _trapz = getattr(np, "trapezoid", getattr(np, "trapz", None))
 
 #: Columns whose exact float64 values identify a posterior row.
 MATCH_KEYS = ("mass_1", "mass_2", "luminosity_distance")
+
+#: The mixture-prior conventions (see the module docstring).  The first is the
+#: default and reproduces every store built before the option existed.
+MIXTURE_CONVENTIONS = ("equal_weight", "own_prior")
 
 
 class ConstituentMixtureError(ValueError):
@@ -184,11 +201,14 @@ def _row_keys(samples: dict, keys=MATCH_KEYS):
 
 
 def match_constituent_rows(mixed: dict, constituents: Dict[str, dict],
-                           keys: Sequence[str] = MATCH_KEYS):
+                           keys: Sequence[str] = MATCH_KEYS,
+                           return_rows: bool = False):
     """Assign every Mixed row to the constituent row it equals, exactly.
 
     Returns ``(labels, counts)``: the contributing constituent labels (file
-    order) and their row counts.  Raises :class:`ConstituentMixtureError`
+    order) and their row counts; with ``return_rows=True`` also, third, the
+    index into ``labels`` of the constituent each Mixed row came from (what
+    the ``"own_prior"`` convention needs).  Raises :class:`ConstituentMixtureError`
     unless EVERY Mixed row matches exactly one constituent row and each
     contributing constituent supplies exactly ``n_Mixed / K`` rows -- the
     row-by-row proof that the mixing fractions are the equal weights the prior
@@ -236,11 +256,26 @@ def match_constituent_rows(mixed: dict, constituents: Dict[str, dict],
             f"constituent {dict((lab, counts[lab]) for lab in labels)} of "
             f"{n} (expected {n / K:g} each). An equal-weight mixture prior "
             f"would misdescribe it.")
-    return labels, {lab: counts[lab] for lab in labels}
+    counts_out = {lab: counts[lab] for lab in labels}
+    if not return_rows:
+        return labels, counts_out
+    pos = {lab: i for i, lab in enumerate(labels)}
+    rows = np.fromiter((pos[owner[kb]] for kb in mk), dtype=np.int64,
+                       count=n)
+    return labels, counts_out, rows
 
 
-def mixture_prior_densities(m1, q, dL, components: Sequence[dict]):
-    """``(p_mass_dL, p_dL)`` of the equal-weight mixture, per sample.
+def mixture_prior_densities(m1, q, dL, components: Sequence[dict],
+                            convention: str = "equal_weight",
+                            row_component=None):
+    """``(p_mass_dL, p_dL)`` of the mixture prior, per sample.
+
+    ``convention`` is one of :data:`MIXTURE_CONVENTIONS`.  ``"own_prior"``
+    needs ``row_component``, the index into ``components`` of the constituent
+    each sample came from (:func:`match_constituent_rows` with
+    ``return_rows=True``), and gives each sample its own constituent's
+    ``pi_k(m1, q) pi_k(dL)`` and ``pi_k(dL)``.  The rest of this docstring
+    describes the default ``"equal_weight"``.
 
     Each component is a dict with the mass bounds (``mc_min, mc_max, q_min,
     q_max, m1_min, m1_max, m2_min, m2_max, mt_min, mt_max``), ``Z`` and a
@@ -253,9 +288,23 @@ def mixture_prior_densities(m1, q, dL, components: Sequence[dict]):
     K = len(components)
     if K == 0:
         raise ConstituentMixtureError("no components.")
+    if convention not in MIXTURE_CONVENTIONS:
+        raise ConstituentMixtureError(
+            f"convention={convention!r}; choose one of {MIXTURE_CONVENTIONS}.")
+    if convention == "own_prior":
+        if row_component is None:
+            raise ConstituentMixtureError(
+                "convention='own_prior' needs row_component (which constituent "
+                "each sample came from).")
+        row_component = np.asarray(row_component)
+        if (row_component.shape != np.shape(m1)
+                or not np.all((row_component >= 0) & (row_component < K))):
+            raise ConstituentMixtureError(
+                f"row_component must give a component index in [0, {K}) for "
+                f"every sample.")
     joint = np.zeros(np.shape(m1), dtype=float)
     marg = np.zeros(np.shape(m1), dtype=float)
-    for c in components:
+    for k, c in enumerate(components):
         pm = uic_density_m1q(
             m1, q, mc_min=c["mc_min"], mc_max=c["mc_max"], q_min=c["q_min"],
             q_max=c["q_max"], Z=c["Z"], m1_min=c.get("m1_min"),
@@ -263,6 +312,11 @@ def mixture_prior_densities(m1, q, dL, components: Sequence[dict]):
             m2_max=c.get("m2_max"), mt_min=c.get("mt_min"),
             mt_max=c.get("mt_max"))
         pd = np.asarray(c["p_dL"](dL), dtype=float)
+        if convention == "own_prior":
+            mine = row_component == k
+            joint = np.where(mine, pm * pd, joint)
+            marg = np.where(mine, pd, marg)
+            continue
         joint += pm * pd / K
         marg += pd / K
     return joint, marg
