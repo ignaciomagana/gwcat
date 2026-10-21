@@ -433,10 +433,39 @@ def test_the_historical_table_agrees_with_the_bundled_lists():
     for short, full in HISTORICAL_DATE_ONLY_NAMES.items():
         assert full.startswith(short + "_"), (short, full)
     members = {f for f in HISTORICAL_DATE_ONLY_NAMES.values() if f in BBH_ALL}
-    # GWTC-1's ten BBH plus GW190412 and GW190521; the BNS and the mass-gap
-    # system are not members
-    assert len(members) == 12
-    assert "GW190814_211039" in NON_BBH_EXCLUSIONS
+    # GWTC-1's ten BBH, GW190412, GW190521, GW230814, GW231123, GW241011,
+    # GW241110 and GW250114; the BNS, the NSBH and the mass-gap system are not
+    # members
+    assert len(members) == 17
+    others = set(HISTORICAL_DATE_ONLY_NAMES.values()) - members
+    assert others == {"GW170817_124104", "GW190425_081805", "GW190814_211039",
+                      "GW200105_162426", "GW200115_042309", "GW230529_181500"}
+    assert {"GW190814_211039", "GW200105_162426", "GW200115_042309",
+            "GW230529_181500"} <= NON_BBH_EXCLUSIONS
+
+
+@pytest.mark.parametrize("short,full", [
+    ("GW200105", "GW200105_162426"),
+    ("GW200115", "GW200115_042309"),
+    ("GW230529", "GW230529_181500"),
+    ("GW230814", "GW230814_230901"),
+    ("GW231123", "GW231123_135430"),
+    ("GW241011", "GW241011_233834"),
+    ("GW241110", "GW241110_124123"),
+    ("GW250114", "GW250114_082203"),
+])
+def test_later_discovery_paper_names_resolve(short, full):
+    """LVK kept publishing date-only names after O3a.  GW250114_082203 is a
+    curated member (bbh_o4b.txt): 3ba1dbf resolved ``GW250114`` by prefix, and
+    a table without it refused the name and left the CLI preflight with no
+    'the store has ...' hint.  ``GW230814`` names the loud single-detector
+    event, not the other one of that day."""
+    from gwcat.population_samples import resolve_event_name_aliases
+    same_day = [n for n in ("GW230814_061920",) if n.startswith(short + "_")]
+    resolved, aliases = resolve_event_name_aliases(
+        [short], [full, *same_day, "GW200129_065458"])
+    assert resolved == [full]
+    assert aliases == {short: full}
 
 
 # ==========================================================================

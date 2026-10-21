@@ -26,11 +26,14 @@ if TYPE_CHECKING:  # pragma: no cover
 _SHORT_EVENT_RE = re.compile(r"^GW\d{6}$")
 _FULL_EVENT_RE = re.compile(r"^GW\d{6}_\d{6}$")
 
-#: The date-only names under which LVK published events before every GWTC name
-#: took the ``GWyymmdd_hhmmss`` form: GWTC-1's eleven, and the four O3a events
-#: with their own discovery papers.  The suffix is the UTC time of the event's
-#: GPS time, which is how every GWTC name is formed (GW150914: GPS
-#: 1126259462.4 = 2015-09-14 09:50:45 UTC).
+#: The date-only names under which LVK has published events, up to GWTC-5.0:
+#: GWTC-1's eleven, and every event with its own discovery paper -- GW190412,
+#: GW190425, GW190521 and GW190814 (O3a), GW200105 and GW200115 (O3b),
+#: GW230529, GW230814 and GW231123 (O4a), GW241011, GW241110 and GW250114
+#: (O4b/c).  The suffix is the UTC time of the event's GPS time, which is how
+#: every GWTC name is formed (GW150914: GPS 1126259462.4 = 2015-09-14 09:50:45
+#: UTC); each full name below is the one its GWTC release file carries.  A new
+#: discovery paper's date-only name resolves only once it is added here.
 #:
 #: A date-only name resolves ONLY through this table.  Prefix-matching it
 #: against whatever the store happens to hold picked the other event of the
@@ -54,6 +57,14 @@ HISTORICAL_DATE_ONLY_NAMES = {
     "GW190425": "GW190425_081805",
     "GW190521": "GW190521_030229",
     "GW190814": "GW190814_211039",
+    "GW200105": "GW200105_162426",
+    "GW200115": "GW200115_042309",
+    "GW230529": "GW230529_181500",
+    "GW230814": "GW230814_230901",   # the single-detector event, not _061920
+    "GW231123": "GW231123_135430",
+    "GW241011": "GW241011_233834",
+    "GW241110": "GW241110_124123",
+    "GW250114": "GW250114_082203",
 }
 
 
