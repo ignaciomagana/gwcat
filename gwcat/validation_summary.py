@@ -88,6 +88,13 @@ def gwcat_commit() -> str:
     code is worse than none.  Never raises; a non-git install returns
     ``"unknown"``.  Cached per process (attrs are stamped per export, and the
     answer cannot change mid-process for an already-imported package).
+
+    The commit is accepted only when the repository git finds IS gwcat's own
+    tree: its top level is the directory holding the package and this file is
+    tracked there.  ``git -C <pkg_dir>`` walks up to the nearest repository,
+    so a non-editable install into a git-ignored ``.venv`` inside some other
+    checkout used to be stamped with THAT repository's HEAD -- a clean-looking
+    and wrong gwcat commit.  Such an install now says ``"unknown"``.
     """
     global _GWCAT_COMMIT_CACHE
     if _GWCAT_COMMIT_CACHE is not None:
@@ -96,6 +103,20 @@ def gwcat_commit() -> str:
     import subprocess
     pkg_dir = os.path.dirname(os.path.abspath(__file__))
     try:
+        top = subprocess.run(
+            ["git", "-C", pkg_dir, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        tracked = subprocess.run(
+            ["git", "-C", pkg_dir, "ls-files", "--error-unmatch", "--",
+             os.path.basename(os.path.abspath(__file__))],
+            capture_output=True, text=True, timeout=10,
+        ).returncode == 0
+        if (not top or not tracked
+                or os.path.realpath(top)
+                != os.path.realpath(os.path.dirname(pkg_dir))):
+            _GWCAT_COMMIT_CACHE = "unknown"
+            return _GWCAT_COMMIT_CACHE
         commit = subprocess.run(
             ["git", "-C", pkg_dir, "rev-parse", "HEAD"],
             capture_output=True, text=True, timeout=10,
@@ -148,6 +169,31 @@ def _json_default(o: Any):
     if isinstance(o, float) and not np.isfinite(o):
         return None
     return str(o)
+
+
+def _json_safe(o: Any) -> Any:
+    """``o`` with every non-finite float (at any depth) replaced by ``None``.
+
+    :func:`_json_default` is only consulted for objects ``json`` cannot encode
+    itself, and a Python ``float`` -- or a numpy array it turns into a list of
+    them -- is not one, so a NaN reached the file as a bare ``NaN`` token,
+    which strict JSON parsers reject.  The production selection summary
+    carried such tokens.  Sanitising first and dumping with
+    ``allow_nan=False`` makes the output valid JSON by construction.
+    """
+    if isinstance(o, dict):
+        return {k: _json_safe(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_json_safe(v) for v in o]
+    if isinstance(o, (set, frozenset)):
+        return [_json_safe(v) for v in sorted(o)]
+    if isinstance(o, np.ndarray):
+        return _json_safe(o.tolist())
+    if isinstance(o, np.generic):
+        return _json_safe(o.item())
+    if isinstance(o, float) and not np.isfinite(o):
+        return None
+    return o
 
 
 # ---------------------------------------------------------------------------
@@ -489,7 +535,8 @@ def write_validation_summary(
     json_path = out_path + ".validation_summary.json"
     with atomic_output_path(json_path) as tmp:
         with open(tmp, "w") as f:
-            json.dump(summary, f, indent=2, default=_json_default)
+            json.dump(_json_safe(summary), f, indent=2, default=_json_default,
+                      allow_nan=False)
             f.write("\n")
 
     md_path = None

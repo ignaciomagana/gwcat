@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from typing import Optional, Sequence
@@ -91,6 +92,14 @@ def _add_space_argument(parser, kind) -> None:
                              f"--spin-basis is an accepted alias. "
                              f"Run 'export list-spaces' for every declared "
                              f"space, including ones no builder ships yet.")
+
+
+def _positive_int(text: str) -> int:
+    """argparse type: an integer >= 1 (``--nsamp 0`` wrote an empty product)."""
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {value}")
+    return value
 
 
 def _invoked_program_name() -> str:
@@ -151,6 +160,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_inspect.add_argument("--json", action="store_true",
                            help="Print machine-readable JSON instead of a "
                                 "human-readable table.")
+    from .export.pe_builder import SUPPORTED_SPIN_BASES as _pe_spaces
+    from .params import list_spaces as _list_spaces
+    p_inspect.add_argument("--parameter-space", "--spin-basis",
+                           dest="spin_basis",
+                           default=DEFAULT_PARAMETER_SPACE,
+                           choices=[s for s in _list_spaces()
+                                    if s in _pe_spaces],
+                           help=f"Report missing_required_parameters for a "
+                                f"PE export in this space (default: "
+                                f"{DEFAULT_PARAMETER_SPACE}, the space "
+                                f"'export pe' defaults to).")
 
     # -- export-darksirens ----------------------------------------------
     from .waveform_policy import WAVEFORM_POLICIES
@@ -176,13 +196,21 @@ def build_parser() -> argparse.ArgumentParser:
                                "stored PE cosmology.")
     p_export.add_argument("--event-list", default=None, metavar="FILE",
                           help="Restrict to a user event-list file (one name "
-                               "per line, '#' comments allowed).")
+                               "per line, '#' comments allowed). Every name "
+                               "must be in the store, exactly as the store "
+                               "spells it; see --allow-missing-events.")
+    p_export.add_argument("--allow-missing-events", action="store_true",
+                          help="With --event-list: skip listed names the "
+                               "store does not hold (with a warning) instead "
+                               "of refusing; the skipped names are recorded "
+                               "in the validation summary, so this cannot be "
+                               "combined with --no-summary.")
     p_export.add_argument("--far-max", type=float, default=None,
                           metavar="FAR_YR")
     far_group = p_export.add_mutually_exclusive_group()
     far_group.add_argument("--allow-missing-far", action="store_true")
     far_group.add_argument("--require-far", action="store_true")
-    p_export.add_argument("--nsamp", type=int, default=4096)
+    p_export.add_argument("--nsamp", type=_positive_int, default=4096)
     p_export.add_argument("--seed", type=int, default=0)
     p_export.add_argument("--z-max", type=float, default=None)
     # "auto" like the v2 `export pe` sibling (GW-37): one hardcoded ceiling
@@ -254,13 +282,36 @@ def build_parser() -> argparse.ArgumentParser:
                            "stored PE cosmology.")
     p_pe.add_argument("--event-list", default=None, metavar="FILE",
                       help="Restrict to a user event-list file (one name "
-                           "per line, '#' comments allowed).")
+                           "per line, '#' comments allowed). Every name must "
+                           "be in the store, exactly as the store spells it; "
+                           "see --allow-missing-events.")
+    p_pe.add_argument("--allow-missing-events", action="store_true",
+                      help="With --event-list: skip listed names the store "
+                           "does not hold (with a warning) instead of "
+                           "refusing; the skipped names are recorded in the "
+                           "validation summary, so this cannot be combined "
+                           "with --no-summary.")
     p_pe.add_argument("--far-max", type=float, default=None, metavar="FAR_YR")
     pe_far_group = p_pe.add_mutually_exclusive_group()
     pe_far_group.add_argument("--allow-missing-far", action="store_true")
     pe_far_group.add_argument("--require-far", action="store_true")
-    p_pe.add_argument("--pastro-min", type=float, default=None)
-    p_pe.add_argument("--nsamp", type=int, default=4096)
+    p_pe.add_argument("--pastro-min", type=float, default=None,
+                      help="Drop events with p_astro below this. Refused "
+                           "unless --allow-unpaired-pastro-min is also given: "
+                           "no injection campaign carries p_astro, so no "
+                           "selection export reproduces this cut. Cut on "
+                           "--far-max or select by --event-list instead.")
+    p_pe.add_argument("--allow-unpaired-pastro-min", action="store_true",
+                      help="Write the file despite --pastro-min. It is then "
+                           "NOT usable with a selection function.")
+    p_pe.add_argument("--allow-projection-basis", action="store_true",
+                      help="Required by --parameter-space chieff_chip, which "
+                           "is opt-in and not a shipped product: a projection "
+                           "of the spin vector, definable only against a "
+                           "uniform-magnitude isotropic injected draw. Use "
+                           "'component' unless you need the projected "
+                           "density.")
+    p_pe.add_argument("--nsamp", type=_positive_int, default=4096)
     p_pe.add_argument("--seed", type=int, default=0)
     p_pe.add_argument("--z-max", type=float, default=None)
     p_pe.add_argument("--amax", default="auto", metavar="AMAX",
@@ -362,9 +413,20 @@ def build_parser() -> argparse.ArgumentParser:
                              "cumulative mixtures ship no sky position at "
                              "all. gwcat2 (2.0) format only.")
     p_xsel.add_argument("--H0", type=float, default=None,
-                        help="Reference cosmology (default: Planck15) applied "
-                             "to every injection file.")
-    p_xsel.add_argument("--Om0", type=float, default=None)
+                        help="Override the cosmology of the ddL/dz Jacobian. "
+                             "Omit it (default) and each campaign uses its "
+                             "own: a file that ships "
+                             "dluminosity_distance_dredshift (every O4-era "
+                             "events file) reads it and no cosmology enters "
+                             "its pdraw; any other uses its generation "
+                             "cosmology detected from its (z, dL) pairs, and "
+                             "Planck15 only if that fails. An override reaches "
+                             "only the second kind, so one that would reach "
+                             "only some campaigns of a combined export (O3 + "
+                             "O4) is refused: omit it there.")
+    p_xsel.add_argument("--Om0", type=float, default=None,
+                        help="Matter density of the --H0 override (same "
+                             "rules).")
     p_xsel.add_argument("--no-summary", action="store_true",
                         help="Skip writing validation_summary.json/.md "
                              "next to --out.")
@@ -389,8 +451,13 @@ def build_parser() -> argparse.ArgumentParser:
     # -- selection -------------------------------------------------------
     p_sel = sub.add_parser(
         "selection",
-        help="Build a darksirens selection-function export from one or more "
-             "injection files (SelectionSet / CombinedSelectionSet).")
+        help="Build a v1 (gwcat-selection-1.0, chi_eff only) selection export "
+             "from one or more injection files (SelectionSet / "
+             "CombinedSelectionSet.to_darksirens). It replaces each "
+             "campaign's spin draw with the isotropic chi_eff prior and "
+             "refuses a campaign that did not draw spins that way, such as "
+             "O4ab; for O3 + O4ab use `export selection --parameter-space "
+             "chieff_reference --spin-reference-amax 0.99` without --H0.")
     p_sel.add_argument("--injections", nargs="+", required=True, metavar="FILE",
                        help="One or more LVK injection HDF5 files. More than "
                             "one is combined via CombinedSelectionSet.")
@@ -408,9 +475,17 @@ def build_parser() -> argparse.ArgumentParser:
                        help="bbh / nsbh / bns / massgap / cbc, or a canonical "
                             "class name.")
     p_sel.add_argument("--H0", type=float, default=None,
-                       help="Reference cosmology (default: Planck15) applied "
-                            "to every --injections file.")
-    p_sel.add_argument("--Om0", type=float, default=None)
+                       help="Override the cosmology of the ddL/dz Jacobian. "
+                            "Omit it (default) and each campaign uses its "
+                            "own: the shipped dluminosity_distance_dredshift "
+                            "of an O4-era events file, else the generation "
+                            "cosmology detected from its (z, dL) pairs "
+                            "(Planck15 only if that fails). An override that "
+                            "would reach only some of several --injections "
+                            "files is refused.")
+    p_sel.add_argument("--Om0", type=float, default=None,
+                       help="Matter density of the --H0 override (same "
+                            "rules).")
     p_sel.add_argument("--no-summary", action="store_true",
                        help="Skip writing validation_summary.json/.md next "
                             "to --out.")
@@ -428,8 +503,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_val.add_argument("selection_path", nargs="?", default=None,
                        metavar="SELECTION.h5")
     p_val.add_argument("--strict", action="store_true",
-                       help="Raise on the first internal-consistency failure "
-                            "(cross-file contract checks always raise).")
+                       help="Raise on the first internal-consistency failure. "
+                            "Most cross-file contract checks fail with or "
+                            "without it, but some only warn unless it is "
+                            "given (a chi_eff-prior implementation recorded "
+                            "on one side only, e.g. a pre-exact-prior PE file "
+                            "with an exact selection; a PE file too old to "
+                            "check the chieff_reference spin-prior contract) "
+                            "and one only ever warns (a redshift truncation "
+                            "stated on one side only). Use it whenever the "
+                            "pair gates an analysis, and read the warnings.")
     p_val.add_argument("--spin-prior-allow-list", default=None, metavar="FILE",
                        help="Events a chieff/chieff_reference pair may carry "
                             "whose spin prior is not their label's own "
@@ -451,6 +534,23 @@ def build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 # Subcommand implementations (thin argparse -> library-call translation)
 # ---------------------------------------------------------------------------
+def _cosmology_problems(H0: Optional[float], Om0: Optional[float]) -> list:
+    """What is wrong with a command-line cosmology, if anything.
+
+    ``float()`` accepts ``nan`` and ``inf``, so an empty shell variable or a
+    typo used to reach the builders as a cosmology: ``--cosmology nan,0.3``
+    exited 0 with all-NaN source-frame columns that ``validate --strict``
+    passed, and ``70,1.5`` died in astropy with a raw ``TypeError``.
+    """
+    problems = []
+    if H0 is not None and not (math.isfinite(H0) and H0 > 0):
+        problems.append(f"H0={H0!r} must be finite and > 0")
+    if Om0 is not None and not (math.isfinite(Om0) and 0 < Om0 <= 1):
+        problems.append(f"Om0={Om0!r} must be finite with 0 < Om0 <= 1 "
+                        f"(flat LCDM)")
+    return problems
+
+
 def _parse_cosmology(spec: Optional[str]):
     if not spec:
         return None
@@ -459,21 +559,43 @@ def _parse_cosmology(spec: Optional[str]):
         raise SystemExit(
             f"--cosmology must be 'H0,Om0' (e.g. 67.74,0.3089), got {spec!r}")
     try:
-        return float(parts[0]), float(parts[1])
+        H0, Om0 = float(parts[0]), float(parts[1])
     except ValueError as e:
         raise SystemExit(f"--cosmology: {e}")
+    problems = _cosmology_problems(H0, Om0)
+    if problems:
+        raise SystemExit(f"--cosmology {spec!r}: " + "; ".join(problems))
+    return H0, Om0
+
+
+def _selection_cosmology_kwargs(args) -> dict:
+    """The ``--H0``/``--Om0`` override as SelectionSet kwargs, checked first."""
+    problems = _cosmology_problems(args.H0, args.Om0)
+    if problems:
+        raise SystemExit("--H0/--Om0: " + "; ".join(problems))
+    kwargs = {}
+    if args.H0 is not None:
+        kwargs["H0"] = args.H0
+    if args.Om0 is not None:
+        kwargs["Om0"] = args.Om0
+    return kwargs
 
 
 def _cmd_inspect(args) -> int:
     from .catalog import GWCatalog
-    from .validation_summary import summarize_catalog, _json_default
+    from .validation_summary import (summarize_catalog, _json_default,
+                                     _json_safe)
 
     cat = GWCatalog(args.store)
-    info = summarize_catalog(cat)
+    # Requirements of the space an export would use, not the chi_eff-only
+    # legacy list: a store without the component spins reported nothing
+    # missing, and the default `export pe` then failed on it.
+    info = summarize_catalog(cat, parameter_space=args.spin_basis)
     info["store_path"] = args.store
 
     if args.json:
-        print(json.dumps(info, indent=2, default=_json_default))
+        print(json.dumps(_json_safe(info), indent=2, default=_json_default,
+                         allow_nan=False))
         return 0
 
     cat.summary()
@@ -483,7 +605,7 @@ def _cmd_inspect(args) -> int:
     print(f"stored_parameters ({len(info['stored_parameters'])}): "
           f"{', '.join(info['stored_parameters'])}")
     if info["missing_required_parameters"]:
-        print(f"missing_required_parameters: "
+        print(f"missing_required_parameters ({args.spin_basis}): "
               f"{info['missing_required_parameters']}")
     if info["missing_optional_parameters"]:
         print(f"missing_optional_parameters: "
@@ -515,6 +637,59 @@ def _parse_source_class(spec: Optional[str]):
     return [s.strip() for s in spec.split(",") if s.strip()]
 
 
+def _event_list_preflight(args, cat) -> Optional[dict]:
+    """Refuse an ``--event-list`` naming events the store does not hold.
+
+    ``GWCatalog.select`` only warns about such names and drops them, so a short
+    alias (``GW150914`` for ``GW150914_095045``) or a typo silently lost that
+    event: the export exited 0, recorded ``n_allowed_names`` one above ``nobs``,
+    and ``validate --strict`` passed it.  The CLI user asked for those events
+    by name, so a name that matches nothing is an error, with the store's
+    spelling suggested when the name is a historical date-only GWTC name.
+    ``--allow-missing-events`` restores the skip, and the skipped names go into
+    the validation summary -- the only place they are recorded, so the opt-out
+    is refused together with ``--no-summary``.  Returns the summary fields to
+    record (or None).
+    """
+    if (getattr(args, "allow_missing_events", False)
+            and getattr(args, "no_summary", False)):
+        raise ValueError(
+            "--allow-missing-events cannot be combined with --no-summary: the "
+            "validation summary is the only record of which listed events "
+            "were skipped, so without it the product would hold fewer events "
+            "than the list with nothing saying which. Drop --no-summary, or "
+            "fix the event list and drop --allow-missing-events.")
+    if args.event_list is None:
+        return None
+    from .population_samples import resolve_event_name_aliases
+    from .source_class import load_event_list
+
+    store_names = [str(n) for n in cat.names]
+    store_set = set(store_names)
+    missing = [n for n in load_event_list(args.event_list)
+               if n not in store_set]
+    if not missing:
+        return None
+    if getattr(args, "allow_missing_events", False):
+        return {"event_list_missing_names": missing,
+                "event_list_allow_missing_events": True}
+
+    rows = []
+    for name in missing:
+        try:
+            _resolved, alias = resolve_event_name_aliases([name], store_names)
+        except ValueError:
+            alias = {}
+        rows.append(f"{name!r} (the store has {alias[name]!r})"
+                    if name in alias else repr(name))
+    raise ValueError(
+        f"--event-list {args.event_list}: {len(missing)} listed name(s) are "
+        f"not in the store, and an export would silently drop them: "
+        f"{', '.join(rows)}. List each event exactly as the store spells it "
+        f"(`gwcat inspect` shows the names), or pass --allow-missing-events "
+        f"to skip them deliberately.")
+
+
 def _prior_impl_scope(args):
     """The chi_eff-prior implementation this command builds with (GW-40i).
 
@@ -536,8 +711,10 @@ def _cmd_export_darksirens_impl(args) -> int:
 
     cosmology = _parse_cosmology(args.cosmology)
     cat = GWCatalog(args.store)
+    summary_context = _event_list_preflight(args, cat)
     cat.to_darksirens(
         args.out,
+        summary_context=summary_context,
         source_class=_parse_source_class(args.source_class),
         spin_prior_mode=args.spin_prior_mode,
         waveform_policy=args.waveform_policy,
@@ -606,11 +783,13 @@ def _cmd_export_pe(args) -> int:
 
     cosmology = _parse_cosmology(args.cosmology)
     cat = GWCatalog(args.store)
+    summary_context = _event_list_preflight(args, cat)
     cat.export(
         args.out,
         format=args.format,
         spin_basis=args.spin_basis,
         write_summary=not args.no_summary,
+        summary_context=summary_context,
         source_class=_parse_source_class(args.source_class),
         waveform_policy=args.waveform_policy,
         approximant=args.approximant,
@@ -626,6 +805,8 @@ def _cmd_export_pe(args) -> int:
         amax=args.amax,
         amax_fallback=args.amax_fallback,
         drop_spin_above_ceiling=args.drop_spin_above_ceiling,
+        allow_unpaired_pastro_min=args.allow_unpaired_pastro_min,
+        allow_projection_basis=args.allow_projection_basis,
         sample_set_map=args.sample_set_map,
         nrsur_q_rule=args.nrsur_q_rule,
         nrsur_q_rule_substitute=args.nrsur_q_rule_substitute,
@@ -646,11 +827,7 @@ def _cmd_export_selection(args) -> int:
             "exposure, which biases the detection probability low and the "
             "inferred rate high.")
 
-    kwargs = {}
-    if args.H0 is not None:
-        kwargs["H0"] = args.H0
-    if args.Om0 is not None:
-        kwargs["Om0"] = args.Om0
+    kwargs = _selection_cosmology_kwargs(args)
 
     sets = [SelectionSet(path, **kwargs) for path in args.injections]
     target = sets[0] if len(sets) == 1 else CombinedSelectionSet(sets)
@@ -693,11 +870,7 @@ def _cmd_selection(args) -> int:
 def _cmd_selection_impl(args) -> int:
     from .selection import SelectionSet, CombinedSelectionSet
 
-    kwargs = {}
-    if args.H0 is not None:
-        kwargs["H0"] = args.H0
-    if args.Om0 is not None:
-        kwargs["Om0"] = args.Om0
+    kwargs = _selection_cosmology_kwargs(args)
 
     sets = [SelectionSet(path, **kwargs) for path in args.injections]
     target = sets[0] if len(sets) == 1 else CombinedSelectionSet(sets)
@@ -756,8 +929,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if args.command == "inspect":
-        return _cmd_inspect(args)
     # A ValueError out of these commands is a *diagnosed refusal* -- an
     # unrecognised --source-class token, a partial cosmology override, a
     # zero-density injection -- whose message already says what to fix.  The
@@ -765,8 +936,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # (validate already did; the export commands surfaced raw tracebacks).
     # A SpinBasisError (a RuntimeError; BlockCampaignMismatch is one) is a
     # diagnosed refusal too -- e.g. the chieff basis on a joint-density file.
+    # So is a MissingParameterError (a KeyError: the store lacks a column the
+    # requested space needs), which escaped as a raw traceback.
     from .export.selection_builder import SpinBasisError
+    from .schema import MissingParameterError
     try:
+        if args.command == "inspect":
+            return _cmd_inspect(args)
         if args.command == "export-darksirens":
             return _cmd_export_darksirens(args)
         if args.command == "export":
@@ -777,6 +953,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return _cmd_validate(args)
     except (ValueError, SpinBasisError) as e:
         print(f"{PROG} {args.command}: error: {e}", file=sys.stderr)
+        return 1
+    except MissingParameterError as e:
+        print(f"{PROG} {args.command}: error: "
+              f"{e.args[0] if e.args else e}", file=sys.stderr)
         return 1
 
     parser.error(f"unknown command {args.command!r}")  # pragma: no cover
