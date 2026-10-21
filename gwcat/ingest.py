@@ -214,6 +214,13 @@ META_STR_FIELDS += ["constituent_mixture_labels", "constituent_mixture_counts"]
 # OTHER constituents (e.g. C01:SEOBNRv4PHM, which has no analytic group)
 # declared, so a per-half ceiling difference is visible on the row.
 META_STR_FIELDS += ["spin_amax_config_per_constituent"]
+# The constituents a combined set's own ``meta_data/combined`` record names
+# ("+"-joined, "" when the record names no label of the file), and whether
+# their analytic priors agree (review 2026-10-20, critical-1): "" for a row
+# that is not a combined set, "agree", "differ:<keys>" or
+# "unverified:<why>".  A Mixed row divides out ONE sibling's prior, which is
+# the Mixed set's prior only when its constituents' priors agree.
+META_STR_FIELDS += ["mixed_constituent_labels", "mixed_constituent_priors"]
 
 # Default waveform priority when no Mixed set exists (O4b/GWTC-5 events).
 O4_WAVEFORM_PRIORITY = [
@@ -276,6 +283,16 @@ class IngestConfig:
     #: samples are no longer zeroed (GW-01), but the mismatch means the recorded
     #: bounds describe a different analysis than the one being ingested.
     dL_outside_warn_frac: float = 0.0
+    #: What to do with a combined (``Mixed``) row whose constituents, as named
+    #: by its ``meta_data/combined`` record, declare DIFFERENT analytic priors
+    #: (review 2026-10-20, critical-1: 44 GWTC-4.1 C00:Mixed sets include
+    #: C00:NRSur7dq4, whose q >= 1/6 and 60 <= Mtot <= 400 differ from its
+    #: siblings).  "warn" (default) keeps the sibling-borrowed prior, warns and
+    #: records ``mixed_constituent_priors = "differ:<keys>"``; "raise" refuses
+    #: such a row unless ``constituent_mixture_prior`` builds a
+    #: constituent-aware prior for it.  Which prior a Mixed set should divide
+    #: out is the owner's convention; this only makes the disagreement visible.
+    mixed_prior_mismatch: str = "warn"
 
 
 # --------------------------------------------------------------------------
@@ -613,6 +630,92 @@ def _sample_set_meta(analysis: str, preferred_label: str, ranked, path: str,
         priority_rank=rank,
         selection_reason=reason,
     )
+
+
+# --------------------------------------------------------------------------
+# Combined-set constituents (review 2026-10-20)
+# --------------------------------------------------------------------------
+def combined_constituents(data, analysis, analyses=()):
+    """The constituent labels a combined set's ``meta_data/combined`` names.
+
+    Every Mixed set in the local GWTC-2.1/3/4.1/5 releases carries this
+    record.  The O4 releases name the constituent analyses in it
+    (``"C00:IMRPhenomXPHM-SpinTaylor, C00:NRSur7dq4, C00:SEOBNRv5PHM"``);
+    GWTC-2.1/3 name internal run tags (``"Prod5, Prod6_extended"``) that are
+    not labels.  Only names that are analyses of this file (other than
+    ``analysis`` itself) are returned, in the record's order; ``[]`` when
+    there is no usable record (``data`` None, no record, or no label in it).
+    """
+    if data is None:
+        return []
+    node = _extra_kwargs_for(data, analysis)
+    md = node.get("meta_data") if isinstance(node, dict) else None
+    raw = md.get("combined") if isinstance(md, dict) else None
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple, np.ndarray)):
+        raw = ",".join(_decode(x) for x in np.asarray(raw, dtype=object).ravel())
+    else:
+        raw = _decode(raw)
+    have = set(analyses)
+    out = []
+    for tok in raw.split(","):
+        lab = tok.strip().strip("'\"")
+        if lab and lab != analysis and lab in have and lab not in out:
+            out.append(lab)
+    return out
+
+
+#: Analytic prior keys compared across a combined set's constituents
+#: (critical-1): every key that enters the exported ``p_pe`` or bounds its
+#: support.  Any other key a constituent declares as a ``Constraint`` is
+#: compared too -- NRSur7dq4's ``total_mass`` Constraint is the live case.
+_MIXED_PRIOR_KEYS = ("chirp_mass", "mass_ratio", "mass_1", "mass_2",
+                     "total_mass", "symmetric_mass_ratio",
+                     "luminosity_distance", "a_1", "a_2", "tilt_1", "tilt_2",
+                     "chi_1", "chi_2")
+
+
+def compare_constituent_priors(analysis, constituents, priors):
+    """Whether a combined set's constituents declare the same analytic priors.
+
+    Returns ``"agree"``, ``"differ:<k1>,<k2>"`` (the keys whose reprs differ,
+    or that only some constituents declare), or ``"unverified:<why>"`` when
+    the record names no constituent label or a constituent has no analytic
+    group.  Reprs are compared with whitespace removed.
+    """
+    if not constituents:
+        return "unverified:no_constituent_labels"
+    analytic = priors.get("analytic", {}) if isinstance(priors, dict) else {}
+    nodes, missing = {}, []
+    for lab in constituents:
+        node = analytic.get(lab) if isinstance(analytic, dict) else None
+        if not node:
+            missing.append(lab)
+        else:
+            nodes[lab] = node
+    if missing:
+        return f"unverified:no_analytic({','.join(missing)})"
+
+    def _is_constraint(v):
+        got = _parse_analytic_spin(v)
+        return got is not None and got[0] == "Constraint"
+
+    keys = set()
+    for node in nodes.values():
+        keys |= {k for k in node
+                 if k in _MIXED_PRIOR_KEYS or _is_constraint(node[k])}
+    differ = []
+    for k in sorted(keys):
+        vals = {re.sub(r"\s+", "", str(node[k])) if k in node else None
+                for node in nodes.values()}
+        if len(vals) > 1:
+            differ.append(k)
+    return f"differ:{','.join(differ)}" if differ else "agree"
+
+
+class MixedPriorMismatchError(ValueError):
+    """A combined set's constituents declare different analytic priors."""
 
 
 # --------------------------------------------------------------------------
@@ -1948,6 +2051,10 @@ def build_store(paths, out_path, params=None, extra_params=None,
                    byte-identical to one written before the flag existed.
     """
     cfg = cfg or IngestConfig()
+    if cfg.mixed_prior_mismatch not in ("warn", "raise"):
+        raise ValueError(
+            f"IngestConfig.mixed_prior_mismatch={cfg.mixed_prior_mismatch!r} "
+            f"is invalid; use 'warn' or 'raise'.")
     params = list(params or DEFAULT_PARAMS)
     if extra_params:
         params += [p for p in extra_params if p not in params]
@@ -2109,6 +2216,28 @@ def build_store(paths, out_path, params=None, extra_params=None,
                     flavour)
                 rec["p_dL_pe"] = cmix["p_dL"]
                 rec["p_mass_dL_pe"] = cmix["p_mass_dL"]
+            # ── Do a combined set's constituents agree? (critical-1) ────────
+            constituents = combined_constituents(data, analysis, analyses)
+            mixed_priors = ""
+            if constituents or _label_parts(analysis)[1] == "Mixed":
+                mixed_priors = compare_constituent_priors(
+                    analysis, constituents, priors)
+            if mixed_priors.startswith("differ:"):
+                msg = (
+                    f"{name} [{analysis}]: the constituents its "
+                    f"meta_data/combined record names ({constituents}) "
+                    f"declare different analytic priors for "
+                    f"{mixed_priors[len('differ:'):]}, but this row divides "
+                    f"out the prior of one sibling "
+                    f"({res.prior_source_label or 'none'} for the distance, "
+                    f"the first matching sibling for mass and spin). That is "
+                    f"the Mixed set's prior only where the constituents "
+                    f"agree; recorded as mixed_constituent_priors.")
+                if cfg.mixed_prior_mismatch == "raise" and cmix is None:
+                    raise MixedPriorMismatchError(
+                        msg + " Refused (mixed_prior_mismatch='raise'); use "
+                        "constituent_mixture_prior=True or exclude the row.")
+                warnings.warn(msg)
             records.append((name, n, rec))
 
             # metadata
@@ -2181,6 +2310,8 @@ def build_store(paths, out_path, params=None, extra_params=None,
             meta["prior_source_kind_spin"].append(sp.source_kind)
             meta["spin_amax_config_per_constituent"].append(
                 constituent_spin_amax_config(data, analysis, analyses))
+            meta["mixed_constituent_labels"].append("+".join(constituents))
+            meta["mixed_constituent_priors"].append(mixed_priors)
             meta["prior_source_label_dL"].append(res.prior_source_label)
             meta["prior_source_kind_dL"].append(res.prior_source_kind)
             meta["mass_prior_chirp_min"].append(
@@ -3168,6 +3299,13 @@ def _cli(
                          "with the mixing fractions verified row by row "
                          "(GW-40f; needed only for label policies that use "
                          "C00:Mixed). Default: off.")
+    ap.add_argument("--refuse-mixed-prior-mismatch", action="store_true",
+                    help="Refuse a combined (Mixed) row whose constituents, "
+                         "as named by its meta_data/combined record, declare "
+                         "different analytic priors, unless "
+                         "--constituent-mixture-prior builds a "
+                         "constituent-aware prior for it. Default: warn and "
+                         "record mixed_constituent_priors.")
     a = ap.parse_args(argv)
     if a.inspect:
         inspect(a.inspect)
@@ -3194,7 +3332,9 @@ def _cli(
     cfg = IngestConfig(
         release_reweight_cosmology_table=a.release_reweight_cosmology_table,
         constituent_mixture_prior=a.constituent_mixture_prior,
-        dL_prior_impl="auto" if a.legacy_grid_priors else "exact")
+        dL_prior_impl="auto" if a.legacy_grid_priors else "exact",
+        mixed_prior_mismatch=("raise" if a.refuse_mixed_prior_mismatch
+                              else "warn"))
     build_store(paths, a.out, event_table=event_table, sample_sets=sample_sets,
                 cache_dir=a.cache_dir, offline=offline, cfg=cfg,
                 file_provenance=file_provenance, write_summary=write_summary)
