@@ -778,3 +778,18 @@ def test_v1_records_an_assumed_spin_prior(tmp_path):
         # The legacy resolution label is kept, by design.
         assert _strs(f.attrs["chi_eff_amax_source_per_event"]) == [
             "analytic", "analytic"]
+
+
+# ==========================================================================
+# A bootstrapped event records how many samples its draw had
+# ==========================================================================
+def test_v1_bootstrapped_events_record_the_samples_available(tmp_path):
+    rows = [_row("GW150914_095045", n=10), _row("GW900002_000002", n=200)]
+    out = tmp_path / "boot.h5"
+    with pytest.warns(UserWarning, match="bootstrapped WITH replacement"):
+        GWCatalog(_store(tmp_path, rows)).to_darksirens(
+            str(out), nsamp=64, seed=0, cosmology=_COSMO)
+    with h5py.File(out, "r") as f:
+        np.testing.assert_array_equal(f.attrs["n_samples_available_per_event"],
+                                      [10, 200])
+        assert int(f.attrs["n_unique_samples_per_event"][0]) <= 10

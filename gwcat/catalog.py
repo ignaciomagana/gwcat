@@ -1841,6 +1841,12 @@ class GWCatalog:
         kept_ss_name, kept_ss_approx, kept_ss_reason = [], [], []
         # Resampling provenance (GW-13), aligned with ``kept``.
         n_unique_per_event, upsampled_events = [], []
+        #: Posterior samples available to each kept event's draw (after the
+        #: z_max cut).  A bootstrapped event's per-event Monte Carlo variance
+        #: is understated by about 1 + nsamp / n_available when its repeated
+        #: rows are treated as independent (review 2026-10-20); recorded so a
+        #: consumer can correct it.
+        n_available_per_event = []
 
         def _ss_meta(row, field):
             v = sub.meta.get(field)
@@ -1983,6 +1989,7 @@ class GWCatalog:
             # by the duplication factor -- which is precisely the diagnostic
             # meant to flag the event as unusable.
             n_unique_per_event.append(int(np.unique(idx_orig).size))
+            n_available_per_event.append(int(n_kept))
             if rep and n_kept < nsamp:
                 upsampled_events.append(str(sub.event_names[e]))
 
@@ -2368,6 +2375,11 @@ class GWCatalog:
             f.attrs["resampled_with_replacement"] = bool(upsampled_events)
             f.attrs["n_events_resampled_with_replacement"] = int(
                 len(upsampled_events))
+            if upsampled_events:
+                # Only when an event was bootstrapped (the case it corrects);
+                # the 2.0 builder does not write it yet.
+                f.attrs["n_samples_available_per_event"] = np.asarray(
+                    n_available_per_event, dtype=np.int64)
             # The per-sample redshift truncation (review 2026-10-20), under the
             # 2.0 builder's names: NaN = no truncation.
             f.attrs["z_max"] = (float("nan") if z_max is None
