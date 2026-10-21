@@ -712,3 +712,55 @@ def test_named_astropy_generation_cosmology_is_matched_and_used(tmp_path,
         model = f.attrs["cosmology_model_per_campaign"][0]
     model = model.decode() if isinstance(model, bytes) else model
     assert model == "astropy.cosmology.Planck18"
+
+
+# ======================================================================
+# August test-gaps #2 / #4: a non-uniform component campaign, and the
+# chi_p reader's file-vs-formula preference
+# ======================================================================
+def test_component_basis_on_a_non_uniform_campaign_from_the_file(tmp_path):
+    from test_selection_chieff_reference import write_o4_nonuniform
+    from gwcat.export.selection_builder import SpinBasisError
+    path = write_o4_nonuniform(tmp_path / "nonuni.hdf", n=250, seed=121)
+    s = SelectionSet(path, strict_spin_checks="off")
+    assert s.spin_meta["uniform_isotropic"] is False
+    assert s.spin_meta["amax_detected"] == (None, None)
+    out = tmp_path / "comp.h5"
+    s.export(str(out), spin_basis="component")
+    dens, w, far = _component_density_from_file(path)
+    with h5py.File(path, "r") as f:
+        T = float(f.attrs["total_analysis_time"]) / (365.25 * 24 * 3600)
+    det = far < 1.0
+    with h5py.File(out, "r") as f:
+        np.testing.assert_allclose(f["pdraw"][:], (dens / (T * w))[det],
+                                   rtol=1e-12)
+    for strict in (True, False):
+        with pytest.raises(SpinBasisError):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                s.export(str(tmp_path / "chip.h5"), spin_basis="chieff_chip",
+                         strict=strict)
+
+
+def _chi_p_by_hand(a1, a2, c1, c2, m1, m2):
+    q = m2 / m1
+    k = q * (4.0 * q + 3.0) / (4.0 + 3.0 * q)
+    return np.maximum(a1 * np.sqrt(1 - c1 ** 2), k * a2 * np.sqrt(1 - c2 ** 2))
+
+
+def test_chi_p_reader_prefers_the_file_column_and_the_formula_is_right(
+        tmp_path):
+    path = write_o4_full(tmp_path / "o4.hdf", n=50, seed=131)
+    with h5py.File(path, "r+") as f:
+        g = f["events"]
+        offset = g["chi_p"][:] + 0.05          # distinguishable from formula
+        del g["chi_p"]
+        g.create_dataset("chi_p", data=offset)
+    s = SelectionSet(path)
+    np.testing.assert_array_equal(s.chi_p, offset)
+    by_hand = _chi_p_by_hand(s.a1, s.a2, s.cost1, s.cost2, s._m1src, s._m2src)
+    assert np.allclose(s.chi_p - by_hand, 0.05, rtol=0, atol=1e-12)
+    with h5py.File(path, "r+") as f:
+        del f["events"]["chi_p"]
+    s = SelectionSet(path)
+    np.testing.assert_allclose(s.chi_p, by_hand, rtol=1e-12)
