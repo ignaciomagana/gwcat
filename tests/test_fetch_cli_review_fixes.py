@@ -18,7 +18,8 @@
      GWTC names, never to whichever same-day event the store holds.
   6. ``--event-list`` refuses names the store does not hold instead of
      dropping them with a Python warning; ``--allow-missing-events`` skips
-     them and records them in the validation summary.
+     them and records them in the validation summary, and is refused with
+     ``--no-summary``, which would leave no record.
   7. ``inspect`` reports the requirements of the space ``export pe`` would
      use; a MissingParameterError is a clean CLI error; ``--parameter-space
      chieff_chip`` and ``--pastro-min`` have the opt-in flags they need.
@@ -525,6 +526,23 @@ def test_allow_missing_events_skips_and_records_them(tmp_path):
         open(str(out) + ".validation_summary.json").read())
     assert summary["event_list_missing_names"] == ["GW999999_999999"]
     assert summary["event_list_allow_missing_events"] is True
+
+
+@pytest.mark.parametrize("cmd", [["export-darksirens"], ["export", "pe"]])
+def test_allow_missing_events_is_refused_without_a_summary(tmp_path, capsys,
+                                                           cmd):
+    """The summary is the only record of the skipped names; with --no-summary
+    the product held fewer events than the list and nothing said which."""
+    from gwcat.cli import main
+    store, listed = _store_and_list(
+        tmp_path, ["GW150914_095045", "GW910002_000002", "GW999999_999999"])
+    out = tmp_path / "gw.h5"
+    rc = main(cmd + [store, "--out", str(out), "--event-list", listed,
+                     "--allow-missing-events", "--nsamp", "8",
+                     "--allow-missing-far", "--no-summary"])
+    assert rc == 1
+    assert "cannot be combined with --no-summary" in capsys.readouterr().err
+    assert not out.exists()
 
 
 def test_a_complete_event_list_exports_as_before(tmp_path):

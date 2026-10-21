@@ -203,7 +203,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help="With --event-list: skip listed names the "
                                "store does not hold (with a warning) instead "
                                "of refusing; the skipped names are recorded "
-                               "in the validation summary.")
+                               "in the validation summary, so this cannot be "
+                               "combined with --no-summary.")
     p_export.add_argument("--far-max", type=float, default=None,
                           metavar="FAR_YR")
     far_group = p_export.add_mutually_exclusive_group()
@@ -288,7 +289,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="With --event-list: skip listed names the store "
                            "does not hold (with a warning) instead of "
                            "refusing; the skipped names are recorded in the "
-                           "validation summary.")
+                           "validation summary, so this cannot be combined "
+                           "with --no-summary.")
     p_pe.add_argument("--far-max", type=float, default=None, metavar="FAR_YR")
     pe_far_group = p_pe.add_mutually_exclusive_group()
     pe_far_group.add_argument("--allow-missing-far", action="store_true")
@@ -645,8 +647,18 @@ def _event_list_preflight(args, cat) -> Optional[dict]:
     by name, so a name that matches nothing is an error, with the store's
     spelling suggested when the name is a historical date-only GWTC name.
     ``--allow-missing-events`` restores the skip, and the skipped names go into
-    the validation summary.  Returns the summary fields to record (or None).
+    the validation summary -- the only place they are recorded, so the opt-out
+    is refused together with ``--no-summary``.  Returns the summary fields to
+    record (or None).
     """
+    if (getattr(args, "allow_missing_events", False)
+            and getattr(args, "no_summary", False)):
+        raise ValueError(
+            "--allow-missing-events cannot be combined with --no-summary: the "
+            "validation summary is the only record of which listed events "
+            "were skipped, so without it the product would hold fewer events "
+            "than the list with nothing saying which. Drop --no-summary, or "
+            "fix the event list and drop --allow-missing-events.")
     if args.event_list is None:
         return None
     from .population_samples import resolve_event_name_aliases
