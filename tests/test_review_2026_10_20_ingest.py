@@ -855,3 +855,24 @@ def test_mixture_row_distance_record_describes_the_mixture(tmp_path,
     assert float(_meta(store, "n_samples_outside_dL_prior_bounds")) == 0.0
     assert _meta(store, "dL_prior_sampling_kind") == "UniformSourceFrame"
     assert np.isnan(float(_meta(store, "dL_prior_ks")))
+
+
+# ==========================================================================
+# low-33: observing_run from the GPS time, not the event-name date
+# ==========================================================================
+def test_engineering_run_event_is_not_stored_as_o4a():
+    """GW230518_125908: GPS 1368449966, before O4a's official start."""
+    smp = {"geocent_time": np.full(10, 1368449966.4)}
+    assert ing._observing_run_for("GW230518_125908", smp) == (
+        "", "gps_outside_exposure_windows")
+    assert ing._observing_run_for(
+        "GW230601_224134", {"geocent_time": np.full(5, 1369694512.0)}) == (
+        "O4a", "gps_exposure_windows")
+    assert ing._observing_run_for("GW230518_125908", {}) == (
+        "O4a", "event_name")
+
+
+def test_store_records_how_the_run_was_assigned(tmp_path, monkeypatch):
+    store = _ingest(tmp_path, monkeypatch, {O3_NAME: _gw191109_like()})
+    assert _meta(store, "observing_run") == "O3b"
+    assert _meta(store, "observing_run_source") == "gps_exposure_windows"

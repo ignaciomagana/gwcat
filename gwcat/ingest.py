@@ -254,6 +254,11 @@ META_FLOAT_FIELDS += ["dL_prior_ks_threshold", "dL_prior_n_prior_samples",
                       "dL_prior_frac_samples_outside",
                       "dL_prior_bounds_pvalue"]
 META_STR_FIELDS += ["spin_sample_max_per_constituent"]
+# How observing_run was assigned: "gps_exposure_windows" (median GPS time in
+# gwcat's official run table), "gps_outside_exposure_windows" (observing_run
+# ""), or "event_name" (no GPS time; the name's date).  Review 2026-10-20,
+# low-33.
+META_STR_FIELDS += ["observing_run_source"]
 
 # Default waveform priority when no Mixed set exists (O4b/GWTC-5 events).
 O4_WAVEFORM_PRIORITY = [
@@ -2350,6 +2355,33 @@ def _observing_run_from_name(name: str) -> str:
 SKY_AREA_MIN_PER_PIXEL = 20
 
 
+def _observing_run_for(name, samples):
+    """``(observing_run, source)`` for one row (review 2026-10-20, low-33).
+
+    From the median ``geocent_time`` against gwcat's own official run
+    windows (:data:`gwcat.observing_runs.EXPOSURE_WINDOWS_GPS`, the table
+    events are assigned with): ``source="gps_exposure_windows"``.  An event
+    outside every window gets ``""`` and ``"gps_outside_exposure_windows"``
+    -- GW230518_125908 (an engineering-run event, before O4a's start) used to
+    be stored as O4a from its name's date.  Without a usable GPS time the
+    name-based guess is kept, ``source="event_name"``.
+    """
+    from .observing_runs import (EXPOSURE_WINDOWS_GPS, RunWindowError,
+                                 run_of_gps)
+    t = None
+    if samples is not None and "geocent_time" in samples:
+        gt = np.asarray(samples["geocent_time"], dtype=float)
+        gt = gt[np.isfinite(gt)]
+        if gt.size:
+            t = float(np.median(gt))
+    if t is None:
+        return _observing_run_from_name(name), "event_name"
+    try:
+        return str(run_of_gps(t, EXPOSURE_WINDOWS_GPS)), "gps_exposure_windows"
+    except RunWindowError:
+        return "", "gps_outside_exposure_windows"
+
+
 def _sky_area_90_info(ra_samples, dec_samples, nside=64,
                       min_per_pixel=SKY_AREA_MIN_PER_PIXEL):
     """``(area_deg2, nside_used)`` of the 90% credible sky area.
@@ -2974,7 +3006,9 @@ def build_store(paths, out_path, params=None, extra_params=None,
             meta["source_class_method"].append(source_class_method)
             meta["source_class_reference"].append(source_class_reference)
             meta["release"].append(catalog)
-            meta["observing_run"].append(_observing_run_from_name(name))
+            obs_run, obs_src = _observing_run_for(name, s)
+            meta["observing_run"].append(obs_run)
+            meta["observing_run_source"].append(obs_src)
             meta["metadata_source"].append(metadata_source)
             meta["far_available"].append(far_available)
             meta["p_astro"].append(p_astro)
