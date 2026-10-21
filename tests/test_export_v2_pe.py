@@ -228,6 +228,49 @@ def test_component_ppe_constant_per_event(tmp_path):
     assert bool(attrs["component_spin_prior_applied_to_p_pe"]) is True
 
 
+def test_component_samples_bound_widening_value(tmp_path):
+    """The samples_bound ceiling, checked against the SAMPLES, not against the
+    file's own recorded ceiling (review Low 79: a 1.5x widening mutant passed
+    every test).  The declared box is U(0, 0.8) on a_1, the samples reach
+    0.95: the ceiling becomes max|a_1| over the exported rows times
+    (1 + 1e-6), the inflation is max|a_1|/0.8 - 1, and p_pe carries
+    1/(4 amax_1 amax_2) at that widened value."""
+    events = [{"name": "GWsb_000001", "amax1": 0.80, "amax2": 0.99},
+              {"name": "GWsb_000002", "amax1": 0.99, "amax2": 0.99}]
+    store, _ = _build_spin_store(tmp_path, events, name="sb_store.h5")
+    with h5py.File(store, "r+") as f:
+        off = f["index/offsets"][:]
+        a1 = f["samples/a_1"][:]
+        n0 = int(off[1] - off[0])
+        a1[int(off[0]):int(off[1])] = np.linspace(0.0, 0.95, n0)
+        f["samples/a_1"][...] = a1
+    out = tmp_path / "sb.h5"
+    with pytest.warns(UserWarning, match="samples_bound"):
+        GWCatalog(store).export(str(out), format="gwcat2",
+                                spin_basis="component", nsamp=64, seed=0,
+                                cosmology=(67.74, 0.3089))
+    cols, attrs = _read(out)
+    nsamp = int(attrs["nsamp"])
+    sl = slice(0, nsamp)
+    s1 = float(np.max(np.abs(cols["a1"][sl])))
+    assert 0.8 < s1 <= 0.95
+    want_amax1 = s1 * (1.0 + 1e-6)
+    amax1 = np.asarray(attrs["spin_amax_1_per_event"], float)
+    amax2 = np.asarray(attrs["spin_amax_2_per_event"], float)
+    assert amax1[0] == pytest.approx(want_amax1, rel=1e-15)
+    assert amax2[0] == 0.99 and amax1[1] == 0.99
+    infl = np.asarray(attrs["spin_amax_inflation_per_event"], float)
+    assert infl[0] == pytest.approx(s1 / 0.8 - 1.0, rel=1e-12)
+    assert infl[1] == 0.0
+    src = [s.decode() if isinstance(s, bytes) else s
+           for s in attrs["spin_amax_source_1_per_event"]]
+    assert src == ["samples_bound", "analytic"]
+    # p_pe at the widened box, from the samples rather than the attrs.
+    np.testing.assert_allclose(
+        cols["p_pe"][sl] / (cols["m1det"][sl] * _P_DL_CONST),
+        1.0 / (4.0 * want_amax1 * 0.99), rtol=1e-12)
+
+
 # ==========================================================================
 # 2. component shares the chieff scaffold; emits a1/a2/cost1/cost2/chip
 # ==========================================================================
