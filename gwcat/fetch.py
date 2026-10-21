@@ -772,17 +772,33 @@ def fetch_and_build(
 #: sample -- and it silently passed only because the query was contaminated
 #: (GW-15).  Unfiltered, the live query returns 286 names across eight
 #: catalogs, 41 of them third-party IAS-O3a entries that supersede the LVK
-#: version of the same event under ``lastver=true``.  Restricted to LVK GWTC
-#: catalogs the same query returns ~244 (the review measured 244; an
-#: independent re-run of the identical filter measured 243) -- fewer than the
-#: curated population sample, because the population sample is a curated
-#: membership list, not "every GWOSC event with a PE mass_2_source above 3
-#: Msun".  The guard is two-sided against this number: *fewer* means an
+#: version of the same event under ``lastver=true``.
+#:
+#: It was then 244, measured with the LVK-catalog filter still applied to a
+#: ``lastver=true`` response -- and that number was itself short: under
+#: ``lastver`` GWOSC returns ONE version per event, which for ~30 O3a events is
+#: the IAS-O3a one, so dropping non-LVK entries dropped those genuine LVK
+#: events with them (GW190408_181802, GW190412_053044, ...), and a guard
+#: baselined on the loss could never report it.  The query now asks for every
+#: version and keeps the highest LVK version of each event.
+#:
+#: 272 is the same selection measured offline on the GWOSC cumulative GWTC
+#: event table -- the latest LVK version of every event -- as cached on
+#: 2026-09-24: GWTC-5.0 104, GWTC-4.1 86, GWTC-2.1-confident 50,
+#: GWTC-3-confident 32 (the O1/O2 events counted under GWOSC's date-only
+#: names).  It has not been re-measured against the live event-versions
+#: endpoint.  The guard is two-sided against this number: *fewer* means an
 #: incomplete live index, *more* means entries the LVK-catalog filter did not
 #: expect to admit.  It is a warning, not an assertion: it exists to be noticed
-#: and re-baselined by whoever re-runs the query, which is exactly what the old
-#: one-sided 259 could never do.
-_GWOSC_BBH_EXPECTED_NAMES = 244
+#: and re-baselined by whoever re-runs the query.
+_GWOSC_BBH_EXPECTED_NAMES = 272
+
+#: Cache key stem of the all-versions BBH query.  Deliberately not the stem
+#: the ``lastver=true`` query cached under (``bbh_names_m2min_<m2>``): a cache
+#: written by that query holds one version per event, so replaying it through
+#: the all-versions logic would silently reproduce the short list.  An old
+#: cache is therefore a cache miss, named as one.
+_GWOSC_BBH_CACHE_STEM = "bbh_names_allversions_m2min"
 
 #: GWOSC catalog labels the BBH query accepts: the LVK GWTC releases, in any of
 #: the spellings GWOSC uses ("GWTC-2", "GWTC-2.1-confident", "GWTC-4.1",
@@ -879,6 +895,25 @@ def _clean_gwosc_event_name(name: object) -> str:
     return re.sub(r"-v\d+$", "", str(name or ""))
 
 
+def _gwosc_event_version(event: dict) -> Optional[int]:
+    """The version number of one GWOSC event-versions entry, if it says.
+
+    Read from the entry's ``version`` field, else from a ``-vN`` suffix on its
+    name.  ``None`` when neither is present.
+    """
+    value = event.get("version")
+    if value is not None and not isinstance(value, bool):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            pass
+    for key in ("name", "shortName"):
+        match = re.search(r"-v(\d+)$", str(event.get(key) or ""))
+        if match:
+            return int(match.group(1))
+    return None
+
+
 def _gwosc_json(url: str, timeout: int) -> dict:
     """Fetch one GWOSC JSON page."""
     req = Request(
@@ -910,6 +945,27 @@ def _gwosc_best_parameter(parameters: object, *names: str) -> Optional[float]:
     return None
 
 
+def _cached_pages(cached, cache_dir, key: str) -> list:
+    """The ``pages`` list of a cached paginated GWOSC response.
+
+    Both GWOSC readers indexed ``cached["pages"]`` unguarded, so a payload
+    without one -- not written by this module, or written by a version that
+    stored something else -- surfaced as a raw ``KeyError``/``TypeError`` out
+    of the offline path.  It is a cache miss, named as one, the same contract
+    :func:`gwcat.fetch_cache.read_metadata_cache` applies to a truncated file.
+    """
+    pages = cached.get("pages") if isinstance(cached, dict) else None
+    if not isinstance(pages, list) or not all(isinstance(p, dict)
+                                              for p in pages):
+        raise fetch_cache.OfflineCacheMissError(
+            f"Offline mode: the cached GWOSC response at "
+            f"{fetch_cache.metadata_cache_path(cache_dir, key)} (key={key!r}) "
+            "records no list of response pages. Delete it and re-run the "
+            f"equivalent fetch once online with cache_dir={str(cache_dir)!r}."
+        )
+    return pages
+
+
 def fetch_bbh_names_gwosc(
     m2_min: float = 3.0,
     verbose: bool = True,
@@ -919,12 +975,12 @@ def fetch_bbh_names_gwosc(
 ) -> list[str]:
     """Return BBH event names from the paginated GWOSC v2 event API.
 
-    The GWOSC endpoint is filtered for the latest event version with a
-    secondary source-frame mass above ``m2_min`` and default parameters included.
-    Events are kept only when they come from an **LVK GWTC catalog**, carry a
-    canonical GWTC event name, are not a curated non-BBH event under any
-    spelling, and the returned default PE parameters contain ``mass_2_source``
-    (or the legacy alias ``m2_source``) above the threshold.
+    The GWOSC endpoint is queried for **every version** of every event, with
+    default parameters included.  Of each event's versions only those from an
+    **LVK GWTC catalog** count, and the highest of them decides: the event is
+    kept when it carries a canonical GWTC event name, is not a curated non-BBH
+    event under any spelling, and that version's default PE parameters contain
+    ``mass_2_source`` (or the legacy alias ``m2_source``) above ``m2_min``.
 
     The catalog restriction is the point (GW-15).  GWOSC indexes third-party
     catalogs beside GWTC, and under ``lastver=true`` a non-LVK version
@@ -936,14 +992,23 @@ def fetch_bbh_names_gwosc(
     what the server accepts can only ever make this stricter, never silently
     return an unfiltered list.
 
+    Neither ``lastver`` nor ``min-mass-2-source`` is sent.  ``lastver=true``
+    returns one version per event, so for the ~30 O3a events whose latest
+    version is the IAS one, dropping non-LVK entries dropped the event and its
+    LVK version was never seen.  A server-side mass cut is applied to each
+    version on its own, so it could hide an event's current LVK version while
+    returning an older one; the cut is applied here, to the version that
+    decides.
+
     cache_dir / offline : see :mod:`gwcat.fetch_cache`.  ``None``/unset (the
     defaults) disable caching/offline-mode entirely -- unchanged, byte-identical
     default behavior.  When caching, every raw page of the paginated response is
     written under one cache key so an offline replay reconstructs the exact same
-    ``names`` set via the same per-event filter logic.
+    ``names`` set via the same per-event filter logic.  A cache written by the
+    earlier ``lastver=true`` query is not read (it lives under another key).
     """
     offline_mode = fetch_cache.is_offline(offline)
-    key = fetch_cache.gwosc_cache_key(f"bbh_names_m2min_{m2_min}")
+    key = fetch_cache.gwosc_cache_key(f"{_GWOSC_BBH_CACHE_STEM}_{m2_min}")
 
     if offline_mode:
         if cache_dir is None:
@@ -952,13 +1017,11 @@ def fetch_bbh_names_gwosc(
                 "locate the previously cached GWOSC response."
             )
         cached = fetch_cache.read_metadata_cache(cache_dir, key)
-        pages = cached["pages"]
+        pages = _cached_pages(cached, cache_dir, key)
     else:
         query = urlencode(
             {
                 "include-default-parameters": "true",
-                "lastver": "true",
-                "min-mass-2-source": m2_min,
                 "pagesize": 100,
             }
         )
@@ -981,13 +1044,16 @@ def fetch_bbh_names_gwosc(
 
         if cache_dir is not None:
             fetch_cache.write_metadata_cache(
-                cache_dir, key, {"m2_min": m2_min, "pages": pages})
+                cache_dir, key,
+                {"m2_min": m2_min, "query": "all versions, no server-side cut",
+                 "pages": pages})
 
-    names: set[str] = set()
     n_entries = 0
     n_with_catalog = 0
     dropped_catalogs: Dict[str, int] = {}
     dropped_names: set[str] = set()
+    # name -> (version, m2_source) of the highest LVK version seen so far
+    lvk_versions: Dict[str, tuple] = {}
     for data in pages:
         for event in data.get("results", []):
             if not isinstance(event, dict):
@@ -1009,14 +1075,36 @@ def fetch_bbh_names_gwosc(
                 if name:
                     dropped_names.add(name)
                 continue
-            if _is_non_bbh_name(name):
-                continue
 
+            version = _gwosc_event_version(event)
             params = event.get("default_parameters")
             m2_source = _gwosc_best_parameter(params, "mass_2_source", "m2_source")
-            if m2_source is None or m2_source <= m2_min:
-                continue
-            names.add(name)
+            prev = lvk_versions.get(name)
+            if prev is not None:
+                if prev[0] is None or version is None or prev[0] == version:
+                    if prev == (version, m2_source):
+                        continue            # the same entry twice
+                    # Two LVK entries for one event that cannot be ordered: no
+                    # rule says which one is current, and they disagree.
+                    raise RuntimeError(
+                        f"GWOSC returned two LVK entries for {name} that "
+                        f"cannot be ordered (versions {prev[0]!r} and "
+                        f"{version!r}, mass_2_source {prev[1]!r} and "
+                        f"{m2_source!r}), so which one is current is unknown. "
+                        "The event-versions API shape may have changed; update "
+                        "gwcat.fetch._gwosc_event_version before trusting this "
+                        "list.")
+                if version < prev[0]:
+                    continue
+            lvk_versions[name] = (version, m2_source)
+
+    names: set[str] = set()
+    for name, (_version, m2_source) in lvk_versions.items():
+        if _is_non_bbh_name(name):
+            continue
+        if m2_source is None or m2_source <= m2_min:
+            continue
+        names.add(name)
 
     if n_entries and not n_with_catalog:
         # Every entry lacking a catalog label means the response shape changed,
@@ -1148,7 +1236,7 @@ def fetch_event_table_gwosc(
             )
         cached = fetch_cache.read_metadata_cache(cache_dir, key)
         table: dict = {}
-        for page in cached["pages"]:
+        for page in _cached_pages(cached, cache_dir, key):
             _parse_gwosc_event_table_page(page, table)
         return table
 

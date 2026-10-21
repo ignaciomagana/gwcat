@@ -473,8 +473,10 @@ def test_bbh_query_filters_to_lvk_catalogs(monkeypatch):
     names = _run_bbh_query(monkeypatch, _LVK_ENTRIES + _NON_LVK_ENTRIES)
 
     assert names == _EXPECTED_LVK_BBH
-    # the 35 O3a events whose only surviving version is the IAS one are gone:
-    # admitting them would have made the m2 > 3 decision on IAS PE
+    # an event whose only version in the response is the IAS one stays out:
+    # admitting it would make the m2 > 3 decision on IAS PE.  (A real
+    # all-versions response also carries the LVK version of these O3a events,
+    # and then they are kept -- see test_fetch_cli_review_fixes.py.)
     assert not (set(names) & set(_IAS_SUPERSEDED_O3A))
     # ... and so is every non-GWTC name the unfiltered query used to admit
     assert "GW190814_192009" not in names       # mass gap, third spelling
