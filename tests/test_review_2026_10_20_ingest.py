@@ -738,3 +738,34 @@ def test_sibling_search_order_puts_constituents_then_same_variant_first():
         constituents=["C00:IMRPhenomXPHM:HighSpin"])
     assert order == ["C00:IMRPhenomXPHM:HighSpin", "C00:SEOBNRv5PHM:HighSpin",
                      "C00:IMRPhenomNSBH", "C00:IMRPhenomXPHM:LowSpin"]
+
+
+# ==========================================================================
+# low-73: C00:Mixed+XO4a is a combined set, ranked after C00:Mixed
+# ==========================================================================
+GW230601_LABELS = [XO, XP, MX, MXO, NR, SE]
+
+
+def test_mixed_plus_xo4a_is_combined_and_ranked_after_plain_mixed():
+    cfg = ing.IngestConfig()
+    assert ing.find_mixed_analyses(GW230601_LABELS, "C00") == [MX, MXO]
+    assert ing.select_analysis(GW230601_LABELS, "C00", cfg,
+                               catalog="GWTC-4.1") == MX
+    ranked = ing.rank_analyses(GW230601_LABELS, "C00", cfg, catalog="GWTC-4.1")
+    assert ranked[:2] == [MX, MXO]
+    meta = ing._sample_set_meta(MXO, MX, ranked, O4_NAME_XO4A, "all")
+    assert meta["is_mixed"] == 1.0 and meta["priority_rank"] == 1.0
+
+
+def test_mixed_plus_xo4a_row_carries_its_constituent_record(tmp_path,
+                                                            monkeypatch):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        store = _ingest(tmp_path, monkeypatch,
+                        {O4_NAME_XO4A: _gw230601_like()},
+                        sample_sets=[MXO])
+    assert _meta(store, "analysis_used") == MXO
+    assert float(_meta(store, "is_mixed")) == 1.0
+    assert sorted(json.loads(_meta(store, "spin_amax_config_per_constituent"))
+                  ) == sorted([XP, NR, SE])
+    assert _meta(store, "mixed_constituent_labels") == f"{XP}+{SE}+{NR}"

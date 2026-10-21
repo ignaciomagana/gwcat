@@ -492,12 +492,17 @@ def find_mixed_analyses(analyses, prefix: str):
     ``C00:IMRPhenomNSBH``, an aligned-spin NSBH approximant, chosen over three
     available Mixed sets, and the reason recorded for it was
     ``"preferred_priority"``.
+
+    Extended combined sets (``C00:Mixed+XO4a``, review 2026-10-20, low-73) are
+    combined sets too; they follow the plain ``Mixed`` sets.
     """
     cands = []
     for a in analyses:
         pfx, base, variant = _label_parts(a)
-        if pfx == prefix and base == "Mixed":
-            cands.append((_variant_rank(variant), a))
+        if pfx == prefix and _is_combined_base(base):
+            # An extended combined set (C00:Mixed+XO4a) ranks after every
+            # plain Mixed set, so the preferred choice is unchanged (low-73).
+            cands.append(((base != "Mixed", _variant_rank(variant)), a))
     # stable: ties keep the file's own order
     return [a for _r, a in sorted(cands, key=lambda t: t[0])]
 
@@ -648,7 +653,8 @@ def _sample_set_meta(analysis: str, preferred_label: str, ranked, path: str,
     _pfx, approximant, spin_variant = _label_parts(analysis)
     if not approximant:
         approximant = analysis
-    is_mixed = 1.0 if approximant.lower() == "mixed" else 0.0
+    # Any combined set, C00:Mixed+XO4a included (review 2026-10-20, low-73).
+    is_mixed = 1.0 if _is_combined_base(approximant) else 0.0
     is_preferred = 1.0 if analysis == preferred_label else 0.0
     try:
         rank = float(list(ranked).index(analysis))
@@ -709,7 +715,8 @@ def combined_constituents(data, analysis, analyses=()):
     if raw is None:
         return []
     if isinstance(raw, (list, tuple, np.ndarray)):
-        raw = ",".join(_decode(x) for x in np.asarray(raw, dtype=object).ravel())
+        raw = ",".join(_decode(x)
+                       for x in np.asarray(raw, dtype=object).ravel())
     else:
         raw = _decode(raw)
     have = set(analyses)
@@ -1477,7 +1484,7 @@ class ResolvedSpinPrior:
 
 
 class SpinCeilingExceededError(ValueError):
-    """Samples exceed the resolved spin ceiling (``spin_exceeds_amax='raise'``)."""
+    """Spin samples exceed the resolved ceiling (spin_exceeds_amax="raise")."""
 
 
 #: The LALInference ``[engine]`` keys that declare the spin-magnitude ceilings.
@@ -1564,10 +1571,11 @@ def _spin_amax_from_config(data, analysis, analyses=(),
         if want:
             msg = (f"{analysis}: no sibling config with spin variant {want!r} "
                    f"declares engine/a_spin1-max, a_spin2-max; the only ones "
-                   f"declare a different spin restriction ({others}). Borrowing "
-                   f"across spin variants inflates a restricted secondary-spin "
-                   f"prior by up to ~20x, so gwcat refuses; pass "
-                   f"allow_variant_mismatch=True to accept it with a warning.")
+                   f"declare a different spin restriction ({others}). "
+                   f"Borrowing across spin variants inflates a restricted "
+                   f"secondary-spin prior by up to ~20x, so gwcat refuses; "
+                   f"pass allow_variant_mismatch=True to accept it with a "
+                   f"warning.")
             if not allow_variant_mismatch:
                 raise SpinPriorMismatchError(msg)
             warnings.warn(msg)
@@ -1597,7 +1605,7 @@ def constituent_spin_amax_config(data, analysis, analyses, constituents=()):
     """
     import json as _json
     prefix, base, _variant = _label_parts(analysis)
-    if base != "Mixed":
+    if not _is_combined_base(base):
         return ""
     cfg_all = getattr(data, "config", None)
     if not isinstance(cfg_all, dict):
@@ -1605,7 +1613,7 @@ def constituent_spin_amax_config(data, analysis, analyses, constituents=()):
     out = {}
     for an in (list(constituents) or analyses):
         p2, b2, _v2 = _label_parts(an)
-        if an == analysis or p2 != prefix or b2 == "Mixed":
+        if an == analysis or p2 != prefix or _is_combined_base(b2):
             continue
         got = _spin_amax_from_config(data, an, ())
         out[str(an)] = (None if got is None
@@ -1626,11 +1634,12 @@ def constituent_spin_sample_max(analysis, analyses, samples_dict,
     to a spin of about 1.0.
     """
     prefix, base, _variant = _label_parts(analysis)
-    if base != "Mixed":
+    if not _is_combined_base(base):
         return ""
     labs = list(constituents) or [
         an for an in analyses if an != analysis
-        and _label_parts(an)[0] == prefix and _label_parts(an)[1] != "Mixed"]
+        and _label_parts(an)[0] == prefix
+        and not _is_combined_base(_label_parts(an)[1])]
     out = {}
     for lab in labs:
         smp = samples_dict.get(lab) if hasattr(samples_dict, "get") else None
@@ -2185,12 +2194,12 @@ def inspect(path: str, cfg: Optional[IngestConfig] = None):
                                                      sp.kind, sp.source)
     mass_prior = resolve_mass_prior(analysis, analyses, priors,
                                     constituents=constituents)
+    combined = _is_combined_base(_label_parts(analysis)[1])
     mixed_priors = (compare_constituent_priors(analysis, constituents, priors)
-                    if constituents or _label_parts(analysis)[1] == "Mixed"
-                    else "")
+                    if constituents or combined else "")
     cmix_info = None
     if (cfg.constituent_mixture_prior and _label_parts(analysis)[0] == "C00"
-            and _label_parts(analysis)[1] == "Mixed"):
+            and _is_combined_base(_label_parts(analysis)[1])):
         # What the build would do with --constituent-mixture-prior: the
         # verified constituents, or why the row would be refused.
         from .constituent_mixture import ConstituentMixtureError
@@ -2671,14 +2680,15 @@ def build_store(paths, out_path, params=None, extra_params=None,
                         # miss them, so no KS can be computed.  That used to
                         # read like "no prior samples" and bypassed
                         # prior_ks_fatal (review 2026-10-20, low-28).
+                        pct_out = 100 * v["frac_prior_samples_outside_bounds"]
                         msg = (
                             f"{name} [{analysis}]: the file's own "
                             f"{v['n_prior_samples']} distance prior samples "
                             f"from {v['analysis']} do not overlap the parsed "
                             f"prior {v['sampling_kind']} on [{dmin:.4g}, "
                             f"{dmax:.4g}] Mpc "
-                            f"({100 * v['frac_prior_samples_outside_bounds']:.1f}% "
-                            f"outside), so the KS check cannot be computed. "
+                            f"({pct_out:.1f}% outside), so the KS check "
+                            f"cannot be computed. "
                             f"The parse or the bounds are wrong.")
                         if cfg.prior_ks_fatal:
                             raise PriorMismatchError(msg)
@@ -2720,10 +2730,10 @@ def build_store(paths, out_path, params=None, extra_params=None,
                             f"samples fall outside the bounds and "
                             f"{100 * v['frac_prior_mass_uncovered']:.2f}% of "
                             f"the declared prior's mass lies beyond the "
-                            f"samples (p={pval:.3g} for correct draws). The KS "
-                            f"is computed on the overlap and so does not see "
-                            f"this; it usually means the bounds came from a "
-                            f"sibling analysis.")
+                            f"samples (p={pval:.3g} for correct draws). The "
+                            f"KS is computed on the overlap and so does not "
+                            f"see this; it usually means the bounds came from "
+                            f"a sibling analysis.")
             # distance prior evaluated per sample, stored mass-prior-agnostic.
             # Dispatched on the EFFECTIVE distribution class (GW-02) and
             # evaluated over the FULL sample range rather than truncated at the
@@ -2772,11 +2782,12 @@ def build_store(paths, out_path, params=None, extra_params=None,
             a2_samp = np.asarray(s["a_2"], float) if "a_2" in s else None
             cmix_row = (cfg.constituent_mixture_prior
                         and _label_parts(analysis)[0] == "C00"
-                        and _label_parts(analysis)[1] == "Mixed")
+                        and _is_combined_base(_label_parts(analysis)[1]))
+            allow_mm = cfg.spin_prior_allow_variant_mismatch
             try:
                 sp = resolve_spin_prior_full(
                     analysis, analyses, priors, a1_samp, a2_samp,
-                    allow_variant_mismatch=cfg.spin_prior_allow_variant_mismatch,
+                    allow_variant_mismatch=allow_mm,
                     data=data, constituents=constituents)
             except SpinPriorMismatchError:
                 # A constituent-mixture row REPLACES the borrowed spin prior,
@@ -2807,7 +2818,7 @@ def build_store(paths, out_path, params=None, extra_params=None,
                 rec["p_mass_dL_pe"] = cmix["p_mass_dL"]
             # ── Do a combined set's constituents agree? (critical-1) ────────
             mixed_priors = ""
-            if constituents or _label_parts(analysis)[1] == "Mixed":
+            if constituents or _is_combined_base(_label_parts(analysis)[1]):
                 mixed_priors = compare_constituent_priors(
                     analysis, constituents, priors)
             if mixed_priors.startswith("differ:"):
