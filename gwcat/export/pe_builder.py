@@ -539,8 +539,9 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                 f"have no stored PE cosmology (dL_prior_H0/dL_prior_Om0 is "
                 f"NaN): {bad_names}. Pass an explicit cosmology=(H0, Om0) "
                 f"override to apply one cosmology to all events.")
-        pe_H0 = float(per_event_H0[0]) if sub.n_events else float("nan")
-        pe_Om0 = float(per_event_Om0[0]) if sub.n_events else float("nan")
+        # The file-level scalar is set AFTER the loop, from the EXPORTED
+        # events (review Medium 7): selected event 0 may be skipped later.
+        pe_H0 = pe_Om0 = float("nan")
 
     # Per-event cosmology objects, built once per unique (H0, Om0) pair.
     _cosmo_cache: dict = {}
@@ -1075,6 +1076,22 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     kept_Om0_arr = np.asarray(kept_Om0, dtype=float)
     cosmology_per_event_varies = bool(
         nobs > 1 and (np.ptp(kept_H0_arr) > 0 or np.ptp(kept_Om0_arr) > 0))
+    # ── The scalar PE cosmology (review Medium 7) ───────────────────────────
+    # pe_cosmology_H0/Om0 (core reads them) were the first SELECTED event's,
+    # set before the loop: wrong whenever that event was not exported (no
+    # rows, all above z_max, too few samples with replace=False).  They are
+    # now the first EXPORTED event's.  When the exported events' cosmologies
+    # differ, one scalar cannot describe them all; the file says so, and how
+    # many events it does describe, rather than the number silently changing.
+    if cosmology is None:
+        pe_H0, pe_Om0 = float(kept_H0_arr[0]), float(kept_Om0_arr[0])
+        pe_cosmology_scalar_source = ("first_exported_event"
+                                      if cosmology_per_event_varies
+                                      else "all_exported_events")
+    else:
+        pe_cosmology_scalar_source = "override"
+    pe_cosmology_scalar_n_events = int(np.sum(
+        (kept_H0_arr == pe_H0) & (kept_Om0_arr == pe_Om0)))
 
     import h5py
     _str = h5py.string_dtype()
@@ -1443,6 +1460,11 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                                else amax_fallback)),
         "pe_cosmology_H0": pe_H0,
         "pe_cosmology_Om0": pe_Om0,
+        # WHERE the scalar comes from: "override", "all_exported_events"
+        # (they share it) or "first_exported_event" (they do not -- read
+        # cosmology_H0/Om0_per_event), and how many exported events it fits.
+        "pe_cosmology_scalar_source": pe_cosmology_scalar_source,
+        "pe_cosmology_scalar_n_events": pe_cosmology_scalar_n_events,
         "homogeneous_sample_sets": homogeneous,
         "n_unique_samples_per_event": np.asarray(n_unique_per_event,
                                                  dtype=np.int64),
@@ -1584,6 +1606,8 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         "cosmology_mode": cosmology_mode,
         "cosmology_override_used": bool(cosmology is not None),
         "cosmology_per_event_varies": bool(cosmology_per_event_varies),
+        "pe_cosmology_scalar_source": pe_cosmology_scalar_source,
+        "pe_cosmology_scalar_n_events": pe_cosmology_scalar_n_events,
         "waveform_policy": str(waveform_policy),
         "approximant": None if approximant is None else str(approximant),
         "homogeneous_sample_sets": homogeneous,

@@ -183,3 +183,60 @@ def test_reference_pair_refuses_pe_rows_above_a_ref_under_strict(tmp_path):
         warnings.simplefilter("ignore")
         res = validate_export_v2(str(pe_cut), str(sel), strict=True)
     assert res["xcheck_reference_spin_support"] is True
+
+
+# ==========================================================================
+# The scalar PE cosmology comes from the exported events (review Medium 7)
+# ==========================================================================
+def _store_cosmologies(tmp_path, H0s, Om0s, far_first=False, name="cos.h5"):
+    events = [{"name": f"GWk_00000{i + 1}"} for i in range(len(H0s))]
+    store, _ = _build_spin_store(tmp_path, events, name=name)
+    with h5py.File(store, "r+") as f:
+        f["meta/dL_prior_H0"][...] = np.asarray(H0s, float)
+        f["meta/dL_prior_Om0"][...] = np.asarray(Om0s, float)
+        if far_first:
+            off = f["index/offsets"][:]
+            dL = f["samples/luminosity_distance"][:]
+            dL[int(off[0]):int(off[1])] = 60000.0     # every sample at z > 1
+            f["samples/luminosity_distance"][...] = dL
+    return store
+
+
+def test_pe_cosmology_scalar_is_an_exported_events_cosmology(tmp_path):
+    """Selected event 0 (the only one at the first cosmology) is dropped by
+    z_max; the scalar used to keep describing it, with
+    cosmology_per_event_varies=False, so the file stated a cosmology none of
+    its events was analysed under."""
+    store = _store_cosmologies(tmp_path, [70.74, 67.74, 67.74],
+                               [0.30, 0.3089, 0.3089], far_first=True)
+    out = tmp_path / "pe.h5"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        GWCatalog(store).export(str(out), format="gwcat2",
+                                spin_basis="chieff", nsamp=32, seed=0,
+                                z_max=1.0)
+    _cols, attrs = _read(out)
+    assert _names(attrs["event_names"]) == ["GWk_000002", "GWk_000003"]
+    assert bool(attrs["cosmology_per_event_varies"]) is False
+    assert float(attrs["pe_cosmology_H0"]) == 67.74
+    assert float(attrs["pe_cosmology_Om0"]) == 0.3089
+    src = attrs["pe_cosmology_scalar_source"]
+    assert (src.decode() if isinstance(src, bytes) else src) \
+        == "all_exported_events"
+    assert int(attrs["pe_cosmology_scalar_n_events"]) == 2
+
+
+def test_pe_cosmology_scalar_says_when_it_describes_only_some_events(tmp_path):
+    store = _store_cosmologies(tmp_path, [67.74, 67.90, 67.90],
+                               [0.3075, 0.3065, 0.3065], name="cos2.h5")
+    out = tmp_path / "pe.h5"
+    GWCatalog(store).export(str(out), format="gwcat2", spin_basis="chieff",
+                            nsamp=32, seed=0)
+    _cols, attrs = _read(out)
+    assert bool(attrs["cosmology_per_event_varies"]) is True
+    src = attrs["pe_cosmology_scalar_source"]
+    assert (src.decode() if isinstance(src, bytes) else src) \
+        == "first_exported_event"
+    assert int(attrs["pe_cosmology_scalar_n_events"]) == 1
+    # The scalar itself is unchanged when event 0 is exported.
+    assert float(attrs["pe_cosmology_H0"]) == 67.74
