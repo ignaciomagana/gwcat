@@ -758,3 +758,23 @@ def test_an_unknown_class_in_an_override_is_refused():
         assemble_event_metadata(
             ["GW190425_081805"], online_table={},
             user_overrides={"GW190425_081805": {"source_class": "BHBH"}})
+
+
+# ==========================================================================
+# The v1 file records where each spin prior came from
+# ==========================================================================
+def test_v1_records_an_assumed_spin_prior(tmp_path):
+    rows = [_row("GW190425_081805", prior_source_kind_spin="assumed_default"),
+            _row("GW900002_000002")]
+    out = tmp_path / "psk.h5"
+    with pytest.warns(UserWarning, match="ASSUMED one at ingest"):
+        GWCatalog(_store(tmp_path, rows)).to_darksirens(
+            str(out), nsamp=8, seed=0, cosmology=_COSMO)
+    with h5py.File(out, "r") as f:
+        assert _strs(f.attrs["prior_source_kind_spin_per_event"]) == [
+            "assumed_default", "own_analytic"]
+        assert _strs(f.attrs["spin_prior_assumed_events"]) == [
+            "GW190425_081805"]
+        # The legacy resolution label is kept, by design.
+        assert _strs(f.attrs["chi_eff_amax_source_per_event"]) == [
+            "analytic", "analytic"]

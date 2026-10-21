@@ -1912,6 +1912,27 @@ class GWCatalog:
             return out[0], out[1], src
 
         kept_amax1, kept_amax2, kept_amax_src = [], [], []
+        # WHERE each event's spin prior came from (the store's GW-40b
+        # provenance), carried onto the v1 file under the 2.0 builder's names
+        # and with its legacy fallback (review 2026-10-20).  The v1 file
+        # labels a store-resolved ceiling "analytic" by design, so without
+        # this it could not show that an event's ceiling was ASSUMED (an event
+        # with no spin prior of its own, such as GW190425, gets 0.99).
+        def _meta_strs(name):
+            v = sub.meta.get(name)
+            if v is None:
+                return None
+            return [x.decode() if isinstance(x, (bytes, bytearray)) else str(x)
+                    for x in np.asarray(v)[sel_rows]]
+        spin_kinds = _meta_strs("prior_source_kind_spin")
+        if spin_kinds is None or not any(spin_kinds):
+            legacy = _meta_strs("spin_prior_kind")
+            spin_kinds = ["assumed_default" if k == "assumed_default"
+                          else "release_reweighted" if k == "release_reweighted"
+                          else "unrecorded"
+                          for k in (legacy or [""] * sub.n_events)]
+        spin_kinds = [k or "unrecorded" for k in spin_kinds]
+        kept_spin_kind = []
         amax_fallback_events = []
         # The z_max truncation, recorded (review 2026-10-20) as the 2.0
         # builder records it: per kept event, the samples the cut removed, and
@@ -2004,6 +2025,7 @@ class GWCatalog:
             kept_amax1.append(a1_e)
             kept_amax2.append(a2_e)
             kept_amax_src.append(asrc_e)
+            kept_spin_kind.append(spin_kinds[e])
             if asrc_e == "fallback":
                 amax_fallback_events.append(str(sub.event_names[e]))
             kept_H0.append(float(per_event_H0[e]))
@@ -2136,6 +2158,15 @@ class GWCatalog:
                 f"spin amax (meta/spin_amax_1/2 NaN); the chi_eff prior used "
                 f"amax_fallback={amax_fallback} for them, recorded in "
                 f"chi_eff_amax_source_per_event: {amax_fallback_events[:10]}")
+        spin_assumed_events = [str(n) for n, k in zip(kept, kept_spin_kind)
+                               if k == "assumed_default"]
+        if spin_assumed_events and forced_amax is None:
+            warnings.warn(
+                f"{len(spin_assumed_events)} exported event(s) carry no spin "
+                f"prior of their own; the store ASSUMED one at ingest, so the "
+                f"chi_eff prior was evaluated at an assumed ceiling, not a "
+                f"released one: {spin_assumed_events[:10]}. Recorded in "
+                f"spin_prior_assumed_events.")
 
         # ── Exported-weight support contract (GW-01) ────────────────────────
         from .schema import check_p_pe_positive
@@ -2274,6 +2305,10 @@ class GWCatalog:
             f.attrs["spin_amax_fallback"] = float(amax_fallback)
             f.attrs["spin_amax_fallback_events"] = np.array(
                 amax_fallback_events, dtype=h5py.string_dtype())
+            f.attrs["prior_source_kind_spin_per_event"] = np.array(
+                kept_spin_kind, dtype=h5py.string_dtype())
+            f.attrs["spin_prior_assumed_events"] = np.array(
+                spin_assumed_events, dtype=h5py.string_dtype())
             # Spin-support accounting (review 2026-10-20), under the 2.0
             # builder's names; the v1 validator reads it to tell recorded
             # spin-support zeros from a truncated distance prior.
