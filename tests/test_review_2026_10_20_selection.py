@@ -642,3 +642,22 @@ def test_v1_combined_ceilings_have_one_entry_per_campaign(tmp_path):
     src = [x.decode() if isinstance(x, bytes) else x for x in src]
     assert src == ["no_detections", "detected"]
     assert np.isclose(scalar, 0.998)
+
+
+# ======================================================================
+# low-17: a zero per-spin pdf in the O3 fallback is refused, not floored
+# ======================================================================
+def test_zero_per_spin_pdf_in_the_fallback_is_refused(tmp_path):
+    path = write_endo3_full(tmp_path / "o3.hdf", n=20, seed=101)
+    with h5py.File(path, "r+") as f:
+        g = f["injections"]
+        del g["sampling_pdf"]                 # forces the per-spin fallback
+        spd = g["spin1x_spin1y_spin1z_sampling_pdf"][:]
+        spd[3] = 0.0
+        del g["spin1x_spin1y_spin1z_sampling_pdf"]
+        g.create_dataset("spin1x_spin1y_spin1z_sampling_pdf", data=spd)
+    with pytest.raises(ValueError,
+                       match="spin1x_spin1y_spin1z_sampling_pdf"):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            SelectionSet(path)._load()

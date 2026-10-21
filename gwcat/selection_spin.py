@@ -156,10 +156,22 @@ def ln_p_spin_cart_component(spin_pdf_cart, a):
     marginalisation, θ→cosθ Jacobian cancels the volume ``sinθ``).  For the
     endo3 uniform-isotropic draw ``p_cart = 1/(4π a² max_spin)`` this collapses
     to ``1/(2·max_spin)``.
+
+    ``spin_pdf_cart`` must be finite and strictly positive: a zero is a
+    malformed row, and flooring it at 1e-300 (as this did until review
+    2026-10-20, low-17) fabricated a draw density ~1e-300 times too small.
     """
     spin_pdf_cart = np.asarray(spin_pdf_cart, dtype=float)
-    return np.log(np.maximum(spin_pdf_cart, _SIN_FLOOR)) \
-        + 2.0 * np.log(clip_a(a)) + LN_2PI
+    bad = ~np.isfinite(spin_pdf_cart) | (spin_pdf_cart <= 0.0)
+    if np.any(bad):
+        first = int(np.flatnonzero(np.atleast_1d(bad))[0])
+        raise ValueError(
+            f"per-spin cartesian sampling pdf is not finite and strictly "
+            f"positive: {int(np.sum(bad))} of {bad.size} entries (first at "
+            f"index {first}, value {np.atleast_1d(spin_pdf_cart)[first]!r}); "
+            f"a zero draw density is a malformed row, refused rather than "
+            f"floored.")
+    return np.log(spin_pdf_cart) + 2.0 * np.log(clip_a(a)) + LN_2PI
 
 
 # ----------------------------------------------------------------------

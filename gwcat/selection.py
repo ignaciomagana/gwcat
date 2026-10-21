@@ -2069,9 +2069,14 @@ class SelectionSet:
                 ln_joint, self._a1, self._a2)
             ln_spin = ln_p_comp - ln_pdraw_no_spin
         elif have_cart and have_spin_pdf:
-            # Fall back to the factored per-spin cartesian marginals.
-            spd1 = np.asarray(inj[spd1_key], float)
-            spd2 = np.asarray(inj[spd2_key], float)
+            # Fall back to the factored per-spin cartesian marginals --
+            # validated, not floored at 1e-300 (review 2026-10-20, low-17):
+            # a zero per-spin density is a malformed row, exactly as a zero
+            # joint sampling_pdf is above.
+            spd1 = _require_positive_finite(
+                np.asarray(inj[spd1_key], float), spd1_key, self.path)
+            spd2 = _require_positive_finite(
+                np.asarray(inj[spd2_key], float), spd2_key, self.path)
             ln_spin = (_sspin.ln_p_spin_cart_component(spd1, self._a1)
                        + _sspin.ln_p_spin_cart_component(spd2, self._a2))
 
