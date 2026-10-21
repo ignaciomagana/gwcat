@@ -43,35 +43,48 @@ for old, new in aliases.items():
     print(f"{old} -> {new}")
 PY
 
-# 5. Export PE samples using authoritative event membership. Do not add
-#    --source-class bbh here: membership comes from the canonical list alone,
-#    and reapplying the generic mass classifier could disagree with it.
-gwcat export-darksirens store.h5 \
+# 5. Export PE samples (gwcat-pe-2.0, chieff basis) using authoritative event
+#    membership. Do not add --source-class bbh here: membership comes from the
+#    canonical list alone, and reapplying the generic mass classifier could
+#    disagree with it. --event-list refuses names the store does not hold.
+gwcat export pe store.h5 \
     --out gw_gwtc5_population.h5 \
+    --format gwcat2 --parameter-space chieff \
     --event-list gwtc5_bbh_population.txt \
     --waveform-policy mixed-first \
-    --spin-prior-mode include \
-    --cosmology 67.74,0.3089 \
     --nsamp 4096 --seed 0
 
 # 6. Build the matching O3+O4ab selection export. Retain all detected CBC
 #    injection support; the downstream population density assigns zero weight
-#    outside its modeled BBH/mass-gap support.
-gwcat selection \
-    --injections ./injections/injections-O3-BBH/endo3_bbhpop-LIGO-T2100113-v12.hdf5 \
-                 ./injections/injections-O4ab/samples-rpo4ab-1366933504-55469568-clipped.hdf \
+#    outside its modeled BBH/mass-gap support. chieff_reference reweights each
+#    campaign's exact spin draw to the isotropic reference the PE side divides
+#    out; the chi_eff swap (`gwcat selection`) refuses rpo4ab. No --H0/--Om0:
+#    each campaign's Jacobian uses its own cosmology.
+gwcat export selection \
+    ./injections/injections-O3-BBH/endo3_bbhpop-LIGO-T2100113-v12.hdf5 \
+    ./injections/injections-O4ab/samples-rpo4ab-1366933504-55469568-clipped.hdf \
     --out selection_o3o4ab_allsky.h5 \
-    --far-threshold 1.0 \
-    --H0 67.74 --Om0 0.3089
+    --format gwcat2 --parameter-space chieff_reference --spin-reference-amax 0.99 \
+    --far-threshold 1.0
 
 # 7. Validate before population inference.
-gwcat validate gw_gwtc5_population.h5 selection_o3o4ab_allsky.h5
+gwcat validate --strict gw_gwtc5_population.h5 selection_o3o4ab_allsky.h5
 ```
+
+Two things step 7 does not settle for this pair. The 259-event list holds 10
+O1/O2 events, and the O3+O4ab injections have no O1/O2 exposure; the
+selection file records its campaigns' GPS spans and runs, but `gwcat validate`
+does not yet compare them with the PE events, so drop those events (or use the
+cumulative O1-O4b mixture, which darksirens-core cannot load yet) for a
+consistent pair. Under `--strict`, the posterior rows above the 0.99 spin
+ceiling are refused unless step 5 adds `--drop-spin-above-ceiling`, and the
+Mixed-label events that divide out a borrowed spin prior need
+`--spin-prior-allow-list`.
 
 For a strict mass-classified BBH sample instead, use `--source-class bbh` on
 both PE and selection exports. That is a different sample and should not be
 called the authoritative 259-event GWTC-5 population list.
 
-Every `ingest`, `export-darksirens`, and `selection` step writes
+Every `ingest`, `export`, `export-darksirens`, and `selection` step writes
 `<out>.validation_summary.json` and `.md` by default. Pass `--no-summary` to
 skip those sidecars.
