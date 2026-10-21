@@ -793,3 +793,24 @@ def test_v1_bootstrapped_events_record_the_samples_available(tmp_path):
         np.testing.assert_array_equal(f.attrs["n_samples_available_per_event"],
                                       [10, 200])
         assert int(f.attrs["n_unique_samples_per_event"][0]) <= 10
+
+
+# ==========================================================================
+# The v1 validator flags a file that counts one event several times
+# ==========================================================================
+def test_v1_validator_flags_an_all_policy_file(tmp_path):
+    cat = GWCatalog(_store(tmp_path, _multiset_rows()))
+    out = tmp_path / "all.h5"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        cat.to_darksirens(str(out), nsamp=8, seed=0, cosmology=_COSMO,
+                          waveform_policy="all")
+    results = validate_export(str(out))
+    assert results["pe_one_row_per_event"] is False
+    with pytest.raises(AssertionError, match="pe_one_row_per_event"):
+        validate_export(str(out), strict=True)
+    one = tmp_path / "one.h5"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        cat.to_darksirens(str(one), nsamp=8, seed=0, cosmology=_COSMO)
+    assert validate_export(str(one))["pe_one_row_per_event"] is True

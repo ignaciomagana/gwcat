@@ -2767,6 +2767,22 @@ def validate_export(gw_path: str, selection_path: str = None, strict: bool = Fal
             else:
                 _check("pe_p_pe_nonempty", False, "p_pe is empty")
 
+        # One row per event.  waveform_policy="all" writes one physical event
+        # as several blocks, which the consumer counts as independent
+        # detections; the writer flags it (homogeneous_sample_sets=False) but
+        # nothing checked the flag (review 2026-10-20; the August finding on
+        # "all" exports).
+        ev_names = [x.decode() if isinstance(x, (bytes, bytearray)) else str(x)
+                    for x in np.atleast_1d(f.attrs.get("event_names", []))]
+        dup = sorted({n for n in ev_names if ev_names.count(n) > 1})
+        homog = bool(f.attrs.get("homogeneous_sample_sets", True))
+        _check("pe_one_row_per_event", not dup and homog,
+               f"the file holds {len(dup)} event(s) more than once "
+               f"({dup[:5]}) or records homogeneous_sample_sets=False "
+               f"(waveform_policy={f.attrs.get('waveform_policy', '?')!r}); "
+               f"a consumer counts every block as an independent detection. "
+               f"Re-export with a policy that keeps one sample set per event.")
+
         if "m1src" in f and "m1det" in f:
             _check("pe_m1src_le_m1det",
                    np.all(np.array(f["m1src"]) <= np.array(f["m1det"]) + 1e-10))
