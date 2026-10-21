@@ -1450,7 +1450,8 @@ def _config_float(val):
     return v if np.isfinite(v) else None
 
 
-def _spin_amax_from_config(data, analysis, analyses=()):
+def _spin_amax_from_config(data, analysis, analyses=(),
+                           allow_variant_mismatch=False):
     """Spin ceilings DECLARED by a LALInference config (GW-40b).
 
     The six GWTC-2.1 LALInference events (GW170608_020116, GW190707_093326,
@@ -1459,11 +1460,18 @@ def _spin_amax_from_config(data, analysis, analyses=()):
     ``assumed_default``.  Their constituent runs' ``config_file/engine`` DOES
     declare ``a_spin1-max = a_spin2-max = 0.99``.
 
-    Search order: ``analysis``'s own config, else every sibling that declares
-    the keys.  Returns ``(amax_1, amax_2, labels, consistent)`` or ``None``;
-    ``consistent`` is False when siblings declare different ceilings (then the
-    caller must NOT upgrade the provenance -- a Mixed set built from runs with
-    different ceilings is not a single declared prior).
+    Search order: ``analysis``'s own config, else every same-prefix sibling
+    that declares the keys AND shares the label's spin-variant token, exactly
+    as the analytic search does (review 2026-10-20, medium-45: a LowSpin
+    sibling's a_spin2-max = 0.05 used to be adopted for a HighSpin label as
+    "config_file_declared").  Only differently-restricted siblings on offer
+    raises :class:`SpinPriorMismatchError` for a label that declares a
+    variant (a warning under ``allow_variant_mismatch``); a label declaring no
+    variant takes the best-ranked one, with a warning.  Returns ``(amax_1,
+    amax_2, labels, consistent)`` or ``None``; ``consistent`` is False when
+    siblings declare different ceilings (then the caller must NOT upgrade the
+    provenance -- a Mixed set built from runs with different ceilings is not
+    a single declared prior).
     """
     cfg_all = getattr(data, "config", None)
     if not isinstance(cfg_all, dict):
@@ -1487,13 +1495,41 @@ def _spin_amax_from_config(data, analysis, analyses=()):
     own = _one(analysis)
     if own is not None:
         return own[0], own[1], [analysis], True
-    hits = [(an, _one(an)) for an in analyses if an != analysis]
+    pfx, _base, variant = _label_parts(analysis)
+    want = _spin_variant_token(variant)
+
+    def _tok(an):
+        return _spin_variant_token(_label_parts(an)[2])
+
+    hits = [(an, _one(an)) for an in analyses
+            if an != analysis and _label_parts(an)[0] == pfx]
     hits = [(an, v) for an, v in hits if v is not None]
     if not hits:
         return None
-    vals = {v for _an, v in hits}
-    a1, a2 = hits[0][1]
-    return a1, a2, [an for an, _v in hits], len(vals) == 1
+    use = [(an, v) for an, v in hits if _tok(an) == want]
+    if not use:
+        others = [an for an, _v in hits]
+        if want:
+            msg = (f"{analysis}: no sibling config with spin variant {want!r} "
+                   f"declares engine/a_spin1-max, a_spin2-max; the only ones "
+                   f"declare a different spin restriction ({others}). Borrowing "
+                   f"across spin variants inflates a restricted secondary-spin "
+                   f"prior by up to ~20x, so gwcat refuses; pass "
+                   f"allow_variant_mismatch=True to accept it with a warning.")
+            if not allow_variant_mismatch:
+                raise SpinPriorMismatchError(msg)
+            warnings.warn(msg)
+            use = hits
+        else:
+            best = min((_tok(an) for an in others), key=_variant_rank)
+            warnings.warn(
+                f"{analysis}: the ingested label declares no spin variant but "
+                f"every sibling config declaring spin ceilings does "
+                f"({others}); assuming the {best!r} variant.")
+            use = [(an, v) for an, v in hits if _tok(an) == best]
+    vals = {v for _an, v in use}
+    a1, a2 = use[0][1]
+    return a1, a2, [an for an, _v in use], len(vals) == 1
 
 
 def constituent_spin_amax_config(data, analysis, analyses):
@@ -1780,7 +1816,9 @@ def resolve_spin_prior_full(analysis, analyses, priors, a1_samples,
         kind = "assumed_default"
         source = "default(no_analytic_prior)"
         src_label, src_kind = "", "assumed_default"
-        declared = (_spin_amax_from_config(data, analysis, analyses)
+        declared = (_spin_amax_from_config(
+                        data, analysis, analyses,
+                        allow_variant_mismatch=allow_variant_mismatch)
                     if data is not None else None)
         if declared is not None:
             c1, c2, clabels, consistent = declared

@@ -512,3 +512,33 @@ def test_nocosmo_row_with_no_declaration_at_all_is_refused(tmp_path,
     with pytest.raises(DistancePriorKindError, match="refusing"):
         _ingest(tmp_path, monkeypatch,
                 {_NOCOSMO: _gw170608_like(config=False)})
+
+
+# ==========================================================================
+# medium-45: the config-file spin ceilings borrowed across spin variants
+# ==========================================================================
+def _cfg_data(engines):
+    return _Data({lab: {} for lab in engines},
+                 config={lab: {"engine": e} for lab, e in engines.items()})
+
+
+def test_config_ceilings_are_not_borrowed_across_spin_variants():
+    labels = ["C01:X:HighSpin", "C01:X:LowSpin"]
+    data = _cfg_data({"C01:X:HighSpin": {},
+                      "C01:X:LowSpin": {"a_spin1-max": "0.99",
+                                        "a_spin2-max": "0.05"}})
+    with pytest.raises(ing.SpinPriorMismatchError, match="HighSpin"):
+        ing.resolve_spin_prior_full("C01:X:HighSpin", labels, {}, None, None,
+                                    data=data)
+
+
+def test_config_ceilings_of_the_same_variant_are_still_used():
+    labels = ["C01:Mixed", "C01:IMRPhenomXPHM", "C01:SEOBNRv4PHM"]
+    eng = {"a_spin1-max": b"0.99", "a_spin2-max": b"0.99"}
+    data = _cfg_data({"C01:Mixed": {}, "C01:IMRPhenomXPHM": eng,
+                      "C01:SEOBNRv4PHM": eng})
+    sp = ing.resolve_spin_prior_full("C01:Mixed", labels, {}, None, None,
+                                     data=data)
+    assert (sp.amax_1, sp.amax_2) == (0.99, 0.99)
+    assert sp.source_kind == "config_file_declared"
+    assert sp.source_label == "C01:IMRPhenomXPHM,C01:SEOBNRv4PHM"
