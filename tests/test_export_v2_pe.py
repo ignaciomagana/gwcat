@@ -583,10 +583,15 @@ def test_rng_neutrality_chieff_fetches_no_extra_store_columns(tmp_path,
     calls = []
     orig = _SampleReader.read
 
-    def spy(self, e, params, **kw):
-        calls.append((params,) if isinstance(params, str) else tuple(params))
-        return orig(self, e, params, **kw)
+    def spy(self, e, params, rows=None, **kw):
+        if rows is not None:   # the drawn-row fetch; whole-slice reads apart
+            calls.append((params,) if isinstance(params, str)
+                         else tuple(params))
+        else:
+            whole.append(tuple(params))
+        return orig(self, e, params, rows=rows, **kw)
 
+    whole = []
     monkeypatch.setattr(_SampleReader, "read", spy)
     cat.export(str(tmp_path / "c.h5"), format="gwcat2", spin_basis="chieff",
                nsamp=32, seed=0, cosmology=(67.74, 0.3089))
@@ -595,6 +600,9 @@ def test_rng_neutrality_chieff_fetches_no_extra_store_columns(tmp_path,
     assert len(calls) == 1, f"chieff made {len(calls)} store fetches: {calls}"
     assert set(calls[0]) == set(schema.EXPORT_REQUIREMENTS["gwcat2_pe:chieff"])
     assert get_space("chieff").store_params_fetched == ()
+    # The one whole-slice read is the spin-ceiling COUNT (review High 1): the
+    # magnitudes only, before the draw, consuming no random numbers.
+    assert whole == [("a_1", "a_2")]
 
     # ... whereas component DOES fetch extras, which is why it is exempt from
     # the parity contract rather than violating it.
@@ -1092,11 +1100,17 @@ def test_pe_export_reads_only_the_rows_it_emits(tmp_path, monkeypatch):
     nsamp = 32
 
     rows_read = []
+    whole_reads = []
     orig_read = _SampleReader.read
 
     def spy_read(self, e, params, rows=None, **kw):
         out = orig_read(self, e, params, rows=rows, **kw)
-        rows_read.append(sum(np.size(v) for v in out.values()))
+        if rows is None:
+            # The spin-ceiling count (review High 1) reads the magnitudes of
+            # the whole slice before the draw; it emits nothing.
+            whole_reads.append(tuple(params))
+        else:
+            rows_read.append(sum(np.size(v) for v in out.values()))
         return out
 
     got = []
@@ -1129,8 +1143,10 @@ def test_pe_export_reads_only_the_rows_it_emits(tmp_path, monkeypatch):
     # every read is a drawn-row read, and they sum to the emitted rows x columns
     assert len(rows_read) == len(events)
     assert sum(rows_read) == nsamp * len(events) * ncols_read
-    # ... and not one whole-selection posterior fetch happened
+    # ... and not one whole-selection posterior fetch happened; the only
+    # whole-slice reads are the per-event spin-magnitude counts
     assert got == [], f"export still fetched whole slices: {got}"
+    assert whole_reads == [("a_1", "a_2")] * len(events)
 
 
 def test_pe_export_z_max_reads_dL_once_then_only_the_drawn_rows(tmp_path,
@@ -1161,7 +1177,10 @@ def test_pe_export_z_max_reads_dL_once_then_only_the_drawn_rows(tmp_path,
                    cosmology=(67.74, 0.3089))
 
     assert calls[0] == ("luminosity_distance", None)
-    assert all(n == 16 for _params, n in calls[1:])
+    # then the whole-slice spin-magnitude count (review High 1), which emits
+    # nothing, and the drawn rows only
+    assert calls[1] == (["a_1", "a_2"], None)
+    assert all(n == 16 for _params, n in calls[2:])
 
 
 def test_pe_export_emits_the_rows_the_rng_drew_from_the_full_slice(tmp_path):

@@ -319,6 +319,14 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     draw then sees only the kept samples, so ``replace="auto"`` resamples with replacement exactly when
     fewer than ``nsamp`` remain.  Off by default: the default draw is unchanged.
 
+    The samples above the ceiling are COUNTED with or without the cut (the
+    count reads ``a_1``/``a_2`` but calls no rng): ``n_above_spin_ceiling_raw``
+    over the raw label, and ``n_exported_above_spin_ceiling_per_event`` over
+    the exported rows -- the rows a ``chieff_reference`` selection weights at
+    zero when the cut is off (a chieff export warns about them).  ``-1`` marks
+    an event that cannot be counted (no spin ceiling, or no ``a_1``/``a_2``
+    samples), and ``spin_ceiling_counted`` says whether every event was.
+
     Per-prior provenance (GW-40c)
     -----------------------------
     ``prior_source_{kind,label}_{mass,spin,dL}_per_event`` carry the store's
@@ -700,10 +708,17 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     n_dropped_spin = []
     #: ... and the same count over the event's WHOLE raw label, before any
     #: z_max cut: the number an independent count of the raw file reproduces.
+    #: Counted whether or not the cut is applied (it uses no random numbers);
+    #: -1 where it cannot be counted (no ceiling, or no a_1/a_2 samples).
     n_above_spin_ceiling_raw = []
-    if drop_spin_above_ceiling:
+    #: Exported ROWS (repeats included) whose a_1 or a_2 is above the ceiling:
+    #: what a chieff_reference selection, which has zero density there, would
+    #: disagree with.  0 by construction under the cut; -1 where not counted.
+    n_exported_above_spin_ceiling = []
+    if need_amax:
         avail_a1_cut = sub.param_available("a_1")
         avail_a2_cut = sub.param_available("a_2")
+    if drop_spin_above_ceiling:
         no_spin = [str(sub.event_names[e]) for e in range(sub.n_events)
                    if not (avail_a1_cut[e] and avail_a2_cut[e])]
         if no_spin:
@@ -775,22 +790,27 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             else:
                 idx_map = np.arange(n)
 
-            # ── The spin-support cut (GW-40c), BEFORE the draw ──────────────
+            # ── The spin-support count and cut (GW-40c), BEFORE the draw ────
             # Reads the event's full a_1/a_2 (a sample read, but not an rng
-            # call, so with the flag off nothing here runs and the draw is the
-            # historical one bit for bit).
+            # call, so the draw is the historical one bit for bit) and COUNTS
+            # the samples above the ceiling the spin prior is evaluated at --
+            # always, so a file built without the cut says how many it kept
+            # instead of writing zeros (review High 1 / Medium 5).  Only the
+            # flag removes them.
             # Order: the z_max cut (above) runs first, so
             # n_dropped_spin_above_ceiling counts only samples with z <= z_max;
             # n_above_spin_ceiling_raw counts the whole raw label.
             n_drop_e = 0
-            n_raw_e = 0
-            if drop_spin_above_ceiling:
+            n_raw_e = -1
+            above_raw = None
+            if need_amax and avail_a1_cut[e] and avail_a2_cut[e]:
                 c1, c2, _fb = _declared_ceiling(e)
                 ab = reader.read(e, ["a_1", "a_2"])
                 a1_raw = np.asarray(ab["a_1"], dtype=float)
                 a2_raw = np.asarray(ab["a_2"], dtype=float)
                 above_raw = (np.abs(a1_raw) > c1) | (np.abs(a2_raw) > c2)
                 n_raw_e = int(np.sum(above_raw))
+            if drop_spin_above_ceiling:
                 ok = ~above_raw[idx_map]
                 n_drop_e = int(np.sum(~ok))
                 if not ok.any():
@@ -869,6 +889,9 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             n_cut_by_z_max.append(n_cut_e)
             n_dropped_spin.append(n_drop_e)
             n_above_spin_ceiling_raw.append(n_raw_e)
+            n_exported_above_spin_ceiling.append(
+                int(np.sum(above_raw[idx_orig])) if above_raw is not None
+                else -1)
             for _p in ("mass", "spin", "dL"):
                 kept_prior_kind[_p].append(sel_prior_kind[_p][e])
                 kept_prior_label[_p].append(sel_prior_label[_p][e])
@@ -1336,6 +1359,28 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
               f"mass_prior_verified=False; it is NOT stamped as a verified "
               f"uniform prior.")
 
+    # ── Rows kept above the spin ceiling (review High 1) ────────────────────
+    # The chieff basis keeps the declared ceiling, so a row whose a_1 or a_2
+    # exceeds it gets a finite p_pe here while a chieff_reference selection
+    # gives that region zero density.  Counted above; said here, because the
+    # cut that removes them is opt-in.
+    above_hit = [(str(kept[i]), int(n)) for i, n in
+                 enumerate(n_exported_above_spin_ceiling) if n > 0]
+    if (spin_basis == "chieff" and not drop_spin_above_ceiling
+            and above_hit):
+        worst = sorted(above_hit, key=lambda t: -t[1])[:5]
+        warnings.warn(
+            f"spin_basis='chieff': {sum(n for _k, n in above_hit)} of "
+            f"{nobs * nsamp} exported rows, in {len(above_hit)} of {nobs} "
+            f"event(s), have a_1 or a_2 above the ceiling their chi_eff prior "
+            f"is evaluated at (largest: "
+            + ", ".join(f"{k}: {n}/{nsamp}" for k, n in worst)
+            + "). A chieff_reference selection gives that region zero "
+              "density, so the two files have different spin supports. "
+              "drop_spin_above_ceiling=True (CLI --drop-spin-above-ceiling) "
+              "removes them before the draw (exact rejection to U(0, amax)); "
+              "the counts are in n_exported_above_spin_ceiling_per_event.")
+
     if z_max is not None and any(n > 0 for n in n_cut_by_z_max):
         warnings.warn(
             f"z_max={z_max} dropped {sum(n_cut_by_z_max)} posterior sample(s) "
@@ -1435,10 +1480,19 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             dtype=np.int64),
         # The same count over the WHOLE raw label, before the z_max cut -- the
         # integer an independent raw-file count reproduces.  Equal to the
-        # above when z_max is None.
+        # above when the cut is applied and z_max is None.  Counted with or
+        # without the cut (it was written as zeros without it); -1 where it
+        # cannot be counted (a basis with no spin ceiling, or an event with
+        # no a_1/a_2 samples).
         "n_above_spin_ceiling_raw_per_event": np.asarray(
-            n_above_spin_ceiling_raw if drop_spin_above_ceiling
-            else [0] * nobs, dtype=np.int64),
+            n_above_spin_ceiling_raw, dtype=np.int64),
+        # Exported ROWS (repeats included) above the ceiling: 0 under the
+        # cut; without it, the rows a chieff_reference selection weights at
+        # zero.  -1 where not counted.
+        "n_exported_above_spin_ceiling_per_event": np.asarray(
+            n_exported_above_spin_ceiling, dtype=np.int64),
+        "spin_ceiling_counted": bool(
+            nobs and all(n >= 0 for n in n_above_spin_ceiling_raw)),
         "spin_ceiling_cut_order": ("after_z_max_cut" if z_max is not None
                                    else "no_z_max_cut"),
         # ── Per-prior source provenance (GW-40c) ─────────────────────────────
@@ -1551,7 +1605,13 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         "chi_p_definition": str(chi_p_definition),
         "spin_ceiling_cut_applied": bool(drop_spin_above_ceiling),
         "n_dropped_spin_above_ceiling": int(sum(n_dropped_spin)),
-        "n_above_spin_ceiling_raw": int(sum(n_above_spin_ceiling_raw)),
+        # Sums over the events that could be counted (-1 = not counted).
+        "n_above_spin_ceiling_raw": int(sum(
+            n for n in n_above_spin_ceiling_raw if n > 0)),
+        "n_exported_above_spin_ceiling": int(sum(
+            n for n in n_exported_above_spin_ceiling if n > 0)),
+        "spin_ceiling_counted": bool(
+            nobs and all(n >= 0 for n in n_above_spin_ceiling_raw)),
         "prior_source_kind_counts": {
             p: {k: int(kept_prior_kind[p].count(k))
                 for k in sorted(set(kept_prior_kind[p]))}

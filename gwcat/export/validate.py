@@ -1414,6 +1414,29 @@ def _xcheck_reference_pair(_check, _fail, results, pe_attrs, sel_attrs,
                   f"the PE file at that amax).")
         results["xcheck_reference_amax_matches"] = True
 
+    # The same SUPPORT, not only the same declared ceiling (review High 1).
+    # The selection gives a_i > a_ref zero density; a PE file built without
+    # the spin cut keeps rows above it at a finite p_pe.  A PE file written
+    # before the count was recorded cannot be checked here.
+    n_above = pe_attrs.get("n_exported_above_spin_ceiling_per_event")
+    if n_above is not None:
+        n_above = np.atleast_1d(np.asarray(n_above, dtype=np.int64))
+        n_rows = int(n_above[n_above > 0].sum())
+        cut = bool(pe_attrs.get("spin_ceiling_cut_applied", False))
+        if n_rows and not cut:
+            msg = (f"chieff_reference: the PE file keeps {n_rows} row(s) in "
+                   f"{int((n_above > 0).sum())} event(s) with a_1 or a_2 "
+                   f"above the spin ceiling (n_exported_above_spin_ceiling_"
+                   f"per_event, spin_ceiling_cut_applied=False), a region the "
+                   f"selection's reference prior gives zero density, so the "
+                   f"two files have different spin supports. Re-export the PE "
+                   f"file with drop_spin_above_ceiling=True (CLI "
+                   f"--drop-spin-above-ceiling).")
+            if strict:
+                _fail("xcheck_reference_spin_support", msg)
+            warnings.warn(msg)
+        results["xcheck_reference_spin_support"] = not (n_rows and not cut)
+
     # WHERE each event's ceiling came from, not only its value (GW-40d).
     _xcheck_reference_spin_prior_source(_fail, results, pe_attrs,
                                         spin_prior_allow_list, strict=strict)
