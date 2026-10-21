@@ -813,8 +813,10 @@ def _o4_aligned_hemisphere(path, n, seed):
         ev["spin2_polar_angle"][:] = th2
         ev["lnpdraw_spin1_polar_angle"][:] = np.log(s1)    # p(θ) = sin θ
         ev["lnpdraw_spin2_polar_angle"][:] = np.log(s2)
-        ev["spin1x"][:], ev["spin1y"][:] = a1 * s1 * np.cos(ph1), a1 * s1 * np.sin(ph1)
-        ev["spin2x"][:], ev["spin2y"][:] = a2 * s2 * np.cos(ph2), a2 * s2 * np.sin(ph2)
+        ev["spin1x"][:] = a1 * s1 * np.cos(ph1)
+        ev["spin1y"][:] = a1 * s1 * np.sin(ph1)
+        ev["spin2x"][:] = a2 * s2 * np.cos(ph2)
+        ev["spin2y"][:] = a2 * s2 * np.sin(ph2)
         ev["spin1z"][:], ev["spin2z"][:] = a1 * c1, a2 * c2
         ev["chi_eff"][:] = (m1 * a1 * c1 + m2 * a2 * c2) / (m1 + m2)
         ev["chi_p"][:] = chi_p_from_components(a1, a2, c1, c2, m1, m2)

@@ -126,10 +126,12 @@ The converse hole is real and is checked: if a campaign's magnitudes stop BELOW
 put in the missing region, and alpha comes out biased low.  With a detectable
 (uniform-magnitude) ceiling that is provable and raises under ``strict``; on a
 campaign with no detectable ceiling it falls back to the largest magnitude
-actually drawn and warns, because "not observed" is weaker than "not drawn".
-The same holds for orientations: the reference is isotropic, so a campaign
-that never drew part of ``cos(tilt) in [-1, 1]`` (an aligned-hemisphere draw)
-leaves a hole too, found from the widest gap between its drawn tilts
+actually drawn and warns, because "not observed" is weaker than "not drawn" --
+until the shortfall is wider than sampling noise could leave over that
+campaign's rows, which raises under ``strict`` too.  The same holds for
+orientations: the reference is isotropic, so a campaign that never drew part of
+``cos(tilt) in [-1, 1]`` (an aligned-hemisphere draw) leaves a hole too, found
+from the widest gap between its drawn tilts
 (:func:`_check_reference_tilt_coverage`).  "Assumes nothing about how the
 campaign drew its spins" therefore means nothing about their DENSITY; their
 support must still cover the reference's.
