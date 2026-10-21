@@ -1120,7 +1120,7 @@ class GWCatalog:
             z = z_of_dL(d["luminosity_distance"], make_cosmology(*cosmology))
         return d["mass_1"] / (1 + z), d["mass_2"] / (1 + z)
 
-    # ---- darksirens export (Jacobian lives here, and only here) ----------
+    # ---- v1 darksirens export (Jacobian here and in the gwcat2 PE builder) --
     def to_darksirens(self, out_path, compact_type=None, nsamp=4096,
                       far_max=None, pastro_min=None, z_max=None,
                       seed=0, replace="auto", cosmology=None, amax=AMAX_AUTO,
@@ -1148,7 +1148,8 @@ class GWCatalog:
 
             p_pe = m1det * p_dL_pe
 
-        This is the ONLY place the mass Jacobian is applied. The store keeps the
+        The mass Jacobian is applied at export only: here and, for gwcat2
+        products, in gwcat.export.build_pe_product. The store keeps the
         mass-prior-agnostic p_dL_pe, and the distance prior p_dL_pe remains a
         FACTOR of p_pe (it is not divided out).
 
