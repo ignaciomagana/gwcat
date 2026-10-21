@@ -1104,3 +1104,27 @@ def test_unusable_masses_distance_redshift_are_refused(tmp_path, field, value):
     setattr(s, field, arr)
     with pytest.raises(ValueError, match="unusable"):
         build_selection_product(s, spin_basis="component")
+
+
+def test_p_astro_columns_are_recorded_per_campaign(tmp_path):
+    """Every selection product said p_astro_available=False and the pastro_min
+    refusal read that as 'the campaigns carry no per-injection p_astro', but
+    both production campaigns do.  What each campaign carries is recorded,
+    separately from the (unchanged) statement that none is used."""
+    from gwcat.export import build_selection_product
+
+    o4 = write_o4_full(tmp_path / "o4.hdf", n=20, seed=24)
+    with h5py.File(o4, "r+") as f:
+        f["events"].create_dataset("gstlal_p_astro",
+                                   data=np.full(20, 0.9))
+    e3 = write_endo3_full(tmp_path / "e3.hdf", n=20, seed=25)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        prod = build_selection_product([SelectionSet(e3), SelectionSet(o4)],
+                                       spin_basis="component")
+    assert json.loads(prod.attrs["p_astro_columns_per_campaign"]) == [
+        [], ["gstlal_p_astro"]]
+    assert prod.attrs["p_astro_used_for_detection"] is False
+    assert bool(prod.attrs["p_astro_available"]) is False      # unchanged
+    assert prod.summary["p_astro_columns_per_campaign"] == [
+        [], ["gstlal_p_astro"]]

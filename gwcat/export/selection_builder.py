@@ -1786,6 +1786,12 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     attrs["campaign_file_size_bytes"] = np.array(campaign_sizes,
                                                  dtype=np.int64)
     attrs["campaign_file_sha256"] = np.array(campaign_sha256, dtype=_str)
+    # p_astro_available (above) states that no per-injection p_astro is USED
+    # for detection; these say which campaigns CARRY one, which is what the
+    # pastro_min pairing refusal needs to describe truthfully.
+    p_astro_columns = [_p_astro_columns(p) for p in campaign_files]
+    attrs["p_astro_used_for_detection"] = False
+    attrs["p_astro_columns_per_campaign"] = json.dumps(p_astro_columns)
     if mixture_attrs is not None:
         attrs.update(mixture_attrs)
     if reference_coverage_runs is not None:
@@ -1832,7 +1838,11 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                           else float(snr_threshold)),
         "significance_columns": list(far_columns_union),
         "significance_available": bool(far_columns_union),
+        # False = no per-injection p_astro is used for detection (the attr's
+        # meaning); which campaigns carry one is the per-campaign list below.
         "p_astro_available": False,
+        "p_astro_used_for_detection": False,
+        "p_astro_columns_per_campaign": p_astro_columns,
         "source_class_filter": format_source_class_filter(source_class),
         CUT_ESTIMATOR_ATTR: selection_cut_estimator(source_class),
         "source_class_counts_detected": value_counts(
@@ -1967,6 +1977,26 @@ def _campaign_identity(set_list):
                 f"injections would be counted twice. Pass each campaign once.")
         seen[d] = p
     return paths, sizes, digests
+
+
+def _p_astro_columns(path):
+    """The per-injection p_astro columns an injection file carries.
+
+    Both production campaigns carry them (endo3 ``pastro_*``, rpo4ab
+    ``*_p_astro``), while every selection product said
+    ``p_astro_available=False`` -- which means "not used for the detection
+    cut", and was being read as "not present" (review fix).
+    """
+    with h5py.File(path, "r") as f:
+        for grp in ("events", "injections"):
+            if grp not in f:
+                continue
+            obj = f[grp]
+            names = (list(obj.dtype.names or ()) if isinstance(obj, h5py.Dataset)
+                     else list(obj.keys()))
+            return sorted(n for n in names
+                          if "pastro" in n.lower() or "p_astro" in n.lower())
+    return []
 
 
 def _time_coverage_attrs(set_list):
