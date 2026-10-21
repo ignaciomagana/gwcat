@@ -227,3 +227,81 @@ def test_spin_samples_above_the_ceiling_refused_on_request(
     cfg = ing.IngestConfig(spin_exceeds_amax="raise", **_CFG)
     with pytest.raises(ing.SpinCeilingExceededError, match="0.99"):
         _ingest(tmp_path, monkeypatch, files, cfg=cfg)
+
+
+# ==========================================================================
+# high-11: aligned-spin labels inherited a precessing sibling's prior
+# ==========================================================================
+# The real analysis labels in
+# IGWN-GWTC4p1-18965dda8_5-GW230529_181500-combined_PEDataRelease.hdf5
+GW230529_LABELS = [
+    "C00:IMRPhenomNSBH", "C00:IMRPhenomPv2_NRTidalv2",
+    "C00:IMRPhenomXAS:HighSpin", "C00:IMRPhenomXAS:LowSpinSecondary",
+    "C00:IMRPhenomXHM", "C00:IMRPhenomXP", "C00:IMRPhenomXPHM:HighSpin",
+    "C00:IMRPhenomXPHM:LowSpin", "C00:IMRPhenomXPHM:LowSpinSecondary",
+    "C00:Mixed:HighSpin", "C00:Mixed:LowSpinSecondary",
+    "C00:SEOBNRv4_ROM_NRTidalv2_NSBH", "C00:SEOBNRv5PHM:HighSpin",
+    "C00:SEOBNRv5PHM:LowSpinSecondary"]
+
+
+def _gw230529_priors():
+    """Each label's real spin declaration (a_1/a_2 or AlignedSpin chi_1/chi_2)."""
+    prec = {"C00:IMRPhenomPv2_NRTidalv2": (0.99, 0.05),
+            "C00:IMRPhenomXP": (0.99, 0.99),
+            "C00:IMRPhenomXPHM:HighSpin": (0.99, 0.99),
+            "C00:IMRPhenomXPHM:LowSpin": (0.05, 0.05),
+            "C00:IMRPhenomXPHM:LowSpinSecondary": (0.99, 0.05),
+            "C00:SEOBNRv5PHM:HighSpin": (0.99, 0.99),
+            "C00:SEOBNRv5PHM:LowSpinSecondary": (0.99, 0.05)}
+    aligned = {"C00:IMRPhenomNSBH": (0.5, 0.05),
+               "C00:IMRPhenomXAS:HighSpin": (0.99, 0.99),
+               "C00:IMRPhenomXAS:LowSpinSecondary": (0.5, 0.05),
+               "C00:IMRPhenomXHM": (0.99, 0.99),
+               "C00:SEOBNRv4_ROM_NRTidalv2_NSBH": (0.9, 0.05)}
+    an = {lab: {"a_1": _a(1, a1), "a_2": _a(2, a2)}
+          for lab, (a1, a2) in prec.items()}
+    an.update({lab: {"chi_1": _aligned(a1), "chi_2": _aligned(a2)}
+               for lab, (a1, a2) in aligned.items()})
+    return {"analytic": an}
+
+
+@pytest.mark.parametrize("label, ceilings", [
+    ("C00:IMRPhenomNSBH", (0.5, 0.05)),
+    ("C00:IMRPhenomXHM", (0.99, 0.99)),
+    ("C00:SEOBNRv4_ROM_NRTidalv2_NSBH", (0.9, 0.05)),
+    ("C00:IMRPhenomXAS:LowSpinSecondary", (0.5, 0.05)),
+])
+def test_aligned_spin_label_uses_its_own_ceilings(label, ceilings):
+    rng = np.random.default_rng(3)
+    a1 = rng.uniform(0, ceilings[0], 50)
+    a2 = rng.uniform(0, ceilings[1], 50)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")      # no samples-exceed warning
+        sp = ing.resolve_spin_prior_full(label, GW230529_LABELS,
+                                         _gw230529_priors(), a1, a2)
+    assert (sp.amax_1, sp.amax_2) == pytest.approx(ceilings)
+    assert sp.kind == "aligned_spin"
+    assert sp.source_kind == "own_analytic" and sp.source_label == label
+
+
+def test_mixed_label_still_borrows_a_precessing_same_variant_sibling():
+    sp = ing.resolve_spin_prior_full("C00:Mixed:HighSpin", GW230529_LABELS,
+                                     _gw230529_priors(), None, None)
+    assert (sp.amax_1, sp.amax_2) == pytest.approx((0.99, 0.99))
+    assert sp.kind == "uniform_magnitude_isotropic"
+    assert sp.source_kind == "sibling_inherited"
+
+
+def test_same_variant_siblings_with_different_ceilings_are_refused():
+    """Which sibling an unsuffixed label borrows from followed file order."""
+    analyses = ["C01:IMRPhenomA", "C01:IMRPhenomB", "C01:Mixed"]
+    priors = {"analytic": {"C01:IMRPhenomA": {"a_1": _a(1, 0.99),
+                                              "a_2": _a(2, 0.99)},
+                           "C01:IMRPhenomB": {"a_1": _a(1, 0.8),
+                                              "a_2": _a(2, 0.8)}}}
+    with pytest.raises(ing.SpinPriorMismatchError, match="different spin"):
+        ing.resolve_spin_prior_full("C01:Mixed", analyses, priors, None, None)
+    with pytest.warns(UserWarning, match="different spin ceilings"):
+        sp = ing.resolve_spin_prior_full("C01:Mixed", analyses, priors, None,
+                                         None, allow_variant_mismatch=True)
+    assert "candidates_disagree" in sp.source

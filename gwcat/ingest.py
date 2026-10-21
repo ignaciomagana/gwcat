@@ -1390,6 +1390,42 @@ def constituent_spin_sample_max(analysis, analyses, samples_dict,
     return json.dumps(out, sort_keys=True)
 
 
+def _parse_aligned_spin(prior_repr):
+    """The magnitude ceiling of a standard bilby ``AlignedSpin`` repr, or None.
+
+    ``AlignedSpin(a_prior=Uniform(minimum=0, maximum=amax), z_prior=Uniform(
+    minimum=-1, maximum=1), ...)`` -- the shape of the GWTC-4.1 aligned-spin
+    runs -- gives ``amax``; anything else (another class, a non-uniform
+    magnitude prior, a non-standard z_prior) gives None.
+    """
+    if prior_repr is None:
+        return None
+    s = str(prior_repr)
+    m = re.search(r"([A-Za-z_]\w*)\s*\(", s)
+    if not m or m.group(1) != "AlignedSpin":
+        return None
+    a_repr, z_repr = _balanced_arg(s, "a_prior"), _balanced_arg(s, "z_prior")
+    pa = _parse_analytic_spin(a_repr) if a_repr else None
+    if (pa is None or pa[0] != "Uniform" or pa[1] is None
+            or abs(pa[1]) > 1e-9 or pa[2] is None):
+        return None
+    pz = _parse_analytic_spin(z_repr) if z_repr else None
+    if pz is not None and not (pz[0] == "Uniform" and pz[1] == -1.0
+                               and pz[2] == 1.0):
+        return None
+    return float(pa[2])
+
+
+def _declared_ceilings(found):
+    """``(a_1 max, a_2 max)`` a sibling's a_1/a_2 reprs declare (None if not
+    parsable) -- what two candidate siblings must agree on."""
+    out = []
+    for k in ("a_1", "a_2"):
+        p = _parse_analytic_spin(found[k]) if found and k in found else None
+        out.append(None if p is None or p[2] is None else float(p[2]))
+    return tuple(out)
+
+
 def resolve_spin_prior(analysis, analyses, priors, a1_samples, a2_samples,
                        fallback_amax=0.99, allow_variant_mismatch=False):
     """Return ``(amax_1, amax_2, kind, source)`` for the spin-magnitude prior.
@@ -1422,10 +1458,14 @@ def resolve_spin_prior_full(analysis, analyses, priors, a1_samples,
 
     ``kind`` is ``"uniform_magnitude_isotropic"`` only when both ``a_1`` and
     ``a_2`` parse as ``Uniform(0, amax_i)`` AND the tilt priors parse as
-    ``Sine`` (or are absent).  Otherwise ``kind`` is ``"unrecognized"`` and the
-    raw repr(s) are recorded in ``source``.  When nothing analytic is found
-    anywhere, fall back to ``amax = fallback_amax`` with
-    ``kind = "assumed_default"``.
+    ``Sine`` (or are absent).  A label whose own group declares bilby
+    ``AlignedSpin`` ``chi_1``/``chi_2`` priors gets ``kind = "aligned_spin"``
+    with ITS ``a_prior`` ceilings, and never borrows (review 2026-10-20,
+    high-11).  Otherwise ``kind`` is ``"unrecognized"`` and the raw repr(s)
+    are recorded in ``source``.  When nothing analytic is found anywhere, fall
+    back to ``amax = fallback_amax`` with ``kind = "assumed_default"``.
+    Same-variant siblings that declare different ceilings are refused
+    (:class:`SpinPriorMismatchError`) unless ``allow_variant_mismatch``.
 
     Regardless of how the bounds were obtained, ``max(|a_i samples|)`` is checked
     against ``amax_i * (1 + 1e-3)``; a violation warns and is noted in
@@ -1447,7 +1487,19 @@ def resolve_spin_prior_full(analysis, analyses, priors, a1_samples,
     found = _find(analysis)
     src_an = analysis
     src_label = analysis if found is not None else ""
+    # An ALIGNED-spin label declares its own prior in chi_1/chi_2 (bilby's
+    # AlignedSpin), not in a_1/a_2.  It used to be treated as declaring
+    # nothing and borrowed a precessing sibling's isotropic U(0, amax) with
+    # that sibling's ceilings (review 2026-10-20, high-11): GW230529_181500's
+    # C00:IMRPhenomNSBH declares a_1 < 0.5, a_2 < 0.05 and resolved to
+    # (0.99, 0.05).  Its own declaration is read instead, never a sibling's.
+    aligned = None
     if found is None:
+        node = _node(analysis)
+        if node and ("chi_1" in node or "chi_2" in node):
+            aligned = {k: node[k] for k in ("chi_1", "chi_2") if k in node}
+    disagree = ""
+    if found is None and aligned is None:
         # Sibling search (an O4 Mixed set carries no priors group of its own).
         #
         # It must respect the SPIN VARIANT (GW-07).  Borrowing across variants is
@@ -1457,18 +1509,36 @@ def resolve_spin_prior_full(analysis, analyses, priors, a1_samples,
         # took the first sibling carrying a_1/a_2 in h5py key order, i.e. by
         # alphabet.
         #
-        # (Aligned-spin siblings are already skipped for free: they record
-        # chi_1/chi_2 rather than a_1/a_2, so `_find` returns None for them.
-        # Verified on GW230529_181500, whose C00:IMRPhenomNSBH analytic group has
+        # (Aligned-spin siblings are skipped: they record chi_1/chi_2 rather
+        # than a_1/a_2, so `_find` returns None for them -- their AlignedSpin
+        # prior is not the isotropic one being borrowed.  Verified on
+        # GW230529_181500, whose C00:IMRPhenomNSBH analytic group has
         # chi_1/chi_2 and no a_1/a_2.)
         want = _spin_variant_token(_label_parts(analysis)[2])
         cands = [a for a in analyses if _find(a) is not None]
         same = [a for a in cands if _spin_variant_token(_label_parts(a)[2]) == want]
         other = [a for a in cands if a not in same]
 
+        # Siblings that would all be acceptable must AGREE on the ceilings:
+        # otherwise which one is borrowed -- and so the ceiling -- follows
+        # file order (review 2026-10-20, high-11, August part b).
+        if len(same) > 1:
+            ceil = {a: _declared_ceilings(_find(a)) for a in same}
+            if len(set(ceil.values())) > 1:
+                msg = (
+                    f"{analysis}: its sibling analyses with spin variant "
+                    f"{want!r} declare different spin ceilings {ceil}; "
+                    f"borrowing the first in file order would make the "
+                    f"ceiling depend on that order. Ingest one of them "
+                    f"explicitly, or pass allow_variant_mismatch=True to "
+                    f"accept the first with a warning.")
+                if not allow_variant_mismatch:
+                    raise SpinPriorMismatchError(msg)
+                warnings.warn(msg)
+                disagree = ":candidates_disagree"
         for an in same:
             found = _find(an)
-            src_an = an
+            src_an = an + disagree
             src_label = an
             break
 
@@ -1530,7 +1600,21 @@ def resolve_spin_prior_full(analysis, analyses, priors, a1_samples,
 
     src_kind = ("" if found is None else
                 "own_analytic" if src_label == analysis else "sibling_inherited")
-    if found is None:
+    if aligned is not None:
+        c1 = _parse_aligned_spin(aligned.get("chi_1"))
+        c2 = _parse_aligned_spin(aligned.get("chi_2"))
+        amax_1 = float(fallback_amax) if c1 is None else c1
+        amax_2 = float(fallback_amax) if c2 is None else c2
+        src_label, src_kind = analysis, "own_analytic"
+        if c1 is not None and c2 is not None:
+            kind = "aligned_spin"
+            source = (f"analytic[{analysis}]:AlignedSpin(a_max={c1:g},"
+                      f"{c2:g})")
+        else:
+            kind = "unrecognized"
+            raw = "; ".join(f"{k}={aligned[k]!r}" for k in sorted(aligned))
+            source = f"analytic[{analysis}]:unrecognized({raw})"
+    elif found is None:
         amax_1 = amax_2 = float(fallback_amax)
         kind = "assumed_default"
         source = "default(no_analytic_prior)"
@@ -2259,10 +2343,22 @@ def build_store(paths, out_path, params=None, extra_params=None,
             # Spin-magnitude prior resolution (PR 2), mirroring resolve_dL_prior.
             a1_samp = np.asarray(s["a_1"], float) if "a_1" in s else None
             a2_samp = np.asarray(s["a_2"], float) if "a_2" in s else None
-            sp = resolve_spin_prior_full(
-                analysis, analyses, priors, a1_samp, a2_samp,
-                allow_variant_mismatch=cfg.spin_prior_allow_variant_mismatch,
-                data=data)
+            cmix_row = (cfg.constituent_mixture_prior
+                        and _label_parts(analysis)[0] == "C00"
+                        and _label_parts(analysis)[1] == "Mixed")
+            try:
+                sp = resolve_spin_prior_full(
+                    analysis, analyses, priors, a1_samp, a2_samp,
+                    allow_variant_mismatch=cfg.spin_prior_allow_variant_mismatch,
+                    data=data)
+            except SpinPriorMismatchError:
+                # A constituent-mixture row REPLACES the borrowed spin prior,
+                # and the mixture refuses disagreeing constituents itself.
+                if not cmix_row:
+                    raise
+                sp = resolve_spin_prior_full(
+                    analysis, analyses, priors, a1_samp, a2_samp,
+                    allow_variant_mismatch=True, data=data)
             spin_amax_1, spin_amax_2, spin_kind, spin_src = (
                 sp.amax_1, sp.amax_2, sp.kind, sp.source)
             if sp.samples_exceed_amax and cfg.spin_exceeds_amax == "raise":
@@ -2275,9 +2371,7 @@ def build_store(paths, out_path, params=None, extra_params=None,
                     f"(spin_exceeds_amax='raise').")
             # ── Constituent-mixture prior for C00:Mixed (GW-40f, opt-in) ─────
             cmix = None
-            if (cfg.constituent_mixture_prior
-                    and _label_parts(analysis)[0] == "C00"
-                    and _label_parts(analysis)[1] == "Mixed"):
+            if cmix_row:
                 cmix = _constituent_mixture_prior(
                     catalog, analysis, analyses, samples_dict, priors, cfg,
                     flavour)
