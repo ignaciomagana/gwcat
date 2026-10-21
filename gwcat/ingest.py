@@ -44,7 +44,8 @@ import h5py
 from .cosmology import (make_cosmology, uniform_source_frame_prob,
                         dL_prior_prob, DL_PRIOR_KINDS, DL_PRIOR_NEEDS_ALPHA,
                         DistancePriorKindError, NAMED_COSMOLOGIES,
-                        PLANCK15, O4_FALLBACK)
+                        PLANCK15, O4_FALLBACK, UnrecognisedCosmologyError,
+                        is_radiation_free_flat_lcdm, resolve_named_cosmology)
 from .source_class import (normalize_source_class, classify_by_mass,
                           DEFAULT_NSBH_MASS_THRESHOLD)
 from .spin import chi_p_from_components
@@ -701,7 +702,9 @@ def _parse_analytic_dL(prior_string: str) -> AnalyticDLPrior:
     The class name is taken from the first ``Name(`` in the string, so a dotted
     module path is stripped and a nested cosmology repr cannot be mistaken for
     it.  Cosmology resolution is by EXACT token match against
-    :data:`gwcat.cosmology.NAMED_COSMOLOGIES`: the old ``"Planck15" in tok``
+    :data:`gwcat.cosmology.NAMED_COSMOLOGIES` (plus bilby's case-insensitive
+    ``planck15_lal``, :func:`gwcat.cosmology.resolve_named_cosmology`; a
+    cosmology with radiation is left unresolved): the old ``"Planck15" in tok``
     substring test also matched ``'Planck15_LAL'``, silently giving 190 O4 rows
     astropy's (67.74, 0.3075) instead of LAL's (67.90, 0.3065).
     """
@@ -740,14 +743,15 @@ def _parse_analytic_dL(prior_string: str) -> AnalyticDLPrior:
             else:
                 cosmology_name = bare.split("(", 1)[0].strip()
                 cosmology_recognized = False
-        elif bare in NAMED_COSMOLOGIES:
-            cosmo = NAMED_COSMOLOGIES[bare]
+        elif is_radiation_free_flat_lcdm(resolve_named_cosmology(bare)):
+            cosmo = resolve_named_cosmology(bare)
             H0, Om0 = cosmo.H0.value, cosmo.Om0
             cosmology_name = bare
             cosmology_recognized = True
         else:
-            # A named cosmology gwcat does not know.  Do NOT guess: record the
-            # token and leave H0/Om0 unresolved so the caller can be loud.
+            # A named cosmology gwcat does not know -- or one (H0, Om0) cannot
+            # describe, like astropy's Planck15 with radiation.  Do NOT guess:
+            # record the token and leave H0/Om0 unresolved; the caller refuses.
             cosmology_name = bare
             cosmology_recognized = False
 
@@ -936,17 +940,20 @@ def resolve_dL_prior(catalog, analysis, analyses, priors, dL_samples,
     H0, Om0 = parsed.H0, parsed.Om0
     cosmology_source = "analytic_declared"
     if H0 is None:
+        if parsed.cosmology_recognized is False:
+            known = resolve_named_cosmology(parsed.cosmology_name)
+            why = ("is a cosmology with radiation, which the (H0, Om0) a "
+                   "store records cannot represent exactly"
+                   if known is not None else "is not one gwcat knows")
+            raise UnrecognisedCosmologyError(
+                f"{analysis}: analytic distance prior names cosmology "
+                f"{parsed.cosmology_name!r}, which {why}. Refusing to evaluate "
+                f"it at the catalog default {default_cosmo} instead. Add it "
+                f"to gwcat.cosmology.NAMED_COSMOLOGIES if it is a real flat, "
+                f"radiation-free cosmology.")
         H0, Om0 = default_cosmo
         src += "+default_cosmo"
         cosmology_source = "catalog_default"
-        if parsed.cosmology_recognized is False:
-            warnings.warn(
-                f"{analysis}: analytic distance prior names an unrecognised "
-                f"cosmology {parsed.cosmology_name!r}; falling back to "
-                f"(H0={H0}, Om0={Om0}). Add it to "
-                f"gwcat.cosmology.NAMED_COSMOLOGIES if it is real -- the KS "
-                f"check against the file's own prior samples is the only thing "
-                f"standing between this guess and a wrong p_dL_pe.")
 
     kind = sampling_kind or "UniformSourceFrame"
     alpha = parsed.alpha
