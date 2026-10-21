@@ -1376,7 +1376,9 @@ class GWCatalog:
                       summary_context: Optional[dict] = None,
                       allow_zero_p_pe: bool = False,
                       allow_unpaired_pastro_min: bool = False,
-                      allow_unpaired_point_estimate_cuts: bool = False):
+                      allow_unpaired_point_estimate_cuts: bool = False,
+                      max_out_of_support_frac: float = 0.0,
+                      allow_out_of_support: bool = False):
         """Write an HDF5 consumable by darksirens.gw.utils.load_gw_samples.
 
         p_pe convention (spin-prior contract)
@@ -1510,6 +1512,13 @@ class GWCatalog:
             ``sky_area_max``), which no injection campaign reproduces.  The
             file then records ``point_estimate_cuts`` and the paired
             validator refuses it; see :meth:`SelectionSpec.check_pairable`.
+        max_out_of_support_frac, allow_out_of_support
+            The 2.0 builder's spin-support gate: a sample outside the chi_eff
+            prior's support (a forced ``amax`` below the samples) gets an
+            exactly-zero p_pe, and the export refuses when the fraction of such
+            samples exceeds ``max_out_of_support_frac`` (default 0) unless
+            ``allow_out_of_support=True``.  The counts are recorded either way
+            (``n_samples_out_of_support``, ``n_out_of_support_per_event``).
 
         Provenance (GW-33)
         ------------------
@@ -1832,17 +1841,51 @@ class GWCatalog:
             # density, so the finiteness test admitted excluded samples with a
             # p_pe ~1e12 too small -- an inverse weight ~1e12 too LARGE (GW-31).
             in_support_v1 = np.concatenate(sup_parts) & np.isfinite(logp_chi)
-            n_unsupported = int(np.sum(~in_support_v1))
-            if n_unsupported:
-                warnings.warn(
-                    f"to_darksirens: {n_unsupported} of {logp_chi.size} samples "
-                    f"fall outside the chi_eff prior's support (per-event amax "
-                    f"in [{min(kept_amax1):g}, {max(kept_amax1):g}]); their "
-                    f"p_pe is exactly zero, which the consumer masks while "
-                    f"still counting them in n for the per-event MC variance.")
             with np.errstate(over="ignore"):
                 data["p_pe"] = data["p_pe"] * np.where(
                     in_support_v1, np.exp(logp_chi), 0.0)
+
+        # ── The out-of-support gate (review 2026-10-20) ─────────────────────
+        # The 2.0 builder's gate, under its names.  This writer used to warn
+        # and write the zeros for ANY fraction of out-of-support samples, with
+        # no record, and its validator then failed the file and blamed the
+        # distance prior: `--amax 0.3` wrote 19% zero-weight samples that the
+        # consumer masks, truncating the posterior.
+        n_out_v1 = int(np.sum(~in_support_v1))
+        frac_out_v1 = (n_out_v1 / in_support_v1.size
+                       if in_support_v1.size else 0.0)
+        n_out_per_event_v1 = (
+            (~in_support_v1.reshape(nobs, nsamp)).sum(axis=1).astype(np.int64)
+            if nobs and nsamp and in_support_v1.size == nobs * nsamp
+            else np.zeros(nobs, dtype=np.int64))
+        if (n_out_v1 and frac_out_v1 > max_out_of_support_frac
+                and not allow_out_of_support):
+            from .export.pe_builder import OutOfSupportError
+            hit = np.nonzero(n_out_per_event_v1)[0]
+            listed = ", ".join(f"{kept[i]}: {int(n_out_per_event_v1[i])}/{nsamp}"
+                               for i in hit[:10])
+            more = "" if hit.size <= 10 else f", ... (+{hit.size - 10} more)"
+            raise OutOfSupportError(
+                f"to_darksirens: {n_out_v1} of {in_support_v1.size} samples "
+                f"({100 * frac_out_v1:.3f}%) fall outside the chi_eff prior's "
+                f"support (per-event amax_1 in [{min(kept_amax1):g}, "
+                f"{max(kept_amax1):g}]), above max_out_of_support_frac="
+                f"{max_out_of_support_frac:g}. Affected event(s) [{hit.size} "
+                f"of {nobs}]: {listed}{more}. Their p_pe would be exactly zero "
+                f"-- the prior assigns them no density -- which means the "
+                f"ceiling does not cover the samples; the consumer would mask "
+                f"them, truncating the posterior. Use the events' own ceilings "
+                f"(amax='auto'), or pass allow_out_of_support=True to export "
+                f"anyway (recorded).")
+        if n_out_v1:
+            warnings.warn(
+                f"to_darksirens: exporting with {n_out_v1} of "
+                f"{in_support_v1.size} samples ({100 * frac_out_v1:.3f}%) "
+                f"outside the chi_eff prior's support (allow_out_of_support="
+                f"{bool(allow_out_of_support)}); their p_pe is exactly zero, "
+                f"which the consumer masks while still counting them in n for "
+                f"the per-event MC variance. Recorded as "
+                f"n_samples_out_of_support.")
 
         # ── Mass-prior basis, from the rows written (GW-34/GW-37) ───────────
         mass_kinds = [str(k) for k in kept_mass_kind]
@@ -2009,6 +2052,14 @@ class GWCatalog:
             f.attrs["spin_amax_fallback"] = float(amax_fallback)
             f.attrs["spin_amax_fallback_events"] = np.array(
                 amax_fallback_events, dtype=h5py.string_dtype())
+            # Spin-support accounting (review 2026-10-20), under the 2.0
+            # builder's names; the v1 validator reads it to tell recorded
+            # spin-support zeros from a truncated distance prior.
+            f.attrs["n_samples_out_of_support"] = int(n_out_v1)
+            f.attrs["frac_samples_out_of_support"] = float(frac_out_v1)
+            f.attrs["n_out_of_support_per_event"] = n_out_per_event_v1
+            f.attrs["max_out_of_support_frac"] = float(max_out_of_support_frac)
+            f.attrs["out_of_support_allowed"] = bool(allow_out_of_support)
             # Scalar PE cosmology: the override, or the first kept event's
             # cosmology in per-event mode (authoritative record is the
             # per-event array above when cosmology_per_event_varies=True).
@@ -2378,13 +2429,45 @@ def validate_export(gw_path: str, selection_path: str = None, strict: bool = Fal
                 # zero weight into a -inf log-weight that still counts in n.
                 n_zero = int(np.sum(p == 0))
                 n_neg = int(np.sum(p < 0))
-                _check("pe_p_pe_positive", n_zero == 0 and n_neg == 0,
+                # Zeros the writer RECORDED as spin-support zeros (written on
+                # purpose under allow_out_of_support) are not the distance-
+                # prior failure this check exists for, and blaming the distance
+                # prior for them sent the user to re-ingest a correct store
+                # (review 2026-10-20).  They are counted against the record;
+                # any zero beyond it still fails.
+                n_oos = 0
+                if bool(f.attrs.get("out_of_support_allowed", False)):
+                    try:
+                        n_oos = int(f.attrs.get("n_samples_out_of_support", 0))
+                    except (TypeError, ValueError):
+                        n_oos = 0
+                n_unexplained = max(n_zero - n_oos, 0)
+                if n_oos and n_zero >= n_oos:
+                    cause = (f"{n_oos} of the zeros are recorded spin-support "
+                             f"zeros (n_samples_out_of_support, written under "
+                             f"allow_out_of_support=True); the other "
+                             f"{n_unexplained} are not, and a zero at an "
+                             f"in-support sample means the store's p_dL_pe was "
+                             f"truncated at the recorded distance-prior bounds "
+                             f"-- re-ingest so the distance prior is evaluated "
+                             f"over the full sample range.")
+                elif n_oos:
+                    cause = (f"the file records {n_oos} spin-support zeros but "
+                             f"holds only {n_zero}; the record does not "
+                             f"describe the data.")
+                else:
+                    cause = ("A zero p_pe means the store's p_dL_pe was "
+                             "truncated at the recorded distance-prior bounds "
+                             "-- re-ingest so the distance prior is evaluated "
+                             "over the full sample range -- or the samples lie "
+                             "outside the spin prior's support (a forced amax "
+                             "below them), which the writer refuses unless "
+                             "allow_out_of_support=True.")
+                _check("pe_p_pe_positive",
+                       n_unexplained == 0 and n_neg == 0 and n_zero >= n_oos,
                        f"{n_zero} zero ({100 * n_zero / p.size:.2f}%) and "
                        f"{n_neg} negative of {p.size} samples; "
-                       f"min={np.nanmin(p):.3e}. A zero p_pe means the store's "
-                       f"p_dL_pe was truncated at the recorded distance-prior "
-                       f"bounds -- re-ingest so the distance prior is evaluated "
-                       f"over the full sample range.")
+                       f"min={np.nanmin(p):.3e}. " + cause)
                 # Check no event is entirely zero-weight.  A ragged file is the
                 # exact condition this function exists to report, so record it
                 # as a failed check -- reshape would raise and take the whole

@@ -366,3 +366,33 @@ def test_v1_symmetric_ceiling_is_still_written(tmp_path):
         spin_prior_mode="exclude")
     with h5py.File(out, "r") as f:
         assert float(f.attrs["chi_eff_amax"]) == 0.99
+
+
+# ==========================================================================
+# The v1 exporter gates out-of-support samples like the 2.0 builder
+# ==========================================================================
+def test_v1_out_of_support_samples_are_refused_by_default(tmp_path):
+    """`gwcat export-darksirens --amax 0.3` wrote 19% zero-weight samples with
+    only a warning and no record."""
+    from gwcat.export.pe_builder import OutOfSupportError
+    out = tmp_path / "oos.h5"
+    with pytest.raises(OutOfSupportError, match="max_out_of_support_frac"):
+        GWCatalog(_three(tmp_path)).to_darksirens(
+            str(out), nsamp=32, seed=0, cosmology=_COSMO, amax=0.1)
+    assert not out.exists()
+
+
+def test_v1_allowed_out_of_support_zeros_are_recorded_and_validate(tmp_path):
+    out = tmp_path / "oos_ok.h5"
+    with pytest.warns(UserWarning, match="outside the chi_eff prior's support"):
+        GWCatalog(_three(tmp_path)).to_darksirens(
+            str(out), nsamp=32, seed=0, cosmology=_COSMO, amax=0.1,
+            allow_out_of_support=True)
+    with h5py.File(out, "r") as f:
+        n_oos = int(f.attrs["n_samples_out_of_support"])
+        assert n_oos > 0
+        assert int(np.sum(np.asarray(f["p_pe"]) == 0)) == n_oos
+        assert int(np.sum(f.attrs["n_out_of_support_per_event"])) == n_oos
+    results = validate_export(str(out))
+    # The recorded spin-support zeros are not a distance-prior failure.
+    assert results["pe_p_pe_positive"] is True
