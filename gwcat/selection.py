@@ -1018,8 +1018,9 @@ def campaign_provenance_attrs(set_list, *, draw_domain=None,
     declared injection draw domain (review 2026-10-20, high-4): each
     campaign's declared bounds (``None`` = undeclared), the extent its rows
     actually span, whether some campaign drew past another's declared bound,
-    and which ``draw_domain`` policy the export applied; and the FAR-column
-    discovery record (medium-31).
+    and which ``draw_domain`` policy the export applied; the FAR-column
+    discovery record (medium-31); and the detected generation cosmology,
+    which an override does not erase (medium-33).
     """
     if draw_domain_mismatch is None:
         draw_domain_mismatch = draw_domain_mismatches(set_list)
@@ -1046,6 +1047,15 @@ def campaign_provenance_attrs(set_list, *, draw_domain=None,
         # searches / FAR-looking columns that were not used (medium-31).
         "significance_far_discovery_per_campaign": json.dumps(
             [getattr(s, "_far_discovery", None) or {} for s in set_list]),
+        # The generation cosmology detected from each campaign's (z, dL)
+        # pairs, also when an override was used for the Jacobian instead;
+        # NaN where none was detected or none applies (medium-33).
+        "cosmology_generation_H0_per_campaign": np.array(
+            [_cosmo_or_nan(s, "_cosmology_generation_H0") for s in set_list],
+            dtype=float),
+        "cosmology_generation_Om0_per_campaign": np.array(
+            [_cosmo_or_nan(s, "_cosmology_generation_Om0") for s in set_list],
+            dtype=float),
     }
 
 
@@ -1108,6 +1118,10 @@ class SelectionSet:
         self._cosmology_used_H0 = None
         self._cosmology_used_Om0 = None
         self._cosmology_detect_residual = None
+        # The generation cosmology detected from the file's (z, dL) pairs,
+        # recorded even when an override is used instead (medium-33).
+        self._cosmology_generation_H0 = None
+        self._cosmology_generation_Om0 = None
         # PR4 read-time spin checks: "warn" (default) records + emits a warning
         # on failure, "raise" raises, "off" records silently.  Normalised here
         # so an invalid value fails loudly at construction.
@@ -1191,11 +1205,15 @@ class SelectionSet:
     def _resolve_jacobian_cosmology(self, z, dL):
         """Pick the cosmology for ``ddL/dz`` on a file that does not ship it.
 
-        An explicit override wins -- an analyst may be deliberately probing a
-        different cosmology -- but the campaign's *own* generation cosmology is
-        the default, because using anything else silently mis-states the
-        Jacobian that converts the generated ``(m1src, m2src, z)`` density into
-        the ``(m1det, q, dL)`` one.
+        The campaign's *own* generation cosmology is the default, because using
+        anything else mis-states the Jacobian that converts the generated
+        ``(m1src, m2src, z)`` density into the ``(m1det, q, dL)`` one.  An
+        explicit override is still honoured, but it is never a valid draw
+        density when the generation cosmology is detectable: the ``(z, dL)``
+        pairs in the file fix the draw, so the override changes only ``ddL/dz``
+        (review 2026-10-20, medium-33).  It therefore warns with the size of
+        the z-dependent distortion and records the detected generation
+        cosmology next to the override (``cosmology_generation_*``).
 
         The production build passed ``(67.74, 0.3089)``.  The endo3 BBH campaign
         was generated at ``(67.90, 0.3065)``, so its ``pdraw`` carried a
@@ -1206,6 +1224,27 @@ class SelectionSet:
         """
         if self._cosmology_override:
             self._record_cosmology("override", self.H0, self.Om0)
+            det = detect_generation_cosmology(z, dL)
+            if det is not None:
+                H0_g, Om0_g, _ = det
+                self._cosmology_generation_H0 = float(H0_g)
+                self._cosmology_generation_Om0 = float(Om0_g)
+                if not (np.isclose(H0_g, self.H0, rtol=1e-5, atol=0.0)
+                        and np.isclose(Om0_g, self.Om0, rtol=1e-5, atol=0.0)):
+                    ratio = (_ddL_dz(z, dL, H0_g, Om0_g)
+                             / _ddL_dz(z, dL, self.H0, self.Om0))
+                    warnings.warn(
+                        f"{self.path}: the explicit cosmology (H0={self.H0}, "
+                        f"Om0={self.Om0}) differs from the generation "
+                        f"cosmology detected from the campaign's own (z, dL) "
+                        f"pairs (H0={H0_g:.6g}, Om0={Om0_g:.6g}). The draws "
+                        f"were made at the latter, so the override changes "
+                        f"only ddL/dz and scales pdraw by a z-dependent "
+                        f"factor in [{float(np.min(ratio)):.6f}, "
+                        f"{float(np.max(ratio)):.6f}] -- not a valid draw "
+                        f"density. Drop H0/Om0 to use the generation "
+                        f"cosmology. Recorded as cosmology_source='override' "
+                        f"with cosmology_generation_H0/Om0_per_campaign.")
             return self.H0, self.Om0
 
         det = detect_generation_cosmology(z, dL)
@@ -1222,6 +1261,8 @@ class SelectionSet:
 
         H0, Om0, resid = det
         self._record_cosmology("detected", H0, Om0, resid)
+        self._cosmology_generation_H0 = float(H0)
+        self._cosmology_generation_Om0 = float(Om0)
         return H0, Om0
 
     def _load(self):

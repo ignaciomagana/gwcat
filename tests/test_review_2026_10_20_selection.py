@@ -385,3 +385,53 @@ def test_fallback_far_scan_order_does_not_depend_on_the_hash_seed(tmp_path):
                              capture_output=True, text=True, check=True)
         seen.add(out.stdout.strip())
     assert seen == {",".join(names)}          # file order, every seed
+
+
+# ======================================================================
+# medium-33: an explicit cosmology against the detected generation one
+# ======================================================================
+def _endo3_at_cosmology(path, cosmo, n=400, seed=31):
+    """An endo3 fixture whose (z, dL) pairs were made with ``cosmo``."""
+    write_endo3_full(path, n=n, seed=seed)
+    z = np.sort(np.random.default_rng(seed).uniform(0.02, 1.5, n))
+    with h5py.File(path, "r+") as f:
+        g = f["injections"]
+        m1s, m2s = g["mass1_source"][:], g["mass2_source"][:]
+        for k, v in {"redshift": z,
+                     "distance": cosmo.luminosity_distance(z).value,
+                     "mass1": m1s * (1 + z), "mass2": m2s * (1 + z)}.items():
+            del g[k]
+            g.create_dataset(k, data=v)
+    return str(path)
+
+
+def test_override_against_a_detected_generation_cosmology_warns_and_records(
+        tmp_path):
+    from astropy.cosmology import FlatLambdaCDM
+    path = _endo3_at_cosmology(tmp_path / "o3.hdf",
+                               FlatLambdaCDM(H0=67.90, Om0=0.3065))
+    s = SelectionSet(path, H0=67.74, Om0=0.3089, strict_spin_checks="off")
+    with pytest.warns(UserWarning, match="differs from the generation"):
+        s._load()
+    assert s._cosmology_source == "override"
+    assert np.isclose(s._cosmology_generation_H0, 67.90, rtol=1e-5)
+    out = tmp_path / "sel.h5"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        s.export(str(out), spin_basis="component")
+    with h5py.File(out, "r") as f:
+        gen = np.asarray(f.attrs["cosmology_generation_H0_per_campaign"])
+        used = np.asarray(f.attrs["cosmology_H0_per_campaign"])
+    assert np.isclose(gen[0], 67.90, rtol=1e-5) and used[0] == 67.74
+
+
+def test_no_override_records_the_detected_generation_cosmology(tmp_path):
+    from astropy.cosmology import FlatLambdaCDM
+    path = _endo3_at_cosmology(tmp_path / "o3.hdf",
+                               FlatLambdaCDM(H0=67.90, Om0=0.3065))
+    s = SelectionSet(path, strict_spin_checks="off")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        s._load()
+    assert s._cosmology_source == "detected"
+    assert np.isclose(s._cosmology_generation_Om0, 0.3065, rtol=1e-5)
