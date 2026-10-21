@@ -55,8 +55,11 @@ factor -- is isolated in :func:`_apply_chieff_basis` (and, for PR 6, in
 :func:`_apply_component_basis` / :func:`_apply_chieff_chip_basis`), so the shared
 scaffold is untouched.  Extra per-sample columns the new bases need
 (``a_1``/``a_2``/``cos_tilt_i``/``chi_p``) are fetched and resampled ONLY for
-the non-chieff bases: the chieff path never fetches them, so the rng stream and
-therefore the chieff parity is preserved exactly.
+the non-chieff bases: the chieff path never fetches them as columns, so the rng
+stream and therefore the chieff parity is preserved exactly.  (Every spin basis
+does read an event's whole ``a_1``/``a_2`` once, before its draw, to COUNT the
+samples above the spin ceiling -- a read, never an rng call; see the
+spin-support section of :func:`build_pe_product`.)
 
 Design decisions (PR 6)
 -----------------------
@@ -160,6 +163,12 @@ def _ess_of_inverse_weights(p_pe, nobs, nsamp):
     This is the diagnostic the ``-50`` floor destroyed: floored samples carried
     ~1e21 times the median weight, so a single one drove ESS to ~1 out of
     thousands, and nothing recorded it.
+
+    It is over ROWS: an event drawn with replacement counts each repeated row
+    again, so its ESS can exceed its number of distinct samples.
+    :func:`_ess_of_inverse_weights_distinct` is the same sum over distinct
+    samples, the number a consumer's per-event MC variance should be read
+    against.
     """
     if not nobs or not nsamp:
         return np.array([], dtype=float)
@@ -172,6 +181,29 @@ def _ess_of_inverse_weights(p_pe, nobs, nsamp):
     with np.errstate(divide="ignore", invalid="ignore"):
         ess = np.where(s2 > 0, s1 ** 2 / s2, 0.0)
     return np.asarray(ess, dtype=float)
+
+
+def _ess_of_inverse_weights_distinct(p_pe, rows_per_event, nobs, nsamp,
+                                     ess_rows):
+    """Per-event ESS of the ``1/p_pe`` reweighting over DISTINCT samples.
+
+    ``rows_per_event[i]`` are the store rows behind event ``i``'s ``nsamp``
+    exported rows.  A bootstrapped event (drawn with replacement) repeats rows,
+    and the row ESS counts every repeat as an independent sample; here each
+    distinct sample counts once, at its first exported position.  An event with
+    no repeated row keeps its row ESS (``ess_rows``) bit for bit.
+    """
+    out = np.array(ess_rows, dtype=float, copy=True)
+    if not nobs or not nsamp:
+        return out
+    p = np.asarray(p_pe, dtype=float).reshape(nobs, nsamp)
+    for i, rows in enumerate(rows_per_event):
+        _u, first = np.unique(np.asarray(rows), return_index=True)
+        if first.size == nsamp:
+            continue
+        first.sort()
+        out[i] = _ess_of_inverse_weights(p[i, first], 1, first.size)[0]
+    return out
 
 
 class ProjectionBasisNotAllowed(ValueError):
@@ -575,6 +607,9 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     kept_ss_name, kept_ss_approx, kept_ss_reason = [], [], []
     # Resampling provenance (GW-13), aligned with ``kept``.
     n_unique_per_event, upsampled_events = [], []
+    #: The store rows behind each kept event's nsamp exported rows (the ESS
+    #: over distinct samples needs to know which rows repeat).
+    drawn_rows = []
 
     # ── Per-event spin-prior ceiling scaffolding (every spin basis) ─────────
     # Per-event spin amax from the store meta (aligned with selected events).
@@ -779,6 +814,7 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             # it a bootstrapped event's per-event ESS reads high by the duplication
             # factor -- the very diagnostic that should flag it as unusable.
             n_unique_per_event.append(int(np.unique(idx_orig).size))
+            drawn_rows.append(idx_orig)
             if rep and n_kept < nsamp:
                 upsampled_events.append(str(sub.event_names[e]))
 
@@ -1205,6 +1241,10 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     # diagnostic the -50 floor destroyed: a single floored sample took
     # essentially all the weight, giving ESS ~ 1 out of thousands.
     ess_per_event = _ess_of_inverse_weights(columns["p_pe"], nobs, nsamp)
+    # The same over DISTINCT samples: a bootstrapped event's repeated rows are
+    # not independent, so its row ESS above can exceed its n_unique.
+    ess_distinct_per_event = _ess_of_inverse_weights_distinct(
+        columns["p_pe"], drawn_rows, nobs, nsamp, ess_per_event)
 
     if n_out and frac_out > max_out_of_support_frac and not allow_out_of_support:
         hit = np.nonzero(n_out_per_event)[0]
@@ -1378,7 +1418,12 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         "n_samples_out_of_support": int(n_out),
         "frac_samples_out_of_support": float(frac_out),
         "n_out_of_support_per_event": n_out_per_event,
+        # Over the nsamp ROWS (a repeated row counts again) ...
         "prior_reweight_ess_per_event": ess_per_event,
+        # ... and over the DISTINCT samples behind them, each counted once:
+        # the one to compare with n_unique_samples_per_event, and the one a
+        # consumer's per-event MC variance should be read against.
+        "prior_reweight_ess_distinct_per_event": ess_distinct_per_event,
         "max_out_of_support_frac": float(max_out_of_support_frac),
         "out_of_support_allowed": bool(allow_out_of_support),
         # ── The spin-support cut (GW-40c) ────────────────────────────────────
@@ -1497,6 +1542,12 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                                    if ess_per_event.size else None),
         "prior_reweight_ess_median": (float(np.median(ess_per_event))
                                       if ess_per_event.size else None),
+        "prior_reweight_ess_distinct_min": (
+            float(np.min(ess_distinct_per_event))
+            if ess_distinct_per_event.size else None),
+        "prior_reweight_ess_distinct_median": (
+            float(np.median(ess_distinct_per_event))
+            if ess_distinct_per_event.size else None),
         "chi_p_definition": str(chi_p_definition),
         "spin_ceiling_cut_applied": bool(drop_spin_above_ceiling),
         "n_dropped_spin_above_ceiling": int(sum(n_dropped_spin)),
