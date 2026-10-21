@@ -765,6 +765,11 @@ def validate_export_v2(pe_path, selection_path=None, strict=False, *,
         # (e2b) Mock-data provenance on the two sides.
         _xcheck_mock_data(results, pe_attrs, sel_attrs)
 
+        # (e2c) A cumulative mixture must detect something in every PE
+        # event's run.
+        if bool(sel_attrs.get("cumulative_mixture", False)):
+            _xcheck_mixture_event_runs(_fail, results, pe_attrs, sel_attrs)
+
         # (e3) The same chi_eff prior implementation on both sides (GW-40i).
         _xcheck_chi_eff_prior_impl(_fail, results, pe_attrs, sel_attrs,
                                    strict=strict,
@@ -925,6 +930,143 @@ def _xcheck_mock_data(results, pe_attrs, sel_attrs):
             f"for a mock-events-through-real-injections design; otherwise the "
             f"pair is mismatched.")
     results["xcheck_mock_data"] = True
+
+
+#: Leap seconds GPS - UTC from each UTC date on (none since 2017-01-01).
+_GPS_LEAP_SECONDS = ((2012, 7, 1, 16), (2015, 7, 1, 17), (2017, 1, 1, 18))
+
+
+def _event_gps_span(name):
+    """The GPS time of an event NAME, as a ``(start, end)`` span, or ``None``.
+
+    ``GWyymmdd_hhmmss`` is a UTC time and gives a zero-width span; a bare
+    ``GWyymmdd`` gives its whole UTC day.  Anything else (synthetic names) is
+    ``None``: the files record no event times, so the name is the only clock.
+    """
+    import datetime as _dt
+    import re as _re
+
+    m = _re.fullmatch(r"GW(\d{2})(\d{2})(\d{2})(?:_(\d{2})(\d{2})(\d{2}))?",
+                      str(name).strip())
+    if m is None:
+        return None
+    y, mo, d = (int(x) for x in m.group(1, 2, 3))
+    try:
+        t0 = _dt.datetime(2000 + y, mo, d)
+        if m.group(4) is not None:
+            t0 = t0.replace(hour=int(m.group(4)), minute=int(m.group(5)),
+                            second=int(m.group(6)))
+    except ValueError:
+        return None
+
+    def _gps(t):
+        leap = 0
+        for yy, mm, dd, n in _GPS_LEAP_SECONDS:
+            if t >= _dt.datetime(yy, mm, dd):
+                leap = n
+        return (t - _dt.datetime(1980, 1, 6)).total_seconds() + leap
+
+    if m.group(4) is not None:
+        g = _gps(t0)
+        return g, g
+    return _gps(t0), _gps(t0 + _dt.timedelta(days=1)) - 1.0
+
+
+def _event_run(name):
+    """The observing run of an event name (official exposure windows), or
+    ``None`` when the name gives no time, or a time in no single window."""
+    from ..observing_runs import EXPOSURE_WINDOWS_GPS, RunWindowError, run_of_gps
+
+    span = _event_gps_span(name)
+    if span is None:
+        return None
+    try:
+        lo = run_of_gps(span[0], EXPOSURE_WINDOWS_GPS)
+        hi = run_of_gps(span[1], EXPOSURE_WINDOWS_GPS)
+    except RunWindowError:
+        return None
+    return lo if lo == hi else None
+
+
+def _xcheck_mixture_event_runs(_fail, results, pe_attrs, sel_attrs):
+    """Every PE event's run must have detectable rows in the mixture.
+
+    A cumulative-mixture selection records, per run, how many rows it wrote
+    (``n_detected_per_run``) and which detection rule applied
+    (``detection_rule_per_run``).  An acknowledged FAR-only export detects
+    nothing in O1/O2 (rule ``none(semianalytic_rows_excluded)``): it is correct
+    only for an event list with no O1/O2 events, and nothing compared the two.
+    Each PE event is placed in a run by the time in its name (official
+    exposure windows); an event in a run the mixture does not cover, or covers
+    with no detectable rows, enters the likelihood with no term for its run in
+    mu, which is refused.
+
+    With other campaigns in the product, an event outside the mixture's runs
+    may be covered by one of them (the files record no campaign time ranges),
+    so that case warns.  Names that give no time (synthetic events) warn.
+    """
+    names = pe_attrs.get("event_names")
+    runs = sel_attrs.get("run_labels")
+    if names is None or runs is None:
+        # The sel_mixture_has_* checks report a missing run_labels; a PE file
+        # without event_names has nothing to place.
+        results["xcheck_mixture_event_runs"] = True
+        return
+    runs = [_impl_str(r) for r in np.atleast_1d(runs)]
+    n_per = np.atleast_1d(np.asarray(
+        sel_attrs.get("n_detected_per_run", [0] * len(runs)))).astype(int)
+    rules = [_impl_str(r) for r in np.atleast_1d(
+        sel_attrs.get("detection_rule_per_run", [""] * len(runs)))]
+    if not (len(runs) == n_per.size == len(rules)):
+        # The alignment checks above have failed already.
+        results["xcheck_mixture_event_runs"] = True
+        return
+    n_camp = len(np.atleast_1d(
+        sel_attrs.get("campaign_kind_per_campaign", [""])))
+    detectable = {r: (int(n) > 0 and not rule.startswith("none"))
+                  for r, n, rule in zip(runs, n_per, rules)}
+    blind, outside, untimed = [], [], []
+    for n in (_impl_str(x) for x in np.atleast_1d(names)):
+        if _event_gps_span(n) is None:
+            untimed.append(n)
+            continue
+        r = _event_run(n)
+        if r is None or r not in detectable:
+            outside.append((n, r))
+        elif not detectable[r]:
+            blind.append((n, r))
+    if blind:
+        by_run = {}
+        for n, r in blind:
+            by_run.setdefault(r, []).append(n)
+        _fail("xcheck_mixture_event_runs",
+              f"{len(blind)} PE event(s) lie in run(s) where the cumulative-"
+              f"mixture selection detects nothing: "
+              + "; ".join(f"{r} [{len(v)}]: {v[:5]}"
+                          for r, v in sorted(by_run.items()))
+              + f" (n_detected_per_run={dict(zip(runs, n_per.tolist()))}, "
+                f"detection_rule_per_run={dict(zip(runs, rules))}). Those "
+                f"events enter the likelihood with no term for their run in "
+                f"mu. Drop them from the PE export (--event-list), or build "
+                f"the selection with --snr-threshold so the semianalytic rows "
+                f"are detected.")
+    if outside:
+        msg = (f"{len(outside)} PE event(s) lie outside every run of the "
+               f"cumulative mixture ({runs}): "
+               + ", ".join(f"{n} ({r or 'no official run window'})"
+                           for n, r in outside[:10])
+               + ". Their exposure is not in this mixture.")
+        if n_camp > 1:
+            warnings.warn(msg + " Another campaign of this product may cover "
+                                "them; the files cannot show which.")
+        else:
+            _fail("xcheck_mixture_event_runs", msg)
+    if untimed:
+        warnings.warn(
+            f"{len(untimed)} PE event name(s) carry no GPS time (e.g. "
+            f"{untimed[:3]}), so whether the cumulative mixture detects "
+            f"anything in their runs cannot be checked.")
+    results["xcheck_mixture_event_runs"] = True
 
 
 def _xcheck_source_class_estimator(_fail, results, pe_attrs, sel_attrs):

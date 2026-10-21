@@ -176,3 +176,65 @@ def test_reference_sentinel_that_is_a_real_weight_fails(tmp_path):
     res = validate_export_v2(str(pe), str(sel))
     assert res["sel_reference_sentinel_rows"] is True
     assert res["sel_reference_sentinel_negligible"] is False
+
+
+# ======================================================================
+# A cumulative mixture must detect something in every PE event's run
+# ======================================================================
+def _mixture_sel_o1o2_blind(tmp_path):
+    from test_selection_cumulative_mixture import (write_cumulative_mixture,
+                                                   _ANCHORS)
+    path, _, _ = write_cumulative_mixture(tmp_path / "mix.hdf")
+    out = tmp_path / "sel_mix_ack.h5"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        SelectionSet(path).export(str(out), spin_basis="component",
+                                  snr_threshold=None,
+                                  acknowledge_semianalytic_excluded=True,
+                                  mixture_anchors=_ANCHORS)
+    return out
+
+
+def _pe_named(tmp_path, names, tag):
+    events = [{"name": n, "amax1": 0.99, "amax2": 0.99} for n in names]
+    store, _ = _build_spin_store(tmp_path, events, name=f"store_{tag}.h5")
+    out = tmp_path / f"pe_{tag}.h5"
+    GWCatalog(store).export(str(out), format="gwcat2", spin_basis="component",
+                            nsamp=32, seed=0, cosmology=_COSMO)
+    return out
+
+
+def test_o1o2_blind_mixture_refuses_a_pe_file_with_an_o1_event(tmp_path):
+    """The acknowledged FAR-only mixture export detects nothing in O1/O2; it
+    passed --strict against a PE file holding O1/O2 events."""
+    sel = _mixture_sel_o1o2_blind(tmp_path)
+    pe = _pe_named(tmp_path, ["GW150914_095045", "GW200129_065458"], "o1")
+    with pytest.raises(ValueError) as ei:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            validate_export_v2(str(pe), str(sel), strict=True)
+    msg = str(ei.value)
+    assert "xcheck_mixture_event_runs" in msg
+    assert "GW150914_095045" in msg and "O1" in msg
+    assert "GW200129_065458" not in msg
+
+
+def test_o1o2_blind_mixture_accepts_an_o3_only_pe_file(tmp_path):
+    sel = _mixture_sel_o1o2_blind(tmp_path)
+    pe = _pe_named(tmp_path, ["GW200129_065458", "GW190521_030229"], "o3")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        res = validate_export_v2(str(pe), str(sel))
+    assert res["xcheck_mixture_event_runs"] is True
+
+
+def test_event_names_map_to_their_official_runs():
+    from gwcat.export.validate import _event_gps_span, _event_run
+
+    # GW150914's GPS time is 1126259462.4; the name carries whole seconds.
+    assert _event_gps_span("GW150914_095045") == (1126259462.0, 1126259462.0)
+    assert _event_run("GW150914_095045") == "O1"
+    assert _event_run("GW170817_124104") == "O2"
+    assert _event_run("GW230529_181500") == "O4a"
+    assert _event_run("GW150914") == "O1"          # a whole day inside O1
+    assert _event_gps_span("GWv0_000001") is None
