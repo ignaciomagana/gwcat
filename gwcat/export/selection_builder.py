@@ -187,7 +187,8 @@ from ..selection import (SelectionSet, CombinedSelectionSet,
                          _cosmology_is_mixed, SNR_COLUMN,
                          CAMPAIGN_CUMULATIVE_MIXTURE, MixtureDetectionError,
                          MixtureInvariantError, _mixture_far_only_message,
-                         _semianalytic_far_only_message)
+                         _semianalytic_far_only_message,
+                         _require_positive_finite)
 from ..observing_runs import (RUN_LABELS, SEMIANALYTIC_RUNS,
                               INJECTION_SUPPORT_GPS, EXPOSURE_WINDOWS_GPS,
                               MIXTURE_COMPONENTS, MIXTURE_RELEASE_ANCHORS,
@@ -1494,6 +1495,20 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         data["pdraw"] = np.where(excluded, float(out_of_reference_pdraw),
                                  data["pdraw"])
         n_out_of_reference = int(np.sum(excluded))
+
+    # ── The finished pdraw, every basis (review fix) ────────────────────────
+    # The loader validates `_pdraw`, but the spin factor, the Essick fractions
+    # and the reference change all touch it afterwards, and the multiply above
+    # runs with overflow silenced: a finite-but-huge ln factor became an
+    # infinite pdraw (a zero weight) and an underflow a zero pdraw (an infinite
+    # one), written without a word for the component, chieff and chieff_chip
+    # bases.  What is written is what is checked.
+    _require_positive_finite(
+        data["pdraw"], "pdraw",
+        ", ".join(str(s.path) for s in set_list),
+        note="this is the FINISHED selection pdraw (after the spin factor, the "
+             "Essick N_k/N_total fractions and any reference change); the "
+             "selection integral divides by it.")
 
     # ── Output columns: legacy 10 + (a1,a2,cost1,cost2,chip when available) ──
     columns = {

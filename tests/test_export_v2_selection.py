@@ -1050,3 +1050,20 @@ def test_a_forced_amax_that_contradicts_the_detected_ceiling_warns(tmp_path):
                    for w in rec)
     assert [x.decode() if isinstance(x, bytes) else x
             for x in a["chi_eff_amax_source_per_campaign"]] == ["caller"]
+
+
+@pytest.mark.parametrize("ln_spin", [750.0, -800.0])
+def test_the_finished_pdraw_is_rechecked_for_every_basis(tmp_path, ln_spin):
+    """A finite but huge (or tiny) per-injection spin factor overflowed to an
+    infinite pdraw (or underflowed to zero) with the overflow silenced, and
+    the component basis wrote it -- the loader's positivity check runs before
+    the spin factor, and nothing re-checked the array actually written."""
+    from gwcat.export import build_selection_product
+
+    path = write_o4_full(tmp_path / "o4.hdf", n=20, seed=20)
+    s = SelectionSet(path)
+    s._load()
+    s._ln_spin_component = np.array(s._ln_spin_component, dtype=float)
+    s._ln_spin_component[3] = ln_spin
+    with pytest.raises(ValueError, match="FINISHED selection pdraw"):
+        build_selection_product(s, spin_basis="component")
