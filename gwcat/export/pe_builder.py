@@ -612,6 +612,9 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     #: truncated export and an untruncated one compared EQUAL on
     #: selection_spec_digest, event_list_digest and contract_hash alike.
     n_cut_by_z_max = []
+    #: Selected events with EVERY sample above z_max, which therefore are not
+    #: exported, and the samples each had (review Medium 39).
+    dropped_by_z_max, n_cut_dropped_by_z_max = [], []
     kept_H0, kept_Om0 = [], []
     kept_ss_name, kept_ss_approx, kept_ss_reason = [], [], []
     # Resampling provenance (GW-13), aligned with ``kept``.
@@ -797,6 +800,11 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                 keep = z_e <= z_max
                 n_cut_e = int(np.sum(~keep))
                 if not keep.any():
+                    # Every sample is beyond the cut: the event leaves the
+                    # export.  Named and recorded (review Medium 39) -- it
+                    # used to vanish without a word.
+                    dropped_by_z_max.append(str(sub.event_names[e]))
+                    n_cut_dropped_by_z_max.append(n_cut_e)
                     continue
                 idx_map = np.nonzero(keep)[0]
             else:
@@ -1435,10 +1443,27 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
               "frequencies; f_ref_per_event records each event's. No "
               "pairing check compares f_ref yet.")
 
-    if z_max is not None and any(n > 0 for n in n_cut_by_z_max):
+    # Counted over the SELECTED events, so an event the cut removed entirely
+    # is in both numbers (review Medium 39).
+    n_cut_total = sum(n_cut_by_z_max) + sum(n_cut_dropped_by_z_max)
+    n_events_cut = (sum(1 for n in n_cut_by_z_max if n)
+                    + len(dropped_by_z_max))
+    if z_max is not None and n_cut_total:
+        dropped_msg = ""
+        if dropped_by_z_max:
+            more = ("" if len(dropped_by_z_max) <= 10
+                    else f", ... (+{len(dropped_by_z_max) - 10} more)")
+            dropped_msg = (
+                f", including EVERY sample of {len(dropped_by_z_max)} "
+                f"event(s), which are therefore NOT in the export: "
+                f"{dropped_by_z_max[:10]}{more} (events_dropped_by_z_max). "
+                f"Dropping an event because its whole posterior lies beyond "
+                f"the cut is a selection on the data that no injection cut "
+                f"reproduces")
         warnings.warn(
-            f"z_max={z_max} dropped {sum(n_cut_by_z_max)} posterior sample(s) "
-            f"across {sum(1 for n in n_cut_by_z_max if n)} of {nobs} event(s). "
+            f"z_max={z_max} dropped {n_cut_total} posterior sample(s) "
+            f"across {n_events_cut} of {sub.n_events} selected event(s)"
+            f"{dropped_msg}. "
             f"The selection product must be built with the SAME z_max "
             f"(build_selection_product(z_max=...), CLI --z-max) or mu "
             f"integrates over a redshift range the exported posteriors do not "
@@ -1466,6 +1491,11 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         # validator cross-checks the two.
         "z_max": float("nan") if z_max is None else float(z_max),
         "n_samples_cut_by_z_max": np.asarray(n_cut_by_z_max, dtype=np.int64),
+        # Selected events the cut removed ENTIRELY (every sample above
+        # z_max), with their sample counts (review Medium 39).
+        "events_dropped_by_z_max": np.array(dropped_by_z_max, dtype=_str),
+        "n_samples_cut_by_z_max_dropped_events": np.asarray(
+            n_cut_dropped_by_z_max, dtype=np.int64),
         # spin basis (new in v2)
         "spin_basis": spin_basis,
         # provenance
@@ -1628,6 +1658,7 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         # The redshift truncation, in the sidecar too (GW-37).
         "z_max": None if z_max is None else float(z_max),
         "n_samples_cut_by_z_max": int(sum(n_cut_by_z_max)),
+        "events_dropped_by_z_max": list(dropped_by_z_max),
         # The EFFECTIVE selection (GW-33), the same record the attrs carry.
         "selection_spec": spec.to_dict(),
         "selection_spec_digest": spec.digest(),

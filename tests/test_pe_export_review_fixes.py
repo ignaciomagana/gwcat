@@ -287,3 +287,36 @@ def test_one_f_ref_does_not_warn_and_chieff_never_does(tmp_path):
     _cols, attrs = _read(out)
     f_ref = np.asarray(attrs["f_ref_per_event"], float)
     assert f_ref[0] == 10.0 and np.isnan(f_ref[1])
+
+
+# ==========================================================================
+# An event wholly above z_max is named and recorded (review Medium 39)
+# ==========================================================================
+def test_an_event_wholly_above_z_max_is_named_and_recorded(tmp_path):
+    """Three selected events, one with every sample at dL 5-6 Gpc: it
+    vanished from the export, and the only warning counted the samples over
+    the kept events (or did not fire at all)."""
+    events = [{"name": f"GWz_00000{i + 1}"} for i in range(3)]
+    store, _ = _build_spin_store(tmp_path, events, name="zdrop.h5")
+    with h5py.File(store, "r+") as f:
+        off = f["index/offsets"][:]
+        dL = f["samples/luminosity_distance"][:]
+        n0 = int(off[1] - off[0])
+        dL[int(off[0]):int(off[1])] = np.linspace(5000.0, 6000.0, n0)
+        f["samples/luminosity_distance"][...] = dL
+    out = tmp_path / "pe.h5"
+    with pytest.warns(UserWarning, match=r"1 of 3 selected event.*GWz_000001"):
+        GWCatalog(store).export(str(out), format="gwcat2",
+                                spin_basis="chieff", nsamp=32, seed=0,
+                                cosmology=_COSMO, z_max=0.3)
+    _cols, attrs = _read(out)
+    assert _names(attrs["event_names"]) == ["GWz_000002", "GWz_000003"]
+    assert _names(attrs["events_dropped_by_z_max"]) == ["GWz_000001"]
+    assert [int(x) for x in attrs["n_samples_cut_by_z_max_dropped_events"]] \
+        == [n0]
+    # Without z_max nothing is dropped, and the record says so.
+    out2 = tmp_path / "pe_noz.h5"
+    GWCatalog(store).export(str(out2), format="gwcat2", spin_basis="chieff",
+                            nsamp=32, seed=0, cosmology=_COSMO)
+    _cols, a2 = _read(out2)
+    assert len(a2["events_dropped_by_z_max"]) == 0
