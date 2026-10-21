@@ -86,6 +86,22 @@ def _compact_class_set(compact_type):
     return out
 
 
+def sample_set_map_digest(smap) -> str:
+    """A content digest of a sample-set map: its labels and substitutes.
+
+    The same map gives the same digest however it was handed over -- a JSON
+    file, a mapping, a :class:`gwcat.waveform_policy.SampleSetMap` built in
+    code -- which neither the file's byte hash (``map_sha256``) nor the empty
+    hash of an in-code map did (review 2026-10-20).  It is the formula
+    :func:`gwcat.waveform_policy.sample_set_map_from_mapping` already used for
+    a mapping.
+    """
+    import hashlib
+    return hashlib.sha256(json.dumps(
+        {"events": dict(smap.labels), "substitutes": dict(smap.substitutes)},
+        sort_keys=True).encode()).hexdigest()
+
+
 def _round(x):
     """A float rounded to the digest's precision, or ``None``."""
     return None if x is None else round(float(x), 10)
@@ -680,6 +696,9 @@ class GWCatalog:
         self._selection_reasons = None
         self._homogeneous_sample_sets = True
         self._sample_set_map_report = None
+        #: Content digest of the event-map that chose this view's sample sets
+        #: (:func:`sample_set_map_digest`), or None.
+        self._sample_set_map_digest = None
 
     # ---- selection (operates on metadata only; cheap) --------------------
     @property
@@ -1124,29 +1143,101 @@ class GWCatalog:
         cand = m_evt & in_view
         cand &= np.isin(self.names, list(pass_names))
         sel = np.nonzero(cand)[0]
-        from .waveform_policy import resolve_policy, resolve_event_map
+        from .waveform_policy import (resolve_policy, resolve_event_map,
+                                      load_sample_set_map, WAVEFORM_POLICIES)
         map_report = None
-        if waveform_policy == "event-map":
-            kept, reasons, homogeneous, map_report = resolve_event_map(
-                self.names, sel, self.meta, sample_set_map,
-                q_frac_fn=self._q_below_nrsur_floor_frac,
-                nrsur_q_rule=nrsur_q_rule,
-                nrsur_q_rule_substitute=nrsur_q_rule_substitute)
+        map_digest = None
+        if sample_set_map is not None and waveform_policy == "event-map":
+            sample_set_map = load_sample_set_map(sample_set_map)
+            map_digest = sample_set_map_digest(sample_set_map)
+
+        # ── A chained view keeps the sample sets its policy chose ────────────
+        # (review 2026-10-20).  The exporters re-select with their own default
+        # waveform_policy="preferred", and a second select() used to overwrite
+        # the view's policy with whatever it was passed: the rows stayed the
+        # ones the first policy chose, while the file recorded
+        # waveform_policy='preferred', an empty map hash, no substitutions and
+        # reasons 'preferred:single_sample_set'.  Now a call that asks for no
+        # policy of its own (or for the view's own) inherits the view's
+        # choice, reasons and event-map report; a call asking for a DIFFERENT
+        # policy is refused when the view's events have other sample sets in
+        # the store, because those sets are no longer in the view to choose
+        # from.  A view under "all" still holds every set, so any policy may
+        # choose among them.
+        # A request resolve_policy itself rejects (an unknown policy, a map or
+        # q-rule without event-map) goes straight to it, for its own error.
+        well_formed = (waveform_policy in WAVEFORM_POLICIES and (
+            waveform_policy == "event-map"
+            or (sample_set_map is None and nrsur_q_rule is None)))
+        view_resolved = (self._selection_reasons is not None) and well_formed
+        view_policy = self._waveform_policy
+        default_call = (waveform_policy == "preferred" and approximant is None
+                        and sample_set_map is None and nrsur_q_rule is None
+                        and not nrsur_q_rule_substitute)
+        same_as_view = (
+            waveform_policy == view_policy
+            and approximant in (None, self._waveform_approximant)
+            and (map_digest is None
+                 or map_digest == self._sample_set_map_digest)
+            and (nrsur_q_rule is None
+                 or self._sample_set_map_report is not None
+                 and nrsur_q_rule == self._sample_set_map_report.get(
+                     "nrsur_q_rule"))
+            and (not nrsur_q_rule_substitute
+                 or self._sample_set_map_report is not None
+                 and self._sample_set_map_report.get(
+                     "nrsur_q_rule_substitute")))
+        if view_resolved and (default_call or same_as_view):
+            eff_policy = view_policy
+            eff_approximant = self._waveform_approximant
+            map_report = self._sample_set_map_report
+            map_digest = self._sample_set_map_digest
+            view_reason = dict(zip(np.asarray(self._sel).tolist(),
+                                   list(self._selection_reasons)))
+            kept = np.asarray(sel, dtype=int)
+            reasons = [str(view_reason.get(int(r), "")) for r in kept]
+            kept_names_all = self.names[kept] if kept.size else self.names[:0]
+            homogeneous = len(set(kept_names_all.tolist())) == kept.size
         else:
-            kept, reasons, homogeneous = resolve_policy(
-                self.names, sel, self.meta, policy=waveform_policy,
-                approximant=approximant, sample_set_map=sample_set_map,
-                nrsur_q_rule=nrsur_q_rule)
+            if view_resolved and view_policy != "all":
+                counts = {}
+                for nm in self.names.tolist():
+                    counts[nm] = counts.get(nm, 0) + 1
+                multi = sorted({str(nm) for nm in self.names[sel].tolist()
+                                if counts.get(nm, 0) > 1})
+                if multi:
+                    raise ValueError(
+                        f"this view's sample sets were already chosen by "
+                        f"waveform_policy={view_policy!r}, and {len(multi)} of "
+                        f"its events have other sample sets in the store that "
+                        f"are no longer in the view (e.g. {multi[:5]}), so "
+                        f"waveform_policy={waveform_policy!r} cannot re-choose "
+                        f"them; the file would record a policy that did not "
+                        f"make the choice. Pass the policy to the FIRST "
+                        f"select() (or export from the unfiltered catalog).")
+            eff_policy = waveform_policy
+            eff_approximant = approximant
+            if waveform_policy == "event-map":
+                kept, reasons, homogeneous, map_report = resolve_event_map(
+                    self.names, sel, self.meta, sample_set_map,
+                    q_frac_fn=self._q_below_nrsur_floor_frac,
+                    nrsur_q_rule=nrsur_q_rule,
+                    nrsur_q_rule_substitute=nrsur_q_rule_substitute)
+            else:
+                kept, reasons, homogeneous = resolve_policy(
+                    self.names, sel, self.meta, policy=waveform_policy,
+                    approximant=approximant, sample_set_map=sample_set_map,
+                    nrsur_q_rule=nrsur_q_rule)
         kept = np.asarray(kept, dtype=int)
         chosen_ok = m_row[kept] if kept.size else np.zeros(0, dtype=bool)
         if not chosen_ok.all():
             lost = sorted({str(self.names[r]) for r in kept[~chosen_ok]})
             kept_names_ok = {str(self.names[r]) for r in kept[chosen_ok]}
             lost = [n for n in lost if n not in kept_names_ok]
-            if lost and waveform_policy != "all":
+            if lost and eff_policy != "all":
                 warnings.warn(
                     f"{len(lost)} event(s) dropped because the sample set "
-                    f"waveform_policy={waveform_policy!r} chose for them fails "
+                    f"waveform_policy={eff_policy!r} chose for them fails "
                     f"a per-sample-set cut (source_class/compact_type/snr_min/"
                     f"m1_src_range/m2_src_range/sky_area_max), although another "
                     f"of their sample sets passes: {lost[:10]}"
@@ -1175,7 +1266,7 @@ class GWCatalog:
             allowed_names_authoritative=allowed_names_authoritative,
             far_policy=far_policy, n_missing_far=n_missing_far,
             allow_missing_far=allow_missing_far, require_far=require_far,
-            waveform_policy=waveform_policy, approximant=approximant,
+            waveform_policy=eff_policy, approximant=eff_approximant,
             allow_point_estimate_cuts=allow_unpaired_point_estimate_cuts,
             n_missing_snr=n_missing_snr)
 
@@ -1191,11 +1282,12 @@ class GWCatalog:
         result._snr_min = snr_min
         result._selection_source_class = source_class
         result._selection_event_list = event_list
-        result._waveform_policy = waveform_policy
-        result._waveform_approximant = approximant
+        result._waveform_policy = eff_policy
+        result._waveform_approximant = eff_approximant
         result._selection_reasons = np.asarray(reasons, dtype=object)
         result._homogeneous_sample_sets = bool(homogeneous)
         result._sample_set_map_report = map_report
+        result._sample_set_map_digest = map_digest
         return result
 
     def _q_below_nrsur_floor_frac(self, event, label):
@@ -2123,8 +2215,12 @@ class GWCatalog:
             # advertised as homogeneous, even if a duplicate row was later
             # skipped by z_max/undersampling and the written file happens to be
             # one-row-per-event.
-            f.attrs["waveform_policy"] = str(waveform_policy)
-            f.attrs["approximant"] = "" if approximant is None else str(approximant)
+            # The view's EFFECTIVE policy (review 2026-10-20), as the spec
+            # attrs above already state it -- not this call's keyword, which
+            # is "preferred" for an export of an already-resolved view.
+            f.attrs["waveform_policy"] = str(sub._waveform_policy)
+            f.attrs["approximant"] = ("" if sub._waveform_approximant is None
+                                      else str(sub._waveform_approximant))
             # Derived from the policy resolution, not re-inferred from name
             # uniqueness: `kept` holds store ROW indices, so two sample sets of
             # one event are two distinct rows and the old test called that
@@ -2207,8 +2303,9 @@ class GWCatalog:
                 "cosmology_mode": cosmology_mode,
                 "cosmology_override_used": bool(cosmology is not None),
                 "cosmology_per_event_varies": bool(cosmology_per_event_varies),
-                "waveform_policy": str(waveform_policy),
-                "approximant": None if approximant is None else str(approximant),
+                "waveform_policy": str(sub._waveform_policy),
+                "approximant": (None if sub._waveform_approximant is None
+                                else str(sub._waveform_approximant)),
                 # The SAME policy-derived value the HDF5 attr carries (GW-37),
                 # not a re-inference from name uniqueness: the two disagreed
                 # whenever a duplicate row was later dropped by z_max or by

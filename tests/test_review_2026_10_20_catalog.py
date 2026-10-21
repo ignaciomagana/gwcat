@@ -430,3 +430,55 @@ def test_disjoint_compact_type_and_source_class_are_refused():
         SelectionSpec().refine(compact_type="BBH").refine(source_class="nsbh")
     with pytest.raises(ValueError, match="share no class"):
         SelectionSpec().refine(compact_type="BBH").refine(compact_type="NSBH")
+
+
+# ==========================================================================
+# A chained view keeps the waveform policy that chose its sample sets
+# ==========================================================================
+def _strs(v):
+    return [x.decode() if isinstance(x, bytes) else str(x) for x in v]
+
+
+def test_an_exported_view_records_the_policy_that_chose_it(tmp_path):
+    cat = GWCatalog(_store(tmp_path, _multiset_rows()))
+    view = cat.select(waveform_policy="mixed-first")
+    v1, v2 = tmp_path / "v1.h5", tmp_path / "v2.h5"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        view.to_darksirens(str(v1), nsamp=8, seed=0, cosmology=_COSMO)
+        view.export(str(v2), spin_basis="chieff", nsamp=8, seed=0,
+                    cosmology=_COSMO)
+    for out in (v1, v2):
+        with h5py.File(out, "r") as f:
+            assert _attr(f, "waveform_policy") == "mixed-first"
+            assert _strs(f.attrs["sample_set_selection_reason"]) == [
+                "mixed-first:is_mixed", "mixed-first:is_mixed"]
+            assert json.loads(_attr(f, "selection_spec"))[
+                "waveform_policy"] == "mixed-first"
+
+
+def test_an_event_map_view_keeps_its_map_through_the_export(tmp_path):
+    cat = GWCatalog(_store(tmp_path, _multiset_rows()))
+    smap = {"GW900001_000001": "C01:IMRPhenomXPHM",
+            "GW900002_000002": "C01:Mixed"}
+    view = cat.select(waveform_policy="event-map", sample_set_map=smap)
+    out = tmp_path / "emap.h5"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        view.export(str(out), spin_basis="chieff", nsamp=8, seed=0,
+                    cosmology=_COSMO)
+    with h5py.File(out, "r") as f:
+        assert _attr(f, "waveform_policy") == "event-map"
+        assert _attr(f, "sample_set_map_sha256") != ""
+        assert _strs(f.attrs["sample_set_selection_reason"]) == [
+            "event-map:mapped:C01:IMRPhenomXPHM", "event-map:mapped:C01:Mixed"]
+
+
+def test_a_different_policy_cannot_rechoose_a_resolved_view(tmp_path):
+    cat = GWCatalog(_store(tmp_path, _multiset_rows()))
+    with pytest.raises(ValueError, match="already chosen"):
+        cat.select().select(waveform_policy="mixed-first")
+    # A view under "all" still holds every set, so a policy may choose.
+    sub = cat.select(waveform_policy="all").select(waveform_policy="mixed-first")
+    assert sub._waveform_policy == "mixed-first"
+    assert list(sub._selection_reasons) == ["mixed-first:is_mixed"] * 2
