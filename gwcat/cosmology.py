@@ -2,7 +2,8 @@
 
 Everything here is mass-prior-agnostic. We only ever deal with the marginal
 distance prior p(dL | cosmo). The (m1det, q, dL)-basis mass Jacobian is applied
-elsewhere (exclusively in GWCatalog.to_darksirens).
+elsewhere, at export only: by GWCatalog.to_darksirens (v1) and by the gwcat2 PE
+builder (gwcat.export.build_pe_product).
 
 The cosmo files (GWTC-2.1/3 *cosmo.h5 and the O4 combined files) use a
 luminosity-distance prior that is uniform in comoving volume and source-frame
@@ -84,10 +85,11 @@ O4_FALLBACK = LAL_PLANCK15
 #: EXACT match (after stripping quotes/whitespace) -- never by substring.
 #:
 #: ``'Planck15_lal'`` (GW-40a) is the lower-case spelling some pesummary
-#: ``meta_data`` blocks and prior reprs use for the same LAL object.  It is an
-#: EXACT alias -- there is still no case-folding, so ``'planck15_lal'`` or
-#: ``'PLANCK15_LAL'`` remain unrecognised and fail loudly -- and it is consulted
-#: only for a cosmology an analytic prior string explicitly DECLARES.  gwcat
+#: ``meta_data`` blocks and prior reprs use for the same LAL object.  Tokens
+#: are resolved by :func:`resolve_named_cosmology`, which adds bilby's own one
+#: case-insensitive rule (any spelling of ``planck15_lal`` is LAL's Planck15,
+#: as in ``bilby.gw.cosmology.get_cosmology``), and it is consulted only for a
+#: cosmology an analytic prior string explicitly DECLARES.  gwcat
 #: never reads ``meta_data/cosmology`` to decide a reweighted release's prior
 #: (that field is absent on every GWTC-2.1/3 ``C01:Mixed`` set and contradicts
 #: the stored z(dL) for several GWTC-4.1/5 labels); see
@@ -97,6 +99,48 @@ NAMED_COSMOLOGIES = {
     "Planck15_LAL": LAL_PLANCK15,
     "Planck15_lal": LAL_PLANCK15,
 }
+
+
+def resolve_named_cosmology(token):
+    """The cosmology a NAMED token of an analytic prior repr denotes, or None.
+
+    Exact match against :data:`NAMED_COSMOLOGIES` (never a substring), plus
+    bilby's one case-insensitive rule: any spelling of ``planck15_lal`` is
+    LAL's Planck15, exactly as ``bilby.gw.cosmology.get_cosmology`` reads it,
+    so a prior bilby accepted is not refused here (review 2026-10-20).
+    """
+    bare = str(token).strip().strip("'\"")
+    if bare in NAMED_COSMOLOGIES:
+        return NAMED_COSMOLOGIES[bare]
+    if bare.lower() == "planck15_lal":
+        return LAL_PLANCK15
+    return None
+
+
+def is_radiation_free_flat_lcdm(cosmology) -> bool:
+    """True when ``(H0, Om0)`` alone reproduce ``cosmology``'s distances.
+
+    The store records a distance prior's cosmology as ``(H0, Om0)`` and
+    rebuilds it with :func:`make_cosmology` (flat, no radiation).  astropy's
+    ``Planck15`` carries radiation (``Tcmb0 = 2.7255 K``), so reducing it to
+    ``(67.74, 0.3075)`` changes the ln p_dL shape by ~1.8e-3 while calling the
+    result "declared"; such a cosmology is refused rather than approximated.
+    """
+    if not isinstance(cosmology, FlatLambdaCDM):
+        return False
+    tcmb = getattr(cosmology, "Tcmb0", None)
+    tcmb = 0.0 if tcmb is None else float(getattr(tcmb, "value", tcmb))
+    return tcmb == 0.0
+
+
+class UnrecognisedCosmologyError(ValueError):
+    """An analytic distance prior names a cosmology gwcat cannot represent.
+
+    Either the token is unknown, or it is a known cosmology that ``(H0, Om0)``
+    cannot describe exactly (radiation).  The old behaviour -- warn, then
+    evaluate at the catalog default -- contradicted this module's "fail
+    loudly" contract (review 2026-10-20).
+    """
 
 
 def make_cosmology(H0: float, Om0: float) -> FlatLambdaCDM:

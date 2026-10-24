@@ -26,16 +26,60 @@ if TYPE_CHECKING:  # pragma: no cover
 _SHORT_EVENT_RE = re.compile(r"^GW\d{6}$")
 _FULL_EVENT_RE = re.compile(r"^GW\d{6}_\d{6}$")
 
+#: The date-only names under which LVK has published events, up to GWTC-5.0:
+#: GWTC-1's eleven, and every event with its own discovery paper -- GW190412,
+#: GW190425, GW190521 and GW190814 (O3a), GW200105 and GW200115 (O3b),
+#: GW230529, GW230814 and GW231123 (O4a), GW241011, GW241110 and GW250114
+#: (O4b/c).  The suffix is the UTC time of the event's GPS time, which is how
+#: every GWTC name is formed (GW150914: GPS 1126259462.4 = 2015-09-14 09:50:45
+#: UTC); each full name below is the one its GWTC release file carries.  A new
+#: discovery paper's date-only name resolves only once it is added here.
+#:
+#: A date-only name resolves ONLY through this table.  Prefix-matching it
+#: against whatever the store happens to hold picked the other event of the
+#: day whenever only one of a same-day pair was present (``GW200208`` became
+#: the non-member GW200208_222617), and a store carrying one event in several
+#: sample-set rows made the match spuriously "ambiguous".  GWTC-2's
+#: ``GW190521`` is GW190521_030229, not the same-day GW190521_074359.
+HISTORICAL_DATE_ONLY_NAMES = {
+    "GW150914": "GW150914_095045",
+    "GW151012": "GW151012_095443",
+    "GW151226": "GW151226_033853",
+    "GW170104": "GW170104_101158",
+    "GW170608": "GW170608_020116",
+    "GW170729": "GW170729_185629",
+    "GW170809": "GW170809_082821",
+    "GW170814": "GW170814_103043",
+    "GW170817": "GW170817_124104",
+    "GW170818": "GW170818_022509",
+    "GW170823": "GW170823_131358",
+    "GW190412": "GW190412_053044",
+    "GW190425": "GW190425_081805",
+    "GW190521": "GW190521_030229",
+    "GW190814": "GW190814_211039",
+    "GW200105": "GW200105_162426",
+    "GW200115": "GW200115_042309",
+    "GW230529": "GW230529_181500",
+    "GW230814": "GW230814_230901",   # the single-detector event, not _061920
+    "GW231123": "GW231123_135430",
+    "GW241011": "GW241011_233834",
+    "GW241110": "GW241110_124123",
+    "GW250114": "GW250114_082203",
+}
+
 
 def resolve_event_name_aliases(
     requested_names: Iterable[str],
     available_names: Iterable[str],
 ) -> tuple[list[str], dict[str, str]]:
-    """Resolve exact names and unique historical date-only aliases.
+    """Resolve exact names and historical date-only aliases.
 
-    Exact matches always win. A date-only name such as ``GW150914`` may resolve
-    to exactly one available name beginning with ``GW150914_``. Full timestamped
-    names are never shortened or fuzzily matched.
+    Exact matches always win. A date-only name such as ``GW150914`` resolves
+    only when it is one of the historical GWTC names in
+    :data:`HISTORICAL_DATE_ONLY_NAMES`, to the event that table names, and only
+    when that event is available. Any other date-only name is refused: a date
+    does not identify an event (O3 and O4 have many same-day pairs). Full
+    timestamped names are never shortened or fuzzily matched.
 
     Parameters
     ----------
@@ -53,10 +97,12 @@ def resolve_event_name_aliases(
     Raises
     ------
     ValueError
-        If a name is missing, a short alias is ambiguous, or two requested names
-        resolve to the same local event.
+        If a name is missing, a short name is not a historical GWTC name or
+        names an unavailable event, or two requested names resolve to the same
+        local event.
     """
-    available = [str(name) for name in available_names]
+    # One entry per event: a store lists an event once per sample-set row.
+    available = list(dict.fromkeys(str(name) for name in available_names))
     available_set = set(available)
     resolved: list[str] = []
     aliases: dict[str, str] = {}
@@ -68,19 +114,25 @@ def resolve_event_name_aliases(
             continue
 
         if _SHORT_EVENT_RE.fullmatch(requested):
-            candidates = sorted(
+            same_day = sorted(
                 name for name in available if name.startswith(requested + "_")
             )
-            if len(candidates) == 1:
-                aliases[requested] = candidates[0]
-                resolved.append(candidates[0])
-                continue
-            if not candidates:
+            hint = f" (available on that date: {same_day})" if same_day else ""
+            canonical = HISTORICAL_DATE_ONLY_NAMES.get(requested)
+            if canonical is None:
                 failures.append(
-                    f"{requested}: no exact match and no {requested}_HHMMSS alias"
+                    f"{requested}: not a historical date-only GWTC name, so it "
+                    f"does not identify one event{hint}; use the full "
+                    f"GWyymmdd_hhmmss name"
                 )
+            elif canonical in available_set:
+                aliases[requested] = canonical
+                resolved.append(canonical)
             else:
-                failures.append(f"{requested}: ambiguous aliases {candidates}")
+                failures.append(
+                    f"{requested}: the historical name of {canonical}, which "
+                    f"is not available{hint}"
+                )
             continue
 
         if _FULL_EVENT_RE.fullmatch(requested):

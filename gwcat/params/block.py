@@ -126,6 +126,13 @@ class CampaignRequirement:
             if (amax is None
                     or any(a is None or not np.isfinite(a) for a in amax)):
                 out.append("single_amax")
+        if self.uniform_azimuth:
+            # Only a factored file measures its azimuth density.  A block that
+            # KEEPS the azimuths (6-D, cartesian) needs it uniform; a 4-D block
+            # marginalises that factor exactly and declares nothing here.
+            az = checks.get("azimuth_uniform")
+            if az is not None and not all(bool(x) for x in np.atleast_1d(az)):
+                out.append("uniform_azimuth")
         if self.needs_sky_draw and meta.get("sky_position_available") is False:
             out.append("needs_sky_draw")
         return tuple(out)
@@ -135,10 +142,22 @@ class CampaignRequirement:
 class ParameterBlock:
     """One group of fit coordinates plus its two-sided density contract.
 
-    The callables are intentionally optional: GW-17 is a pure assembly PR, so a
-    block may declare its contract (columns, ranges, map kind, campaign
-    requirements) before its densities are wired to the builders.  Nothing in
-    :mod:`gwcat` imports this package yet.
+    The callables are intentionally optional: a block may declare its
+    contract (columns, ranges, map kind, campaign requirements) before its
+    densities are wired to the builders.  The builders import this package:
+    they compose the MASS block's PE factor through
+    :func:`gwcat.params.compose.block_prior_factor_pe` and read the store
+    and column views off the registry.  The campaign requirements are not
+    read from here: a projection's are enforced by the selection builder's
+    own chi_eff swap check (GW-06), and the sky block's ``needs_sky_draw`` by
+    the 2.1 selection writer, row by row
+    (:meth:`gwcat.params.registry.ParameterSpace.refuse_nonfinite_fit_columns`).
+    The spin blocks' ``ln_prior_pe`` are the same densities the builders
+    evaluate directly; they are kept equal to them, not called by them.  No
+    builder calls a block's ``ln_draw_inj`` either: the selection builder
+    reads each campaign's draw density off its file
+    (:class:`gwcat.selection.SelectionSet`), so those callables are
+    declarations of the same densities, not the code that writes ``pdraw``.
     """
     name: str
     kind: str

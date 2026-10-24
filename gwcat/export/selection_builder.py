@@ -126,7 +126,15 @@ The converse hole is real and is checked: if a campaign's magnitudes stop BELOW
 put in the missing region, and alpha comes out biased low.  With a detectable
 (uniform-magnitude) ceiling that is provable and raises under ``strict``; on a
 campaign with no detectable ceiling it falls back to the largest magnitude
-actually drawn and warns, because "not observed" is weaker than "not drawn".
+actually drawn and warns, because "not observed" is weaker than "not drawn" --
+until the shortfall is wider than sampling noise could leave over that
+campaign's rows, which raises under ``strict`` too.  The same holds for
+orientations: the reference is isotropic, so a campaign that never drew part of
+``cos(tilt) in [-1, 1]`` (an aligned-hemisphere draw) leaves a hole too, found
+from the widest gap between its drawn tilts
+(:func:`_check_reference_tilt_coverage`).  "Assumes nothing about how the
+campaign drew its spins" therefore means nothing about their DENSITY; their
+support must still cover the reference's.
 
 Columns (all bases): the legacy 10 (``m1det, m2det, dL, chieff, ra, dec, m1src,
 m2src, redshift, pdraw``) plus ``a1, a2, cost1, cost2, chip`` whenever every
@@ -162,7 +170,9 @@ coverage check per run as well as per campaign.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import warnings
 
 import numpy as np
@@ -171,7 +181,8 @@ import h5py
 from ..params import BLOCKS, DEFAULT_PARAMETER_SPACE, get_space
 from ..source_class import (format_source_class_filter, CUT_ESTIMATOR_ATTR,
                             selection_cut_estimator)
-from ..spin import (AMAX_AUTO, chi_eff_chi_p_prior_logprob_in_support,
+from ..spin import (AMAX_AUTO, check_amax_value,
+                    chi_eff_chi_p_prior_logprob_in_support,
                     chi_eff_prior_logprob_in_support, parse_amax_option)
 from ..selection import (SelectionSet, CombinedSelectionSet,
                          PDRAW_STATE_BY_BASIS, _selection_provenance_dict,
@@ -179,7 +190,8 @@ from ..selection import (SelectionSet, CombinedSelectionSet,
                          _cosmology_is_mixed, SNR_COLUMN,
                          CAMPAIGN_CUMULATIVE_MIXTURE, MixtureDetectionError,
                          MixtureInvariantError, _mixture_far_only_message,
-                         _semianalytic_far_only_message)
+                         _semianalytic_far_only_message,
+                         _require_positive_finite)
 from ..observing_runs import (RUN_LABELS, SEMIANALYTIC_RUNS,
                               INJECTION_SUPPORT_GPS, EXPOSURE_WINDOWS_GPS,
                               MIXTURE_COMPONENTS, MIXTURE_RELEASE_ANCHORS,
@@ -207,6 +219,10 @@ _REFERENCE_BASES = ("chieff_reference",)
 #: Same value as the sentinel the marked-transition analysis had been patching in
 #: downstream, so a product built here matches one built there row for row.
 OUT_OF_REFERENCE_PDRAW = 1e300
+#: The smallest ``out_of_reference_pdraw`` accepted: an excluded row's weight
+#: ``p_pop * J / pdraw`` must be negligible against every real one, as the
+#: attrs (``spin_reference_excluded_rows``, "weight exactly zero") say it is.
+_MIN_OUT_OF_REFERENCE_PDRAW = 1e100
 
 #: The cumulative-mixture SNR column used by the optional OR-branch.
 _SNR_COLUMN = SNR_COLUMN
@@ -230,7 +246,9 @@ class OverlappingCampaignError(ValueError):
     A cumulative mixture already contains every run's exposure in its
     ``total_generated``/``total_analysis_time`` and per-row weights; adding a
     campaign that overlaps it in time (endo3 for O3, rpo4ab for O4) counts that
-    exposure twice and double-counts its detections in the Essick sum.
+    exposure twice and double-counts its detections in the Essick sum.  The
+    same holds for any two campaigns over the same time, including one file
+    passed twice (see :func:`_refuse_overlapping_campaigns`).
     """
 
 #: Extra per-injection spin columns (emitted when available for every campaign).
@@ -298,17 +316,32 @@ def _detect_keep(s, far_threshold, source_class, snr_threshold, z_max=None,
 
 
 def _refuse_overlapping_campaigns(set_list):
-    """Refuse a cumulative mixture combined with a campaign that overlaps it.
+    """Refuse campaigns that cover the same time in one selection product.
 
-    A mixture's normalisation (``total_generated``, ``total_analysis_time``) and
-    its per-row weights already hold every run it spans; a second campaign over
-    any of that time -- endo3 for O3, rpo4ab for O4 -- would count the shared
-    exposure twice.  The overlap is judged on GPS ranges (the rows' own times,
-    else the campaign's ``gps_start``/``gps_end`` attrs); a campaign whose
-    range is unknown is refused too, because an overlap cannot be ruled out.
+    Each campaign's ``pdraw`` is scaled by ``N_k/N_total`` and its exposure
+    enters ``T_obs``, so ``mu = sum_k T_k xi_k``: two campaigns over the same
+    time EACH add that time's ``T xi``, and the shared exposure (and its
+    detected injections) is counted twice.
+
+    * A cumulative mixture's normalisation (``total_generated``,
+      ``total_analysis_time``) and per-row weights already hold every run it
+      spans; a second campaign over any of that time -- endo3 for O3, rpo4ab
+      for O4 -- is refused, and so is one whose range is unknown, because an
+      overlap cannot be ruled out.
+    * Any other pair (review fix) is refused when it is the same injection
+      file twice, or when both GPS ranges are known and intersect (an
+      O4a-only set plus rpo4ab, two campaigns over one run).  A pair whose
+      overlap cannot be judged (no row times, no ``gps_start``/``gps_end``)
+      warns: the legacy spin-less campaigns carry no times at all, and the
+      per-campaign GPS record (``campaign_gps_range_source_per_campaign =
+      'unknown'``) says so in the file.
+
+    The overlap is judged on GPS ranges: the rows' own times, else the
+    campaign's ``gps_start``/``gps_end`` attrs.
     """
     if len(set_list) < 2:
         return
+    _refuse_overlapping_single_campaigns(set_list)
     mixtures = [s for s in set_list
                 if s.campaign_kind == CAMPAIGN_CUMULATIVE_MIXTURE]
     for m in mixtures:
@@ -336,6 +369,53 @@ def _refuse_overlapping_campaigns(set_list):
                     f"injections) in the selection integral. Export the "
                     f"mixture alone; to use another campaign for one run, "
                     f"build that run from its own campaign instead.")
+
+
+def _refuse_overlapping_single_campaigns(set_list):
+    """The pairwise half of :func:`_refuse_overlapping_campaigns`.
+
+    Pairs involving a cumulative mixture are left to the mixture rule there,
+    which is stricter (an unknown range is refused, not warned about).
+    """
+    unknown = []
+    for i, a in enumerate(set_list):
+        for b in set_list[i + 1:]:
+            if CAMPAIGN_CUMULATIVE_MIXTURE in (a.campaign_kind,
+                                               b.campaign_kind):
+                continue
+            pa, pb = os.fspath(a.path), os.fspath(b.path)
+            if os.path.realpath(pa) == os.path.realpath(pb):
+                raise OverlappingCampaignError(
+                    f"the same injection file appears twice in one selection "
+                    f"product: {pa!r} and {pb!r}. Each copy adds its draws "
+                    f"to ndraw, its exposure to T_obs and its detected "
+                    f"injections to the sum, so the campaign's exposure is "
+                    f"counted twice. Pass each campaign once.")
+            ra, rb = a.gps_range, b.gps_range
+            if ra is None or rb is None:
+                unknown.append((pa, pb))
+                continue
+            if ra[0] <= rb[1] and rb[0] <= ra[1]:
+                raise OverlappingCampaignError(
+                    f"{pa} (GPS [{ra[0]:.0f}, {ra[1]:.0f}]) and {pb} (GPS "
+                    f"[{rb[0]:.0f}, {rb[1]:.0f}]) cover overlapping time. The "
+                    f"builder combines campaigns by their Essick fractions "
+                    f"N_k/N_total, which is right only for campaigns over "
+                    f"DISJOINT time: each campaign adds its own exposure, so "
+                    f"the shared stretch is counted twice in the selection "
+                    f"integral (and its detected injections twice in the "
+                    f"sum). Two campaigns over the same time are one mixture "
+                    f"density, which needs every campaign's draw density on "
+                    f"every injection and is not what this builder writes; "
+                    f"export one campaign per stretch of time.")
+    if unknown:
+        warnings.warn(
+            "cannot rule out a time overlap between campaign(s) "
+            + "; ".join(f"{a} and {b}" for a, b in unknown)
+            + ": at least one carries no row times and no gps_start/gps_end "
+              "attrs. Campaigns over the same time double-count its exposure "
+              "in the selection integral; the file records "
+              "campaign_gps_range_source_per_campaign='unknown' for them.")
 
 
 def _mixture_run_attrs(s, keep, detect, far_threshold, snr_threshold,
@@ -478,11 +558,27 @@ def _campaign_chieff_amax(s, forced_amax, amax_fallback):
     and no ceiling is knowable) -- which warns, because a fabricated ceiling in a
     density that depends on it is exactly what GW-31 was about.
     """
-    if forced_amax is not None:
-        return "caller", float(forced_amax), float(forced_amax)
     detected = (s.spin_meta or {}).get("amax_detected")
-    if (detected is not None
-            and all(a is not None and np.isfinite(a) for a in detected[:2])):
+    has_det = (detected is not None
+               and all(a is not None and np.isfinite(a) for a in detected[:2]))
+    if forced_amax is not None:
+        # The forced ceiling is a documented legacy mode, but it silently
+        # overrode a ceiling the campaign's own draw states (review fix):
+        # endo3 forced to 0.99 instead of its 0.998 puts pdraw off by 0.7% in
+        # the bulk and ~29% above chi_eff 0.9.
+        if has_det and not all(
+                np.isclose(float(forced_amax), float(a), rtol=1e-9, atol=1e-12)
+                for a in detected[:2]):
+            warnings.warn(
+                f"{s.path}: amax={float(forced_amax)} forces the chi_eff swap's "
+                f"ceiling, and it differs from the campaign's own detected "
+                f"injected ceiling {tuple(float(a) for a in detected[:2])}. "
+                f"The swap replaces that draw's spin density, so the exported "
+                f"pdraw is off by a chi_eff-DEPENDENT factor that does not "
+                f"cancel; recorded as chi_eff_amax_source_per_campaign="
+                f"'caller'. Use amax='auto' for the detected ceiling.")
+        return "caller", float(forced_amax), float(forced_amax)
+    if has_det:
         return "detected", float(detected[0]), float(detected[1])
     warnings.warn(
         f"{s.path}: spin_basis='chieff' needs the ceiling of the injected spin "
@@ -544,10 +640,13 @@ def _campaign_chieff_chip_lnfactor(s, keep, strict):
     # file -- burying the warning that matters, which is a genuine NSBH prior
     # with a restricted secondary (amax_2 ~ 0.05).
     if not np.isclose(amax_1, amax_2, rtol=1e-9, atol=1e-12):
-        warnings.warn(
+        # Refused, like the PE side (review 2026-10-20 recheck): evaluating
+        # both bodies at amax_1 is the wrong draw density for the secondary.
+        raise SpinBasisError(
             f"{s.path}: injected spin_amax_1={amax_1} != spin_amax_2={amax_2}; "
-            f"the joint (chi_eff, chi_p) prior assumes a single amax and uses "
-            f"amax_1={amax_1} (mirroring the PE builder convention).")
+            f"the joint (chi_eff, chi_p) prior assumes one shared ceiling. Use "
+            f"spin_basis='component', which keeps the campaign's exact "
+            f"per-injection spin draw.")
     lnp, sup = chi_eff_chi_p_prior_logprob_in_support(
         s._chieff[keep], s._chi_p[keep], s._m1src[keep], s._m2src[keep],
         amax=amax_1)
@@ -610,7 +709,13 @@ def _check_reference_coverage(set_list, a_ref, *, strict):
     Two evidences, deliberately not conflated.  A campaign with a DETECTED
     (uniform-magnitude) ceiling proves the hole, so it raises under ``strict``.
     A campaign without one leaves only the largest magnitude actually drawn,
-    which is a sample maximum and not a support bound -- that warns.
+    which is a sample maximum and not a support bound.  That warns while the
+    shortfall ``(a_ref - max)/a_ref`` is one sampling noise could leave; once
+    it is wider than that at false-alarm :data:`_COVERAGE_FALSE_ALARM` (for a
+    draw whose density near ``a_ref`` is at least a tenth of the reference's)
+    it is a hole on the rows' own evidence and raises under ``strict`` too
+    (review fix: it used to warn even then -- an O4-sized campaign stopping at
+    0.95 against ``a_ref = 0.99`` exported, and core never reads the flag).
 
     Returns ``(covered_flags, evidence_per_campaign)``.
     """
@@ -621,6 +726,7 @@ def _check_reference_coverage(set_list, a_ref, *, strict):
         has_det = (detected is not None
                    and all(a is not None and np.isfinite(a)
                            for a in detected[:2]))
+        n_rows = 0
         if has_det:
             bound = float(min(detected[0], detected[1]))
             source = "detected"
@@ -628,23 +734,38 @@ def _check_reference_coverage(set_list, a_ref, *, strict):
             mags = [np.asarray(a, dtype=float) for a in (s._a1, s._a2)
                     if a is not None]
             bound = float(min(m.max() for m in mags)) if mags else float("nan")
+            n_rows = int(min(np.isfinite(m).sum() for m in mags)) if mags else 0
             source = "drawn_max"
         ok = bool(np.isfinite(bound) and bound >= a_ref)
         covered.append(ok)
         evidence.append({"path": str(s.path), "bound": bound,
                          "bound_source": source, "covers_a_ref": ok})
         if not ok:
-            (proven_bad if source == "detected" else unproven_bad).append(
-                evidence[-1])
+            if source == "detected":
+                proven_bad.append(evidence[-1])
+            elif ((a_ref - bound) / a_ref
+                  > -np.log(_COVERAGE_FALSE_ALARM)
+                  / (_COVERAGE_MIN_DENSITY_RATIO * max(n_rows, 1))):
+                # No draw in (bound, a_ref] over n_rows rows: improbable
+                # below the false-alarm level unless the region is undrawn.
+                evidence[-1]["n_rows"] = n_rows
+                proven_bad.append(evidence[-1])
+            else:
+                unproven_bad.append(evidence[-1])
 
     def _detail(rows):
-        return "; ".join(f"{r['path']} (magnitudes reach {r['bound']:.6g}, "
-                         f"from {r['bound_source']})" for r in rows)
+        return "; ".join(
+            f"{r['path']} (magnitudes reach {r['bound']:.6g}, from "
+            f"{r['bound_source']}"
+            + (f" over {r['n_rows']} rows" if "n_rows" in r else "") + ")"
+            for r in rows)
 
     if proven_bad:
         msg = (
             f"spin_reference_amax={a_ref} exceeds the injected spin magnitude "
-            f"ceiling of {len(proven_bad)} campaign(s): {_detail(proven_bad)}. "
+            f"ceiling of {len(proven_bad)} campaign(s) (detected, or a drawn "
+            f"maximum over too many rows to be sampling noise): "
+            f"{_detail(proven_bad)}. "
             f"The reference prior puts probability where those campaigns drew "
             f"no injections at all, so the reweighted selection integral is "
             f"missing that region entirely and alpha is biased LOW -- which "
@@ -667,6 +788,99 @@ def _check_reference_coverage(set_list, a_ref, *, strict):
     return covered, evidence
 
 
+#: False-alarm probability of the sample-based coverage-hole tests: a gap this
+#: unlikely under a draw that covers the reference is not sampling noise.
+_COVERAGE_FALSE_ALARM = 1e-9
+#: The smallest campaign draw density, as a fraction of the reference density,
+#: that the hole tests allow inside a covered region (a non-isotropic draw such
+#: as O4ab's varies by a factor ~2; this allows ten).
+_COVERAGE_MIN_DENSITY_RATIO = 0.1
+
+
+def _tilt_max_gap(cost):
+    """Widest interval of ``cos(tilt)`` in [-1, 1] holding no drawn value."""
+    c = np.asarray(cost, dtype=float)
+    c = np.sort(np.clip(c[np.isfinite(c)], -1.0, 1.0))
+    if not c.size:
+        return 2.0
+    return float(np.max(np.diff(np.concatenate(([-1.0], c, [1.0])))))
+
+
+def _tilt_gap_tolerance(n):
+    """Widest ``cos(tilt)`` gap that ``n`` covering draws leave by chance.
+
+    For ``n`` draws whose density is at least ``rho`` times the isotropic
+    reference's (1/2 on [-1, 1]) everywhere, P(some gap wider than ``w``) <=
+    ``(n + 1) exp(-n rho w / 2)``; this is the ``w`` at which that bound is
+    :data:`_COVERAGE_FALSE_ALARM`.  Above 2 (the whole range) for a handful of
+    draws, i.e. too few rows to show anything.
+    """
+    if n <= 0:
+        return float("inf")
+    return float(2.0 * (np.log(n + 1.0) - np.log(_COVERAGE_FALSE_ALARM))
+                 / (_COVERAGE_MIN_DENSITY_RATIO * n))
+
+
+def _check_reference_tilt_coverage(set_list, *, strict):
+    """Refuse/warn when a campaign's drawn tilts do not COVER the reference.
+
+    The reference is isotropic, so the reweighting needs draws over all of
+    ``cos(tilt) in [-1, 1]`` for both bodies, exactly as it needs magnitudes up
+    to ``a_ref`` (:func:`_check_reference_coverage`): an orientation range the
+    campaign never drew carries reference probability and no injections, and
+    alpha comes out biased LOW.  The magnitude check alone let an
+    aligned-hemisphere campaign (``cos(tilt) ~ U(0, 1)``) export with
+    ``coverage_ok=True`` and a detected fraction of a quarter of the truth
+    (review fix).
+
+    The evidence is the drawn values (every row of the campaign, detected or
+    not): the widest gap between them, including the gaps to -1 and +1,
+    against :func:`_tilt_gap_tolerance`.  A gap above the tolerance is a hole
+    at false-alarm probability :data:`_COVERAGE_FALSE_ALARM`, so it raises
+    under ``strict`` (warns otherwise); the production campaigns span the full
+    range with gaps far below it.
+
+    Returns ``(covered_flags, max_gap_per_campaign, tolerance_per_campaign)``.
+    """
+    covered, gaps, tols, bad = [], [], [], []
+    for s in set_list:
+        costs = [c for c in (s._cost1, s._cost2) if c is not None]
+        if len(costs) < 2:
+            # Unreachable for a reference basis (it needs the component spin
+            # draw, which carries both tilts); recorded as unchecked if not.
+            gaps.append((float("nan"), float("nan")))
+            tols.append(float("nan"))
+            covered.append(False)
+            bad.append(f"{s.path} (no drawn tilts to check)")
+            continue
+        n = int(min(np.isfinite(np.asarray(c, dtype=float)).sum()
+                    for c in costs))
+        g = tuple(_tilt_max_gap(c) for c in costs)
+        tol = _tilt_gap_tolerance(n)
+        ok = bool(max(g) <= tol)
+        gaps.append(g)
+        tols.append(tol)
+        covered.append(ok)
+        if not ok:
+            bad.append(f"{s.path} (widest undrawn cos(tilt) interval "
+                       f"{max(g):.4g} wide over {n} rows; sampling noise "
+                       f"leaves at most {tol:.3g})")
+    if bad:
+        msg = (
+            f"the isotropic reference spin prior puts probability on spin "
+            f"orientations that {len(bad)} campaign(s) never drew: "
+            + "; ".join(bad)
+            + ". The reweighting can only redistribute weight where a "
+              "campaign drew, so the selection integral is missing that "
+              "region and alpha is biased LOW. Use spin_basis='component', "
+              "which needs no reference. Pass strict=False to export anyway; "
+              "the file records spin_reference_tilt_coverage_per_campaign.")
+        if strict:
+            raise BlockCampaignMismatch(msg)
+        warnings.warn(msg)
+    return covered, gaps, tols
+
+
 def _campaign_reference_lnfactor(s, keep, a_ref):
     """``(ln p_iso(chieff|q,a_ref), in_reference_support)`` for one campaign.
 
@@ -687,6 +901,20 @@ def _campaign_reference_lnfactor(s, keep, a_ref):
             f"magnitudes a1/a2 to evaluate the reference support "
             f"(a_i <= a_ref), and this file carries none "
             f"(spin_format={s.spin_meta.get('spin_format')!r}).")
+    # A NaN chi_eff or magnitude fails every support comparison, so it used to
+    # turn a DETECTED injection into a zero-weight row counted as a physical
+    # exclusion (review fix).  It is malformed input, not "outside the
+    # reference", and is refused by name.
+    for name, arr in (("chieff", s._chieff), ("a1", s._a1), ("a2", s._a2)):
+        vals = np.asarray(arr, dtype=float)[keep]
+        n_bad = int(np.count_nonzero(~np.isfinite(vals)))
+        if n_bad:
+            raise ValueError(
+                f"{s.path}: {n_bad} of {vals.size} detected injections have a "
+                f"non-finite {name!r}. spin_basis='chieff_reference' decides "
+                f"each row's reference support from chieff, a1 and a2, and a "
+                f"NaN would silently mark a detected injection as excluded "
+                f"(weight zero) rather than as malformed.")
     lnp, chi_sup = chi_eff_prior_logprob_in_support(
         s._chieff[keep], s._m1src[keep], s._m2src[keep], amax=a_ref)
     in_ref = (np.asarray(chi_sup, dtype=bool)
@@ -838,7 +1066,7 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                             detection_policy="far",
                             acknowledge_semianalytic_excluded=False,
                             sky_marginal=False, mixture_anchors=None,
-                            mock_data=None):
+                            mock_data=None, draw_domain=None):
     """Build a selection :class:`ExportProduct` from one or more SelectionSets.
 
     Parameters
@@ -884,7 +1112,7 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         ``pdraw`` written for a row the reference assigns zero density to
         (``a_i > a_ref``), so its importance weight underflows to exactly zero
         while the file keeps a finite positive ``pdraw`` everywhere.  Reference
-        bases only.
+        bases only; must be finite and at least 1e100.
     z_max : float, optional
         Redshift truncation matching the PE export's per-sample ``z_max``
         (GW-37).  Injections above it are SUBSET out (``ndraw`` untouched, so
@@ -897,10 +1125,29 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         using the cumulative-mixture ``semianalytic_observed_phase_maximized_snr_net``
         column.  Default ``None`` reproduces the FAR-only cut exactly.
     strict : bool, default True
-        For ``"chieff_chip"``: raise :class:`SpinBasisError` when a campaign is
-        not verified single-uniform-isotropic.  ``False`` warns and proceeds
-        when a detected amax is nonetheless available (an undetectable amax
-        always raises).
+        Whether a campaign that contradicts the requested basis's assumption is
+        refused (``True``) or exported with a warning and recorded in the attrs
+        (``False``).  It governs:
+
+        * ``"chieff_chip"``: a campaign not verified single-uniform-isotropic
+          raises :class:`SpinBasisError`; ``False`` proceeds when a detected
+          amax is nonetheless available (an undetectable amax always raises);
+        * ``"chieff"``: the uniform-isotropic gate on the chi_eff swap
+          (:func:`_check_chieff_swap_valid`) -- a campaign MEASURED
+          non-uniform-isotropic, or one shipping a joint spin density that
+          cannot be checked, raises :class:`BlockCampaignMismatch`; ``False``
+          records it in ``spin_basis_assumption_violations``.  A spin-less
+          legacy campaign (nothing to check) is never refused, only recorded;
+        * ``"chieff_reference"``: the reference-coverage checks -- magnitudes
+          short of ``spin_reference_amax`` (a detected ceiling, or a drawn
+          maximum too far below it to be sampling noise) and drawn tilts that
+          leave part of ``[-1, 1]`` uncovered raise
+          :class:`BlockCampaignMismatch`; ``False`` writes the file with
+          ``spin_reference_coverage_ok=False``.
+
+        Checks that are not about the basis's assumption -- an out-of-support
+        detected injection, a non-finite pdraw, overlapping campaigns, bad
+        thresholds -- raise whatever ``strict`` says.
     detection_policy : {"far", "lvk-cumulative"}, default "far"
         Recorded in the attrs.  ``"lvk-cumulative"`` (GW-39) requires a
         cumulative-mixture campaign and ``snr_threshold``, and states that the
@@ -930,6 +1177,20 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         :func:`gwcat.export.product.resolve_mock_data`).  The attr is written
         only when True, so a real-data selection export is byte-identical to
         one written before the flag existed; absent means real.
+    draw_domain : {None, "intersection"}, default None
+        The injection campaigns' DECLARED draw domains (endo3: source-frame
+        ``m1, m2 <= 100`` Msun, ``z <= 1.9``; the O4-era files declare none)
+        are always recorded, per campaign, in
+        ``injection_draw_domain_per_campaign``, and a campaign whose draws
+        reach past another's declared bound sets
+        ``injection_draw_domain_mismatch`` and warns: the combined mu then has
+        no contribution from the first campaign beyond its bound.  ``None``
+        changes nothing else (the default, byte-identical datasets).
+        ``"intersection"`` SUBSETS every campaign's detected injections to the
+        domain all campaigns declare (``ndraw`` untouched, as for
+        ``source_class``/``z_max``), recorded in
+        ``injection_draw_domain_applied``; the population model and the PE
+        samples must then be truncated to the same domain.
 
     Returns
     -------
@@ -944,11 +1205,56 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         raise ValueError(
             f"unknown detection_policy={detection_policy!r}; known policies "
             f"are {list(DETECTION_POLICIES)}.")
+    # Detection thresholds must be finite and positive (review fix).  Every
+    # FAR-only guard tests `snr_threshold is None`, so a NaN or inf SNR
+    # threshold got past the mixture refusal while detecting no semianalytic
+    # row (`snr > nan` and `snr > inf` are False everywhere), and a NaN or
+    # non-positive FAR threshold detected no O3/O4 row -- with their draws and
+    # exposure still in ndraw and T_obs, which is exactly what that refusal
+    # exists to prevent.
+    for name, value in (("far_threshold", far_threshold),
+                        ("snr_threshold", snr_threshold)):
+        if value is None and name == "snr_threshold":
+            continue
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            v = float("nan")
+        if not (np.isfinite(v) and v > 0.0):
+            raise ValueError(
+                f"{name}={value!r}: a detection threshold must be finite and "
+                f"positive. A NaN threshold (or an infinite SNR, or a "
+                f"non-positive FAR threshold) detects nothing on the rows it "
+                f"governs while their draws and exposure stay in ndraw and "
+                f"T_obs, which biases the detection probability low; an "
+                f"infinite FAR threshold is no detection cut at all. "
+                + ("Omit snr_threshold (None) for a FAR-only cut."
+                   if name == "snr_threshold" else ""))
     # `None` = each campaign's own detected ceiling; a float = one forced ceiling.
     forced_amax = parse_amax_option(amax, what="amax")
+    # A fallback ceiling stands in for an undetectable one, so it must be a
+    # spin ceiling too (review 2026-10-20).
+    amax_fallback = check_amax_value(amax_fallback, what="amax_fallback")
     # `None` for every non-reference basis; a validated float for a reference
     # basis, which never defaults it.
     a_ref = _parse_reference_amax(spin_basis, spin_reference_amax)
+    if a_ref is not None:
+        # Review fix: never validated, so a caller-set 1.0 gave excluded rows
+        # a real weight while the attrs still called it zero.
+        try:
+            sentinel = float(out_of_reference_pdraw)
+        except (TypeError, ValueError):
+            sentinel = float("nan")
+        if not (np.isfinite(sentinel)
+                and sentinel >= _MIN_OUT_OF_REFERENCE_PDRAW):
+            raise ValueError(
+                f"out_of_reference_pdraw={out_of_reference_pdraw!r}: the pdraw "
+                f"written for rows the reference assigns zero density must be "
+                f"finite (the file stays finite-and-positive) and at least "
+                f"{_MIN_OUT_OF_REFERENCE_PDRAW:g}, so that their importance "
+                f"weight is negligible; anything smaller gives them a real "
+                f"weight while spin_reference_excluded_rows records them as "
+                f"excluded. The default is {OUT_OF_REFERENCE_PDRAW:g}.")
 
     if isinstance(sets, CombinedSelectionSet):
         set_list = list(sets._sets)
@@ -978,6 +1284,8 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                                      zip(set_list, is_mixture) if m)
             + ". Each already carries every run's exposure; export one.")
     _refuse_overlapping_campaigns(set_list)
+    campaign_files, campaign_sizes, campaign_sha256 = _campaign_identity(
+        set_list)
     if acknowledge_semianalytic_excluded and snr_threshold is not None:
         raise ValueError(
             "acknowledge_semianalytic_excluded=True (--acknowledge-semianalytic-"
@@ -1020,17 +1328,28 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
 
     #: Per-campaign reference-support coverage (reference bases only).
     reference_coverage, reference_coverage_evidence = [], []
+    #: Per-campaign tilt coverage of the isotropic reference (review fix).
+    tilt_coverage, tilt_gaps, tilt_tols = [], [], []
     #: The same check run by run on each mixture campaign (GW-39).
     reference_coverage_runs = None
     if a_ref is not None:
         reference_coverage, reference_coverage_evidence = (
             _check_reference_coverage(set_list, a_ref, strict=strict))
+        tilt_coverage, tilt_gaps, tilt_tols = (
+            _check_reference_tilt_coverage(set_list, strict=strict))
         for s, mix in zip(set_list, is_mixture):
             if mix:
                 reference_coverage_runs = _reference_coverage_per_run(s, a_ref)
 
     ndraw_per = [int(s._ndraw) for s in set_list]
     ndraw_total = sum(ndraw_per)
+
+    # Declared draw domains (review 2026-10-20, high-4): always recorded; a
+    # crossed bound warns; "intersection" subsets to the common domain.
+    from ..selection import (resolve_draw_domain, draw_domain_mask,
+                             campaign_provenance_attrs)
+    domain_applied, domain_mismatch = resolve_draw_domain(set_list,
+                                                          draw_domain)
 
     # Per-injection column names (the legacy 9 + the frac-scaled pdraw).
     base_cols = ["m1det", "m2det", "dL", "chieff", "ra", "dec",
@@ -1052,9 +1371,10 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     n_after_total = 0
     far_columns_union = []
     campaign_info = []
-    chieff_chip_amax = []        # per (non-empty) campaign detected amax used
-    # Per (non-empty) campaign chi_eff ceilings actually used, and how each was
-    # resolved ("detected" / "caller" / "fallback").
+    chieff_chip_amax = []        # per campaign detected amax used (NaN: empty)
+    # Per campaign chi_eff ceilings actually used, and how each was resolved
+    # ("detected" / "caller" / "fallback"; "no_detections" with NaN for a
+    # campaign that contributed no rows).
     chieff_amax_pairs, chieff_amax_sources = [], []
 
     mixture_attrs = None
@@ -1062,6 +1382,9 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         keep, det, sc_mask = _detect_keep(
             s, far_threshold, source_class, snr_threshold, z_max=z_max,
             acknowledge_semianalytic_excluded=acknowledge_semianalytic_excluded)
+        if domain_applied is not None:
+            in_domain = draw_domain_mask(s, domain_applied)
+            keep, sc_mask = keep & in_domain, sc_mask & in_domain
         if is_mixture[k]:
             mixture_attrs = _mixture_run_attrs(
                 s, keep, det, far_threshold, snr_threshold, mixture_anchors)
@@ -1077,8 +1400,17 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                 f"FAR < {far_threshold}"
                 + ("" if source_class is None
                    else f" in source class {source_class!r}"))
+            # Keep the *_per_campaign spin attrs aligned with the campaign
+            # order (review fix): an empty campaign used no ceiling, which is
+            # NaN with its reason, not a missing row that shifts the others.
+            if spin_basis == "chieff":
+                chieff_amax_pairs.append((float("nan"), float("nan")))
+                chieff_amax_sources.append("no_detections")
+            elif spin_basis == "chieff_chip":
+                chieff_chip_amax.append(float("nan"))
             continue
 
+        _refuse_nonphysical_rows(s, keep)
         frac = ndraw_per[k] / ndraw_total
         parts["pdraw"].append(s._pdraw[keep] * frac)
         for name, attr in attr_of.items():
@@ -1231,6 +1563,20 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                                  data["pdraw"])
         n_out_of_reference = int(np.sum(excluded))
 
+    # ── The finished pdraw, every basis (review fix) ────────────────────────
+    # The loader validates `_pdraw`, but the spin factor, the Essick fractions
+    # and the reference change all touch it afterwards, and the multiply above
+    # runs with overflow silenced: a finite-but-huge ln factor became an
+    # infinite pdraw (a zero weight) and an underflow a zero pdraw (an infinite
+    # one), written without a word for the component, chieff and chieff_chip
+    # bases.  What is written is what is checked.
+    _require_positive_finite(
+        data["pdraw"], "pdraw",
+        ", ".join(str(s.path) for s in set_list),
+        note="this is the FINISHED selection pdraw (after the spin factor, the "
+             "Essick N_k/N_total fractions and any reference change); the "
+             "selection integral divides by it.")
+
     # ── Output columns: legacy 10 + (a1,a2,cost1,cost2,chip when available) ──
     columns = {
         "m1det": data["m1det"], "m2det": data["m2det"], "dL": data["dL"],
@@ -1260,6 +1606,11 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
 
     # ── Provenance attrs ────────────────────────────────────────────────────
     _str = h5py.string_dtype()
+    _mixed_cosmology = _cosmology_is_mixed(set_list)
+    scalar_H0 = (float("nan") if _mixed_cosmology
+                 else _cosmo_or_nan(set_list[0], "_cosmology_used_H0"))
+    scalar_Om0 = (float("nan") if _mixed_cosmology
+                  else _cosmo_or_nan(set_list[0], "_cosmology_used_Om0"))
     attrs = dict(_selection_provenance_dict(
         source_class=source_class,
         nsbh_mass_threshold=set_list[0]._nsbh_mass_threshold,
@@ -1279,14 +1630,21 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         "T_obs_yr": float(sum(s._T_yr for s in set_list)),
         "far_threshold": float(far_threshold),
         "n_detected": int(n_det_total),
-        "cosmology_H0": float(set_list[0].H0),
-        "cosmology_Om0": float(set_list[0].Om0),
+        # The cosmology every campaign's pdraw used, NaN when they differ or
+        # when none entered pdraw at all (an events-format campaign reads its
+        # ddL/dz from the file) -- the v1 combined writer's convention.  It
+        # used to be the first campaign's constructor default (Planck15),
+        # which no campaign of the production pair used, so the validator
+        # refused PE files for disagreeing with a cosmology nothing was built
+        # under (review fix).
+        "cosmology_H0": scalar_H0,
+        "cosmology_Om0": scalar_Om0,
         "cosmology_override_used": bool(
             any(getattr(s, "_cosmology_override", False) for s in set_list)),
         # Per-campaign, because a combined export legitimately mixes campaigns
-        # whose pdraw used DIFFERENT cosmologies -- or none at all.  The scalar
-        # above is the first campaign's reference value, kept for backward
-        # compatibility; these are the authoritative record (GW-09).
+        # whose pdraw used DIFFERENT cosmologies -- or none at all.  These are
+        # the authoritative record (GW-09); the scalar above is finite only
+        # when they all agree.
         "cosmology_source_per_campaign": np.array(
             [str(getattr(s, "_cosmology_source", None)) for s in set_list],
             dtype=_str),
@@ -1313,11 +1671,20 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             dtype=bool),
         "injected_spin_checks": json.dumps(
             [_json_checks(s.spin_meta.get("checks", {})) for s in set_list]),
+        # How each campaign's 4-D component spin density treats the azimuths
+        # (review 2026-10-20): exact for a factored file, verified or ASSUMED
+        # uniform for a joint density.  Recorded, not required.
+        "injected_spin_azimuths_per_campaign": np.array(
+            [_injected_spin_azimuths(s) for s in set_list], dtype=_str),
         # False for campaigns whose rows carry no drawn sky position (the
         # semianalytic O1/O2 entries of the cumulative mixtures); their
         # exported ra/dec are NaN.
         "sky_position_available": _sky_availability(set_list),
         "component_columns_emitted": bool(extras_available),
+        # chi_p is dropped on its own condition (a campaign without chi_p),
+        # which component_columns_emitted does not cover (August review,
+        # test-gaps 5).
+        "chip_column_emitted": bool(chip_available),
         # ── Spin-removal amax provenance (GW-19) ─────────────────────────────
         # The cartesian/polar prior-REMOVAL step has to assume a ceiling before
         # the campaign's own is known.  Its amax dependence is the constant
@@ -1338,6 +1705,10 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         "spin_removal_amax_cancels": bool(
             spin_basis == "component" or spin_basis in _REFERENCE_BASES),
     })
+
+    attrs.update(campaign_provenance_attrs(
+        set_list, draw_domain=draw_domain, draw_domain_applied=domain_applied,
+        draw_domain_mismatch=domain_mismatch))
 
     # WHICH chi_eff density every chi_eff factor of this pdraw is (GW-40i):
     # the exact closed form by default, the legacy interpolated table only
@@ -1364,10 +1735,19 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             chieff_amax_sources, dtype=_str)
         attrs["chi_eff_amax_mode"] = ("fixed" if forced_amax is not None
                                       else "per_campaign")
-        attrs["chi_eff_amax"] = (float(pairs.max()) if pairs.size
+        attrs["chi_eff_amax"] = (float(np.nanmax(pairs))
+                                 if np.isfinite(pairs).any()
                                  else float(amax_fallback))
-        # GW-06: empty unless strict=False let a non-uniform-isotropic campaign
-        # through, in which case the file says so about itself.
+        # GW-06: every campaign the swap's uniform-isotropic assumption was not
+        # CONFIRMED for, each with a `verified` flag -- measured violations and
+        # unverifiable joint-density campaigns that strict=False let through
+        # (verified=True / False), and spin-less legacy campaigns, which carry
+        # nothing to check and are recorded even under strict=True
+        # (verified=False).  So it is empty only when every campaign was
+        # verified uniform-isotropic; the two booleans below split it.  (It
+        # used to claim "empty unless strict=False let one through", which
+        # the spin-less case contradicts; core's loader refuses any non-empty
+        # value, as it refuses injected_spin_uniform_isotropic=False.)
         attrs["spin_basis_assumption_violations"] = json.dumps(swap_violations)
         attrs["spin_basis_assumption_violated"] = bool(
             [v for v in swap_violations if v.get("verified")])
@@ -1413,7 +1793,17 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         attrs["spin_reference_coverage_source_per_campaign"] = np.array(
             [e["bound_source"] for e in reference_coverage_evidence],
             dtype=_str)
-        attrs["spin_reference_coverage_ok"] = bool(all(reference_coverage))
+        # The orientation half of the coverage (review fix): the widest
+        # cos(tilt) interval each campaign never drew, per body, against the
+        # widest one sampling noise leaves at false-alarm 1e-9.
+        attrs["spin_reference_tilt_coverage_per_campaign"] = np.array(
+            tilt_coverage, dtype=bool)
+        attrs["spin_reference_tilt_max_gap_per_campaign"] = np.array(
+            tilt_gaps, dtype=float).reshape(-1, 2)
+        attrs["spin_reference_tilt_gap_tolerance_per_campaign"] = np.array(
+            tilt_tols, dtype=float)
+        attrs["spin_reference_coverage_ok"] = bool(
+            all(reference_coverage) and all(tilt_coverage))
     elif spin_basis == "component":
         attrs["spin_prior_mode"] = "component"
         # Stated False, not omitted: darksirens' loader REQUIRES this attr, so
@@ -1436,8 +1826,9 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         # The support bound of the joint prior in force, i.e. the largest
         # detected ceiling -- not the caller's argument, which this basis has
         # never used for anything.
-        attrs["chi_eff_amax"] = (float(np.max(chieff_chip_amax))
-                                 if chieff_chip_amax else float(amax_fallback))
+        attrs["chi_eff_amax"] = (
+            float(np.nanmax(chieff_chip_amax))
+            if np.isfinite(chieff_chip_amax).any() else float(amax_fallback))
 
     # ── GW-39: campaign kind, detection policy, sky, per-run bookkeeping ────
     attrs["cumulative_mixture"] = bool(any(is_mixture))
@@ -1459,6 +1850,21 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     attrs["acknowledge_semianalytic_excluded"] = bool(
         acknowledge_semianalytic_excluded)
     attrs["sky_marginalized"] = bool(sky_marginal)
+    # Which time (GPS span, observing runs, exposure) each campaign covers, so
+    # a PE file holding events from uncovered time can be refused downstream.
+    time_coverage = _time_coverage_attrs(set_list)
+    attrs.update(time_coverage)
+    # Which injection files, byte for byte, this product was built from.
+    attrs["campaign_files"] = np.array(campaign_files, dtype=_str)
+    attrs["campaign_file_size_bytes"] = np.array(campaign_sizes,
+                                                 dtype=np.int64)
+    attrs["campaign_file_sha256"] = np.array(campaign_sha256, dtype=_str)
+    # p_astro_available (above) states that no per-injection p_astro is USED
+    # for detection; these say which campaigns CARRY one, which is what the
+    # pastro_min pairing refusal needs to describe truthfully.
+    p_astro_columns = [_p_astro_columns(p) for p in campaign_files]
+    attrs["p_astro_used_for_detection"] = False
+    attrs["p_astro_columns_per_campaign"] = json.dumps(p_astro_columns)
     if mixture_attrs is not None:
         attrs.update(mixture_attrs)
     if reference_coverage_runs is not None:
@@ -1505,13 +1911,17 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                           else float(snr_threshold)),
         "significance_columns": list(far_columns_union),
         "significance_available": bool(far_columns_union),
+        # False = no per-injection p_astro is used for detection (the attr's
+        # meaning); which campaigns carry one is the per-campaign list below.
         "p_astro_available": False,
+        "p_astro_used_for_detection": False,
+        "p_astro_columns_per_campaign": p_astro_columns,
         "source_class_filter": format_source_class_filter(source_class),
         CUT_ESTIMATOR_ATTR: selection_cut_estimator(source_class),
         "source_class_counts_detected": value_counts(
             [normalize_source_class(c) for c in classes_det]),
-        "cosmology_H0": float(set_list[0].H0),
-        "cosmology_Om0": float(set_list[0].Om0),
+        "cosmology_H0": scalar_H0,
+        "cosmology_Om0": scalar_Om0,
         "cosmology_override_used": bool(
             any(getattr(s, "_cosmology_override", False) for s in set_list)),
         "cosmology_source_per_campaign": [
@@ -1524,12 +1934,24 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         "injected_spin_format": [str(s.spin_meta.get("spin_format"))
                                  for s in set_list],
         "component_columns_emitted": bool(extras_available),
+        "campaign_gps_range_per_campaign": time_coverage[
+            "campaign_gps_range_per_campaign"].tolist(),
+        "campaign_runs_per_campaign": json.loads(
+            time_coverage["campaign_runs_per_campaign"]),
+        "observing_runs_covered": json.loads(
+            time_coverage["observing_runs_covered"]),
+        "T_obs_yr_per_campaign": time_coverage[
+            "T_obs_yr_per_campaign"].tolist(),
+        "campaign_file_size_bytes": list(campaign_sizes),
+        "campaign_file_sha256": list(campaign_sha256),
     }
     if a_ref is not None:
         summary["spin_reference_amax"] = float(a_ref)
         summary["spin_reference_excluded_rows"] = int(n_out_of_reference)
         summary["spin_reference_coverage_per_campaign"] = [
             bool(x) for x in reference_coverage]
+        summary["spin_reference_tilt_coverage_per_campaign"] = [
+            bool(x) for x in tilt_coverage]
 
     for info in campaign_info:
         print(f"  {info}")
@@ -1542,6 +1964,38 @@ def build_selection_product(sets, *, spin_basis=DEFAULT_PARAMETER_SPACE,
 
 
 
+
+
+def _refuse_nonphysical_rows(s, keep):
+    """Refuse written rows whose masses, distance or redshift are unusable.
+
+    Only the sky position and pdraw were checked: a NaN, infinite or
+    non-positive detector/source mass or distance, or a non-finite or negative
+    redshift, on a detected row went straight into the file (August review,
+    export-sel 4).  These are the coordinates the population density is
+    evaluated at, so such a row is malformed input, not a small number.  The
+    NaN sky of the semianalytic mixture rows is legitimate and recorded
+    separately (``sky_position_available``).
+    """
+    checks = (("m1det", s._m1det, True), ("m2det", s._m2det, True),
+              ("dL", s._dL, True), ("m1src", s._m1src, True),
+              ("m2src", s._m2src, True), ("redshift", s._z, False))
+    for name, arr, strictly_positive in checks:
+        vals = np.asarray(arr, dtype=float)[keep]
+        bad = ~np.isfinite(vals) | ((vals <= 0.0) if strictly_positive
+                                    else (vals < 0.0))
+        n_bad = int(np.count_nonzero(bad))
+        if n_bad:
+            first = int(np.flatnonzero(bad)[0])
+            raise ValueError(
+                f"{s.path}: {n_bad} of {vals.size} detected injections have an "
+                f"unusable {name!r} (first: {vals[first]!r}); "
+                + ("masses and distances must be finite and positive"
+                   if strictly_positive
+                   else "redshifts must be finite and non-negative")
+                + ". The population density is evaluated at these values, so "
+                  "the row is malformed input and is refused rather than "
+                  "written.")
 
 
 def _sky_availability(set_list):
@@ -1563,6 +2017,110 @@ def _sky_availability(set_list):
             f"campaigns' injections; cut on campaign, not on finiteness, if "
             f"that is not intended.")
     return sky
+
+
+def _file_sha256(path, chunk=8 << 20):
+    """sha256 of a file, streamed (the O4ab campaign is ~3 GB)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(chunk), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _campaign_identity(set_list):
+    """``(paths, sizes, sha256s)`` of each campaign's injection file.
+
+    The product used to record no identity for its inputs, so a re-clipped
+    injection file under the same name gave a product that paired and
+    validated exactly like the original (review fix).  Two campaigns whose
+    files are byte-identical are one campaign passed twice, which double-counts
+    its exposure exactly as the same path twice does, and are refused.
+    """
+    paths = [os.fspath(s.path) for s in set_list]
+    sizes = [int(os.path.getsize(p)) for p in paths]
+    digests = [_file_sha256(p) for p in paths]
+    seen = {}
+    for p, d in zip(paths, digests):
+        if d in seen:
+            raise OverlappingCampaignError(
+                f"{seen[d]!r} and {p!r} are byte-identical injection files "
+                f"(sha256 {d}): the same campaign appears twice in one "
+                f"selection product, so its draws, exposure and detected "
+                f"injections would be counted twice. Pass each campaign once.")
+        seen[d] = p
+    return paths, sizes, digests
+
+
+def _p_astro_columns(path):
+    """The per-injection p_astro columns an injection file carries.
+
+    Both production campaigns carry them (endo3 ``pastro_*``, rpo4ab
+    ``*_p_astro``), while every selection product said
+    ``p_astro_available=False`` -- which means "not used for the detection
+    cut", and was being read as "not present" (review fix).
+    """
+    with h5py.File(path, "r") as f:
+        for grp in ("events", "injections"):
+            if grp not in f:
+                continue
+            obj = f[grp]
+            names = (list(obj.dtype.names or ()) if isinstance(obj, h5py.Dataset)
+                     else list(obj.keys()))
+            return sorted(n for n in names
+                          if "pastro" in n.lower() or "p_astro" in n.lower())
+    return []
+
+
+def _time_coverage_attrs(set_list):
+    """Per-campaign time coverage of the selection integral (review fix).
+
+    Each campaign's injections stand for the exposure of the time they were
+    drawn over, and only that time: an event from a run no campaign covers
+    enters the likelihood with no matching selection term.  Only the
+    cumulative-mixture branch used to write any GPS information, so a
+    single-campaign product (endo3 + rpo4ab, say) gave a reader no way to see
+    that a PE file paired with it held O1/O2 events.  Recorded here per
+    campaign so a validator or consumer can compare it with the events' times:
+
+    * ``campaign_gps_range_per_campaign`` -- ``(n_campaigns, 2)`` GPS
+      ``[min, max]`` of the campaign's rows (or its ``gps_start``/``gps_end``
+      attrs), NaN when unknown; ``campaign_gps_range_source_per_campaign``
+      says which (``row_times`` / ``attrs_gps_start_end`` / ``unknown``);
+    * ``campaign_runs_per_campaign`` -- JSON list, per campaign, of the
+      observing runs whose official window
+      (:data:`gwcat.observing_runs.EXPOSURE_WINDOWS_GPS`) that range overlaps,
+      and ``observing_runs_covered``, their union in run order;
+    * ``T_obs_yr_per_campaign`` -- each campaign's own exposure (``T_obs_yr``
+      is their sum).
+
+    Recording only: nothing here changes which rows are written or ``pdraw``.
+    """
+    _str = h5py.string_dtype()
+    ranges, sources, runs = [], [], []
+    for s in set_list:
+        rng = s.gps_range
+        sources.append(str(getattr(s, "_gps_range_source", "unknown")))
+        if rng is None:
+            ranges.append((float("nan"), float("nan")))
+            runs.append([])
+            continue
+        lo, hi = float(rng[0]), float(rng[1])
+        ranges.append((lo, hi))
+        runs.append([r for r in RUN_LABELS
+                     if EXPOSURE_WINDOWS_GPS[r][0] <= hi
+                     and lo <= EXPOSURE_WINDOWS_GPS[r][1]])
+    covered = [r for r in RUN_LABELS if any(r in rr for rr in runs)]
+    return {
+        "campaign_gps_range_per_campaign": np.array(
+            ranges, dtype=float).reshape(-1, 2),
+        "campaign_gps_range_source_per_campaign": np.array(sources,
+                                                           dtype=_str),
+        "campaign_runs_per_campaign": json.dumps(runs),
+        "observing_runs_covered": json.dumps(covered),
+        "T_obs_yr_per_campaign": np.array(
+            [float(s._T_yr) for s in set_list], dtype=float),
+    }
 
 
 def _amax_pair(amax_detected):
@@ -1589,3 +2147,39 @@ def _json_checks(checks):
         else:
             out[k] = float(v)
     return out
+
+
+#: The tolerance :func:`gwcat.selection_spin.check_factored_vs_joint` passes at.
+_FACTORED_VS_JOINT_RTOL = 1e-6
+
+
+def _injected_spin_azimuths(s):
+    """How campaign ``s``'s 4-D component spin density treats the azimuths.
+
+    * ``"factored"`` -- the file gives each azimuth's density as its own
+      factor (o4_factored), so the 4-D (a, cos tilt) density marginalises it
+      exactly, whatever that factor is.
+    * ``"checked_isotropic"`` -- a joint cartesian density (O3 endo3) divided
+      out as uniform in azimuth, where the file's per-spin cartesian pdfs
+      check isotropic on every row (a uniform direction, so a uniform
+      azimuth) and the joint pdf, when given, equals their product.
+    * ``"assumed_uniform"`` -- a joint density (joint_cartesian, joint_polar,
+      or an endo3 file whose isotropy check does not pass) reduced to 4-D by
+      dividing each azimuth out as U[0, 2 pi).  One density evaluated at the
+      drawn points cannot show an azimuth dependence, so this is not checked.
+    * ``"none"`` -- the campaign has no component spin density.
+    """
+    if getattr(s, "_ln_spin_component", None) is None:
+        return "none"
+    meta = s.spin_meta or {}
+    fmt = meta.get("spin_format")
+    if fmt == "o4_factored":
+        return "factored"
+    if fmt == "endo3_factored":
+        checks = meta.get("checks") or {}
+        uni = checks.get("max_spin_uniform")
+        dev = checks.get("factored_vs_joint_dev")
+        if (uni is not None and all(bool(x) for x in uni)
+                and (dev is None or float(dev) <= _FACTORED_VS_JOINT_RTOL)):
+            return "checked_isotropic"
+    return "assumed_uniform"

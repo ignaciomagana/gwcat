@@ -80,6 +80,10 @@ INJECTION_SUPPORT_GPS = {
     "O4b": EXPOSURE_WINDOWS_GPS["O4b"],
 }
 
+#: Largest |N_k - round(N_k)| accepted for the solved O1/O2 draw counts (see
+#: :func:`derive_mixture_bookkeeping`).
+N_INTEGRALITY_TOL = 1e-5
+
 #: The exposure components of the cumulative mixture's per-row ``weights``,
 #: the runs each covers, and what its duration T_k MEANS.  The weights are
 #: ``(T_k/T)/(N_k/N)`` per component (Essick 2021, RNAAS 5 220), and the three
@@ -91,9 +95,6 @@ INJECTION_SUPPORT_GPS = {
 #:     rows these are;
 #:   * O4 -- monthly wall-clock time ("constructed based on wall-time within
 #:     each month", README), which includes breaks and is NOT an observing time.
-#: Largest |N_k - round(N_k)| accepted for the solved O1/O2 draw counts.
-N_INTEGRALITY_TOL = 1e-5
-
 MIXTURE_COMPONENTS = (
     ("O1", ("O1",), "coincident_livetime_semianalytic"),
     ("O2", ("O2",), "coincident_livetime_semianalytic"),
@@ -210,8 +211,8 @@ def derive_mixture_bookkeeping(run, weights, total_generated,
 
     and ``T_k = w_k N_k T / N``.  Two checks keep the anchors honest: the O3
     anchor must reproduce the file's (single) O3 weight to 1e-10 relative, and
-    the solved N_O1, N_O2 must be integers to 1e-3 -- a wrong anchor lands them
-    far from any integer.
+    the solved N_O1, N_O2 must be integers to :data:`N_INTEGRALITY_TOL`
+    (1e-5) -- a wrong anchor lands them far from any integer.
 
     Returns a dict with ``components`` (labels), ``N`` and ``T_s`` (floats, in
     component order), ``T_definition``, ``component_runs`` (JSON-able), the

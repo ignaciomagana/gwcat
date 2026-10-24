@@ -147,13 +147,23 @@ def spaces_supported_by(store_params) -> tuple:
 
     A store that predates the spin ingest can supply ``chieff`` and ``nospin``
     and nothing else; saying so turns "a_1 is missing" into an actionable
-    message.
+    message.  A space's ALTERNATIVE groups (``cos_tilt_1`` or ``tilt_1``, ...)
+    must be satisfiable too, or the builder refuses it (review 2026-10-20).
     """
-    from .params import list_spaces
+    from .params import get_space, list_spaces
 
     have = set(store_params)
+
+    def _alternatives_ok(name):
+        for group in get_space(name).store_alternatives:
+            if not any(set((alt,) if isinstance(alt, str) else alt) <= have
+                       for alt in group):
+                return False
+        return True
+
     return tuple(name for name in list_spaces()
-                 if set(export_requirements_for(name)) <= have)
+                 if set(export_requirements_for(name)) <= have
+                 and _alternatives_ok(name))
 
 
 def _supported_spaces_hint(store_params) -> str:
@@ -164,7 +174,11 @@ def _supported_spaces_hint(store_params) -> str:
         # says "pass --parameter-space X" for an X the builder then rejects is
         # worse than no hint.
         from .export.pe_builder import SUPPORTED_SPIN_BASES as _buildable
+        from .params import OPT_IN_SPACES
         ok = tuple(s for s in ok if s in _buildable)
+        # An opt-in space (chieff_chip: not a shipped product, refused without
+        # its flag) is not offered as a remedy (review 2026-10-20).
+        ok = tuple(s for s in ok if s not in OPT_IN_SPACES)
     except Exception:          # a hint must never mask the real error
         return ""
     if not ok:
@@ -315,6 +329,52 @@ def check_required_alternatives(alternative_groups, store_params, avail,
             + ". Provide one alternative per group (or drop the events).")
 
 
+class NonFiniteSampleError(MissingParameterError):
+    """An exported coordinate column holds NaN/inf samples.
+
+    The availability mask records only whether a column is PRESENT for an
+    event (:func:`check_required`), so a present column with NaN samples used
+    to pass every export guard -- and in a spin projection the NaN then read
+    as "outside the spin ceiling" (review 2026-10-20).
+    """
+
+
+def check_columns_finite(columns, event_names=None, nsamp=None, *,
+                         context: str = "export") -> None:
+    """Refuse exported coordinate columns that are not finite per sample.
+
+    ``columns`` maps a column name to its concatenated ``nobs * nsamp``
+    array; with ``event_names``/``nsamp`` the message names the events.  Only
+    the columns passed are checked, so a caller passes the coordinates the
+    density is a function of (an advisory column may legitimately be NaN).
+    """
+    import numpy as np
+
+    problems = []
+    for name, col in columns.items():
+        v = np.asarray(col, dtype=float)
+        bad = ~np.isfinite(v)
+        if not bad.any():
+            continue
+        where = ""
+        if event_names is not None and nsamp:
+            names = np.asarray(event_names)
+            per_event = bad.reshape(len(names), int(nsamp)).sum(axis=1)
+            hit = np.nonzero(per_event)[0]
+            where = " in " + ", ".join(
+                f"{names[i]}: {int(per_event[i])}" for i in hit[:10]) + (
+                "" if hit.size <= 10 else f", ... (+{hit.size - 10} more)")
+        problems.append(f"{name!r}: {int(bad.sum())} sample(s){where}")
+    if problems:
+        raise NonFiniteSampleError(
+            f"{context}: exported coordinate column(s) hold non-finite "
+            f"samples although the store marks them available: "
+            + "; ".join(problems)
+            + ". The availability mask records only that a column is present "
+              "for an event; NaN samples inside it are a broken ingest, not "
+              "a prior-support problem. Re-ingest, or drop those events.")
+
+
 # --------------------------------------------------------------------------
 # Exported-weight support contract (GW-01)
 # --------------------------------------------------------------------------
@@ -346,7 +406,10 @@ def check_p_pe_positive(p_pe, event_names=None, nsamp=None, *,
         When both are given, offending samples are attributed to events so the
         error names them.  ``nsamp`` is the (constant) samples-per-event count.
     allow_zero : bool
-        Warn instead of raising.  Escape hatch for inspecting a legacy store.
+        Warn instead of raising -- for EXACT zeros only.  Escape hatch for
+        inspecting a legacy store.  A NaN, infinite or negative ``p_pe`` is
+        never a legacy truncation, so it raises regardless (review
+        2026-10-20: the flag used to write those too).
     expected_zero : array-like of bool, optional
         Samples whose ``p_pe`` is *legitimately* zero and must be excluded from
         the check -- the out-of-support mask (GW-03).  A prior genuinely assigns
@@ -360,7 +423,9 @@ def check_p_pe_positive(p_pe, event_names=None, nsamp=None, *,
     Returns
     -------
     int
-        The number of offending samples (0 when the column is clean).
+        The number of offending samples (0 when the column is clean) -- with
+        ``allow_zero`` the number of exact zeros written, which a caller
+        records on the product.
     """
     import numpy as np
 
@@ -402,8 +467,11 @@ def check_p_pe_positive(p_pe, event_names=None, nsamp=None, *,
     if remedy:
         msg += f"  {remedy}"
 
-    if allow_zero:
+    if allow_zero and n_bad == n_zero:
         import warnings
         warnings.warn(msg + "  (allow_zero=True: writing it anyway.)")
         return n_bad
+    if allow_zero:
+        msg += ("  allow_zero covers exact zeros only; a NaN, infinite or "
+                "negative p_pe is refused regardless.")
     raise ZeroWeightError(msg)

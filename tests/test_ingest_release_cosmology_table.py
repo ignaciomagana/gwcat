@@ -270,18 +270,21 @@ def test_o4_file_with_c01_labels_uses_o4_defaults():
 # --------------------------------------------------------------------------
 # The exact 'Planck15_lal' alias
 # --------------------------------------------------------------------------
-def test_planck15_lal_alias_is_exact_without_case_folding():
+def test_planck15_lal_alias_matches_bilby_case_insensitively():
+    """bilby.gw.cosmology.get_cosmology reads any spelling of planck15_lal as
+    LAL's Planck15, so gwcat does too (review 2026-10-20); nothing else is
+    case-folded."""
     from gwcat.ingest import _parse_analytic_dL
     assert NAMED_COSMOLOGIES["Planck15_lal"] is LAL_PLANCK15
-    got = _parse_analytic_dL("UniformSourceFrame(minimum=1, maximum=10, "
-                             "cosmology='Planck15_lal')")
-    assert got.cosmology_recognized is True
-    assert (got.H0, got.Om0) == (67.90, 0.3065)
-    for spelling in ("planck15_lal", "PLANCK15_LAL", "Planck15_Lal"):
-        bad = _parse_analytic_dL("UniformSourceFrame(minimum=1, maximum=10, "
+    for spelling in ("Planck15_lal", "planck15_lal", "PLANCK15_LAL",
+                     "Planck15_Lal"):
+        got = _parse_analytic_dL("UniformSourceFrame(minimum=1, maximum=10, "
                                  f"cosmology='{spelling}')")
-        assert bad.cosmology_recognized is False
-        assert bad.H0 is None
+        assert got.cosmology_recognized is True
+        assert (got.H0, got.Om0) == (67.90, 0.3065)
+    bad = _parse_analytic_dL("UniformSourceFrame(minimum=1, maximum=10, "
+                             "cosmology='planck15')")
+    assert bad.cosmology_recognized is False and bad.H0 is None
 
 
 def test_pesummary_version_is_recorded(tmp_path, monkeypatch):

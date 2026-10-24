@@ -10,23 +10,37 @@ Design choices (locked):
     the cosmology used to evaluate it. The (m1det, q, dL)-basis mass Jacobian
     is applied only at darksirens export time.
 
-Format heterogeneity handled (verified by probe):
-  * O3 (C01:*):  prefer 'C01:Mixed'. GWTC-3 has priors/analytic; GWTC-2.1 does
-    NOT -> fall back to LVK default UniformSourceFrame/Planck15 and validate
-    against the stored prior 'samples'.
-  * O4 (C00:*):  prefer 'C00:Mixed'. 'C00:Mixed' carries NO priors group, so
-    read the analytic dL prior from a sibling waveform analysis. Some O4b
+Format heterogeneity handled (verified on the local releases):
+  * O1-O3 (GWTC-2.1/3, C01:*): prefer 'C01:Mixed'.  A Mixed set carries no
+    analytic priors of its own, so they are read from a sibling (45 of the 54
+    GWTC-2.1 files and every GWTC-3 file have an analytic group).  The
+    '_cosmo' releases are reweighted by the LVK to a prior uniform in comoving
+    volume and source-frame time, so their effective distance prior is
+    UniformSourceFrame at the cosmology of the release-reweight table
+    (gwcat/data/release_reweight_cosmology*.yaml), whatever the analytic group
+    records -- also for the 9 GWTC-2.1 rows with no analytic group anywhere.
+    A non-reweighted O1-O3 row with no analytic group takes LALInference's
+    dL^2 prior on the bounds its config declares, or is refused.
+  * O4 (GWTC-4.1/5, C00:*): prefer 'C00:Mixed' (any spin variant; extended
+    sets such as 'C00:Mixed+XO4a' rank after it).  Its priors come from a
+    sibling: the constituents its meta_data/combined record names first,
+    and whether those constituents agree is recorded per row.  Some O4b
     (GWTC-5) events have no Mixed set at all -> fall back to a configurable
     waveform priority list and record the choice per event.
+  * The file's own distance prior samples, where it carries any, check the
+    declared sampling class and bounds (KS and range tests judged against
+    sampling noise).  They cannot detect a wrong cosmology, and rows whose
+    file carries no distance prior samples are not checked against any.
 
 This module uses pesummary.io.read for robustness across the above quirks.
 For the very largest files you can swap _read_event_pesummary for an h5py
 reader of f[analysis]['posterior_samples'] (a structured array) -- the rest of
 the pipeline is agnostic to how samples are obtained.
 
-UNTESTED against your local files: run `python -m gwcat.ingest --inspect <file>`
-on one event per catalog first; it prints the chosen analysis, prior source,
-and the prior-validation result before you launch the full batch.
+Before a full batch, run `gwcat ingest --inspect <file>` with the build's
+flags on one event per catalog: it prints the chosen analysis, each prior's
+source, the combined set's constituents and the prior-validation result,
+under the same IngestConfig the build will use.
 """
 from __future__ import annotations
 
@@ -43,8 +57,10 @@ import h5py
 
 from .cosmology import (make_cosmology, uniform_source_frame_prob,
                         dL_prior_prob, DL_PRIOR_KINDS, DL_PRIOR_NEEDS_ALPHA,
-                        DistancePriorKindError, NAMED_COSMOLOGIES,
-                        PLANCK15, O4_FALLBACK)
+                        DL_PRIOR_NEEDS_COSMOLOGY,
+                        DistancePriorKindError,
+                        PLANCK15, O4_FALLBACK, UnrecognisedCosmologyError,
+                        is_radiation_free_flat_lcdm, resolve_named_cosmology)
 from .source_class import (normalize_source_class, classify_by_mass,
                           DEFAULT_NSBH_MASS_THRESHOLD)
 from .spin import chi_p_from_components
@@ -214,6 +230,36 @@ META_STR_FIELDS += ["constituent_mixture_labels", "constituent_mixture_counts"]
 # OTHER constituents (e.g. C01:SEOBNRv4PHM, which has no analytic group)
 # declared, so a per-half ceiling difference is visible on the row.
 META_STR_FIELDS += ["spin_amax_config_per_constituent"]
+# The constituents a combined set's own ``meta_data/combined`` record names
+# ("+"-joined, "" when the record names no label of the file), and whether
+# their analytic priors agree (review 2026-10-20, critical-1): "" for a row
+# that is not a combined set, "agree", "differ:<keys>" or
+# "unverified:<why>".  A Mixed row divides out ONE sibling's prior, which is
+# the Mixed set's prior only when its constituents' priors agree.
+META_STR_FIELDS += ["mixed_constituent_labels", "mixed_constituent_priors"]
+# max|a_i| over each row's samples, and per constituent of a combined set
+# (JSON {label: [max|a_1|, max|a_2|] | null}, "" for a non-Mixed row), so a
+# sample above the resolved ceiling is a number on the row, not only a
+# substring of spin_prior_source (review 2026-10-20, high-2).
+META_FLOAT_FIELDS += ["spin_sample_max_1", "spin_sample_max_2"]
+# The prior-sample checks of the distance prior, as numbers (review
+# 2026-10-20, medium-48): the KS threshold applied (scaled with N), the
+# number of prior samples, the declared prior's mass beyond their range and
+# its p-value for correct draws, and the fraction of samples outside the
+# declared bounds.  NaN when the file carries no prior samples.
+# The HEALPix nside sky_area_90 was resolved at (NaN when it could not be;
+# review 2026-10-20, medium-49).  The sample count is nsamp_original.
+META_FLOAT_FIELDS += ["sky_area_90_nside"]
+META_FLOAT_FIELDS += ["dL_prior_ks_threshold", "dL_prior_n_prior_samples",
+                      "dL_prior_frac_mass_uncovered",
+                      "dL_prior_frac_samples_outside",
+                      "dL_prior_bounds_pvalue"]
+META_STR_FIELDS += ["spin_sample_max_per_constituent"]
+# How observing_run was assigned: "gps_exposure_windows" (median GPS time in
+# gwcat's official run table), "gps_outside_exposure_windows" (observing_run
+# ""), or "event_name" (no GPS time; the name's date).  Review 2026-10-20,
+# low-33.
+META_STR_FIELDS += ["observing_run_source"]
 
 # Default waveform priority when no Mixed set exists (O4b/GWTC-5 events).
 O4_WAVEFORM_PRIORITY = [
@@ -248,6 +294,12 @@ class IngestConfig:
     #: options b/c).  Off by default so existing stores and the v1 exporter
     #: are unchanged; a row whose mixture cannot be verified is refused.
     constituent_mixture_prior: bool = False
+    #: Which reading of the mixture prior ``constituent_mixture_prior`` builds
+    #: (:data:`gwcat.constituent_mixture.MIXTURE_CONVENTIONS`; review
+    #: 2026-10-20).  "equal_weight" is the original form; "own_prior" divides
+    #: each row by its own constituent's prior.  An owner decision: recorded
+    #: in every mixture row's mass/dL prior source, default unchanged.
+    constituent_mixture_convention: str = "equal_weight"
     validate_prior: bool = True
     compression: str = "gzip"
     #: Which UniformSourceFrame implementation evaluates p_dL_pe (GW-01).
@@ -266,16 +318,59 @@ class IngestConfig:
     #: KS threshold above which the file's own prior samples are taken to reject
     #: the parsed distance prior (GW-02).  This compares the SAMPLING class the
     #: file declares against its own prior draws, so exceeding it means the parse
-    #: / bounds / cosmology mapping is wrong.
+    #: / bounds mapping is wrong.  It is a FLOOR since the 2026-10-20 review:
+    #: the threshold rises with ``prior_ks_alpha`` for few prior samples.  The
+    #: KS checks the distribution class and bounds; it cannot tell a cosmology
+    #: in the plausible range from another (see ``defaulted_cosmology_fatal``).
     prior_ks_max: float = 0.05
+    #: Significance for the N-scaled KS threshold (review 2026-10-20,
+    #: medium-48): the threshold applied is the larger of ``prior_ks_max`` and
+    #: the Kolmogorov critical value at this significance for the row's number
+    #: of prior samples, so correct parses with few samples are not rejected
+    #: (they were 100% of the time at N = 50 and 57% at N = 200).
+    prior_ks_alpha: float = 1e-3
     #: Make that a hard failure rather than a warning.  Default False so a single
     #: odd release cannot block a 282-file ingest; set True for an audited build.
     prior_ks_fatal: bool = False
+    #: Warn on a prior-sample BOUNDS mismatch when the declared prior's mass
+    #: outside the samples' range is this improbable for correct draws
+    #: (p-value of Beta(2, N-1)), or when any prior sample lies outside the
+    #: declared bounds (``dL_outside_warn_frac``).  The old test compared the
+    #: sum against 0.0, which every correct parse exceeds by ~2/(N+1), so it
+    #: fired on 273 of 282 production rows and buried the real mismatches.
+    prior_bounds_pvalue_min: float = 1e-3
+    #: Refuse a row whose distance prior depends on a cosmology
+    #: (UniformSourceFrame / UniformComovingVolume) that the file does not
+    #: declare, so that gwcat would evaluate it at the per-catalog default
+    #: (review 2026-10-20, low-27).  The KS gate cannot catch a wrong
+    #: cosmology, so an audited build should not rely on a guessed one.
+    #: Default False keeps the catalog default (recorded as
+    #: dL_prior_cosmology_source="catalog_default").
+    defaulted_cosmology_fatal: bool = False
     #: Warn when more than this FRACTION of a row's dL samples fall outside the
     #: recorded distance-prior bounds.  The default warns on any occurrence: the
     #: samples are no longer zeroed (GW-01), but the mismatch means the recorded
     #: bounds describe a different analysis than the one being ingested.
     dL_outside_warn_frac: float = 0.0
+    #: What to do with a combined (``Mixed``) row whose constituents, as named
+    #: by its ``meta_data/combined`` record, declare DIFFERENT analytic priors
+    #: (review 2026-10-20, critical-1: 44 GWTC-4.1 C00:Mixed sets include
+    #: C00:NRSur7dq4, whose q >= 1/6 and 60 <= Mtot <= 400 differ from its
+    #: siblings).  "warn" (default) keeps the sibling-borrowed prior, warns and
+    #: records ``mixed_constituent_priors = "differ:<keys>"``; "raise" refuses
+    #: such a row unless ``constituent_mixture_prior`` builds a
+    #: constituent-aware prior for it.  Which prior a Mixed set should divide
+    #: out is the owner's convention; this only makes the disagreement visible.
+    mixed_prior_mismatch: str = "warn"
+    #: What to do when a row's spin samples exceed the ceiling its resolved
+    #: prior declares (review 2026-10-20, high-2; 57 GWTC-2.1/3 C01:Mixed rows,
+    #: whose SEOBNRv4PHM half reaches a spin of about 1.0 under a 0.99
+    #: ceiling).  "warn" (default) keeps the declared ceiling, warns and
+    #: records spin_sample_max_*; "raise" refuses the row.  Whether such
+    #: samples are dropped or the ceiling widened is the owner's decision (the
+    #: exporter's opt-in spin-ceiling cut is one answer); ingest only refuses
+    #: on request.
+    spin_exceeds_amax: str = "warn"
 
 
 # --------------------------------------------------------------------------
@@ -407,6 +502,18 @@ def _spin_variant_token(variant: str) -> str:
     return ""
 
 
+def _is_combined_base(base: str) -> bool:
+    """Whether an analysis BASE names a combined ("Mixed") sample set.
+
+    ``"Mixed"`` and its extended spellings: 29 GWTC-4.1 files ship
+    ``C00:Mixed+XO4a`` beside ``C00:Mixed`` (with the same rows and the same
+    meta_data/combined record).  Testing ``base == "Mixed"`` exactly kept it
+    as a single-waveform label, and so as a CONSTITUENT candidate of
+    ``C00:Mixed`` (review 2026-10-20, high-13 and low-73).
+    """
+    return str(base).startswith("Mixed")
+
+
 def find_mixed_analyses(analyses, prefix: str):
     """Every combined ("Mixed") set for ``prefix``, best spin variant first.
 
@@ -420,12 +527,17 @@ def find_mixed_analyses(analyses, prefix: str):
     ``C00:IMRPhenomNSBH``, an aligned-spin NSBH approximant, chosen over three
     available Mixed sets, and the reason recorded for it was
     ``"preferred_priority"``.
+
+    Extended combined sets (``C00:Mixed+XO4a``, review 2026-10-20, low-73) are
+    combined sets too; they follow the plain ``Mixed`` sets.
     """
     cands = []
     for a in analyses:
         pfx, base, variant = _label_parts(a)
-        if pfx == prefix and base == "Mixed":
-            cands.append((_variant_rank(variant), a))
+        if pfx == prefix and _is_combined_base(base):
+            # An extended combined set (C00:Mixed+XO4a) ranks after every
+            # plain Mixed set, so the preferred choice is unchanged (low-73).
+            cands.append(((base != "Mixed", _variant_rank(variant)), a))
     # stable: ties keep the file's own order
     return [a for _r, a in sorted(cands, key=lambda t: t[0])]
 
@@ -576,7 +688,8 @@ def _sample_set_meta(analysis: str, preferred_label: str, ranked, path: str,
     _pfx, approximant, spin_variant = _label_parts(analysis)
     if not approximant:
         approximant = analysis
-    is_mixed = 1.0 if approximant.lower() == "mixed" else 0.0
+    # Any combined set, C00:Mixed+XO4a included (review 2026-10-20, low-73).
+    is_mixed = 1.0 if _is_combined_base(approximant) else 0.0
     is_preferred = 1.0 if analysis == preferred_label else 0.0
     try:
         rank = float(list(ranked).index(analysis))
@@ -613,6 +726,140 @@ def _sample_set_meta(analysis: str, preferred_label: str, ranked, path: str,
         priority_rank=rank,
         selection_reason=reason,
     )
+
+
+# --------------------------------------------------------------------------
+# Combined-set constituents (review 2026-10-20)
+# --------------------------------------------------------------------------
+def combined_constituents(data, analysis, analyses=()):
+    """The constituent labels a combined set's ``meta_data/combined`` names.
+
+    Every Mixed set in the local GWTC-2.1/3/4.1/5 releases carries this
+    record.  The O4 releases name the constituent analyses in it
+    (``"C00:IMRPhenomXPHM-SpinTaylor, C00:NRSur7dq4, C00:SEOBNRv5PHM"``);
+    GWTC-2.1/3 name internal run tags (``"Prod5, Prod6_extended"``) that are
+    not labels.  Only names that are analyses of this file (other than
+    ``analysis`` itself) are returned, in the record's order; ``[]`` when
+    there is no usable record (``data`` None, no record, or no label in it).
+    """
+    if data is None:
+        return []
+    node = _extra_kwargs_for(data, analysis)
+    md = node.get("meta_data") if isinstance(node, dict) else None
+    raw = md.get("combined") if isinstance(md, dict) else None
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple, np.ndarray)):
+        raw = ",".join(_decode(x)
+                       for x in np.asarray(raw, dtype=object).ravel())
+    else:
+        raw = _decode(raw)
+    have = set(analyses)
+    out = []
+    for tok in raw.split(","):
+        lab = tok.strip().strip("'\"")
+        if lab and lab != analysis and lab in have and lab not in out:
+            out.append(lab)
+    return out
+
+
+#: Analytic prior keys compared across a combined set's constituents
+#: (critical-1): every key that enters the exported ``p_pe`` or bounds its
+#: support.  Any other key a constituent declares as a ``Constraint`` is
+#: compared too -- NRSur7dq4's ``total_mass`` Constraint is the live case.
+_MIXED_PRIOR_KEYS = ("chirp_mass", "mass_ratio", "mass_1", "mass_2",
+                     "total_mass", "symmetric_mass_ratio",
+                     "luminosity_distance", "a_1", "a_2", "tilt_1", "tilt_2",
+                     "chi_1", "chi_2")
+
+
+def compare_constituent_priors(analysis, constituents, priors):
+    """Whether a combined set's constituents declare the same analytic priors.
+
+    Returns ``"agree"``, ``"differ:<k1>,<k2>"`` (the keys whose reprs differ,
+    or that only some constituents declare), or ``"unverified:<why>"`` when
+    the record names no constituent label or a constituent has no analytic
+    group.  Reprs are compared with whitespace removed.
+    """
+    if not constituents:
+        return "unverified:no_constituent_labels"
+    analytic = priors.get("analytic", {}) if isinstance(priors, dict) else {}
+    nodes, missing = {}, []
+    for lab in constituents:
+        node = analytic.get(lab) if isinstance(analytic, dict) else None
+        if not node:
+            missing.append(lab)
+        else:
+            nodes[lab] = node
+    if missing:
+        return f"unverified:no_analytic({','.join(missing)})"
+
+    def _is_constraint(v):
+        got = _parse_analytic_spin(v)
+        return got is not None and got[0] == "Constraint"
+
+    keys = set()
+    for node in nodes.values():
+        keys |= {k for k in node
+                 if k in _MIXED_PRIOR_KEYS or _is_constraint(node[k])}
+    differ = []
+    for k in sorted(keys):
+        vals = {re.sub(r"\s+", "", str(node[k])) if k in node else None
+                for node in nodes.values()}
+        if len(vals) > 1:
+            differ.append(k)
+    return f"differ:{','.join(differ)}" if differ else "agree"
+
+
+def _sibling_search_order(analysis, analyses, constituents=()):
+    """The siblings to borrow a prior from, best first (review 2026-10-20,
+    low-10).
+
+    A combined set's own constituents (as its ``meta_data/combined`` record
+    names them) come first, then siblings sharing the ingested label's spin
+    variant token, then the rest, each group in file order.  The plain file
+    order made 27 production C00:Mixed rows record C00:IMRPhenomXO4a -- not a
+    constituent -- as the source of their distance, mass and spin priors
+    (equal to the constituents' in every key, so no number moved).
+    """
+    want = _spin_variant_token(_label_parts(analysis)[2])
+    first = [c for c in constituents if c != analysis and c in analyses]
+    rest = [a for a in analyses if a != analysis and a not in first]
+    same = [a for a in rest if _spin_variant_token(_label_parts(a)[2]) == want]
+    return first + same + [a for a in rest if a not in same]
+
+
+class MixedPriorMismatchError(ValueError):
+    """A combined set's constituents declare different analytic priors."""
+
+
+class DuplicateSampleSetError(ValueError):
+    """One (event, sample set) would occupy two rows of a store."""
+
+
+def _warn_multiple_preferred(names, is_preferred, where):
+    """Warn when an event carries more than one ``is_preferred`` row.
+
+    The ``preferred`` and ``mixed-first`` waveform policies then break the
+    tie by store order, so which samples are exported is not a choice anyone
+    made (review 2026-10-20, medium-24 / medium-25).
+    """
+    if is_preferred is None:
+        return
+    count = {}
+    for n, f in zip(names, is_preferred):
+        try:
+            pref = float(f) > 0.5
+        except (TypeError, ValueError):
+            pref = False
+        if pref:
+            count[n] = count.get(n, 0) + 1
+    many = sorted(n for n, c in count.items() if c > 1)
+    if many:
+        warnings.warn(
+            f"{where}: {len(many)} event(s) carry more than one preferred "
+            f"sample set ({many[:10]}); the 'preferred' and 'mixed-first' "
+            f"waveform policies would pick between them by store order.")
 
 
 # --------------------------------------------------------------------------
@@ -695,7 +942,9 @@ def _parse_analytic_dL(prior_string: str) -> AnalyticDLPrior:
     The class name is taken from the first ``Name(`` in the string, so a dotted
     module path is stripped and a nested cosmology repr cannot be mistaken for
     it.  Cosmology resolution is by EXACT token match against
-    :data:`gwcat.cosmology.NAMED_COSMOLOGIES`: the old ``"Planck15" in tok``
+    :data:`gwcat.cosmology.NAMED_COSMOLOGIES` (plus bilby's case-insensitive
+    ``planck15_lal``, :func:`gwcat.cosmology.resolve_named_cosmology`; a
+    cosmology with radiation is left unresolved): the old ``"Planck15" in tok``
     substring test also matched ``'Planck15_LAL'``, silently giving 190 O4 rows
     astropy's (67.74, 0.3075) instead of LAL's (67.90, 0.3065).
     """
@@ -734,14 +983,15 @@ def _parse_analytic_dL(prior_string: str) -> AnalyticDLPrior:
             else:
                 cosmology_name = bare.split("(", 1)[0].strip()
                 cosmology_recognized = False
-        elif bare in NAMED_COSMOLOGIES:
-            cosmo = NAMED_COSMOLOGIES[bare]
+        elif is_radiation_free_flat_lcdm(resolve_named_cosmology(bare)):
+            cosmo = resolve_named_cosmology(bare)
             H0, Om0 = cosmo.H0.value, cosmo.Om0
             cosmology_name = bare
             cosmology_recognized = True
         else:
-            # A named cosmology gwcat does not know.  Do NOT guess: record the
-            # token and leave H0/Om0 unresolved so the caller can be loud.
+            # A named cosmology gwcat does not know -- or one (H0, Om0) cannot
+            # describe, like astropy's Planck15 with radiation.  Do NOT guess:
+            # record the token and leave H0/Om0 unresolved; the caller refuses.
             cosmology_name = bare
             cosmology_recognized = False
 
@@ -824,15 +1074,80 @@ class ResolvedDLPrior:
         return make_cosmology(self.H0, self.Om0)
 
 
+#: LALInference's distance prior when its ``[engine]`` sets only the bounds:
+#: p(dL) ~ dL^2 on [distance-min, distance-max], distance-min defaulting to
+#: 1 Mpc.  Any other distance/volume option in the engine section means a
+#: different prior, which gwcat refuses to guess.
+_LALINFERENCE_DL_ALPHA = 2.0
+_LALINFERENCE_DL_MIN_DEFAULT = 1.0
+
+
+def _dL_prior_from_config(data, analysis, analyses):
+    """The LALInference ``config_file/engine`` distance prior, or None.
+
+    Returns ``(dmin, dmax, labels, note)`` from ``analysis``'s own engine
+    section, else from every same-prefix sibling that declares
+    ``distance-max`` (the constituents of a GWTC-2.1 ``C01:Mixed``, which
+    carry no analytic group).  ``note`` is "" or says how the siblings
+    differ.  Raises :class:`DistancePriorKindError` when an engine section
+    sets a distance option other than the bounds.
+    """
+    cfg_all = getattr(data, "config", None) if data is not None else None
+    if not isinstance(cfg_all, dict):
+        return None
+
+    def _one(an):
+        try:
+            cfgd = cfg_all.get(an)
+        except Exception:
+            return None
+        eng = cfgd.get("engine") if isinstance(cfgd, dict) else None
+        if not isinstance(eng, dict):
+            return None
+        dmax = _config_float(eng.get("distance-max"))
+        if dmax is None:
+            return None
+        odd = sorted(k for k in eng
+                     if ("dist" in k.lower() or "volume" in k.lower()
+                         or "malmquist" in k.lower() or "cosmo" in k.lower())
+                     and k not in ("distance-min", "distance-max"))
+        if odd:
+            raise DistancePriorKindError(
+                f"{an}: config_file/engine sets distance option(s) {odd}; "
+                f"gwcat cannot tell which distance prior that run used and "
+                f"refuses to assume LALInference's default dL^2.")
+        dmin = _config_float(eng.get("distance-min"))
+        return (_LALINFERENCE_DL_MIN_DEFAULT if dmin is None else dmin), dmax
+
+    own = _one(analysis)
+    if own is not None:
+        return own[0], own[1], [analysis], ""
+    pfx = _label_parts(analysis)[0]
+    hits = [(an, _one(an)) for an in analyses
+            if an != analysis and _label_parts(an)[0] == pfx]
+    hits = [(an, v) for an, v in hits if v is not None]
+    if not hits:
+        return None
+    lo = min(v[0] for _an, v in hits)
+    hi = max(v[1] for _an, v in hits)
+    note = ("" if len({v for _an, v in hits}) == 1 else
+            "constituent_bounds_differ(" + ";".join(
+                f"{an}:{v[0]:g}-{v[1]:g}" for an, v in hits) + ")")
+    return lo, hi, [an for an, _v in hits], note
+
+
 def resolve_dL_prior(catalog, analysis, analyses, priors, dL_samples,
                      cfg: IngestConfig, flavour: str = "native",
-                     release_table=None):
+                     release_table=None, data=None, constituents=()):
     """Resolve the effective distance prior for one ingested analysis.
 
     Strategy for the bounds is unchanged: read analytic from the chosen
     analysis; if absent (e.g. the GWTC-2.1/3 ``Mixed`` sets, whose analytic AND
     prior-sample groups are both empty), search sibling analyses; if still absent
-    use the bounds of the dL sample range.
+    use the bounds of the dL sample range.  A non-reweighted O1-O3 release with
+    no analytic group anywhere takes LALInference's dL^2 prior on the bounds
+    its ``config_file/engine`` declares (``data``, the pesummary read object),
+    or is refused (review 2026-10-20, medium-44).
 
     GW-02 added the distribution CLASS and an exact cosmology-token mapping.  The
     effective class is the declared one EXCEPT for a reweighted ``_cosmo``
@@ -846,6 +1161,9 @@ def resolve_dL_prior(catalog, analysis, analyses, priors, dL_samples,
     default; a catalog the table lacks raises
     :class:`~gwcat.release_cosmology.ReleaseReweightCosmologyError`.  Any other
     row whose prior declares no cosmology takes the per-CATALOG default.
+
+    ``constituents`` (a combined set's ``meta_data/combined`` labels) are
+    searched first, then same-variant siblings (:func:`_sibling_search_order`).
 
     Returns a :class:`ResolvedDLPrior`.
     """
@@ -865,7 +1183,8 @@ def resolve_dL_prior(catalog, analysis, analyses, priors, dL_samples,
     src = f"analytic[{analysis}]"
     src_label = analysis if parsed is not None else ""
     if parsed is None:
-        for an in analyses:  # sibling search (handles O4 Mixed w/o priors)
+        # sibling search (handles O4 Mixed w/o priors), constituents first
+        for an in _sibling_search_order(analysis, analyses, constituents):
             parsed = _try(an)
             if parsed is not None:
                 src = f"analytic[{an}]"
@@ -888,6 +1207,8 @@ def resolve_dL_prior(catalog, analysis, analyses, priors, dL_samples,
         # No analytic anywhere (9 of the GWTC-2.1 rows).  A cosmo-flavour
         # release is still reweighted, so UniformSourceFrame remains the
         # effective prior; there is simply no declaration to compare it to.
+        # A non-reweighted O1-O3 release is on its LALInference sampling
+        # prior, read from the config below (or refused).
         if reweighted:
             return ResolvedDLPrior(
                 kind="UniformSourceFrame", H0=table_row.H0, Om0=table_row.Om0,
@@ -899,6 +1220,34 @@ def resolve_dL_prior(catalog, analysis, analyses, priors, dL_samples,
                 cosmology_table_sha256=table_sha,
                 prior_source_label="", prior_source_kind="release_reweighted")
         H0, Om0 = default_cosmo
+        if _catalog_era(catalog, _label_parts(analysis)[0]) == "O1-O3":
+            # A non-reweighted O1-O3 release with no analytic group: the
+            # GWTC-2.1 LALInference runs, whose posteriors are on the
+            # LALInference default dL^2 prior, NOT UniformSourceFrame --
+            # assuming USF here was a silent, distance-dependent error in
+            # 1/p_pe (review 2026-10-20, medium-44).  Read the bounds from
+            # the config, or refuse.
+            declared = _dL_prior_from_config(data, analysis, analyses)
+            if declared is None:
+                raise DistancePriorKindError(
+                    f"{analysis}: a {flavour!r} {catalog} release with no "
+                    f"analytic distance prior on any label and no "
+                    f"LALInference config_file/engine distance-max. Its "
+                    f"posteriors are on the sampling prior, which gwcat "
+                    f"cannot identify; refusing to assume UniformSourceFrame.")
+            cmin, cmax, clabels, note = declared
+            where = ",".join(clabels)
+            return ResolvedDLPrior(
+                kind="PowerLaw", H0=H0, Om0=Om0, dmin=cmin, dmax=cmax,
+                source=(f"config_file[{where}]/engine/distance-min={cmin:g},"
+                        f"distance-max={cmax:g}:LALInference_default_dL^2"
+                        + (f" | {note}" if note else "")),
+                alpha=_LALINFERENCE_DL_ALPHA, sampling_kind="PowerLaw",
+                sampling_alpha=_LALINFERENCE_DL_ALPHA, flavour=flavour,
+                basis="config_file_declared",
+                cosmology_source="catalog_default",
+                prior_source_label=where,
+                prior_source_kind="config_file_declared")
         return ResolvedDLPrior(
             kind="UniformSourceFrame", H0=H0, Om0=Om0, dmin=dmin, dmax=dmax,
             source="default(no_analytic)", sampling_kind="",
@@ -930,17 +1279,20 @@ def resolve_dL_prior(catalog, analysis, analyses, priors, dL_samples,
     H0, Om0 = parsed.H0, parsed.Om0
     cosmology_source = "analytic_declared"
     if H0 is None:
+        if parsed.cosmology_recognized is False:
+            known = resolve_named_cosmology(parsed.cosmology_name)
+            why = ("is a cosmology with radiation, which the (H0, Om0) a "
+                   "store records cannot represent exactly"
+                   if known is not None else "is not one gwcat knows")
+            raise UnrecognisedCosmologyError(
+                f"{analysis}: analytic distance prior names cosmology "
+                f"{parsed.cosmology_name!r}, which {why}. Refusing to evaluate "
+                f"it at the catalog default {default_cosmo} instead. Add it "
+                f"to gwcat.cosmology.NAMED_COSMOLOGIES if it is a real flat, "
+                f"radiation-free cosmology.")
         H0, Om0 = default_cosmo
         src += "+default_cosmo"
         cosmology_source = "catalog_default"
-        if parsed.cosmology_recognized is False:
-            warnings.warn(
-                f"{analysis}: analytic distance prior names an unrecognised "
-                f"cosmology {parsed.cosmology_name!r}; falling back to "
-                f"(H0={H0}, Om0={Om0}). Add it to "
-                f"gwcat.cosmology.NAMED_COSMOLOGIES if it is real -- the KS "
-                f"check against the file's own prior samples is the only thing "
-                f"standing between this guess and a wrong p_dL_pe.")
 
     kind = sampling_kind or "UniformSourceFrame"
     alpha = parsed.alpha
@@ -1022,6 +1374,13 @@ class SpinPriorMismatchError(ValueError):
 _UNIFORM_IN_COMPONENTS = ("UniformInComponentsChirpMass",
                           "UniformInComponentsMassRatio")
 
+#: Analytic keys that declare a mass prior when they are not a ``Constraint``
+#: (a Constraint is a cut, not a prior: the releases record mass_1/mass_2,
+#: and NRSur7dq4 total_mass, that way).
+_MASS_PRIOR_KEYS = ("chirp_mass", "mass_ratio", "symmetric_mass_ratio",
+                    "total_mass", "mass_1", "mass_2", "chirp_mass_source",
+                    "total_mass_source", "mass_1_source", "mass_2_source")
+
 
 @dataclass(frozen=True)
 class ResolvedMassPrior:
@@ -1051,7 +1410,8 @@ class ResolvedMassPrior:
     m2_max: Optional[float] = None
 
 
-def resolve_mass_prior(analysis, analyses, priors, *, siblings=True):
+def resolve_mass_prior(analysis, analyses, priors, *, siblings=True,
+                       constituents=()):
     """Parse the analytic mass prior for one ingested analysis.
 
     Searches the chosen analysis then its siblings, exactly as the distance and
@@ -1063,15 +1423,30 @@ def resolve_mass_prior(analysis, analyses, priors, *, siblings=True):
 
     ``siblings=False`` (GW-40f) restricts the search to ``analysis`` itself, for
     a constituent whose OWN prior is required.
+
+    A label that declares a mass prior in any other coordinates (any
+    non-Constraint key of :data:`_MASS_PRIOR_KEYS` besides that pair) is
+    ``"unrecognized"`` on its own declaration and never borrows a sibling's.
     """
     analytic = priors.get("analytic", {}) if isinstance(priors, dict) else {}
 
+    def _is_constraint(v):
+        got = _parse_analytic_spin(v)
+        return got is not None and got[0] == "Constraint"
+
     def _find(an):
+        # A label DECLARES a mass prior when its group has any mass key that
+        # is not a Constraint, in whatever coordinates (review 2026-10-20,
+        # medium-20).  Only the (chirp_mass, mass_ratio) pair used to count,
+        # so (chirp_mass, symmetric_mass_ratio), (total_mass, mass_ratio) or a
+        # non-Constraint mass_1/mass_2 fell through to a sibling's
+        # uniform-in-components prior and was stamped verified.
         node = analytic.get(an) if isinstance(analytic, dict) else None
         if not node:
             return None
-        got = {k: node[k] for k in ("chirp_mass", "mass_ratio") if k in node}
-        if len(got) != 2:
+        got = {k: node[k] for k in _MASS_PRIOR_KEYS
+               if k in node and not _is_constraint(node[k])}
+        if not got:
             return None
         for k in ("mass_1", "mass_2"):
             if k in node:
@@ -1080,7 +1455,8 @@ def resolve_mass_prior(analysis, analyses, priors, *, siblings=True):
 
     found, src_an = _find(analysis), analysis
     if found is None and siblings:
-        for an in analyses:
+        # constituents first, then same-variant siblings (low-10)
+        for an in _sibling_search_order(analysis, analyses, constituents):
             found = _find(an)
             if found is not None:
                 src_an = an
@@ -1099,10 +1475,14 @@ def resolve_mass_prior(analysis, analyses, priors, *, siblings=True):
         return (None if got[1] is None else float(got[1]),
                 None if got[2] is None else float(got[2]))
 
-    mc = _parse_analytic_spin(found["chirp_mass"])
-    q = _parse_analytic_spin(found["mass_ratio"])
+    declared = sorted(k for k in found if not _is_constraint(found[k]))
+    mc = (_parse_analytic_spin(found["chirp_mass"])
+          if "chirp_mass" in found else None)
+    q = (_parse_analytic_spin(found["mass_ratio"])
+         if "mass_ratio" in found else None)
     kinds = (mc[0] if mc else None, q[0] if q else None)
-    if kinds == _UNIFORM_IN_COMPONENTS:
+    if (kinds == _UNIFORM_IN_COMPONENTS
+            and declared == ["chirp_mass", "mass_ratio"]):
         m1lo, m1hi = _constraint("mass_1")
         m2lo, m2hi = _constraint("mass_2")
         return ResolvedMassPrior(
@@ -1114,8 +1494,7 @@ def resolve_mass_prior(analysis, analyses, priors, *, siblings=True):
             source=f"analytic[{src_an}]",
             source_label=src_an, source_kind=src_kind,
             m1_min=m1lo, m1_max=m1hi, m2_min=m2lo, m2_max=m2hi)
-    raw = "; ".join(f"{k}={str(found[k])[:80]!r}" for k in sorted(found)
-                    if k in ("chirp_mass", "mass_ratio"))
+    raw = "; ".join(f"{k}={str(found[k])[:80]!r}" for k in declared)
     return ResolvedMassPrior(
         kind="unrecognized",
         source=f"analytic[{src_an}]:unrecognized({raw})",
@@ -1138,6 +1517,15 @@ class ResolvedSpinPrior:
     source: str
     source_label: str = ""
     source_kind: str = ""
+    #: ``max|a_i|`` over the ingested samples (NaN when absent), and whether
+    #: either exceeds its resolved ceiling (review 2026-10-20, high-2).
+    sample_max_1: float = float("nan")
+    sample_max_2: float = float("nan")
+    samples_exceed_amax: bool = False
+
+
+class SpinCeilingExceededError(ValueError):
+    """Spin samples exceed the resolved ceiling (spin_exceeds_amax="raise")."""
 
 
 #: The LALInference ``[engine]`` keys that declare the spin-magnitude ceilings.
@@ -1162,7 +1550,8 @@ def _config_float(val):
     return v if np.isfinite(v) else None
 
 
-def _spin_amax_from_config(data, analysis, analyses=()):
+def _spin_amax_from_config(data, analysis, analyses=(),
+                           allow_variant_mismatch=False):
     """Spin ceilings DECLARED by a LALInference config (GW-40b).
 
     The six GWTC-2.1 LALInference events (GW170608_020116, GW190707_093326,
@@ -1171,11 +1560,18 @@ def _spin_amax_from_config(data, analysis, analyses=()):
     ``assumed_default``.  Their constituent runs' ``config_file/engine`` DOES
     declare ``a_spin1-max = a_spin2-max = 0.99``.
 
-    Search order: ``analysis``'s own config, else every sibling that declares
-    the keys.  Returns ``(amax_1, amax_2, labels, consistent)`` or ``None``;
-    ``consistent`` is False when siblings declare different ceilings (then the
-    caller must NOT upgrade the provenance -- a Mixed set built from runs with
-    different ceilings is not a single declared prior).
+    Search order: ``analysis``'s own config, else every same-prefix sibling
+    that declares the keys AND shares the label's spin-variant token, exactly
+    as the analytic search does (review 2026-10-20, medium-45: a LowSpin
+    sibling's a_spin2-max = 0.05 used to be adopted for a HighSpin label as
+    "config_file_declared").  Only differently-restricted siblings on offer
+    raises :class:`SpinPriorMismatchError` for a label that declares a
+    variant (a warning under ``allow_variant_mismatch``); a label declaring no
+    variant takes the best-ranked one, with a warning.  Returns ``(amax_1,
+    amax_2, labels, consistent)`` or ``None``; ``consistent`` is False when
+    siblings declare different ceilings (then the caller must NOT upgrade the
+    provenance -- a Mixed set built from runs with different ceilings is not
+    a single declared prior).
     """
     cfg_all = getattr(data, "config", None)
     if not isinstance(cfg_all, dict):
@@ -1199,39 +1595,137 @@ def _spin_amax_from_config(data, analysis, analyses=()):
     own = _one(analysis)
     if own is not None:
         return own[0], own[1], [analysis], True
-    hits = [(an, _one(an)) for an in analyses if an != analysis]
+    pfx, _base, variant = _label_parts(analysis)
+    want = _spin_variant_token(variant)
+
+    def _tok(an):
+        return _spin_variant_token(_label_parts(an)[2])
+
+    hits = [(an, _one(an)) for an in analyses
+            if an != analysis and _label_parts(an)[0] == pfx]
     hits = [(an, v) for an, v in hits if v is not None]
     if not hits:
         return None
-    vals = {v for _an, v in hits}
-    a1, a2 = hits[0][1]
-    return a1, a2, [an for an, _v in hits], len(vals) == 1
+    use = [(an, v) for an, v in hits if _tok(an) == want]
+    if not use:
+        others = [an for an, _v in hits]
+        if want:
+            msg = (f"{analysis}: no sibling config with spin variant {want!r} "
+                   f"declares engine/a_spin1-max, a_spin2-max; the only ones "
+                   f"declare a different spin restriction ({others}). "
+                   f"Borrowing across spin variants inflates a restricted "
+                   f"secondary-spin prior by up to ~20x, so gwcat refuses; "
+                   f"pass allow_variant_mismatch=True to accept it with a "
+                   f"warning.")
+            if not allow_variant_mismatch:
+                raise SpinPriorMismatchError(msg)
+            warnings.warn(msg)
+            use = hits
+        else:
+            best = min((_tok(an) for an in others), key=_variant_rank)
+            warnings.warn(
+                f"{analysis}: the ingested label declares no spin variant but "
+                f"every sibling config declaring spin ceilings does "
+                f"({others}); assuming the {best!r} variant.")
+            use = [(an, v) for an, v in hits if _tok(an) == best]
+    vals = {v for _an, v in use}
+    a1, a2 = use[0][1]
+    return a1, a2, [an for an, _v in use], len(vals) == 1
 
 
-def constituent_spin_amax_config(data, analysis, analyses):
+def constituent_spin_amax_config(data, analysis, analyses, constituents=()):
     """JSON ``{sibling: [a1_max, a2_max] | null}`` for a ``Mixed`` label.
 
-    Every same-prefix, non-Mixed sibling of ``analysis`` is listed, with the
-    ceilings its ``config_file/engine/a_spin{1,2}-max`` declares, or ``null``
-    when its config declares none.  ``""`` for a label that is not a combined
+    The constituents its ``meta_data/combined`` record names are listed when
+    given (review 2026-10-20, low-10: the sibling list also took
+    C00:IMRPhenomXO4a and C00:Mixed+XO4a for constituents of C00:Mixed), else
+    every same-prefix, non-Mixed sibling of ``analysis``, with the ceilings
+    its ``config_file/engine/a_spin{1,2}-max`` declares, or ``null`` when its
+    config declares none.  ``""`` for a label that is not a combined
     ``Mixed`` set, or when ``data`` carries no config at all.
     """
     import json as _json
     prefix, base, _variant = _label_parts(analysis)
-    if base != "Mixed":
+    if not _is_combined_base(base):
         return ""
     cfg_all = getattr(data, "config", None)
     if not isinstance(cfg_all, dict):
         return ""
     out = {}
-    for an in analyses:
+    for an in (list(constituents) or analyses):
         p2, b2, _v2 = _label_parts(an)
-        if an == analysis or p2 != prefix or b2 == "Mixed":
+        if an == analysis or p2 != prefix or _is_combined_base(b2):
             continue
         got = _spin_amax_from_config(data, an, ())
         out[str(an)] = (None if got is None
                         else [float(got[0]), float(got[1])])
     return _json.dumps(out, sort_keys=True)
+
+
+def constituent_spin_sample_max(analysis, analyses, samples_dict,
+                                constituents=()):
+    """JSON ``{constituent: [max|a_1|, max|a_2|] | null}`` for a Mixed label.
+
+    The constituents are the ones ``meta_data/combined`` names when it names
+    any, else every same-prefix, non-Mixed sibling (the GWTC-2.1/3 records
+    name run tags, not labels).  ``""`` for a label that is not a combined
+    set.  This is what makes a per-half ceiling difference checkable (review
+    2026-10-20, high-2): GWTC-2.1/3 ``C01:Mixed`` divides out
+    IMRPhenomXPHM's U(0, 0.99) while its C01:SEOBNRv4PHM half was sampled up
+    to a spin of about 1.0.
+    """
+    prefix, base, _variant = _label_parts(analysis)
+    if not _is_combined_base(base):
+        return ""
+    labs = list(constituents) or [
+        an for an in analyses if an != analysis
+        and _label_parts(an)[0] == prefix
+        and not _is_combined_base(_label_parts(an)[1])]
+    out = {}
+    for lab in labs:
+        smp = samples_dict.get(lab) if hasattr(samples_dict, "get") else None
+        if smp is None or "a_1" not in smp or "a_2" not in smp:
+            out[str(lab)] = None
+            continue
+        out[str(lab)] = [float(np.nanmax(np.abs(np.asarray(smp[k], float))))
+                         for k in ("a_1", "a_2")]
+    return json.dumps(out, sort_keys=True)
+
+
+def _parse_aligned_spin(prior_repr):
+    """The magnitude ceiling of a standard bilby ``AlignedSpin`` repr, or None.
+
+    ``AlignedSpin(a_prior=Uniform(minimum=0, maximum=amax), z_prior=Uniform(
+    minimum=-1, maximum=1), ...)`` -- the shape of the GWTC-4.1 aligned-spin
+    runs -- gives ``amax``; anything else (another class, a non-uniform
+    magnitude prior, a non-standard z_prior) gives None.
+    """
+    if prior_repr is None:
+        return None
+    s = str(prior_repr)
+    m = re.search(r"([A-Za-z_]\w*)\s*\(", s)
+    if not m or m.group(1) != "AlignedSpin":
+        return None
+    a_repr, z_repr = _balanced_arg(s, "a_prior"), _balanced_arg(s, "z_prior")
+    pa = _parse_analytic_spin(a_repr) if a_repr else None
+    if (pa is None or pa[0] != "Uniform" or pa[1] is None
+            or abs(pa[1]) > 1e-9 or pa[2] is None):
+        return None
+    pz = _parse_analytic_spin(z_repr) if z_repr else None
+    if pz is not None and not (pz[0] == "Uniform" and pz[1] == -1.0
+                               and pz[2] == 1.0):
+        return None
+    return float(pa[2])
+
+
+def _declared_ceilings(found):
+    """``(a_1 max, a_2 max)`` a sibling's a_1/a_2 reprs declare (None if not
+    parsable) -- what two candidate siblings must agree on."""
+    out = []
+    for k in ("a_1", "a_2"):
+        p = _parse_analytic_spin(found[k]) if found and k in found else None
+        out.append(None if p is None or p[2] is None else float(p[2]))
+    return tuple(out)
 
 
 def resolve_spin_prior(analysis, analyses, priors, a1_samples, a2_samples,
@@ -1249,7 +1743,8 @@ def resolve_spin_prior(analysis, analyses, priors, a1_samples, a2_samples,
 
 def resolve_spin_prior_full(analysis, analyses, priors, a1_samples,
                             a2_samples, fallback_amax=0.99,
-                            allow_variant_mismatch=False, data=None):
+                            allow_variant_mismatch=False, data=None,
+                            constituents=()):
     """Resolve the spin-magnitude prior AND its provenance (GW-40b).
 
     ``data`` (the pesummary read object) enables the LALInference config path:
@@ -1266,10 +1761,16 @@ def resolve_spin_prior_full(analysis, analyses, priors, a1_samples,
 
     ``kind`` is ``"uniform_magnitude_isotropic"`` only when both ``a_1`` and
     ``a_2`` parse as ``Uniform(0, amax_i)`` AND the tilt priors parse as
-    ``Sine`` (or are absent).  Otherwise ``kind`` is ``"unrecognized"`` and the
-    raw repr(s) are recorded in ``source``.  When nothing analytic is found
-    anywhere, fall back to ``amax = fallback_amax`` with
-    ``kind = "assumed_default"``.
+    ``Sine`` (or are absent).  A label whose own group declares bilby
+    ``AlignedSpin`` ``chi_1``/``chi_2`` priors gets ``kind = "aligned_spin"``
+    with ITS ``a_prior`` ceilings, and never borrows (review 2026-10-20,
+    high-11).  Otherwise ``kind`` is ``"unrecognized"`` and the raw repr(s)
+    are recorded in ``source``.  When nothing analytic is found anywhere, fall
+    back to ``amax = fallback_amax`` with ``kind = "assumed_default"``.
+    Same-variant siblings that declare different ceilings are refused
+    (:class:`SpinPriorMismatchError`) unless ``allow_variant_mismatch``;
+    ``constituents`` (a combined set's ``meta_data/combined`` labels) are
+    searched first and, when given, are the candidates that must agree.
 
     Regardless of how the bounds were obtained, ``max(|a_i samples|)`` is checked
     against ``amax_i * (1 + 1e-3)``; a violation warns and is noted in
@@ -1291,7 +1792,19 @@ def resolve_spin_prior_full(analysis, analyses, priors, a1_samples,
     found = _find(analysis)
     src_an = analysis
     src_label = analysis if found is not None else ""
+    # An ALIGNED-spin label declares its own prior in chi_1/chi_2 (bilby's
+    # AlignedSpin), not in a_1/a_2.  It used to be treated as declaring
+    # nothing and borrowed a precessing sibling's isotropic U(0, amax) with
+    # that sibling's ceilings (review 2026-10-20, high-11): GW230529_181500's
+    # C00:IMRPhenomNSBH declares a_1 < 0.5, a_2 < 0.05 and resolved to
+    # (0.99, 0.05).  Its own declaration is read instead, never a sibling's.
+    aligned = None
     if found is None:
+        node = _node(analysis)
+        if node and ("chi_1" in node or "chi_2" in node):
+            aligned = {k: node[k] for k in ("chi_1", "chi_2") if k in node}
+    disagree = ""
+    if found is None and aligned is None:
         # Sibling search (an O4 Mixed set carries no priors group of its own).
         #
         # It must respect the SPIN VARIANT (GW-07).  Borrowing across variants is
@@ -1301,18 +1814,41 @@ def resolve_spin_prior_full(analysis, analyses, priors, a1_samples,
         # took the first sibling carrying a_1/a_2 in h5py key order, i.e. by
         # alphabet.
         #
-        # (Aligned-spin siblings are already skipped for free: they record
-        # chi_1/chi_2 rather than a_1/a_2, so `_find` returns None for them.
-        # Verified on GW230529_181500, whose C00:IMRPhenomNSBH analytic group has
+        # (Aligned-spin siblings are skipped: they record chi_1/chi_2 rather
+        # than a_1/a_2, so `_find` returns None for them -- their AlignedSpin
+        # prior is not the isotropic one being borrowed.  Verified on
+        # GW230529_181500, whose C00:IMRPhenomNSBH analytic group has
         # chi_1/chi_2 and no a_1/a_2.)
         want = _spin_variant_token(_label_parts(analysis)[2])
-        cands = [a for a in analyses if _find(a) is not None]
+        # Constituents first (low-10): a combined set's prior is its
+        # constituents', whatever else the file carries.
+        order = _sibling_search_order(analysis, analyses, constituents)
+        cands = [a for a in order if _find(a) is not None]
         same = [a for a in cands if _spin_variant_token(_label_parts(a)[2]) == want]
         other = [a for a in cands if a not in same]
+        # When the constituents are known, it is THEY that must agree.
+        same = [a for a in same if a in constituents] or same
 
+        # Siblings that would all be acceptable must AGREE on the ceilings:
+        # otherwise which one is borrowed -- and so the ceiling -- follows
+        # file order (review 2026-10-20, high-11, August part b).
+        if len(same) > 1:
+            ceil = {a: _declared_ceilings(_find(a)) for a in same}
+            if len(set(ceil.values())) > 1:
+                msg = (
+                    f"{analysis}: its sibling analyses with spin variant "
+                    f"{want!r} declare different spin ceilings {ceil}; "
+                    f"borrowing the first in file order would make the "
+                    f"ceiling depend on that order. Ingest one of them "
+                    f"explicitly, or pass allow_variant_mismatch=True to "
+                    f"accept the first with a warning.")
+                if not allow_variant_mismatch:
+                    raise SpinPriorMismatchError(msg)
+                warnings.warn(msg)
+                disagree = ":candidates_disagree"
         for an in same:
             found = _find(an)
-            src_an = an
+            src_an = an + disagree
             src_label = an
             break
 
@@ -1374,12 +1910,30 @@ def resolve_spin_prior_full(analysis, analyses, priors, a1_samples,
 
     src_kind = ("" if found is None else
                 "own_analytic" if src_label == analysis else "sibling_inherited")
-    if found is None:
+    if aligned is not None:
+        c1 = _parse_aligned_spin(aligned.get("chi_1"))
+        c2 = _parse_aligned_spin(aligned.get("chi_2"))
+        amax_1 = float(fallback_amax) if c1 is None else c1
+        amax_2 = float(fallback_amax) if c2 is None else c2
+        src_label, src_kind = analysis, "own_analytic"
+        if c1 is not None and c2 is not None:
+            kind = "aligned_spin"
+            source = (f"analytic[{analysis}]:AlignedSpin(a_max={c1:g},"
+                      f"{c2:g})")
+        else:
+            kind = "unrecognized"
+            raw = "; ".join(f"{k}={aligned[k]!r}" for k in sorted(aligned))
+            source = f"analytic[{analysis}]:unrecognized({raw})"
+    elif found is None:
         amax_1 = amax_2 = float(fallback_amax)
         kind = "assumed_default"
         source = "default(no_analytic_prior)"
         src_label, src_kind = "", "assumed_default"
-        declared = (_spin_amax_from_config(data, analysis, analyses)
+        declared = (_spin_amax_from_config(
+                        data, analysis,
+                        _sibling_search_order(analysis, analyses,
+                                              constituents),
+                        allow_variant_mismatch=allow_variant_mismatch)
                     if data is not None else None)
         if declared is not None:
             c1, c2, clabels, consistent = declared
@@ -1418,12 +1972,15 @@ def resolve_spin_prior_full(analysis, analyses, priors, a1_samples,
 
     # Validate the spin samples against the resolved bounds (warn, don't clamp).
     viol = []
+    smaxes = []
     for lbl, samp, amax in (("a_1", a1_samples, amax_1),
                             ("a_2", a2_samples, amax_2)):
+        smax = float("nan")
         if samp is not None and np.size(samp):
             smax = float(np.nanmax(np.abs(np.asarray(samp, float))))
             if np.isfinite(smax) and smax > amax * (1 + 1e-3):
                 viol.append(f"{lbl}:max={smax:.4g}>amax={amax:.4g}")
+        smaxes.append(smax)
     if viol:
         warnings.warn("spin prior: samples exceed resolved amax "
                       f"({'; '.join(viol)}); prior bounds may be wrong")
@@ -1431,7 +1988,9 @@ def resolve_spin_prior_full(analysis, analyses, priors, a1_samples,
 
     return ResolvedSpinPrior(amax_1=amax_1, amax_2=amax_2, kind=kind,
                              source=source, source_label=src_label,
-                             source_kind=src_kind)
+                             source_kind=src_kind, sample_max_1=smaxes[0],
+                             sample_max_2=smaxes[1],
+                             samples_exceed_amax=bool(viol))
 
 
 #: The single chi_p implementation (GW-08).  ``ingest`` previously carried a
@@ -1488,7 +2047,7 @@ def _derive_spin_columns(rec):
 
 
 def _ks_against_prior_samples(dlp, *, kind, cosmo, dmin, dmax, alpha, impl,
-                              return_outside=False):
+                              return_outside=False, return_parts=False):
     """KS distance between prior samples ``dlp`` and one candidate density.
 
     Both CDFs are conditioned on the SAME window (GW-37).  The model CDF was
@@ -1503,16 +2062,26 @@ def _ks_against_prior_samples(dlp, *, kind, cosmo, dmin, dmax, alpha, impl,
     wrong", naming bounds first), so conditioning does not hide it: the fraction
     of prior samples falling OUTSIDE the recorded bounds is returned alongside,
     to be reported as what it is rather than disguised as a failed shape test.
+
+    ``return_parts=True`` returns ``(ks, frac_outside, mass_uncovered,
+    frac_samples_outside)``: the declared prior's mass outside the samples'
+    range, which is about ``2/(N+1)`` for CORRECT draws, and the fraction of
+    samples outside the declared bounds, which is 0 for them (review
+    2026-10-20, medium-48).
     """
     lo = max(dmin, dlp.min())
     hi = min(dmax, dlp.max())
     inside = (dlp >= lo) & (dlp <= hi)
+    nan4 = (float("nan"), 1.0, float("nan"), float("nan"))
     # How much of the DECLARED prior's mass the samples never reach.  Nonzero in
     # BOTH directions of a bounds mismatch -- samples beyond the bounds leave
     # `inside` short, bounds wider than the samples leave model mass uncovered
     # -- which is what makes it a bounds diagnostic rather than half of one.
     frac_outside = float("nan")
+    uncovered, samples_out = float("nan"), float(1.0 - inside.mean())
     if not inside.any() or not np.isfinite(hi - lo) or hi <= lo:
+        if return_parts:
+            return nan4[:3] + (samples_out,)
         return (float("nan"), 1.0) if return_outside else float("nan")
 
     full = np.linspace(dmin, dmax, 2000)
@@ -1524,8 +2093,8 @@ def _ks_against_prior_samples(dlp, *, kind, cosmo, dmin, dmax, alpha, impl,
         covered = (np.interp(hi, full, cdf_full)
                    - np.interp(lo, full, cdf_full)) / cdf_full[-1]
         # Samples outside the bounds count too: both are range disagreements.
-        frac_outside = float(max(0.0, 1.0 - covered)
-                             + (1.0 - inside.mean()))
+        uncovered = float(max(0.0, 1.0 - covered))
+        frac_outside = float(uncovered + samples_out)
 
     grid = np.linspace(lo, hi, 200)
     pdf = dL_prior_prob(grid, kind=kind, cosmology=cosmo, dmin=dmin,
@@ -1533,13 +2102,43 @@ def _ks_against_prior_samples(dlp, *, kind, cosmo, dmin, dmax, alpha, impl,
     cdf_model = np.concatenate(
         [[0], np.cumsum(0.5 * (pdf[1:] + pdf[:-1]) * np.diff(grid))])
     if cdf_model[-1] <= 0:
+        if return_parts:
+            return float("nan"), frac_outside, uncovered, samples_out
         return (float("nan"), frac_outside) if return_outside else float("nan")
     cdf_model = cdf_model / cdf_model[-1]
     # Conditioned on the same window as the model, so the two are comparable.
     dlp_in = np.sort(dlp[inside])
     ecdf = np.searchsorted(dlp_in, grid, side="right") / dlp_in.size
     ks = float(np.max(np.abs(cdf_model - ecdf)))
+    if return_parts:
+        return ks, frac_outside, uncovered, samples_out
     return (ks, frac_outside) if return_outside else ks
+
+
+def _range_uncovered_pvalue(uncovered, n):
+    """P(U >= ``uncovered``) for N draws from the declared prior.
+
+    U is the prior mass outside the draws' range; for N iid draws it is
+    Beta(2, N-1), P(U > u) = (1-u)^(N-1) (1 + (N-1) u).  A small value means
+    the samples do not reach bounds they should reach: a bounds mismatch, not
+    the ~2/(N+1) every correct parse shows (review 2026-10-20, medium-48).
+    """
+    if not (np.isfinite(uncovered) and n and n > 1):
+        return float("nan")
+    u = min(max(float(uncovered), 0.0), 1.0)
+    return float((1.0 - u) ** (n - 1) * (1.0 + (n - 1) * u))
+
+
+def _ks_threshold(n, cfg):
+    """The KS threshold for ``n`` prior samples: ``cfg.prior_ks_max``, raised
+    to the Kolmogorov critical value at ``cfg.prior_ks_alpha`` when that is
+    larger (small N), so a correct parse is not refused for sampling noise
+    (review 2026-10-20, medium-48).  For N above ~1500 at the defaults it is
+    ``prior_ks_max``, as before."""
+    if not n or n < 1 or not (0.0 < cfg.prior_ks_alpha < 1.0):
+        return float(cfg.prior_ks_max)
+    crit = float(np.sqrt(-0.5 * np.log(cfg.prior_ks_alpha / 2.0) / n))
+    return max(float(cfg.prior_ks_max), crit)
 
 
 def validate_prior_against_samples(priors, analyses_to_try, resolved,
@@ -1578,9 +2177,11 @@ def validate_prior_against_samples(priors, analyses_to_try, resolved,
     dmin, dmax = resolved.dmin, resolved.dmax
 
     sampling_kind = resolved.sampling_kind or resolved.kind
-    ks_sampling, frac_outside = _ks_against_prior_samples(
-        dlp, kind=sampling_kind, cosmo=cosmo, dmin=dmin, dmax=dmax,
-        alpha=resolved.sampling_alpha, impl=impl, return_outside=True)
+    ks_sampling, frac_outside, uncovered, samples_out = (
+        _ks_against_prior_samples(
+            dlp, kind=sampling_kind, cosmo=cosmo, dmin=dmin, dmax=dmax,
+            alpha=resolved.sampling_alpha, impl=impl, return_parts=True))
+    n_in = int(np.sum((dlp >= dmin) & (dlp <= dmax)))
     ks_effective = (
         ks_sampling if sampling_kind == resolved.kind
         else _ks_against_prior_samples(
@@ -1592,6 +2193,11 @@ def validate_prior_against_samples(priors, analyses_to_try, resolved,
             # diagnosed as a bounds mismatch instead of surfacing as a rejected
             # parse -- the two used to be conflated in one number.
             "frac_prior_bounds_uncovered": frac_outside,
+            # ... and in its two parts, with the sampling expectation of the
+            # first (review 2026-10-20, medium-48).
+            "frac_prior_mass_uncovered": uncovered,
+            "frac_prior_samples_outside_bounds": samples_out,
+            "prior_bounds_pvalue": _range_uncovered_pvalue(uncovered, n_in),
             "n_prior_samples": int(dlp.size), "analysis": used}
 
 
@@ -1608,8 +2214,10 @@ def inspect(path: str, cfg: Optional[IngestConfig] = None):
     s = samples_dict[analysis]
     dL = np.asarray(s["luminosity_distance"], float)
     flavour = detect_release_flavour(path)
+    constituents = combined_constituents(data, analysis, analyses)
     res = resolve_dL_prior(catalog, analysis, analyses, priors, dL, cfg,
-                           flavour=flavour)
+                           flavour=flavour, data=data,
+                           constituents=constituents)
     val = (validate_prior_against_samples(priors, [analysis] + analyses, res,
                                           impl=cfg.dL_prior_impl)
            if cfg.validate_prior else None)
@@ -1622,10 +2230,31 @@ def inspect(path: str, cfg: Optional[IngestConfig] = None):
     sp = resolve_spin_prior_full(
         analysis, analyses, priors, a1_samp, a2_samp,
         allow_variant_mismatch=cfg.spin_prior_allow_variant_mismatch,
-        data=data)
+        data=data, constituents=constituents)
     spin_amax_1, spin_amax_2, spin_kind, spin_src = (sp.amax_1, sp.amax_2,
                                                      sp.kind, sp.source)
-    mass_prior = resolve_mass_prior(analysis, analyses, priors)
+    mass_prior = resolve_mass_prior(analysis, analyses, priors,
+                                    constituents=constituents)
+    combined = _is_combined_base(_label_parts(analysis)[1])
+    mixed_priors = (compare_constituent_priors(analysis, constituents, priors)
+                    if constituents or combined else "")
+    cmix_info = None
+    if (cfg.constituent_mixture_prior and _label_parts(analysis)[0] == "C00"
+            and _is_combined_base(_label_parts(analysis)[1])):
+        # What the build would do with --constituent-mixture-prior: the
+        # verified constituents, or why the row would be refused.
+        from .constituent_mixture import ConstituentMixtureError
+        try:
+            cm = _constituent_mixture_prior(catalog, analysis, analyses,
+                                            samples_dict, priors, cfg, flavour)
+            cmix_info = {"labels": cm["labels"],
+                         "counts": [int(cm["counts"][lab])
+                                    for lab in cm["labels"]],
+                         "dL_prior_kind": cm["dl_kind"],
+                         "dmin": cm["dmin"], "dmax": cm["dmax"],
+                         "q_min": cm["q_min"], "q_max": cm["q_max"]}
+        except ConstituentMixtureError as e:
+            cmix_info = {"refused": str(e)}
     avail = [p for p in DEFAULT_PARAMS if p in s]
     missing = [p for p in WAVEFORM_PARAMS if p not in s]
     info = {
@@ -1672,6 +2301,17 @@ def inspect(path: str, cfg: Optional[IngestConfig] = None):
                        "chirp_min": mass_prior.chirp_min,
                        "chirp_max": mass_prior.chirp_max,
                        "q_min": mass_prior.q_min, "q_max": mass_prior.q_max},
+        # Combined-set constituents and whether their priors agree, and the
+        # constituent-mixture result when that option is on (review
+        # 2026-10-20, critical-1 / medium-47).
+        "mixed_constituents": {"labels": constituents,
+                               "priors": mixed_priors},
+        "constituent_mixture": cmix_info,
+        "ingest_config": {
+            "dL_prior_impl": cfg.dL_prior_impl,
+            "release_reweight_cosmology_table":
+                cfg.release_reweight_cosmology_table,
+            "constituent_mixture_prior": cfg.constituent_mixture_prior},
         "prior_validation": val,
         "waveform_params_missing": missing,
         "stored_params_available": avail,
@@ -1719,29 +2359,87 @@ def _observing_run_from_name(name: str) -> str:
     return mapping.get(yy, "")
 
 
-def _sky_area_90(ra_samples, dec_samples, nside=64):
-    """Estimate the 90% credible sky area (deg^2) from posterior ra/dec samples.
+#: Fewest posterior samples per pixel, averaged over the 90% region, for the
+#: histogram estimate of ``sky_area_90`` to be resolved rather than limited by
+#: the sample count (review 2026-10-20, medium-49).
+SKY_AREA_MIN_PER_PIXEL = 20
 
-    Uses healpy if available; returns NaN otherwise.  This is computed once at
-    ingest and stored as metadata for fast selection.
+
+def _observing_run_for(name, samples):
+    """``(observing_run, source)`` for one row (review 2026-10-20, low-33).
+
+    From the median ``geocent_time`` against gwcat's own official run
+    windows (:data:`gwcat.observing_runs.EXPOSURE_WINDOWS_GPS`, the table
+    events are assigned with): ``source="gps_exposure_windows"``.  An event
+    outside every window gets ``""`` and ``"gps_outside_exposure_windows"``
+    -- GW230518_125908 (an engineering-run event, before O4a's start) used to
+    be stored as O4a from its name's date.  Without a usable GPS time the
+    name-based guess is kept, ``source="event_name"``.
+    """
+    from .observing_runs import (EXPOSURE_WINDOWS_GPS, RunWindowError,
+                                 run_of_gps)
+    t = None
+    if samples is not None and "geocent_time" in samples:
+        gt = np.asarray(samples["geocent_time"], dtype=float)
+        gt = gt[np.isfinite(gt)]
+        if gt.size:
+            t = float(np.median(gt))
+    if t is None:
+        return _observing_run_from_name(name), "event_name"
+    try:
+        return str(run_of_gps(t, EXPOSURE_WINDOWS_GPS)), "gps_exposure_windows"
+    except RunWindowError:
+        return "", "gps_outside_exposure_windows"
+
+
+def _sky_area_90_info(ra_samples, dec_samples, nside=64,
+                      min_per_pixel=SKY_AREA_MIN_PER_PIXEL):
+    """``(area_deg2, nside_used)`` of the 90% credible sky area.
+
+    Counts samples in HEALPix pixels and takes the fewest pixels holding 90%
+    of them, at the finest ``nside`` (from ``nside`` down to 1) whose selected
+    pixels hold at least ``min_per_pixel`` samples on average.  At a fixed
+    nside-64 grid (0.84 deg^2 pixels) the area of a broad or sparse posterior
+    was capped near 0.9 N x 0.84 deg^2 -- GW200322_091133 (69 samples) was
+    stored at 52.9 deg^2 against 33,562 deg^2 from its LVK sky map -- so a
+    ``sky_area_max`` cut admitted events far larger than the cut.  A
+    well-sampled posterior keeps nside 64 and its previous value.  ``(nan,
+    nan)`` when no nside resolves the region (too few samples) or healpy is
+    unavailable.
     """
     try:
         import healpy as hp
     except ImportError:
-        return np.nan
-    npix = hp.nside2npix(nside)
-    pix_area_deg2 = hp.nside2pixarea(nside, degrees=True)
-    # Convert (ra, dec) → healpy (theta, phi)
+        return np.nan, np.nan
+    # Convert (ra, dec) -> healpy (theta, phi)
     theta = np.pi / 2 - np.asarray(dec_samples)
     phi = np.asarray(ra_samples)
-    pix = hp.ang2pix(nside, theta, phi)
-    counts = np.bincount(pix, minlength=npix)
-    # Sort descending; find smallest set covering 90%
-    sorted_counts = np.sort(counts)[::-1]
-    cumsum = np.cumsum(sorted_counts)
-    threshold = 0.9 * cumsum[-1]
-    n_pix_90 = int(np.searchsorted(cumsum, threshold) + 1)
-    return n_pix_90 * pix_area_deg2
+    ns = int(nside)
+    while ns >= 1:
+        npix = hp.nside2npix(ns)
+        pix = hp.ang2pix(ns, theta, phi)
+        counts = np.bincount(pix, minlength=npix)
+        # Sort descending; find smallest set covering 90%
+        sorted_counts = np.sort(counts)[::-1]
+        cumsum = np.cumsum(sorted_counts)
+        if cumsum[-1] <= 0:
+            break
+        threshold = 0.9 * cumsum[-1]
+        n_pix_90 = int(np.searchsorted(cumsum, threshold) + 1)
+        if cumsum[n_pix_90 - 1] / n_pix_90 >= min_per_pixel:
+            return n_pix_90 * hp.nside2pixarea(ns, degrees=True), float(ns)
+        ns //= 2
+    return np.nan, np.nan
+
+
+def _sky_area_90(ra_samples, dec_samples, nside=64):
+    """Estimate the 90% credible sky area (deg^2) from posterior ra/dec samples.
+
+    Uses healpy if available; returns NaN otherwise, and NaN when the samples
+    are too few to resolve the region (see :func:`_sky_area_90_info`).  This
+    is computed once at ingest and stored as metadata for fast selection.
+    """
+    return _sky_area_90_info(ra_samples, dec_samples, nside)[0]
 
 
 def _resolve_event_table(event_table, cache_dir=None, offline=None):
@@ -1778,7 +2476,10 @@ def _resolve_event_table(event_table, cache_dir=None, offline=None):
 
 def _constituent_mixture_prior(catalog, analysis, analyses, samples_dict,
                                priors, cfg, flavour):
-    """The equal-weight constituent-mixture prior of a ``C00:Mixed`` row.
+    """The constituent-mixture prior of a ``C00:Mixed`` row.
+
+    ``cfg.constituent_mixture_convention`` picks the reading (equal-weight
+    mixture at every row, or each row's own constituent prior).
 
     See :mod:`gwcat.constituent_mixture`.  Every contributing constituent must
     carry its OWN analytic mass (uniform in components), distance and spin
@@ -1787,19 +2488,32 @@ def _constituent_mixture_prior(catalog, analysis, analyses, samples_dict,
     constituent must supply exactly ``n_Mixed / K`` rows.  Anything else is
     refused (:class:`~gwcat.constituent_mixture.ConstituentMixtureError`).
     """
-    from .constituent_mixture import (ConstituentMixtureError,
+    from .constituent_mixture import (MIXTURE_CONVENTIONS,
+                                      ConstituentMixtureError,
+                                      mass_constraint_bounds,
                                       match_constituent_rows,
                                       mixture_prior_densities,
                                       truncated_dL_density, uic_normalisation)
     pfx, _base, variant = _label_parts(analysis)
     want = _spin_variant_token(variant)
+    # Every combined set is excluded, not only the base "Mixed": C00:Mixed+XO4a
+    # carries the C00:Mixed rows, so keeping it as a candidate made every row
+    # ambiguous and aborted the ingest on all 29 GWTC-4.1 files that ship it
+    # (review 2026-10-20, high-13).
     cands = {a: samples_dict[a] for a in analyses
              if a != analysis and _label_parts(a)[0] == pfx
-             and _label_parts(a)[1] != "Mixed"
+             and not _is_combined_base(_label_parts(a)[1])
              and _spin_variant_token(_label_parts(a)[2]) == want}
-    labels, counts = match_constituent_rows(samples_dict[analysis], cands)
+    conv = cfg.constituent_mixture_convention
+    if conv not in MIXTURE_CONVENTIONS:
+        raise ConstituentMixtureError(
+            f"constituent_mixture_convention={conv!r}; choose one of "
+            f"{MIXTURE_CONVENTIONS}.")
+    labels, counts, row_comp = match_constituent_rows(
+        samples_dict[analysis], cands, return_rows=True)
 
     comps, amaxes, cosmos, dl_kinds, bad = [], set(), set(), set(), []
+    alphas, cosmo_sources = set(), set()
     for lab in labels:
         smp = samples_dict[lab]
         mp = resolve_mass_prior(lab, [lab], priors, siblings=False)
@@ -1820,12 +2534,22 @@ def _constituent_mixture_prior(catalog, analysis, analyses, samples_dict,
                 or sp.source_kind != "own_analytic"):
             bad.append(f"{lab}: spin prior {sp.kind}/{sp.source_kind}")
             continue
+        # EVERY Constraint of the constituent's own group (total_mass
+        # included); one the support does not implement is refused.
+        try:
+            cons = mass_constraint_bounds(
+                (priors.get("analytic") or {}).get(lab) or {},
+                _parse_analytic_spin)
+        except ConstituentMixtureError as exc:
+            bad.append(f"{lab}: {exc}")
+            continue
         amaxes.add((sp.amax_1, sp.amax_2))
         cosmos.add((rd.H0, rd.Om0, rd.cosmology_name))
         dl_kinds.add(rd.kind)
+        alphas.add(rd.alpha)
+        cosmo_sources.add(rd.cosmology_source)
         bounds = dict(mc_min=mp.chirp_min, mc_max=mp.chirp_max,
-                      q_min=mp.q_min, q_max=mp.q_max, m1_min=mp.m1_min,
-                      m1_max=mp.m1_max, m2_min=mp.m2_min, m2_max=mp.m2_max)
+                      q_min=mp.q_min, q_max=mp.q_max, **cons)
         comps.append(dict(
             bounds, label=lab, Z=uic_normalisation(**bounds),
             dmin=rd.dmin, dmax=rd.dmax, dl_kind=rd.kind,
@@ -1849,7 +2573,8 @@ def _constituent_mixture_prior(catalog, analysis, analyses, samples_dict,
     m1 = np.asarray(mixed["mass_1"], float)
     q = np.asarray(mixed["mass_2"], float) / m1
     dL = np.asarray(mixed["luminosity_distance"], float)
-    joint, marg = mixture_prior_densities(m1, q, dL, comps)
+    joint, marg = mixture_prior_densities(m1, q, dL, comps, convention=conv,
+                                          row_component=row_comp)
     n_zero = int(np.sum(~(joint > 0)))
     if n_zero:
         raise ConstituentMixtureError(
@@ -1859,8 +2584,12 @@ def _constituent_mixture_prior(catalog, analysis, analyses, samples_dict,
     (a1, a2), = amaxes
     (H0, Om0, cname), = cosmos
     return dict(labels=labels, counts=counts, p_mass_dL=joint, p_dL=marg,
+                convention=conv,
                 amax_1=a1, amax_2=a2, H0=H0, Om0=Om0, cosmology_name=cname,
                 dl_kind=(dl_kinds.pop() if len(dl_kinds) == 1 else "mixture"),
+                alpha=(next(iter(alphas)) if len(alphas) == 1 else None),
+                cosmology_source=(next(iter(cosmo_sources))
+                                  if len(cosmo_sources) == 1 else "mixture"),
                 dmin=min(c["dmin"] for c in comps),
                 dmax=max(c["dmax"] for c in comps),
                 chirp_min=min(c["mc_min"] for c in comps),
@@ -1948,6 +2677,11 @@ def build_store(paths, out_path, params=None, extra_params=None,
                    byte-identical to one written before the flag existed.
     """
     cfg = cfg or IngestConfig()
+    for _opt in ("mixed_prior_mismatch", "spin_exceeds_amax"):
+        if getattr(cfg, _opt) not in ("warn", "raise"):
+            raise ValueError(
+                f"IngestConfig.{_opt}={getattr(cfg, _opt)!r} is invalid; use "
+                f"'warn' or 'raise'.")
     params = list(params or DEFAULT_PARAMS)
     if extra_params:
         params += [p for p in extra_params if p not in params]
@@ -1962,6 +2696,11 @@ def build_store(paths, out_path, params=None, extra_params=None,
     records = []   # per row: (name, n_samples, {param: array}) -- union schema
     offsets = [0]
     names, meta = [], {k: [] for k in META_FLOAT_FIELDS + META_STR_FIELDS}
+    # Row identity is (event, sample set): a second row with the same key is
+    # refused, and two FILES for one event are reported (review 2026-10-20,
+    # medium-24).  Before, a directory holding IGWN-GWTC2p1-v1 and -v2 of one
+    # event stored both and the export silently kept whichever sorted first.
+    row_source, event_files = {}, {}
 
     for path in paths:
         catalog = detect_catalog(path)
@@ -1987,7 +2726,17 @@ def build_store(paths, out_path, params=None, extra_params=None,
         # priors/analytic group records (GW-02).
         flavour = detect_release_flavour(path)
 
+        event_files.setdefault(name, []).append(os.path.basename(path))
         for analysis in labels:
+            if (name, analysis) in row_source:
+                raise DuplicateSampleSetError(
+                    f"{name} [{analysis}] would be ingested twice: from "
+                    f"{row_source[(name, analysis)]} and "
+                    f"{os.path.basename(path)}. A store row is one (event, "
+                    f"sample set); pass each release file once (for a "
+                    f"re-release, merge_store(..., on_duplicate_key="
+                    f"'refresh') replaces the old row).")
+            row_source[(name, analysis)] = os.path.basename(path)
             s = samples_dict[analysis]
 
             n = len(np.asarray(s["luminosity_distance"]))
@@ -1998,23 +2747,56 @@ def build_store(paths, out_path, params=None, extra_params=None,
             rec = {p: np.asarray(s[p], dtype=np.float64) for p in params if p in s}
 
             dL = np.asarray(s["luminosity_distance"], float)
+            # The constituents a combined set's record names (critical-1,
+            # low-10): searched first for every borrowed prior.
+            constituents = combined_constituents(data, analysis, analyses)
             res = resolve_dL_prior(catalog, analysis, analyses, priors, dL, cfg,
                                    flavour=flavour,
-                                   release_table=release_table)
+                                   release_table=release_table, data=data,
+                                   constituents=constituents)
             H0, Om0, dmin, dmax, src = (res.H0, res.Om0, res.dmin, res.dmax,
                                         res.source)
+            if (cfg.defaulted_cosmology_fatal
+                    and res.cosmology_source == "catalog_default"
+                    and res.kind in DL_PRIOR_NEEDS_COSMOLOGY):
+                raise PriorMismatchError(
+                    f"{name} [{analysis}]: the {res.kind} distance prior "
+                    f"({src}) declares no cosmology gwcat recognises, so it "
+                    f"would be evaluated at the catalog default (H0={H0}, "
+                    f"Om0={Om0}); refused (defaulted_cosmology_fatal=True).")
             ks_val = None
+            v = None
+            ks_thr = float("nan")
             if cfg.validate_prior:
                 v = validate_prior_against_samples(
                     priors, [analysis] + analyses, res, impl=cfg.dL_prior_impl)
                 if v is not None:
                     ks_val = v["ks"]
+                    ks_thr = _ks_threshold(v["n_prior_samples"], cfg)
                     # The KS is now against the SAMPLING class the file declares,
                     # so a failure means the parse is wrong -- not that "the
                     # assumed cosmology may be wrong", which is what the
                     # pre-GW-02 message said while comparing two different
                     # distributions on every GWTC-2.1/3 event.
-                    if np.isfinite(ks_val) and ks_val > cfg.prior_ks_max:
+                    if not np.isfinite(ks_val):
+                        # Prior samples ARE present but the parsed bounds
+                        # miss them, so no KS can be computed.  That used to
+                        # read like "no prior samples" and bypassed
+                        # prior_ks_fatal (review 2026-10-20, low-28).
+                        pct_out = 100 * v["frac_prior_samples_outside_bounds"]
+                        msg = (
+                            f"{name} [{analysis}]: the file's own "
+                            f"{v['n_prior_samples']} distance prior samples "
+                            f"from {v['analysis']} do not overlap the parsed "
+                            f"prior {v['sampling_kind']} on [{dmin:.4g}, "
+                            f"{dmax:.4g}] Mpc "
+                            f"({pct_out:.1f}% outside), so the KS check "
+                            f"cannot be computed. "
+                            f"The parse or the bounds are wrong.")
+                        if cfg.prior_ks_fatal:
+                            raise PriorMismatchError(msg)
+                        warnings.warn(msg)
+                    elif ks_val > ks_thr:
                         msg = (
                             f"{name} [{analysis}]: the file's own prior samples "
                             f"reject the parsed distance prior "
@@ -2022,7 +2804,7 @@ def build_store(paths, out_path, params=None, extra_params=None,
                             f"{'' if res.sampling_alpha is None else f'(alpha={res.sampling_alpha:g})'}"
                             f" on [{dmin:.4g}, {dmax:.4g}] Mpc with "
                             f"cosmology={res.cosmology_name or f'(H0={H0}, Om0={Om0})'}: "
-                            f"KS={ks_val:.4f} > {cfg.prior_ks_max} over "
+                            f"KS={ks_val:.4f} > {ks_thr:.4g} over "
                             f"{v['n_prior_samples']} samples from "
                             f"{v['analysis']}. The parse, the bounds or the "
                             f"cosmology mapping is wrong.")
@@ -2034,19 +2816,27 @@ def build_store(paths, out_path, params=None, extra_params=None,
                     # sides, so it no longer absorbs missing tail mass -- which
                     # means this has to be said separately or it stops being
                     # said at all.
-                    frac_out = v.get("frac_prior_bounds_uncovered")
-                    if (frac_out is not None and np.isfinite(frac_out)
-                            and frac_out > cfg.dL_outside_warn_frac):
+                    # Judged against what correct draws give (medium-48):
+                    # any sample outside the bounds, or bounds the samples
+                    # reach improbably short of.
+                    s_out = v.get("frac_prior_samples_outside_bounds")
+                    pval = v.get("prior_bounds_pvalue")
+                    if ((s_out is not None and np.isfinite(s_out)
+                         and s_out > cfg.dL_outside_warn_frac)
+                            or (pval is not None and np.isfinite(pval)
+                                and pval < cfg.prior_bounds_pvalue_min)):
                         warnings.warn(
                             f"{name} [{analysis}]: the file's own distance "
                             f"PRIOR samples and the recorded prior bounds "
                             f"[{dmin:.4g}, {dmax:.4g}] Mpc from {src} describe "
-                            f"different ranges -- {100 * frac_out:.2f}% of the "
-                            f"declared prior's mass is unaccounted for (samples "
-                            f"outside the bounds, or bounds the samples never "
-                            f"reach). The KS is computed on the overlap and so "
-                            f"does not see this; it usually means the bounds "
-                            f"came from a sibling analysis.")
+                            f"different ranges -- {100 * s_out:.2f}% of the "
+                            f"samples fall outside the bounds and "
+                            f"{100 * v['frac_prior_mass_uncovered']:.2f}% of "
+                            f"the declared prior's mass lies beyond the "
+                            f"samples (p={pval:.3g} for correct draws). The "
+                            f"KS is computed on the overlap and so does not "
+                            f"see this; it usually means the bounds came from "
+                            f"a sibling analysis.")
             # distance prior evaluated per sample, stored mass-prior-agnostic.
             # Dispatched on the EFFECTIVE distribution class (GW-02) and
             # evaluated over the FULL sample range rather than truncated at the
@@ -2093,22 +2883,63 @@ def build_store(paths, out_path, params=None, extra_params=None,
             # Spin-magnitude prior resolution (PR 2), mirroring resolve_dL_prior.
             a1_samp = np.asarray(s["a_1"], float) if "a_1" in s else None
             a2_samp = np.asarray(s["a_2"], float) if "a_2" in s else None
-            sp = resolve_spin_prior_full(
-                analysis, analyses, priors, a1_samp, a2_samp,
-                allow_variant_mismatch=cfg.spin_prior_allow_variant_mismatch,
-                data=data)
+            cmix_row = (cfg.constituent_mixture_prior
+                        and _label_parts(analysis)[0] == "C00"
+                        and _is_combined_base(_label_parts(analysis)[1]))
+            allow_mm = cfg.spin_prior_allow_variant_mismatch
+            try:
+                sp = resolve_spin_prior_full(
+                    analysis, analyses, priors, a1_samp, a2_samp,
+                    allow_variant_mismatch=allow_mm,
+                    data=data, constituents=constituents)
+            except SpinPriorMismatchError:
+                # A constituent-mixture row REPLACES the borrowed spin prior,
+                # and the mixture refuses disagreeing constituents itself.
+                if not cmix_row:
+                    raise
+                sp = resolve_spin_prior_full(
+                    analysis, analyses, priors, a1_samp, a2_samp,
+                    allow_variant_mismatch=True, data=data,
+                    constituents=constituents)
             spin_amax_1, spin_amax_2, spin_kind, spin_src = (
                 sp.amax_1, sp.amax_2, sp.kind, sp.source)
+            if sp.samples_exceed_amax and cfg.spin_exceeds_amax == "raise":
+                raise SpinCeilingExceededError(
+                    f"{name} [{analysis}]: spin samples reach "
+                    f"max|a_1|={sp.sample_max_1:.6g}, "
+                    f"max|a_2|={sp.sample_max_2:.6g} above the resolved "
+                    f"ceilings ({spin_amax_1:g}, {spin_amax_2:g}) from "
+                    f"{sp.source_label or sp.source}; refused "
+                    f"(spin_exceeds_amax='raise').")
             # ── Constituent-mixture prior for C00:Mixed (GW-40f, opt-in) ─────
             cmix = None
-            if (cfg.constituent_mixture_prior
-                    and _label_parts(analysis)[0] == "C00"
-                    and _label_parts(analysis)[1] == "Mixed"):
+            if cmix_row:
                 cmix = _constituent_mixture_prior(
                     catalog, analysis, analyses, samples_dict, priors, cfg,
                     flavour)
                 rec["p_dL_pe"] = cmix["p_dL"]
                 rec["p_mass_dL_pe"] = cmix["p_mass_dL"]
+            # ── Do a combined set's constituents agree? (critical-1) ────────
+            mixed_priors = ""
+            if constituents or _is_combined_base(_label_parts(analysis)[1]):
+                mixed_priors = compare_constituent_priors(
+                    analysis, constituents, priors)
+            if mixed_priors.startswith("differ:"):
+                msg = (
+                    f"{name} [{analysis}]: the constituents its "
+                    f"meta_data/combined record names ({constituents}) "
+                    f"declare different analytic priors for "
+                    f"{mixed_priors[len('differ:'):]}, but this row divides "
+                    f"out the prior of one sibling "
+                    f"({res.prior_source_label or 'none'} for the distance, "
+                    f"the first matching sibling for mass and spin). That is "
+                    f"the Mixed set's prior only where the constituents "
+                    f"agree; recorded as mixed_constituent_priors.")
+                if cfg.mixed_prior_mismatch == "raise" and cmix is None:
+                    raise MixedPriorMismatchError(
+                        msg + " Refused (mixed_prior_mismatch='raise'); use "
+                        "constituent_mixture_prior=True or exclude the row.")
+                warnings.warn(msg)
             records.append((name, n, rec))
 
             # metadata
@@ -2165,7 +2996,8 @@ def build_store(paths, out_path, params=None, extra_params=None,
             # |dm2det/dq| = m1det Jacobian that is only valid for a prior
             # uniform in detector-frame component masses, so warn loudly when
             # the file declares something else instead of asserting it silently.
-            mp = resolve_mass_prior(analysis, analyses, priors)
+            mp = resolve_mass_prior(analysis, analyses, priors,
+                                    constituents=constituents)
             if mp.kind == "unrecognized":
                 warnings.warn(
                     f"{name} [{analysis}]: the analytic mass prior is not "
@@ -2180,7 +3012,15 @@ def build_store(paths, out_path, params=None, extra_params=None,
             meta["prior_source_label_spin"].append(sp.source_label)
             meta["prior_source_kind_spin"].append(sp.source_kind)
             meta["spin_amax_config_per_constituent"].append(
-                constituent_spin_amax_config(data, analysis, analyses))
+                constituent_spin_amax_config(data, analysis, analyses,
+                                             constituents))
+            meta["mixed_constituent_labels"].append("+".join(constituents))
+            meta["mixed_constituent_priors"].append(mixed_priors)
+            meta["spin_sample_max_1"].append(float(sp.sample_max_1))
+            meta["spin_sample_max_2"].append(float(sp.sample_max_2))
+            meta["spin_sample_max_per_constituent"].append(
+                constituent_spin_sample_max(analysis, analyses, samples_dict,
+                                            constituents))
             meta["prior_source_label_dL"].append(res.prior_source_label)
             meta["prior_source_kind_dL"].append(res.prior_source_kind)
             meta["mass_prior_chirp_min"].append(
@@ -2197,7 +3037,9 @@ def build_store(paths, out_path, params=None, extra_params=None,
             meta["source_class_method"].append(source_class_method)
             meta["source_class_reference"].append(source_class_reference)
             meta["release"].append(catalog)
-            meta["observing_run"].append(_observing_run_from_name(name))
+            obs_run, obs_src = _observing_run_for(name, s)
+            meta["observing_run"].append(obs_run)
+            meta["observing_run_source"].append(obs_src)
             meta["metadata_source"].append(metadata_source)
             meta["far_available"].append(far_available)
             meta["p_astro"].append(p_astro)
@@ -2234,6 +3076,16 @@ def build_store(paths, out_path, params=None, extra_params=None,
                 else float(res.sampling_alpha))
             meta["dL_prior_ks"].append(
                 np.nan if ks_val is None else float(ks_val))
+            meta["dL_prior_ks_threshold"].append(float(ks_thr))
+            meta["dL_prior_n_prior_samples"].append(
+                np.nan if v is None else float(v["n_prior_samples"]))
+            meta["dL_prior_frac_mass_uncovered"].append(
+                np.nan if v is None else float(v["frac_prior_mass_uncovered"]))
+            meta["dL_prior_frac_samples_outside"].append(
+                np.nan if v is None
+                else float(v["frac_prior_samples_outside_bounds"]))
+            meta["dL_prior_bounds_pvalue"].append(
+                np.nan if v is None else float(v["prior_bounds_pvalue"]))
             # `if f_ref` was also a truthiness bug: a legitimate f_ref of 0.0
             # would have been stored as NaN.  _read_f_ref already rejects
             # non-positive values explicitly, so test against None (GW-07).
@@ -2249,10 +3101,12 @@ def build_store(paths, out_path, params=None, extra_params=None,
             meta["derived_params"].append(",".join(derived_names))
             # Sky area (optional; requires healpy)
             if "ra" in s and "dec" in s:
-                meta["sky_area_90"].append(
-                    _sky_area_90(np.asarray(s["ra"]), np.asarray(s["dec"])))
+                area, area_nside = _sky_area_90_info(np.asarray(s["ra"]),
+                                                     np.asarray(s["dec"]))
             else:
-                meta["sky_area_90"].append(np.nan)
+                area, area_nside = np.nan, np.nan
+            meta["sky_area_90"].append(area)
+            meta["sky_area_90_nside"].append(area_nside)
             # ── Sample-set / waveform contract (PR 6) ──────────────────────
             ss = _sample_set_meta(analysis, preferred_label, ranked, path,
                                   sample_sets, provenance=prov,
@@ -2269,14 +3123,16 @@ def build_store(paths, out_path, params=None, extra_params=None,
                     "constituent_mixture_counts": ",".join(
                         str(cmix["counts"][lab]) for lab in cmix["labels"]),
                     "mass_prior_kind": "constituent_mixture",
-                    "mass_prior_source": f"constituent_mixture[{joined}]",
+                    "mass_prior_source": (f"constituent_mixture:"
+                                          f"{cmix['convention']}[{joined}]"),
                     "mass_prior_chirp_min": cmix["chirp_min"],
                     "mass_prior_chirp_max": cmix["chirp_max"],
                     "mass_prior_q_min": cmix["q_min"],
                     "mass_prior_q_max": cmix["q_max"],
                     "dL_prior_kind": cmix["dl_kind"],
                     "dL_prior_basis": "constituent_mixture",
-                    "dL_prior_source": f"constituent_mixture[{joined}]",
+                    "dL_prior_source": (f"constituent_mixture:"
+                                        f"{cmix['convention']}[{joined}]"),
                     "dL_prior_min": cmix["dmin"],
                     "dL_prior_max": cmix["dmax"],
                     "dL_prior_H0": float(cmix["H0"]),
@@ -2286,6 +3142,26 @@ def build_store(paths, out_path, params=None, extra_params=None,
                     "spin_amax_2": float(cmix["amax_2"]),
                     "spin_prior_kind": "uniform_magnitude_isotropic",
                     "spin_prior_source": f"constituent_mixture[{joined}]",
+                    # The rest of the distance-prior record describes the
+                    # MIXTURE too, not the sibling first resolved (review
+                    # 2026-10-20, low-32: n_samples_outside counted 80
+                    # samples outside a sibling's [100, 6000] when none lie
+                    # outside the mixture's bounds).
+                    "n_samples_outside_dL_prior_bounds": float(np.sum(
+                        (dL < cmix["dmin"]) | (dL > cmix["dmax"]))),
+                    "dL_prior_sampling_kind": cmix["dl_kind"],
+                    "dL_prior_alpha": (np.nan if cmix["alpha"] is None
+                                       else float(cmix["alpha"])),
+                    "dL_prior_sampling_alpha": (
+                        np.nan if cmix["alpha"] is None
+                        else float(cmix["alpha"])),
+                    "dL_prior_cosmology_source": cmix["cosmology_source"],
+                    "dL_prior_ks": np.nan,
+                    "dL_prior_ks_threshold": np.nan,
+                    "dL_prior_n_prior_samples": np.nan,
+                    "dL_prior_frac_mass_uncovered": np.nan,
+                    "dL_prior_frac_samples_outside": np.nan,
+                    "dL_prior_bounds_pvalue": np.nan,
                 }
                 for p in ("mass", "spin", "dL"):
                     over[f"prior_source_label_{p}"] = joined
@@ -2298,9 +3174,17 @@ def build_store(paths, out_path, params=None, extra_params=None,
                 # sibling-borrowed resolution; the mixture REPLACES it.
                 for k, val in over.items():
                     meta[k][-1] = val
-                src = f"constituent_mixture[{joined}]"
+                src = f"constituent_mixture:{cmix['convention']}[{joined}]"
             print(f"[{catalog}] {name}: {n} samp, sample_set={analysis}, "
                   f"prior={src}")
+
+    multi = {n: fs for n, fs in event_files.items() if len(fs) > 1}
+    if multi:
+        warnings.warn(
+            f"{len(multi)} event(s) come from more than one file: "
+            f"{dict(list(multi.items())[:5])}. Their rows are kept as "
+            f"separate sample sets; check that this is intended.")
+    _warn_multiple_preferred(names, meta.get("is_preferred"), "build_store")
 
     # Assemble the UNION of parameters across events, NaN-filling event slices
     # where a parameter is absent, and build the per-event availability mask.
@@ -2315,9 +3199,15 @@ def build_store(paths, out_path, params=None, extra_params=None,
     # Written event slice by event slice into preallocated columns: the union is
     # never concatenated in memory, so the ingest peak is the records alone
     # rather than the records plus a second copy of the whole catalog (GW-24).
+    provenance = _store_build_provenance(
+        "build_store", cfg=cfg, meta=meta,
+        inputs={"files": [os.path.basename(p) for p in paths],
+                "sample_sets": (sample_sets if isinstance(sample_sets, str)
+                                else list(sample_sets))})
     union_params = _write_store_from_records(out_path, records,
                                              candidate_params, offsets, names,
-                                             meta, cfg, mock_data=mock_data)
+                                             meta, cfg, mock_data=mock_data,
+                                             provenance=provenance)
     print(f"\nWrote {out_path}: {len(names)} events, "
           f"{offsets[-1]} total samples, params={union_params}")
 
@@ -2558,6 +3448,43 @@ SCHEMA_VERSION_PRIOR_PROVENANCE = "1.4"
 STORE_MOCK_DATA_ATTR = "mock_data"
 
 
+#: File-level store attrs recording the BUILD (review 2026-10-20, low-31):
+#: which gwcat wrote the store and with which IngestConfig, the
+#: release-reweight table(s) its rows used, and its inputs.  Per-row columns
+#: already record most number-changing choices; nothing recorded the build.
+#: Written by :func:`build_store` and :func:`merge_stores` only.
+STORE_PROVENANCE_ATTRS = ("gwcat_writer_version", "gwcat_writer_commit",
+                          "store_writer", "ingest_config_json",
+                          "release_reweight_table_sha256",
+                          "store_inputs_json")
+
+
+def _store_build_provenance(kind, cfg=None, meta=None, inputs=None):
+    """The :data:`STORE_PROVENANCE_ATTRS` values for one store write."""
+    import dataclasses
+    from .validation_summary import gwcat_commit, package_version
+    prov = {"gwcat_writer_version": str(package_version()),
+            "gwcat_writer_commit": str(gwcat_commit()),
+            "store_writer": str(kind)}
+    if cfg is not None:
+        prov["ingest_config_json"] = json.dumps(
+            dataclasses.asdict(cfg), sort_keys=True, default=str)
+    if meta is not None:
+        prov["release_reweight_table_sha256"] = json.dumps(sorted(
+            {str(x) for x in meta.get("dL_prior_cosmology_table_sha256", [])
+             if x}))
+    if inputs is not None:
+        prov["store_inputs_json"] = json.dumps(inputs, sort_keys=True,
+                                               default=str)
+    return prov
+
+
+def read_store_provenance(f) -> dict:
+    """The :data:`STORE_PROVENANCE_ATTRS` an open store carries ({} if none)."""
+    return {k: _decode(f.attrs[k]) for k in STORE_PROVENANCE_ATTRS
+            if k in f.attrs}
+
+
 def read_store_mock_data(f) -> bool:
     """Whether an open store (or any ``h5py`` object with ``attrs``) is mock."""
     return bool(f.attrs.get(STORE_MOCK_DATA_ATTR, False))
@@ -2596,11 +3523,14 @@ def _store_schema_version(meta):
     return SCHEMA_VERSION
 
 
-def _write_store_attrs(f, stored_params, names, meta, mock_data=False):
+def _write_store_attrs(f, stored_params, names, meta, mock_data=False,
+                       provenance=None):
     """Write the file-level attributes (schema, column names, row count).
 
     ``mock_data`` adds :data:`STORE_MOCK_DATA_ATTR` -- only when True, so a
     real-data store's attrs are exactly what they were before the flag existed.
+    ``provenance`` (:func:`_store_build_provenance`) adds the build record;
+    None writes none.
     """
     f.attrs["schema_version"] = _store_schema_version(meta)
     f.attrs.create("param_names",
@@ -2608,6 +3538,8 @@ def _write_store_attrs(f, stored_params, names, meta, mock_data=False):
     f.attrs["n_events"] = len(names)
     if mock_data:
         f.attrs[STORE_MOCK_DATA_ATTR] = True
+    for k, v in (provenance or {}).items():
+        f.attrs[k] = v
 
 
 def _write_store_index(f, offsets, names, avail, meta, cfg):
@@ -2660,7 +3592,8 @@ def _create_sample_column(g, p, n, cfg):
 
 
 def _write_store_from_records(out_path, records, candidate_params, offsets,
-                              names, meta, cfg, mock_data=False):
+                              names, meta, cfg, mock_data=False,
+                              provenance=None):
     """Write a store straight from per-event arrays, one event slice at a time.
 
     The concatenating path (:func:`_assemble_union` + :func:`_write_store`)
@@ -2678,7 +3611,8 @@ def _write_store_from_records(out_path, records, candidate_params, offsets,
     union_params, avail = _union_params_and_avail(records, candidate_params)
     total = int(offsets[-1]) if len(offsets) else 0
     with h5py.File(out_path, "w") as f:
-        _write_store_attrs(f, union_params, names, meta, mock_data)
+        _write_store_attrs(f, union_params, names, meta, mock_data,
+                           provenance)
         g = f.create_group("samples")
         for p in union_params:
             ds = _create_sample_column(g, p, total, cfg)
@@ -2814,7 +3748,7 @@ def _copy_column(src_ds, dst_ds, runs):
 
 
 def _write_store_streaming(out_path, stored_params, sources, offsets, names,
-                           avail, meta, cfg, mock_data=False):
+                           avail, meta, cfg, mock_data=False, provenance=None):
     """Write a store whose sample columns are COPIED from existing stores.
 
     ``sources`` is a list of ``(store metadata dict, destination start offset)``
@@ -2827,7 +3761,8 @@ def _write_store_streaming(out_path, stored_params, sources, offsets, names,
     """
     total = int(offsets[-1]) if len(offsets) else 0
     with h5py.File(out_path, "w") as f:
-        _write_store_attrs(f, stored_params, names, meta, mock_data)
+        _write_store_attrs(f, stored_params, names, meta, mock_data,
+                           provenance)
         g = f.create_group("samples")
         dsets = {p: _create_sample_column(g, p, total, cfg)
                  for p in stored_params}
@@ -2849,13 +3784,60 @@ def _row_keys(S):
 
     A row of the ragged store is one ``(event, sample_set)`` pair -- that is the
     uniqueness the sample-set contract declares (see SAMPLE_SET_STR_FIELDS) and
-    what ``sample_sets="all"`` produces.  Stores written before the contract, and
-    the single-sample-set default, carry ``sample_set_name = ""`` for every row,
-    so keying on the pair reduces to keying on the name for them.
+    what ``sample_sets="all"`` produces.  Every row :func:`build_store` writes
+    carries its analysis label in ``sample_set_name``, the single-sample-set
+    default included; only stores written before the contract lack the column,
+    and for them (``""``) keying on the pair reduces to keying on the name.
     """
     ss = S["meta"].get("sample_set_name") or [""] * S["n_events"]
     return [(n, str(ss[i]) if i < len(ss) else "")
             for i, n in enumerate(S["names"])]
+
+
+def _preferred_flags(S):
+    """Whether each row of an in-memory store is its event's preferred set."""
+    v = S["meta"].get("is_preferred")
+    if v is None:
+        return [False] * S["n_events"]
+    out = []
+    for x in v:
+        try:
+            out.append(float(x) > 0.5)
+        except (TypeError, ValueError):
+            out.append(False)
+    return out
+
+
+def _duplicate_rows(A, B):
+    """``(A rows, B rows, labels)`` of the rows of ``B`` that duplicate ``A``.
+
+    A ``B`` row duplicates an ``A`` row when the two share the ``(event,
+    sample_set)`` key, OR when both are their event's PREFERRED row.  The
+    second case is a re-release whose preferred label changed
+    (``C00:IMRPhenomNSBH`` -> ``C00:Mixed:HighSpin``): it is the same event's
+    preferred sample set, and keying on the label alone kept both rows, each
+    marked preferred, so "refresh" replaced nothing (review 2026-10-20,
+    medium-25).  A non-preferred new sample set is still not a duplicate.
+    """
+    a_keys, b_keys = _row_keys(A), _row_keys(B)
+    a_pref, b_pref = _preferred_flags(A), _preferred_flags(B)
+    by_key, pref_by_name = {}, {}
+    for i, k in enumerate(a_keys):
+        by_key.setdefault(k, []).append(i)
+        if a_pref[i]:
+            pref_by_name.setdefault(k[0], []).append(i)
+    a_dup, b_dup, listed = set(), set(), []
+    for j, k in enumerate(b_keys):
+        hit = set(by_key.get(k, []))
+        if b_pref[j]:
+            hit |= set(pref_by_name.get(k[0], []))
+        if hit:
+            b_dup.add(j)
+            a_dup |= hit
+            olds = sorted({a_keys[i][1] for i in hit} - {k[1]})
+            tag = f"{k[0]}[{k[1]}]" if k[1] else k[0]
+            listed.append(tag + (f" (preferred; was {olds})" if olds else ""))
+    return a_dup, b_dup, sorted(listed)
 
 
 def merge_stores(store_a, store_b, out_path, cfg: Optional[IngestConfig] = None,
@@ -2873,15 +3855,24 @@ def merge_stores(store_a, store_b, out_path, cfg: Optional[IngestConfig] = None,
     contract declares -- NOT the event name.  A ``store_b`` row whose event
     already appears in ``store_a`` under a DIFFERENT sample set is therefore
     added, not dropped: that is how a second waveform's samples enter an
-    existing catalog (GW-14).
+    existing catalog (GW-14).  The exception is an event's PREFERRED row: a
+    ``store_b`` preferred row duplicates ``store_a``'s preferred row of the
+    same event whatever its label, so a re-release whose preferred label
+    changed replaces (or is skipped against) the old one instead of leaving
+    two preferred rows (review 2026-10-20, medium-25).  A merge that still
+    leaves an event with two preferred rows (``"keep"``) warns.
 
     on_duplicate_key : {"skip", "refresh", "keep"} or None
         What to do with a ``store_b`` row whose full key matches a ``store_a``
         row.  ``"skip"`` drops it and warns (the historical behaviour, and the
         default).  ``"refresh"`` REPLACES the matching ``store_a`` row with
         ``store_b``'s -- how one sample set's samples or metadata are updated
-        without re-ingesting the whole catalog; the refreshed row moves to the
-        end of the store, which is positional only (rows are addressed by key).
+        without re-ingesting the whole catalog.  The refreshed row moves to the
+        END of the store, and row position is not only cosmetic: a seeded PE
+        export draws every event's samples from one random stream in store row
+        order, so a refresh re-draws every event after the old position under
+        the same seed, with every digest unchanged (review 2026-10-20,
+        low-63).  Re-export from a fresh build when draws must match.
         ``"keep"`` appends both, leaving two rows with the same key -- a store
         state the readers treat as duplicate and which is only ever what you
         want mid-pipeline.  ``None`` derives it from the legacy
@@ -2906,21 +3897,18 @@ def merge_stores(store_a, store_b, out_path, cfg: Optional[IngestConfig] = None,
     B = _read_store_meta(store_b)
 
     if on_duplicate_key != "keep":
-        a_keys = _row_keys(A)
-        b_keys = _row_keys(B)
-        dupes = set(a_keys) & set(b_keys)
-        if dupes:
-            listed = sorted(f"{n}[{s}]" if s else n for n, s in dupes)
+        a_dup, b_dup, listed = _duplicate_rows(A, B)
+        if b_dup:
             if on_duplicate_key == "skip":
                 warnings.warn(f"Duplicate events skipped from the second "
                               f"store: {listed}")
-                B = _subset_meta(B, [i for i, k in enumerate(b_keys)
-                                     if k not in dupes])
+                B = _subset_meta(B, [i for i in range(B["n_events"])
+                                     if i not in b_dup])
             else:
                 warnings.warn(f"Refreshed from the second store (the first "
                               f"store's rows are replaced): {listed}")
-                A = _subset_meta(A, [i for i, k in enumerate(a_keys)
-                                     if k not in dupes])
+                A = _subset_meta(A, [i for i in range(A["n_events"])
+                                     if i not in a_dup])
 
     # Union parameter order: store A's columns first, then B's new columns.
     union_params = list(A["params"]) + [p for p in B["params"]
@@ -2962,6 +3950,8 @@ def merge_stores(store_a, store_b, out_path, cfg: Optional[IngestConfig] = None,
     resolved_pastro = resolve_pastro_column(merged_meta, n_total)
     for k in PASTRO_KEYS:
         merged_meta[k] = list(resolved_pastro)
+    _warn_multiple_preferred(names, merged_meta.get("is_preferred"),
+                             "merge_stores")
 
     # The copy reads the inputs WHILE writing the output, so an in-place merge
     # -- out_path IS one of the inputs, which the old in-memory merge allowed
@@ -2974,20 +3964,34 @@ def merge_stores(store_a, store_b, out_path, cfg: Optional[IngestConfig] = None,
     # because the merge producing its replacement failed.
     # A merge holding ANY synthetic row is synthetic: the flag is file-level,
     # and labelling a partly-mock store as real is the error it exists to stop.
-    a_mock, b_mock = bool(A.get("mock_data")), bool(B.get("mock_data"))
+    # Judged on the rows WRITTEN, after deduplication (review 2026-10-20,
+    # low-71): a mock store whose rows were all skipped contributes none, and
+    # a merge holding only real rows used to come out mock for good.
+    a_mock = bool(A.get("mock_data")) and A["n_events"] > 0
+    b_mock = bool(B.get("mock_data")) and B["n_events"] > 0
     mock_data = a_mock or b_mock
-    if a_mock != b_mock:
+    if (A["n_events"] and B["n_events"]
+            and bool(A.get("mock_data")) != bool(B.get("mock_data"))):
         warnings.warn(
             f"merging a mock-data store with a real-data store "
-            f"({store_a!r} mock_data={a_mock}, {store_b!r} mock_data={b_mock}); "
+            f"({store_a!r} mock_data={bool(A.get('mock_data'))}, {store_b!r} "
+            f"mock_data={bool(B.get('mock_data'))}); "
             f"the merged store is flagged mock_data=True, and so is every "
             f"export built from it.")
 
+    inputs = []
+    for path_in in (store_a, store_b):
+        with h5py.File(path_in, "r") as fin:
+            inputs.append(dict(read_store_provenance(fin),
+                               path=os.path.basename(str(path_in))))
+    provenance = _store_build_provenance(
+        "merge_stores", cfg=cfg, meta=merged_meta,
+        inputs={"stores": inputs, "on_duplicate_key": on_duplicate_key})
     write_path = f"{out_path}.gwcat-merge-tmp"
     try:
         _write_store_streaming(write_path, union_params, [(A, 0), (B, a_total)],
                                offsets, names, avail, merged_meta, cfg,
-                               mock_data=mock_data)
+                               mock_data=mock_data, provenance=provenance)
     except BaseException:
         if os.path.exists(write_path):
             os.remove(write_path)
@@ -3006,7 +4010,8 @@ def merge_store(existing_path: str, new_paths, out_path: str = None,
                 extra_params=None, sample_sets="preferred",
                 file_provenance: Optional[dict] = None, cache_dir=None,
                 offline: Optional[bool] = None,
-                on_duplicate_key: str = "skip"):
+                on_duplicate_key: str = "skip",
+                mock_data: Optional[bool] = None):
     """Append new events to an existing store without re-ingesting everything.
 
     Schema-preserving (PR 5): the merged store holds the UNION of parameters.
@@ -3029,9 +4034,20 @@ def merge_store(existing_path: str, new_paths, out_path: str = None,
         ``(event_name, sample_set_name)`` already exists in ``existing_path``.
         ``"skip"`` (default) keeps the existing row; ``"refresh"`` replaces it
         with the newly ingested one -- the way to update one waveform's samples
-        without re-ingesting the catalog.  Note that a new SAMPLE SET for an
-        event already in the store is not a duplicate at all: it is added under
-        either setting (GW-14).
+        without re-ingesting the catalog.  The refreshed row moves to the end
+        of the store, which changes which samples a seeded export draws for
+        every later event (see :func:`merge_stores`).  Note that a new SAMPLE
+        SET for an event already in the store is not a duplicate at all: it is
+        added under either setting (GW-14) -- unless it is that event's
+        preferred row, which replaces or is skipped against the existing
+        preferred row (review 2026-10-20, medium-25).
+    mock_data : bool or None
+        Whether the NEW files are synthetic (:data:`STORE_MOCK_DATA_ATTR`).
+        ``None`` (default) inherits the existing store's flag, so appending to
+        a mock store stays mock without a spurious mixing warning; ``True``
+        marks appended synthetic PE as mock, which makes the merged store mock
+        (review 2026-10-20, medium-54: there was no way to say so, and the
+        merge came out labelled real).
 
     Returns
     -------
@@ -3048,6 +4064,7 @@ def merge_store(existing_path: str, new_paths, out_path: str = None,
     # decide which parameters to ingest for the new events, not its samples,
     # which merge_stores then copies straight from the file (GW-24).
     old = _read_store_meta(existing_path)
+    new_mock = bool(old["mock_data"]) if mock_data is None else bool(mock_data)
 
     # Candidate columns for the new events: the generous default set plus any
     # columns the existing store already has (minus the computed p_dL_pe, which
@@ -3074,7 +4091,7 @@ def merge_store(existing_path: str, new_paths, out_path: str = None,
         tmp_new = os.path.join(tmpdir, "new.h5")
         build_store(new_paths, tmp_new, params=candidates, cfg=cfg,
                     event_table=event_table, sample_sets=sample_sets,
-                    file_provenance=file_provenance)
+                    file_provenance=file_provenance, mock_data=new_mock)
 
         tmp_merged = os.path.join(tmpdir, "merged.h5")
         merge_stores(existing_path, tmp_new, tmp_merged, cfg=cfg,
@@ -3168,13 +4185,57 @@ def _cli(
                          "with the mixing fractions verified row by row "
                          "(GW-40f; needed only for label policies that use "
                          "C00:Mixed). Default: off.")
+    ap.add_argument("--refuse-mixed-prior-mismatch", action="store_true",
+                    help="Refuse a combined (Mixed) row whose constituents, "
+                         "as named by its meta_data/combined record, declare "
+                         "different analytic priors, unless "
+                         "--constituent-mixture-prior builds a "
+                         "constituent-aware prior for it. Default: warn and "
+                         "record mixed_constituent_priors.")
+    ap.add_argument("--refuse-spin-above-amax", action="store_true",
+                    help="Refuse a row whose spin samples exceed the ceiling "
+                         "its resolved spin prior declares. Default: warn and "
+                         "record spin_sample_max_1/2.")
+    ap.add_argument("--refuse-defaulted-cosmology", action="store_true",
+                    help="Refuse a row whose cosmology-dependent distance "
+                         "prior declares no recognised cosmology (it would be "
+                         "evaluated at the catalog default). Default: use the "
+                         "default and record it.")
+    from .constituent_mixture import MIXTURE_CONVENTIONS
+    ap.add_argument("--constituent-mixture-convention",
+                    choices=MIXTURE_CONVENTIONS,
+                    default="equal_weight",
+                    help="With --constituent-mixture-prior: 'equal_weight' "
+                         "(default) evaluates (1/K) sum_k pi_k at every row; "
+                         "'own_prior' divides each row by its own "
+                         "constituent's prior. A modelling choice, recorded in "
+                         "each row's mass/dL prior source.")
     a = ap.parse_args(argv)
+    # The config is built BEFORE --inspect, so the smoke test reports the
+    # prior the build will use (review 2026-10-20, medium-47): inspect used
+    # to run on the defaults whatever --release-reweight-cosmology-table,
+    # --legacy-grid-priors or --constituent-mixture-prior said.
+    cfg = IngestConfig(
+        release_reweight_cosmology_table=a.release_reweight_cosmology_table,
+        constituent_mixture_prior=a.constituent_mixture_prior,
+        constituent_mixture_convention=a.constituent_mixture_convention,
+        dL_prior_impl="auto" if a.legacy_grid_priors else "exact",
+        mixed_prior_mismatch=("raise" if a.refuse_mixed_prior_mismatch
+                              else "warn"),
+        spin_exceeds_amax=("raise" if a.refuse_spin_above_amax else "warn"),
+        defaulted_cosmology_fatal=a.refuse_defaulted_cosmology)
     if a.inspect:
-        inspect(a.inspect)
+        inspect(a.inspect, cfg)
         return
-    paths = []
+    paths, seen = [], set()
     for g in a.glob:
-        paths += sorted(glob.glob(g))
+        # Overlapping globs used to pass one file twice (review 2026-10-20,
+        # medium-24); each file is ingested once, in first-match order.
+        for p in sorted(glob.glob(g)):
+            key = os.path.realpath(p)
+            if key not in seen:
+                seen.add(key)
+                paths.append(p)
     if not paths:
         ap.error("no files matched; pass --glob or --inspect")
     event_table = {} if a.no_event_table else None
@@ -3191,10 +4252,6 @@ def _cli(
     offline = True if a.offline else None
     write_summary = default_write_summary and not a.no_summary
 
-    cfg = IngestConfig(
-        release_reweight_cosmology_table=a.release_reweight_cosmology_table,
-        constituent_mixture_prior=a.constituent_mixture_prior,
-        dL_prior_impl="auto" if a.legacy_grid_priors else "exact")
     build_store(paths, a.out, event_table=event_table, sample_sets=sample_sets,
                 cache_dir=a.cache_dir, offline=offline, cfg=cfg,
                 file_provenance=file_provenance, write_summary=write_summary)

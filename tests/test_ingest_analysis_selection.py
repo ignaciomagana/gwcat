@@ -258,9 +258,15 @@ def test_aligned_spin_siblings_are_skipped_not_borrowed_from():
     analyses = ["C00:Mixed:HighSpin", "C00:IMRPhenomNSBH",
                 "C00:IMRPhenomXPHM:HighSpin"]
     priors = _spin_priors({"C00:IMRPhenomXPHM:HighSpin": 0.99})
+    # The real repr of GW230529_181500's C00:IMRPhenomNSBH (bilby AlignedSpin).
     priors["analytic"]["C00:IMRPhenomNSBH"] = {
-        "chi_1": "Uniform(minimum=-0.5, maximum=0.5, name='chi_1')",
-        "chi_2": "Uniform(minimum=-0.05, maximum=0.05, name='chi_2')",
+        f"chi_{i}": ("bilby.gw.prior.AlignedSpin(a_prior=Uniform(minimum=0, "
+                     f"maximum={amax}, name=None, latex_label=None, unit=None, "
+                     "boundary=None), z_prior=Uniform(minimum=-1, maximum=1, "
+                     "name=None, latex_label=None, unit=None, boundary=None), "
+                     "name=None, latex_label=None, unit=None, boundary=None, "
+                     "minimum=-1.0, maximum=1.0, num_interp=None)")
+        for i, amax in ((1, 0.5), (2, 0.05))
     }
     amax_1, _amax_2, _kind, src = resolve_spin_prior(
         "C00:Mixed:HighSpin", analyses, priors, None, None)

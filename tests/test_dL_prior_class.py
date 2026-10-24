@@ -70,10 +70,12 @@ def test_planck15_lal_is_not_astropy_planck15():
 
     assert lal.cosmology_name == "Planck15_LAL"
     assert (lal.H0, lal.Om0) == pytest.approx((67.90, 0.3065))
+    # astropy's Planck15 carries radiation, which (H0, Om0) cannot describe:
+    # it is recorded and left unresolved (the resolver then refuses it), never
+    # reduced to a radiation-free (67.74, 0.3075) labelled "declared"
+    # (review 2026-10-20).
     assert astro.cosmology_name == "Planck15"
-    assert (astro.H0, astro.Om0) == pytest.approx((67.74, 0.3075))
-    # ... and the two are genuinely different cosmologies.
-    assert lal.H0 != astro.H0 and lal.Om0 != astro.Om0
+    assert astro.cosmology_recognized is False and astro.H0 is None
 
 
 def test_inline_cosmology_repr_is_read_whole():
@@ -199,13 +201,17 @@ def test_power_law_without_alpha_raises():
         _resolve(bad, flavour="nocosmo")
 
 
-def test_unrecognised_cosmology_warns_and_falls_back():
+def test_unrecognised_cosmology_is_refused_not_defaulted():
+    """Review 2026-10-20: an unknown token used to warn and fall back to the
+    catalog default, against the module's 'fail loudly' contract."""
+    from gwcat.cosmology import UnrecognisedCosmologyError
     bad = REPR_USF_LAL.replace("Planck15_LAL", "WMAP9_LAL")
-    with pytest.warns(UserWarning, match="unrecognised cosmology"):
-        r = _resolve(bad, flavour="native", analysis="C00:Mixed",
-                     sibling="C00:IMRPhenomXPHM")
-    assert r.cosmology_name == "WMAP9_LAL"
-    assert "default_cosmo" in r.source
+    with pytest.raises(UnrecognisedCosmologyError, match="WMAP9_LAL"):
+        _resolve(bad, flavour="native", analysis="C00:Mixed",
+                 sibling="C00:IMRPhenomXPHM")
+    with pytest.raises(UnrecognisedCosmologyError, match="radiation"):
+        _resolve(REPR_USF_ASTROPY, flavour="native", analysis="C00:Mixed",
+                 sibling="C00:IMRPhenomXPHM")
 
 
 def test_no_analytic_anywhere_still_resolves_and_says_so():

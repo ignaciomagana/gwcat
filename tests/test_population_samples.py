@@ -57,12 +57,16 @@ def test_historical_short_aliases_resolve_to_timestamped_names():
     assert aliases == {"GW150914": "GW150914_095045"}
 
 
-def test_short_alias_must_be_unique():
-    with pytest.raises(ValueError, match="ambiguous aliases"):
-        resolve_event_name_aliases(
-            ["GW150914"],
-            ["GW150914_095045", "GW150914_123456"],
-        )
+def test_a_short_alias_resolves_through_the_historical_table_only():
+    # GW150914 is GW150914_095045 whatever else the store holds that day ...
+    resolved, aliases = resolve_event_name_aliases(
+        ["GW150914"],
+        ["GW150914_095045", "GW150914_123456"],
+    )
+    assert aliases == {"GW150914": "GW150914_095045"}
+    # ... and is refused, not re-pointed, when that event is absent
+    with pytest.raises(ValueError, match="historical name of GW150914_095045"):
+        resolve_event_name_aliases(["GW150914"], ["GW150914_123456"])
 
 
 def test_full_name_is_not_fuzzily_shortened():

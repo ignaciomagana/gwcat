@@ -1,0 +1,42 @@
+# Review 2026-10-20 (low-66): nothing ran the tests, the packaging tests or a
+# clean-install import, so an undeclared dependency (scipy) could merge
+# unnoticed.  Not yet run on GitHub: the integration was prepared offline.
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  base-install-import:
+    # `pip install .` alone must give an importable package (no extras).
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install .
+      - name: import from outside the checkout
+        working-directory: ${{ runner.temp }}
+        run: python -c "import gwcat, gwcat.export, gwcat.cli; print(gwcat.__version__, gwcat.__file__)"
+
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.11"]
+    # The suite mocks every network call.  Do not set GWCAT_OFFLINE here: the
+    # fetch tests exercise the online code paths against those mocks.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install ".[dev]"
+      - run: python -m pytest -q

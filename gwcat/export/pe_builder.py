@@ -55,8 +55,11 @@ factor -- is isolated in :func:`_apply_chieff_basis` (and, for PR 6, in
 :func:`_apply_component_basis` / :func:`_apply_chieff_chip_basis`), so the shared
 scaffold is untouched.  Extra per-sample columns the new bases need
 (``a_1``/``a_2``/``cos_tilt_i``/``chi_p``) are fetched and resampled ONLY for
-the non-chieff bases: the chieff path never fetches them, so the rng stream and
-therefore the chieff parity is preserved exactly.
+the non-chieff bases: the chieff path never fetches them as columns, so the rng
+stream and therefore the chieff parity is preserved exactly.  (Every spin basis
+does read an event's whole ``a_1``/``a_2`` once, before its draw, to COUNT the
+samples above the spin ceiling -- a read, never an rng call; see the
+spin-support section of :func:`build_pe_product`.)
 
 Design decisions (PR 6)
 -----------------------
@@ -73,14 +76,18 @@ Design decisions (PR 6)
   floor since GW-03) where ``joint_lnprob = chi_eff_chi_p_prior_logprob(chieff, chip,
   m1src, m2src, amax=amax_1)`` -- the SAME source-frame mass convention the
   chieff basis uses for its 1-D chi_eff prior.  ``amax`` is the event's
-  ``amax_1``; a per-event ``amax_1 != amax_2`` warns (the joint prior assumes a
-  single amax) and is recorded in ``spin_amax_mismatch_events``.
+  ``amax_1``; a per-event ``amax_1 != amax_2`` is refused (the joint prior
+  assumes a single amax; review 2026-10-20) unless ``amax=`` forces one or
+  ``allow_chieff_chip_amax_mismatch=True``, which warns and records it in
+  ``spin_amax_mismatch_events``.
 * **chieff_chip output columns.**  Always ``chip`` on top of the legacy 10; the
   raw ``a1``/``a2``/``cost1``/``cost2`` are added only when available for EVERY
-  kept event (so the output stays rectangular).
+  kept event (so the output stays rectangular); ``component_columns_emitted``
+  and ``component_columns_missing_events`` record which, with a warning.
 """
 from __future__ import annotations
 
+import json
 import warnings
 
 import numpy as np
@@ -89,11 +96,12 @@ import numpy as np
 # from one place (SelectionSpec.check_pairable raises it).
 from ..catalog import UnpairableSelectionCut  # noqa: F401
 from ..cosmology import make_cosmology, z_of_dL
+from ..release_cosmology import identify_bundled_tables
 from ..params import (DEFAULT_PARAMETER_SPACE, PEContext,
                       block_prior_factor_pe, get_space)
 from ..params.blocks.mass import UNSTATED_MASS_PRIOR, classify_mass_prior
 from ..source_class import CUT_ESTIMATOR_ATTR, PE_MEDIAN_CUT_WARNING
-from ..spin import AMAX_AUTO, parse_amax_option
+from ..spin import AMAX_AUTO, check_amax_value, parse_amax_option
 from .contract import event_list_digest, mixed_prior_impl_events
 from .product import ExportProduct, resolve_mock_data
 
@@ -160,6 +168,12 @@ def _ess_of_inverse_weights(p_pe, nobs, nsamp):
     This is the diagnostic the ``-50`` floor destroyed: floored samples carried
     ~1e21 times the median weight, so a single one drove ESS to ~1 out of
     thousands, and nothing recorded it.
+
+    It is over ROWS: an event drawn with replacement counts each repeated row
+    again, so its ESS can exceed its number of distinct samples.
+    :func:`_ess_of_inverse_weights_distinct` is the same sum over distinct
+    samples, the number a consumer's per-event MC variance should be read
+    against.
     """
     if not nobs or not nsamp:
         return np.array([], dtype=float)
@@ -172,6 +186,29 @@ def _ess_of_inverse_weights(p_pe, nobs, nsamp):
     with np.errstate(divide="ignore", invalid="ignore"):
         ess = np.where(s2 > 0, s1 ** 2 / s2, 0.0)
     return np.asarray(ess, dtype=float)
+
+
+def _ess_of_inverse_weights_distinct(p_pe, rows_per_event, nobs, nsamp,
+                                     ess_rows):
+    """Per-event ESS of the ``1/p_pe`` reweighting over DISTINCT samples.
+
+    ``rows_per_event[i]`` are the store rows behind event ``i``'s ``nsamp``
+    exported rows.  A bootstrapped event (drawn with replacement) repeats rows,
+    and the row ESS counts every repeat as an independent sample; here each
+    distinct sample counts once, at its first exported position.  An event with
+    no repeated row keeps its row ESS (``ess_rows``) bit for bit.
+    """
+    out = np.array(ess_rows, dtype=float, copy=True)
+    if not nobs or not nsamp:
+        return out
+    p = np.asarray(p_pe, dtype=float).reshape(nobs, nsamp)
+    for i, rows in enumerate(rows_per_event):
+        _u, first = np.unique(np.asarray(rows), return_index=True)
+        if first.size == nsamp:
+            continue
+        first.sort()
+        out[i] = _ess_of_inverse_weights(p[i, first], 1, first.size)[0]
+    return out
 
 
 class ProjectionBasisNotAllowed(ValueError):
@@ -223,7 +260,8 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                      allow_projection_basis=False,
                      drop_spin_above_ceiling=False,
                      sample_set_map=None, nrsur_q_rule=None,
-                     nrsur_q_rule_substitute=False, mock_data=None):
+                     nrsur_q_rule_substitute=False, mock_data=None,
+                     allow_chieff_chip_amax_mismatch=False):
     """Build a PE :class:`ExportProduct` from a :class:`~gwcat.catalog.GWCatalog`.
 
     For ``spin_basis="chieff"`` this reproduces the legacy
@@ -241,6 +279,11 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     stores).  Pass a number to force one ceiling on every event; that is what the
     chieff basis used to do unconditionally, which stamped the caller's default
     0.99 on events whose sampling prior said something else (GW-31).
+
+    The ``chieff_chip`` joint prior admits a single ceiling, so an event with
+    ``amax_1 != amax_2`` is REFUSED (it used to be evaluated at ``amax_1`` with
+    a warning); ``allow_chieff_chip_amax_mismatch=True`` restores that, still
+    recorded in ``spin_amax_mismatch_events``.
 
     The assembled ``p_pe`` must be finite and strictly positive (GW-01); a zero
     weight means the store's ``p_dL_pe`` was written by a pre-GW-01 ingest that
@@ -286,6 +329,16 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     reproduces -- and ``spin_ceiling_cut_order`` records which applies.  The
     draw then sees only the kept samples, so ``replace="auto"`` resamples with replacement exactly when
     fewer than ``nsamp`` remain.  Off by default: the default draw is unchanged.
+
+    The samples above the ceiling are COUNTED with or without the cut (the
+    count reads ``a_1``/``a_2`` but calls no rng): ``n_above_spin_ceiling_raw``
+    over the raw label, and ``n_exported_above_spin_ceiling_per_event`` over
+    the exported rows -- the rows a ``chieff_reference`` selection weights at
+    zero when the cut is off (a chieff export warns about them).  Both count
+    against the DECLARED ceiling (the one the cut uses), before any component
+    ``samples_bound`` widening.  ``-1`` marks an event that cannot be counted
+    (no spin ceiling, or no ``a_1``/``a_2`` samples), and
+    ``spin_ceiling_counted`` says whether every event was.
 
     Per-prior provenance (GW-40c)
     -----------------------------
@@ -356,6 +409,9 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     # chi_eff density depends on that ceiling in a chi_eff-DEPENDENT way, so the
     # error does not cancel in any per-event normalisation.
     forced_amax = parse_amax_option(amax, what="amax")
+    # The fallback is substituted for a missing stored ceiling, so it must be a
+    # ceiling too (a NaN one matched no row of the chieff grouping below).
+    amax_fallback = check_amax_value(amax_fallback, what="amax_fallback")
     # Every basis that divides out a SPIN prior needs a ceiling; nospin does not.
     need_amax = need_extras or spin_basis == "chieff"
     if drop_spin_above_ceiling and not need_amax:
@@ -499,8 +555,9 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                 f"have no stored PE cosmology (dL_prior_H0/dL_prior_Om0 is "
                 f"NaN): {bad_names}. Pass an explicit cosmology=(H0, Om0) "
                 f"override to apply one cosmology to all events.")
-        pe_H0 = float(per_event_H0[0]) if sub.n_events else float("nan")
-        pe_Om0 = float(per_event_Om0[0]) if sub.n_events else float("nan")
+        # The file-level scalar is set AFTER the loop, from the EXPORTED
+        # events (review Medium 7): selected event 0 may be skipped later.
+        pe_H0 = pe_Om0 = float("nan")
 
     # Per-event cosmology objects, built once per unique (H0, Om0) pair.
     _cosmo_cache: dict = {}
@@ -571,10 +628,34 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     #: truncated export and an untruncated one compared EQUAL on
     #: selection_spec_digest, event_list_digest and contract_hash alike.
     n_cut_by_z_max = []
+    #: Selected events with EVERY sample above z_max, which therefore are not
+    #: exported, and the samples each had (review Medium 39).
+    dropped_by_z_max, n_cut_dropped_by_z_max = [], []
+    #: The luminosity distance z_max is, under each kept event's own PE
+    #: cosmology: the distance the cut really is on this side (review Low 18).
+    z_max_dL = []
     kept_H0, kept_Om0 = [], []
     kept_ss_name, kept_ss_approx, kept_ss_reason = [], [], []
+    #: Store-side prior and sample-set provenance strings, per kept event
+    #: (review 2026-10-20): which release-reweight table and source set the
+    #: distance-prior cosmology, the mass prior's source (including a
+    #: constituent mixture's convention), and the INGEST-time rule that made
+    #: the sample set preferred (priority list vs last resort) and its rank.
+    _STORE_PROV = ("dL_prior_cosmology_source",
+                   "dL_prior_cosmology_table_sha256", "mass_prior_source",
+                   "selection_reason")
+    kept_store_prov = {k: [] for k in _STORE_PROV}
+    kept_priority_rank = []
     # Resampling provenance (GW-13), aligned with ``kept``.
     n_unique_per_event, upsampled_events = [], []
+    #: The store rows behind each kept event's nsamp exported rows (the ESS
+    #: over distinct samples needs to know which rows repeat).
+    drawn_rows = []
+    #: Samples each kept event's draw chose from (after z_max and the spin
+    #: cut) -- the pool size a reproduction of the draw needs.
+    n_kept_pool = []
+    #: (name, pool size, distinct rows) of each event drawn with replacement.
+    rep_detail = []
 
     # ── Per-event spin-prior ceiling scaffolding (every spin basis) ─────────
     # Per-event spin amax from the store meta (aligned with selected events).
@@ -657,6 +738,21 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     # --legacy-grid-priors).  A meta read, like the provenance above.
     sel_dL_impl = _meta_str_sel("dL_prior_impl") or [""] * sub.n_events
     kept_dL_impl = []
+    # The reference frequency each event's spins are defined at (review
+    # Medium 19).  Tilts and chi_p evolve with frequency for a precessing
+    # binary, so a fit of tilts across events -- and against injections --
+    # is meaningful only at one f_ref.  The store records it per row; the file
+    # now does too (NaN = unknown).  A meta read, like the provenance above.
+    _f_ref_raw = sub.meta.get("f_ref")
+    sel_f_ref = (np.asarray(_f_ref_raw, dtype=float)[sel_idx]
+                 if _f_ref_raw is not None
+                 else np.full(sub.n_events, np.nan))
+    sel_f_ref_src = _meta_str_sel("f_ref_source") or [""] * sub.n_events
+    kept_f_ref, kept_f_ref_src = [], []
+    # Which distance-prior CLASS each event's p_pe divides out (review
+    # 2026-10-20, Medium 43) -- also a meta read.
+    sel_dL_class = _dL_prior_class_sel(sub, sel_idx, _meta_str_sel)
+    kept_dL_class = []
     kept_prior_kind = {p: [] for p in ("mass", "spin", "dL")}
     kept_prior_label = {p: [] for p in ("mass", "spin", "dL")}
     #: Raw samples removed by the GW-40c spin-support cut, per kept event --
@@ -665,10 +761,17 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     n_dropped_spin = []
     #: ... and the same count over the event's WHOLE raw label, before any
     #: z_max cut: the number an independent count of the raw file reproduces.
+    #: Counted whether or not the cut is applied (it uses no random numbers);
+    #: -1 where it cannot be counted (no ceiling, or no a_1/a_2 samples).
     n_above_spin_ceiling_raw = []
-    if drop_spin_above_ceiling:
+    #: Exported ROWS (repeats included) whose a_1 or a_2 is above the ceiling:
+    #: what a chieff_reference selection, which has zero density there, would
+    #: disagree with.  0 by construction under the cut; -1 where not counted.
+    n_exported_above_spin_ceiling = []
+    if need_amax:
         avail_a1_cut = sub.param_available("a_1")
         avail_a2_cut = sub.param_available("a_2")
+    if drop_spin_above_ceiling:
         no_spin = [str(sub.event_names[e]) for e in range(sub.n_events)
                    if not (avail_a1_cut[e] and avail_a2_cut[e])]
         if no_spin:
@@ -693,6 +796,15 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                        and _group_available_all(sub, "a_2")
                        and _group_available_all(sub, "cos_tilt_1", "tilt_1")
                        and _group_available_all(sub, "cos_tilt_2", "tilt_2"))
+        # WHICH selected events lack a component column, and so switch the
+        # a1/a2/cost1/cost2 columns off for EVERY event (August export-pe 6):
+        # recorded and warned about, so a re-export over a slightly different
+        # event list cannot silently change the file's column set.
+        component_missing_events = [
+            str(sub.event_names[e]) for e in range(sub.n_events)
+            if not (avail_a1[e] and avail_a2[e]
+                    and (avail_cos1[e] or avail_tilt1[e])
+                    and (avail_cos2[e] or avail_tilt2[e]))]
 
         a1_list, a2_list, cost1_list, cost2_list, chip_list = [], [], [], [], []
         chip_src_list = []
@@ -735,27 +847,37 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                 keep = z_e <= z_max
                 n_cut_e = int(np.sum(~keep))
                 if not keep.any():
+                    # Every sample is beyond the cut: the event leaves the
+                    # export.  Named and recorded (review Medium 39) -- it
+                    # used to vanish without a word.
+                    dropped_by_z_max.append(str(sub.event_names[e]))
+                    n_cut_dropped_by_z_max.append(n_cut_e)
                     continue
                 idx_map = np.nonzero(keep)[0]
             else:
                 idx_map = np.arange(n)
 
-            # ── The spin-support cut (GW-40c), BEFORE the draw ──────────────
+            # ── The spin-support count and cut (GW-40c), BEFORE the draw ────
             # Reads the event's full a_1/a_2 (a sample read, but not an rng
-            # call, so with the flag off nothing here runs and the draw is the
-            # historical one bit for bit).
+            # call, so the draw is the historical one bit for bit) and COUNTS
+            # the samples above the ceiling the spin prior is evaluated at --
+            # always, so a file built without the cut says how many it kept
+            # instead of writing zeros (review High 1 / Medium 5).  Only the
+            # flag removes them.
             # Order: the z_max cut (above) runs first, so
             # n_dropped_spin_above_ceiling counts only samples with z <= z_max;
             # n_above_spin_ceiling_raw counts the whole raw label.
             n_drop_e = 0
-            n_raw_e = 0
-            if drop_spin_above_ceiling:
+            n_raw_e = -1
+            above_raw = None
+            if need_amax and avail_a1_cut[e] and avail_a2_cut[e]:
                 c1, c2, _fb = _declared_ceiling(e)
                 ab = reader.read(e, ["a_1", "a_2"])
                 a1_raw = np.asarray(ab["a_1"], dtype=float)
                 a2_raw = np.asarray(ab["a_2"], dtype=float)
                 above_raw = (np.abs(a1_raw) > c1) | (np.abs(a2_raw) > c2)
                 n_raw_e = int(np.sum(above_raw))
+            if drop_spin_above_ceiling:
                 ok = ~above_raw[idx_map]
                 n_drop_e = int(np.sum(~ok))
                 if not ok.any():
@@ -779,8 +901,16 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             # it a bootstrapped event's per-event ESS reads high by the duplication
             # factor -- the very diagnostic that should flag it as unusable.
             n_unique_per_event.append(int(np.unique(idx_orig).size))
-            if rep and n_kept < nsamp:
+            drawn_rows.append(idx_orig)
+            # The pool the draw chose from, after every cut (review Low 2).
+            n_kept_pool.append(int(n_kept))
+            # Every draw WITH replacement, not only an undersampled one: a
+            # forced replace=True bootstraps an event that has enough samples
+            # too (review Low 64), and its rows repeat just the same.
+            if rep:
                 upsampled_events.append(str(sub.event_names[e]))
+                rep_detail.append((str(sub.event_names[e]), int(n_kept),
+                                   n_unique_per_event[-1]))
 
             # The draw is settled: NOW read, and read only the rows it kept.
             drawn = reader.read(e, _read_plan(e), rows=idx_orig)
@@ -831,13 +961,22 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             kept.append(sub.event_names[e])
             kept_mass_kind.append(mass_kind_e)
             n_cut_by_z_max.append(n_cut_e)
+            z_max_dL.append(
+                float("nan") if z_max is None else
+                float(cosmo_e.luminosity_distance(float(z_max)).to_value("Mpc")))
             n_dropped_spin.append(n_drop_e)
             n_above_spin_ceiling_raw.append(n_raw_e)
+            n_exported_above_spin_ceiling.append(
+                int(np.sum(above_raw[idx_orig])) if above_raw is not None
+                else -1)
             for _p in ("mass", "spin", "dL"):
                 kept_prior_kind[_p].append(sel_prior_kind[_p][e])
                 kept_prior_label[_p].append(sel_prior_label[_p][e])
             kept_cfg_amax.append(sel_cfg_amax[e])
             kept_dL_impl.append(sel_dL_impl[e])
+            kept_f_ref.append(float(sel_f_ref[e]))
+            kept_f_ref_src.append(sel_f_ref_src[e])
+            kept_dL_class.append(sel_dL_class[e])
             kept_H0.append(float(per_event_H0[e]))
             kept_Om0.append(float(per_event_Om0[e]))
             row = sel_rows[e]
@@ -846,6 +985,10 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             kept_ss_reason.append(
                 str(reasons_arr[e]) if reasons_arr is not None
                 and e < len(reasons_arr) else "")
+            for _k in _STORE_PROV:
+                kept_store_prov[_k].append(_ss_meta(sub, row, _k))
+            _rank = _ss_meta(sub, row, "priority_rank")
+            kept_priority_rank.append(float(_rank) if _rank else np.nan)
 
             # ── Per-event spin-prior ceiling + (non-chieff) spin columns ────────
             if need_amax:
@@ -900,14 +1043,23 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                 # is wrong.  Raising it to cover them is exact for the COMPONENT
                 # basis, whose density is a flat box: widening the box changes only
                 # the per-event constant 1/(4*amax_1*amax_2), which cancels in the
-                # per-event normalisation the consumer applies.
+                # per-event normalisation the consumer applies -- PROVIDED every
+                # sample of the event was drawn under one box.  A Mixed set whose
+                # constituents declare different ceilings (e.g. 0.99 and ~1.0;
+                # spin_amax_config_per_constituent_per_event) was not: one
+                # widened box describes the higher-ceiling half and misdescribes
+                # the other by the ratio of the two boxes, so there it is an
+                # approximation (review Low 77: about 2%, mostly a per-event
+                # constant).
                 src1 = src2 = ("caller" if forced_amax is not None
                                else "fallback" if used_fallback else "analytic")
                 infl1 = infl2 = 0.0
                 # ONLY for a flat-box (bijection-like) prior.  Widening the box
                 # changes just the per-event constant 1/(4*amax_1*amax_2), which
                 # cancels in the consumer's per-event normalisation -- so it is
-                # exact.  For a PROJECTION (chieff / chieff_chip) the entire density
+                # exact for a sample set drawn under ONE box (approximate for a
+                # Mixed set whose constituents declare different ceilings, see
+                # above).  For a PROJECTION (chieff / chieff_chip) the entire density
                 # p(chi_eff[, chi_p] | amax) depends on the ceiling, so raising it
                 # would silently change the physics rather than fix a bookkeeping
                 # bound.  Those bases keep the declared amax and are refused by the
@@ -1016,9 +1168,37 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     kept_Om0_arr = np.asarray(kept_Om0, dtype=float)
     cosmology_per_event_varies = bool(
         nobs > 1 and (np.ptp(kept_H0_arr) > 0 or np.ptp(kept_Om0_arr) > 0))
+    # ── The scalar PE cosmology (review Medium 7) ───────────────────────────
+    # pe_cosmology_H0/Om0 (core reads them) were the first SELECTED event's,
+    # set before the loop: wrong whenever that event was not exported (no
+    # rows, all above z_max, too few samples with replace=False).  They are
+    # now the first EXPORTED event's.  When the exported events' cosmologies
+    # differ, one scalar cannot describe them all; the file says so, and how
+    # many events it does describe, rather than the number silently changing.
+    if cosmology is None:
+        pe_H0, pe_Om0 = float(kept_H0_arr[0]), float(kept_Om0_arr[0])
+        pe_cosmology_scalar_source = ("first_exported_event"
+                                      if cosmology_per_event_varies
+                                      else "all_exported_events")
+    else:
+        pe_cosmology_scalar_source = "override"
+    pe_cosmology_scalar_n_events = int(np.sum(
+        (kept_H0_arr == pe_H0) & (kept_Om0_arr == pe_Om0)))
 
     import h5py
     _str = h5py.string_dtype()
+
+    # ── Per-sample finiteness of the coordinates (review 2026-10-20) ────────
+    # The availability mask only says a column is PRESENT; a NaN sample inside
+    # it would otherwise reach the spin step and read as "out of support".
+    from ..schema import check_columns_finite
+    _coords = ("ra", "dec", "m1det", "m2det", "q", "dL", "redshift", "m1src",
+               "m2src") + (("chieff",) if "chieff" in space.fit_columns
+                           else ())
+    check_columns_finite({c: data[c] for c in _coords if c in data},
+                         event_names=kept, nsamp=nsamp,
+                         context=f"gwcat-pe-2.0 export (spin_basis="
+                                 f"{spin_basis!r})")
 
     # ── Spin-basis-specific step (columns + p_pe spin factor) ───────────────
     spin_attrs: dict = {}
@@ -1052,20 +1232,52 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             }
         elif emit_extras:  # nobs == 0
             extras = {k: np.array([]) for k in ("a1", "a2", "cost1", "cost2")}
+        # The spin coordinates the basis's density and support read.
+        check_columns_finite(
+            dict(extras or {}, **({"chip": chip} if spin_basis == "chieff_chip"
+                                  else {})),
+            event_names=kept, nsamp=nsamp,
+            context=f"gwcat-pe-2.0 export (spin_basis={spin_basis!r})")
+
+        # ── chieff_chip with two ceilings (August export-pe 3) ──────────────
+        # The joint (chi_eff, chi_p) prior admits ONE amax and is evaluated at
+        # amax_1, so an event whose prior gives the secondary a different
+        # ceiling (an NSBH's a_2 <= 0.05) gets a density of the wrong shape and
+        # support, by a factor no per-event normalisation removes.  Refused
+        # unless asked for; the component basis takes both ceilings exactly.
+        if (spin_basis == "chieff_chip" and mismatch_events
+                and not allow_chieff_chip_amax_mismatch):
+            raise ValueError(
+                f"spin_basis='chieff_chip': {len(mismatch_events)} event(s) "
+                f"have spin_amax_1 != spin_amax_2, but the joint (chi_eff, "
+                f"chi_p) prior admits a single amax and would evaluate them "
+                f"at amax_1, which is not their prior: {mismatch_events[:10]}"
+                + ("" if len(mismatch_events) <= 10
+                   else f", ... (+{len(mismatch_events) - 10} more)")
+                + ". Use spin_basis='component' (exact for any pair of "
+                  "ceilings), exclude the events, force one ceiling with "
+                  "amax=<value>, or pass "
+                  "allow_chieff_chip_amax_mismatch=True to export them at "
+                  "amax_1 anyway.")
 
         if spin_basis == "component":
             columns = _apply_component_basis(data, amax1_ps, amax2_ps,
                                              chip, extras)
         else:  # chieff_chip
+            # The joint prior has ONE ceiling.  Evaluating an event whose two
+            # bodies have different ones at amax_1 for both gave the secondary
+            # the wrong prior, behind a warning (review 2026-10-20 recheck);
+            # it is refused above.  amax=<one value> states one ceiling
+            # explicitly; allow_chieff_chip_amax_mismatch=True keeps the old
+            # amax_1 evaluation, warned and recorded.
             columns = _apply_chieff_chip_basis(data, amax1_ps, chip, extras)
+            if mismatch_events:
+                warnings.warn(
+                    f"spin_basis='chieff_chip': {len(mismatch_events)} event(s) "
+                    f"have spin_amax_1 != spin_amax_2; the joint (chi_eff, chi_p) "
+                    f"prior assumes a single amax and uses amax_1: "
+                    f"{mismatch_events}")
 
-        # Emit warnings once (after the loop).
-        if spin_basis == "chieff_chip" and mismatch_events:
-            warnings.warn(
-                f"spin_basis='chieff_chip': {len(mismatch_events)} event(s) "
-                f"have spin_amax_1 != spin_amax_2; the joint (chi_eff, chi_p) "
-                f"prior assumes a single amax and uses amax_1: "
-                f"{mismatch_events}")
         # ── chi_p definition consistency (GW-08) ────────────────────────────
         if chip_mismatch_events:
             listed = ", ".join(f"{nm}: {d:.4g}" for nm, d in
@@ -1092,11 +1304,24 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                 f"their analytic prior declares, so the ceiling was raised to "
                 f"cover them (spin_amax_source='samples_bound'). Largest "
                 f"inflations: {listed}. For the component basis this is exact "
-                f"-- widening a flat box changes only the per-event constant "
-                f"1/(4*amax_1*amax_2), which cancels in the consumer's "
-                f"per-event normalisation -- which is why it is applied ONLY "
-                f"here. A projection basis keeps its declared ceiling and is "
-                f"refused by the support gate instead.")
+                f"for a sample set drawn under one box -- widening a flat box "
+                f"changes only the per-event constant 1/(4*amax_1*amax_2), "
+                f"which cancels in the consumer's per-event normalisation -- "
+                f"which is why it is applied ONLY here; for a Mixed set whose "
+                f"constituents declare different ceilings "
+                f"(spin_amax_config_per_constituent_per_event) one widened box "
+                f"is an approximation. A projection basis keeps its declared "
+                f"ceiling and is refused by the support gate instead.")
+        if not emit_extras:
+            warnings.warn(
+                f"spin_basis={spin_basis!r}: {len(component_missing_events)} "
+                f"selected event(s) lack a_1, a_2 or a tilt, so the raw "
+                f"component columns a1/a2/cost1/cost2 are omitted for EVERY "
+                f"event (the output must stay rectangular): "
+                f"{component_missing_events[:10]}"
+                + ("" if len(component_missing_events) <= 10
+                   else f", ... (+{len(component_missing_events) - 10} more)")
+                + ". Recorded as component_columns_emitted=False.")
         if chip_no_ingredient_events:
             warnings.warn(
                 f"chi_p_definition='schmidt_recomputed': "
@@ -1127,6 +1352,11 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             "spin_amax_source_2_per_event": np.array(amax_src2_list, dtype=_str),
             "spin_amax_inflation_per_event": np.asarray(amax_infl_list,
                                                         dtype=float),
+            # August export-pe 6: whether a1/a2/cost1/cost2 were written, and
+            # the selected events that switched them off when they were not.
+            "component_columns_emitted": bool(emit_extras),
+            "component_columns_missing_events": np.array(
+                component_missing_events, dtype=_str),
         }
         if spin_basis == "component":
             spin_attrs["component_spin_prior_applied_to_p_pe"] = True
@@ -1205,6 +1435,10 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     # diagnostic the -50 floor destroyed: a single floored sample took
     # essentially all the weight, giving ESS ~ 1 out of thousands.
     ess_per_event = _ess_of_inverse_weights(columns["p_pe"], nobs, nsamp)
+    # The same over DISTINCT samples: a bootstrapped event's repeated rows are
+    # not independent, so its row ESS above can exceed its n_unique.
+    ess_distinct_per_event = _ess_of_inverse_weights_distinct(
+        columns["p_pe"], drawn_rows, nobs, nsamp, ess_per_event)
 
     if n_out and frac_out > max_out_of_support_frac and not allow_out_of_support:
         hit = np.nonzero(n_out_per_event)[0]
@@ -1228,6 +1462,26 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                     "widened to cover the samples exactly (a projection's "
                     "whole density depends on the ceiling, so it cannot). ")
             + f"Or pass allow_out_of_support=True to export anyway.")
+    # ── Per-event floor (review Low 41) ─────────────────────────────────────
+    # max_out_of_support_frac is POOLED over the file, so a raised allowance
+    # let one event leave with EVERY p_pe = 0 (1 of 20 events is 5%): the
+    # consumer then gives it ln Z = -inf.  No allowance covers an event with
+    # no support at all; only allow_out_of_support does.
+    if nobs and nsamp and n_out and not allow_out_of_support:
+        no_support = [str(kept[i]) for i in range(nobs)
+                      if int(n_out_per_event[i]) == nsamp]
+        if no_support:
+            raise OutOfSupportError(
+                f"spin_basis={spin_basis!r}: {len(no_support)} event(s) have "
+                f"EVERY one of their {nsamp} samples outside the spin prior's "
+                f"support, so their p_pe is zero everywhere and the "
+                f"consumer's per-event evidence is -inf: {no_support[:10]}"
+                + ("" if len(no_support) <= 10
+                   else f", ... (+{len(no_support) - 10} more)")
+                + f". max_out_of_support_frac={max_out_of_support_frac:g} is "
+                  f"a pooled allowance and does not cover an event with no "
+                  f"support. Exclude the event(s), or pass "
+                  f"allow_out_of_support=True to export anyway.")
     if n_out and allow_out_of_support:
         warnings.warn(
             f"spin_basis={spin_basis!r}: exporting with {n_out} of "
@@ -1239,7 +1493,9 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
 
     # ── Exported-weight support contract (GW-01) ────────────────────────────
     from ..schema import check_p_pe_positive
-    check_p_pe_positive(
+    # With allow_zero_p_pe, the count of exact zeros written is recorded on
+    # the product (review 2026-10-20: the bypass left no trace).
+    n_zero_p_pe_allowed = check_p_pe_positive(
         columns["p_pe"], event_names=kept, nsamp=nsamp,
         allow_zero=allow_zero_p_pe, expected_zero=~in_support,
         context=f"gwcat-pe-2.0 export (spin_basis={spin_basis!r})",
@@ -1296,10 +1552,90 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
               f"mass_prior_verified=False; it is NOT stamped as a verified "
               f"uniform prior.")
 
-    if z_max is not None and any(n > 0 for n in n_cut_by_z_max):
+    # ── Rows kept above the spin ceiling (review High 1) ────────────────────
+    # The chieff basis keeps the declared ceiling, so a row whose a_1 or a_2
+    # exceeds it gets a finite p_pe here while a chieff_reference selection
+    # gives that region zero density.  Counted above; said here, because the
+    # cut that removes them is opt-in.
+    above_hit = [(str(kept[i]), int(n)) for i, n in
+                 enumerate(n_exported_above_spin_ceiling) if n > 0]
+    if (spin_basis == "chieff" and not drop_spin_above_ceiling
+            and above_hit):
+        worst = sorted(above_hit, key=lambda t: -t[1])[:5]
         warnings.warn(
-            f"z_max={z_max} dropped {sum(n_cut_by_z_max)} posterior sample(s) "
-            f"across {sum(1 for n in n_cut_by_z_max if n)} of {nobs} event(s). "
+            f"spin_basis='chieff': {sum(n for _k, n in above_hit)} of "
+            f"{nobs * nsamp} exported rows, in {len(above_hit)} of {nobs} "
+            f"event(s), have a_1 or a_2 above the ceiling their chi_eff prior "
+            f"is evaluated at (largest: "
+            + ", ".join(f"{k}: {n}/{nsamp}" for k, n in worst)
+            + "). A chieff_reference selection gives that region zero "
+              "density, so the two files have different spin supports. "
+              "drop_spin_above_ceiling=True (CLI --drop-spin-above-ceiling) "
+              "removes them before the draw (exact rejection to U(0, amax)); "
+              "the counts are in n_exported_above_spin_ceiling_per_event.")
+
+    # ── Mixed reference frequencies in a tilt fit (review Medium 19) ────────
+    # chi_eff is conserved under precession; tilts and chi_p are not, so a
+    # basis that fits them (component: cost1/cost2; chieff_chip: chip) is
+    # coherent only at one f_ref -- across events and against the campaign,
+    # whose f_ref this file cannot see.  Recorded per event; said here.
+    f_ref_arr = np.asarray(kept_f_ref, dtype=float)
+    f_ref_values = sorted({float(x) for x in f_ref_arr[np.isfinite(f_ref_arr)]})
+    n_f_ref_unknown = int(np.sum(~np.isfinite(f_ref_arr)))
+    fits_tilts = bool({"cost1", "cost2", "chip"} & set(space.fit_columns))
+    # A store with no f_ref column at all predates the record; it reads NaN
+    # everywhere and is not warned about event by event.
+    if (fits_tilts and _f_ref_raw is not None
+            and (len(f_ref_values) > 1 or n_f_ref_unknown)):
+        warnings.warn(
+            f"spin_basis={spin_basis!r} fits spin TILTS (or chi_p), which "
+            f"are defined only at a reference frequency, but the exported "
+            f"events' spins are defined at f_ref = {f_ref_values} Hz"
+            + (f" ({n_f_ref_unknown} event(s) unknown)" if n_f_ref_unknown
+               else "")
+            + ". One tilt distribution fitted across them -- and against an "
+              "injection campaign defined at its own f_ref -- mixes "
+              "frequencies; f_ref_per_event records each event's. No "
+              "pairing check compares f_ref yet.")
+
+    # ── Draws with replacement are said, not only recorded (August catalog 2)
+    # Their repeated rows are not independent samples: the row ESS and a
+    # consumer's per-event MC variance overstate them by up to the
+    # duplication factor.
+    if rep_detail:
+        listed = ", ".join(f"{nm}: {nu} distinct of {nsamp} rows (pool {nk})"
+                           for nm, nk, nu in rep_detail[:10])
+        more = ("" if len(rep_detail) <= 10
+                else f", ... (+{len(rep_detail) - 10} more)")
+        warnings.warn(
+            f"{len(rep_detail)} of {nobs} event(s) were drawn WITH "
+            f"replacement (replace={replace!r}), so their rows repeat: "
+            f"{listed}{more}. Repeated rows are not independent samples; use "
+            f"n_unique_samples_per_event and "
+            f"prior_reweight_ess_distinct_per_event, not nsamp, for their "
+            f"Monte Carlo error.")
+
+    # Counted over the SELECTED events, so an event the cut removed entirely
+    # is in both numbers (review Medium 39).
+    n_cut_total = sum(n_cut_by_z_max) + sum(n_cut_dropped_by_z_max)
+    n_events_cut = (sum(1 for n in n_cut_by_z_max if n)
+                    + len(dropped_by_z_max))
+    if z_max is not None and n_cut_total:
+        dropped_msg = ""
+        if dropped_by_z_max:
+            more = ("" if len(dropped_by_z_max) <= 10
+                    else f", ... (+{len(dropped_by_z_max) - 10} more)")
+            dropped_msg = (
+                f", including EVERY sample of {len(dropped_by_z_max)} "
+                f"event(s), which are therefore NOT in the export: "
+                f"{dropped_by_z_max[:10]}{more} (events_dropped_by_z_max). "
+                f"Dropping an event because its whole posterior lies beyond "
+                f"the cut is a selection on the data that no injection cut "
+                f"reproduces")
+        warnings.warn(
+            f"z_max={z_max} dropped {n_cut_total} posterior sample(s) "
+            f"across {n_events_cut} of {sub.n_events} selected event(s)"
+            f"{dropped_msg}. "
             f"The selection product must be built with the SAME z_max "
             f"(build_selection_product(z_max=...), CLI --z-max) or mu "
             f"integrates over a redshift range the exported posteriors do not "
@@ -1327,6 +1663,17 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         # validator cross-checks the two.
         "z_max": float("nan") if z_max is None else float(z_max),
         "n_samples_cut_by_z_max": np.asarray(n_cut_by_z_max, dtype=np.int64),
+        # Selected events the cut removed ENTIRELY (every sample above
+        # z_max), with their sample counts (review Medium 39).
+        "events_dropped_by_z_max": np.array(dropped_by_z_max, dtype=_str),
+        # The same z_max is a different distance cut per event (each in its
+        # own PE cosmology) and on the injection side (at injected z): the
+        # distance, in Mpc, it is here, per kept event (review Low 18).  NaN
+        # when unused.
+        "z_max_dL_per_event": np.asarray(z_max_dL, dtype=float),
+        "z_max_cut_coordinate": "redshift_under_each_event_pe_cosmology",
+        "n_samples_cut_by_z_max_dropped_events": np.asarray(
+            n_cut_dropped_by_z_max, dtype=np.int64),
         # spin basis (new in v2)
         "spin_basis": spin_basis,
         # provenance
@@ -1358,17 +1705,41 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                                else amax_fallback)),
         "pe_cosmology_H0": pe_H0,
         "pe_cosmology_Om0": pe_Om0,
+        # WHERE the scalar comes from: "override", "all_exported_events"
+        # (they share it) or "first_exported_event" (they do not -- read
+        # cosmology_H0/Om0_per_event), and how many exported events it fits.
+        "pe_cosmology_scalar_source": pe_cosmology_scalar_source,
+        "pe_cosmology_scalar_n_events": pe_cosmology_scalar_n_events,
         "homogeneous_sample_sets": homogeneous,
         "n_unique_samples_per_event": np.asarray(n_unique_per_event,
                                                  dtype=np.int64),
+        # Any event drawn WITH replacement (rows may repeat): under the
+        # default replace="auto" exactly the undersampled ones, under a
+        # forced replace=True every event (review Low 64).
         "resampled_with_replacement": bool(upsampled_events),
         "n_events_resampled_with_replacement": int(len(upsampled_events)),
+        "events_resampled_with_replacement": np.array(upsampled_events,
+                                                      dtype=_str),
+        # ── How the rows were drawn (review Low 2) ───────────────────────────
+        # A seed-1 rebuild used to carry the same provenance as the seed-0
+        # file; the seed lived only in the build script.
+        "resample_seed": _seed_attr(seed),
+        "resample_replace_policy": str(replace),
+        "resample_rng_scheme": RESAMPLE_RNG_SCHEME,
+        "n_kept_samples_per_event": np.asarray(n_kept_pool, dtype=np.int64),
         "sample_set_name_per_event": np.array(
             [str(x) for x in kept_ss_name], dtype=_str),
         "sample_set_approximant_per_event": np.array(
             [str(x) for x in kept_ss_approx], dtype=_str),
         "sample_set_selection_reason": np.array(
             [str(x) for x in kept_ss_reason], dtype=_str),
+        # The store's INGEST-time reason and rank behind ``is_preferred``
+        # (preferred_mixed / preferred_priority / preferred_last_resort ...);
+        # the export-time reason above reads the same for all of them.
+        "sample_set_ingest_selection_reason_per_event": np.array(
+            kept_store_prov["selection_reason"], dtype=_str),
+        "sample_set_priority_rank_per_event": np.asarray(
+            kept_priority_rank, dtype=float),
         "event_names": np.array([str(k) for k in kept], dtype=_str),
         # ── Prior-support accounting (GW-03) ─────────────────────────────────
         # Observability at the source: how many samples the prior excludes, and
@@ -1378,7 +1749,14 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         "n_samples_out_of_support": int(n_out),
         "frac_samples_out_of_support": float(frac_out),
         "n_out_of_support_per_event": n_out_per_event,
+        "allow_zero_p_pe": bool(allow_zero_p_pe),
+        "n_zero_p_pe_allowed": int(n_zero_p_pe_allowed),
+        # Over the nsamp ROWS (a repeated row counts again) ...
         "prior_reweight_ess_per_event": ess_per_event,
+        # ... and over the DISTINCT samples behind them, each counted once:
+        # the one to compare with n_unique_samples_per_event, and the one a
+        # consumer's per-event MC variance should be read against.
+        "prior_reweight_ess_distinct_per_event": ess_distinct_per_event,
         "max_out_of_support_frac": float(max_out_of_support_frac),
         "out_of_support_allowed": bool(allow_out_of_support),
         # ── The spin-support cut (GW-40c) ────────────────────────────────────
@@ -1390,10 +1768,19 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
             dtype=np.int64),
         # The same count over the WHOLE raw label, before the z_max cut -- the
         # integer an independent raw-file count reproduces.  Equal to the
-        # above when z_max is None.
+        # above when the cut is applied and z_max is None.  Counted with or
+        # without the cut (it was written as zeros without it); -1 where it
+        # cannot be counted (a basis with no spin ceiling, or an event with
+        # no a_1/a_2 samples).
         "n_above_spin_ceiling_raw_per_event": np.asarray(
-            n_above_spin_ceiling_raw if drop_spin_above_ceiling
-            else [0] * nobs, dtype=np.int64),
+            n_above_spin_ceiling_raw, dtype=np.int64),
+        # Exported ROWS (repeats included) above the DECLARED ceiling (before
+        # any samples_bound widening): 0 under the cut; without it, the rows
+        # a chieff_reference selection weights at zero.  -1 where not counted.
+        "n_exported_above_spin_ceiling_per_event": np.asarray(
+            n_exported_above_spin_ceiling, dtype=np.int64),
+        "spin_ceiling_counted": bool(
+            nobs and all(n >= 0 for n in n_above_spin_ceiling_raw)),
         "spin_ceiling_cut_order": ("after_z_max_cut" if z_max is not None
                                    else "no_z_max_cut"),
         # ── Per-prior source provenance (GW-40c) ─────────────────────────────
@@ -1414,6 +1801,29 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         # ── How the two analytic prior factors were evaluated (GW-40i) ──────
         "dL_prior_impl_per_event": np.array(
             [str(x) for x in kept_dL_impl], dtype=_str),
+        # ── The reference frequency of each event's spins (review Med 19) ───
+        # NaN = the store does not know it.  Tilts and chi_p are defined at
+        # it; chi_eff is not affected.
+        "f_ref_per_event": f_ref_arr,
+        "f_ref_source_per_event": np.array(
+            [str(x) for x in kept_f_ref_src], dtype=_str),
+        **_dL_prior_class_attrs(kept_dL_class),
+        # ── Which cosmology the distance prior was evaluated AT (review
+        # 2026-10-20): the release-reweight table's source per event
+        # ("documented" / "inferred_from_z(dL)", the legacy table's
+        # "legacy_gwcat_default", or "analytic_declared" / "catalog_default"
+        # for rows not resolved from a table), the table's sha256, and the
+        # table_id each recorded hash identifies.
+        "dL_prior_cosmology_source_per_event": np.array(
+            kept_store_prov["dL_prior_cosmology_source"], dtype=_str),
+        "dL_prior_cosmology_table_sha256_per_event": np.array(
+            kept_store_prov["dL_prior_cosmology_table_sha256"], dtype=_str),
+        "release_reweight_cosmology_table_ids": json.dumps(
+            identify_bundled_tables(
+                kept_store_prov["dL_prior_cosmology_table_sha256"]),
+            sort_keys=True),
+        "mass_prior_source_per_event": np.array(
+            kept_store_prov["mass_prior_source"], dtype=_str),
     }
     if chi_eff_included:
         from ..spin import CHI_EFF_PRIOR_METHODS, current_chi_eff_prior_impl
@@ -1464,6 +1874,7 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         # The redshift truncation, in the sidecar too (GW-37).
         "z_max": None if z_max is None else float(z_max),
         "n_samples_cut_by_z_max": int(sum(n_cut_by_z_max)),
+        "events_dropped_by_z_max": list(dropped_by_z_max),
         # The EFFECTIVE selection (GW-33), the same record the attrs carry.
         "selection_spec": spec.to_dict(),
         "selection_spec_digest": spec.digest(),
@@ -1485,22 +1896,41 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         "cosmology_mode": cosmology_mode,
         "cosmology_override_used": bool(cosmology is not None),
         "cosmology_per_event_varies": bool(cosmology_per_event_varies),
+        "pe_cosmology_scalar_source": pe_cosmology_scalar_source,
+        "pe_cosmology_scalar_n_events": pe_cosmology_scalar_n_events,
+        "f_ref_values": f_ref_values,
+        "n_events_f_ref_unknown": n_f_ref_unknown,
         "waveform_policy": str(waveform_policy),
         "approximant": None if approximant is None else str(approximant),
         "homogeneous_sample_sets": homogeneous,
         "n_unique_samples_per_event": [int(x) for x in n_unique_per_event],
         "resampled_with_replacement": bool(upsampled_events),
         "n_events_resampled_with_replacement": int(len(upsampled_events)),
+        "resample_seed": _seed_attr(seed),
+        "resample_replace_policy": str(replace),
+        "n_kept_samples_per_event": [int(x) for x in n_kept_pool],
         "n_samples_out_of_support": int(n_out),
         "frac_samples_out_of_support": float(frac_out),
         "prior_reweight_ess_min": (float(np.min(ess_per_event))
                                    if ess_per_event.size else None),
         "prior_reweight_ess_median": (float(np.median(ess_per_event))
                                       if ess_per_event.size else None),
+        "prior_reweight_ess_distinct_min": (
+            float(np.min(ess_distinct_per_event))
+            if ess_distinct_per_event.size else None),
+        "prior_reweight_ess_distinct_median": (
+            float(np.median(ess_distinct_per_event))
+            if ess_distinct_per_event.size else None),
         "chi_p_definition": str(chi_p_definition),
         "spin_ceiling_cut_applied": bool(drop_spin_above_ceiling),
         "n_dropped_spin_above_ceiling": int(sum(n_dropped_spin)),
-        "n_above_spin_ceiling_raw": int(sum(n_above_spin_ceiling_raw)),
+        # Sums over the events that could be counted (-1 = not counted).
+        "n_above_spin_ceiling_raw": int(sum(
+            n for n in n_above_spin_ceiling_raw if n > 0)),
+        "n_exported_above_spin_ceiling": int(sum(
+            n for n in n_exported_above_spin_ceiling if n > 0)),
+        "spin_ceiling_counted": bool(
+            nobs and all(n >= 0 for n in n_above_spin_ceiling_raw)),
         "prior_source_kind_counts": {
             p: {k: int(kept_prior_kind[p].count(k))
                 for k in sorted(set(kept_prior_kind[p]))}
@@ -1510,6 +1940,25 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
 
     return ExportProduct(kind="pe", columns=columns, attrs=attrs,
                          spin_basis=spin_basis, summary=summary)
+
+
+#: How the exported rows are drawn, recorded on every PE file (review Low 2):
+#: with the seed, the replace policy and the per-event pool sizes, enough to
+#: reproduce the draw from the store.
+RESAMPLE_RNG_SCHEME = (
+    "numpy.random.default_rng(resample_seed), ONE stream for the whole "
+    "export: rng.choice(n_kept, nsamp, replace) once per exported event, in "
+    "selection order, over that event's samples left after z_max and the spin "
+    "cut (n_kept_samples_per_event); events skipped before the draw consume "
+    "no random state")
+
+
+def _seed_attr(seed):
+    """The seed as an HDF5-storable attr: the integer itself, else its repr
+    (``"None"`` = OS entropy, not reproducible)."""
+    if isinstance(seed, (int, np.integer)) and not isinstance(seed, bool):
+        return int(seed)
+    return repr(seed)
 
 
 #: The one resolver whose output is the bundled GWTC-5 BBH population.
@@ -1527,6 +1976,52 @@ def _names_sha256(names):
     return hashlib.sha256(("\n".join(uniq) + "\n").encode()).hexdigest()
 
 
+def _dL_prior_class_sel(sub, sel_idx, meta_str_sel):
+    """Per selected row, ``(kind, alpha, basis)`` of the distance prior that
+    the store's ``p_dL_pe`` evaluates, or ``None`` for every row of a store
+    that records no ``dL_prior_kind`` (written before GW-02)."""
+    kinds = meta_str_sel("dL_prior_kind")
+    if kinds is None:
+        return [None] * len(sel_idx)
+    bases = meta_str_sel("dL_prior_basis") or [""] * len(kinds)
+    alpha = sub.meta.get("dL_prior_alpha")
+    alpha = (np.full(len(kinds), np.nan) if alpha is None
+             else np.asarray(alpha, dtype=float)[sel_idx])
+    return [(k, float(a), b) for k, a, b in zip(kinds, alpha, bases)]
+
+
+def _dL_prior_class_attrs(kept_dL_class):
+    """The distance-prior class divided out of p_pe, per event and as one label.
+
+    Review 2026-10-20, Medium 43: the 2.1 writer read ``dL_prior_kind`` from the
+    product attrs, but no builder set it, so the contract field was always
+    null -- a product built from ``_nocosmo`` releases (PowerLaw(2), a 3x swing
+    across the posterior) and one built from ``_cosmo`` releases stated the same
+    contract.  The label is the sorted set of ``kind`` (with ``alpha`` for a
+    power law) over the exported events, joined by ``+`` when they differ.  A
+    store that records no class states nothing rather than a guess.
+    """
+    if not kept_dL_class or any(c is None for c in kept_dL_class):
+        return {}
+    import h5py
+    _str = h5py.string_dtype()
+
+    def _label(kind, alpha):
+        kind = kind or "unrecorded"
+        return f"{kind}(alpha={alpha:g})" if np.isfinite(alpha) else kind
+
+    return {
+        "dL_prior_kind_per_event": np.array(
+            [k for k, _, _ in kept_dL_class], dtype=_str),
+        "dL_prior_alpha_per_event": np.array(
+            [a for _, a, _ in kept_dL_class], dtype=float),
+        "dL_prior_basis_per_event": np.array(
+            [b for _, _, b in kept_dL_class], dtype=_str),
+        "dL_prior_kind": "+".join(sorted(
+            {_label(k, a) for k, a, _ in kept_dL_class})),
+    }
+
+
 def _population_resolver_attrs(cat, kept):
     """Whether the exported event set IS the bundled-population resolver's
     output, with the resolver's inputs (GW-40c).
@@ -1535,8 +2030,11 @@ def _population_resolver_attrs(cat, kept):
     the bundled lists -- no GWOSC); when its output equals the exported event
     set, the file records the resolver's qualified name, the sha256 of every
     bundled list it read and the resolved names' digest.  Otherwise (a subset,
-    a different population, a synthetic store) ``population_resolver`` is ""
-    and ``population_resolver_match`` False -- recorded, never guessed.
+    or a different population) ``population_resolver`` is "" and
+    ``population_resolver_match`` False -- recorded, never guessed.  The match
+    is a pure NAME-set equality: a synthetic or mock store whose event names
+    are the bundled population's records True as well (whether the samples
+    are real is ``mock_data``'s business, not this attr's).
 
     What this does NOT prove: it shows the exported set EQUALS the resolver's
     output on the store's names, not that the caller obtained the set by
@@ -1660,17 +2158,24 @@ def _apply_chieff_basis(data, amax1_ps, amax2_ps):
     in_support = np.ones(p_pe.shape, dtype=bool)
     if data["chieff"].size > 0:
         from ..spin import chi_eff_prior_logprob_in_support
-        logp_chi = np.empty(p_pe.shape, dtype=float)
-        pairs = np.unique(np.stack([np.asarray(amax1_ps, dtype=float),
-                                    np.asarray(amax2_ps, dtype=float)],
-                                   axis=1), axis=0)
-        for a1, a2 in pairs:
-            m = (amax1_ps == a1) & (amax2_ps == a2)
+        # NaN-initialised and grouped by np.unique's inverse index, not by
+        # float equality: a NaN ceiling matched no group and left np.empty's
+        # leftover memory in p_pe (review 2026-10-20).
+        logp_chi = np.full(p_pe.shape, np.nan, dtype=float)
+        pairs, which = np.unique(np.stack([np.asarray(amax1_ps, dtype=float),
+                                           np.asarray(amax2_ps, dtype=float)],
+                                          axis=1), axis=0, return_inverse=True)
+        which = np.asarray(which).reshape(-1)
+        for k, (a1, a2) in enumerate(pairs):
+            m = which == k
             lp, sup = chi_eff_prior_logprob_in_support(
                 data["chieff"][m], data["m1src"][m], data["m2src"][m],
                 amax=float(a1), amax_2=float(a2))
             logp_chi[m] = lp
             in_support[m] = sup
+        if np.isnan(logp_chi).any():
+            raise RuntimeError("internal error: a chieff row was assigned no "
+                               "chi_eff prior ceiling.")
         with np.errstate(over="ignore"):
             p_pe = p_pe * np.exp(logp_chi)
         p_pe = np.where(in_support, p_pe, 0.0)
@@ -1785,14 +2290,20 @@ def _apply_chieff_chip_basis(data, amax1_ps, chip, extras):
     in_support = np.ones(p_pe.shape, dtype=bool)
     if p_pe.size > 0:
         from ..spin import chi_eff_chi_p_prior_logprob_in_support
-        logp = np.empty(p_pe.shape, dtype=float)
-        for a in np.unique(amax1_ps):
-            m = amax1_ps == a
+        logp = np.full(p_pe.shape, np.nan, dtype=float)
+        uniq, which = np.unique(np.asarray(amax1_ps, dtype=float),
+                                return_inverse=True)
+        which = np.asarray(which).reshape(-1)
+        for k, a in enumerate(uniq):
+            m = which == k
             lp, sup = chi_eff_chi_p_prior_logprob_in_support(
                 data["chieff"][m], chip[m], data["m1src"][m], data["m2src"][m],
                 amax=float(a))
             logp[m] = lp
             in_support[m] = sup
+        if np.isnan(logp).any():
+            raise RuntimeError("internal error: a chieff_chip row was "
+                               "assigned no spin prior ceiling.")
         with np.errstate(over="ignore"):
             p_pe = p_pe * np.exp(logp)
         p_pe = np.where(in_support, p_pe, 0.0)

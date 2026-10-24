@@ -270,17 +270,16 @@ def test_chieff_chip_uniform_isotropic_o4(tmp_path):
             pytest.approx(0.9, rel=1e-12)
 
 
-def test_chieff_chip_amax_mismatch_warns(tmp_path):
-    # amax_1 != amax_2 -> joint prior uses amax_1 and warns.
+def test_chieff_chip_amax_mismatch_is_refused(tmp_path):
+    # amax_1 != amax_2: the joint prior has one ceiling, so the campaign is
+    # refused (review 2026-10-20; it used to use amax_1 for both and warn).
+    from gwcat.export.selection_builder import SpinBasisError
     path = write_o4_full(tmp_path / "o4.hdf", n=30, amax=(0.9, 0.7), seed=16)
     out = tmp_path / "cc.h5"
-    with warnings.catch_warnings(record=True) as rec:
-        warnings.simplefilter("always")
-        SelectionSet(path).export(str(out), spin_basis="chieff_chip")
-    assert any("amax_1" in str(w.message) for w in rec)
-    with h5py.File(out, "r") as f:
-        assert f.attrs["chi_eff_chi_p_amax_detected_per_campaign"][0] == \
-            pytest.approx(0.9, rel=1e-12)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pytest.raises(SpinBasisError, match="one shared ceiling"):
+            SelectionSet(path).export(str(out), spin_basis="chieff_chip")
 
 
 def test_chieff_chip_mixture_raises_spin_basis_error(tmp_path):
@@ -639,3 +638,583 @@ def test_removal_amax_is_recorded_per_campaign(tmp_path):
     assert s.spin_meta["spin_format"] == "o4_factored"
     assert getattr(s, "_removal_amax", None) is None, (
         "a factored file must not go through the assumed-prior removal")
+
+
+# ==========================================================================
+# Review 2026-10-20: selection export builder fixes
+# ==========================================================================
+def _o4_with_times(path, n, t_lo, t_hi, seed, **kw):
+    """An O4 factored fixture whose rows carry ``time_geocenter`` in a window."""
+    write_o4_full(path, n=n, amax=(0.9, 0.9), seed=seed, **kw)
+    rng = np.random.default_rng(seed + 1000)
+    with h5py.File(path, "r+") as f:
+        f["events"].create_dataset("time_geocenter",
+                                   data=rng.uniform(t_lo, t_hi, n))
+    return str(path)
+
+
+def test_time_coverage_is_recorded_per_campaign(tmp_path):
+    """A single-campaign product used to say nothing about WHEN its injections
+    were drawn, so a PE file holding O1/O2 events validated cleanly against an
+    O3+O4 selection.  The GPS span, the observing runs it overlaps and each
+    campaign's own exposure are now recorded per campaign."""
+    from gwcat.export import build_selection_product
+    from gwcat.observing_runs import EXPOSURE_WINDOWS_GPS
+
+    o3a = EXPOSURE_WINDOWS_GPS["O3a"]
+    o4a = EXPOSURE_WINDOWS_GPS["O4a"]
+    p1 = _o4_with_times(tmp_path / "a.hdf", 40, o3a[0] + 10, o3a[1] - 10, 1)
+    p2 = _o4_with_times(tmp_path / "b.hdf", 30, o4a[0] + 10, o4a[1] - 10, 2)
+    sets = [SelectionSet(p1), SelectionSet(p2)]
+    prod = build_selection_product(sets, spin_basis="component")
+    a = prod.attrs
+    with h5py.File(p1, "r") as f:
+        t1 = f["events"]["time_geocenter"][:]
+    with h5py.File(p2, "r") as f:
+        t2 = f["events"]["time_geocenter"][:]
+    np.testing.assert_array_equal(
+        a["campaign_gps_range_per_campaign"],
+        [[t1.min(), t1.max()], [t2.min(), t2.max()]])
+    assert [x.decode() if isinstance(x, bytes) else x for x in
+            a["campaign_gps_range_source_per_campaign"]] == ["row_times"] * 2
+    assert json.loads(a["campaign_runs_per_campaign"]) == [["O3a"], ["O4a"]]
+    assert json.loads(a["observing_runs_covered"]) == ["O3a", "O4a"]
+    np.testing.assert_allclose(a["T_obs_yr_per_campaign"],
+                               [s._T_yr for s in sets], rtol=0)
+    assert float(a["T_obs_yr"]) == pytest.approx(
+        float(np.sum(a["T_obs_yr_per_campaign"])), rel=1e-15)
+
+
+def test_time_coverage_unknown_is_nan_not_absent(tmp_path):
+    from gwcat.export import build_selection_product
+
+    p = write_o4_full(tmp_path / "o4.hdf", n=20, seed=3)   # no row times
+    prod = build_selection_product(SelectionSet(p), spin_basis="component")
+    rng = np.asarray(prod.attrs["campaign_gps_range_per_campaign"])
+    assert rng.shape == (1, 2) and np.isnan(rng).all()
+    src = prod.attrs["campaign_gps_range_source_per_campaign"][0]
+    assert (src.decode() if isinstance(src, bytes) else src) == "unknown"
+    assert json.loads(prod.attrs["campaign_runs_per_campaign"]) == [[]]
+    assert json.loads(prod.attrs["observing_runs_covered"]) == []
+
+
+def test_the_same_campaign_twice_is_refused(tmp_path):
+    """build_selection_product([endo3, endo3]) used to double n_det, ndraw and
+    mu without a word -- the overlap refusal compared GPS ranges against
+    cumulative mixtures only."""
+    from gwcat.export import build_selection_product
+    from gwcat.export.selection_builder import OverlappingCampaignError
+
+    p = write_endo3_full(tmp_path / "endo3.hdf", n=30, seed=4)
+    with pytest.raises(OverlappingCampaignError, match="appears twice"):
+        build_selection_product([SelectionSet(p), SelectionSet(p)],
+                                spin_basis="component")
+
+
+def test_two_campaigns_over_one_run_are_refused(tmp_path):
+    from gwcat.export import build_selection_product
+    from gwcat.export.selection_builder import OverlappingCampaignError
+    from gwcat.observing_runs import EXPOSURE_WINDOWS_GPS
+
+    lo, hi = EXPOSURE_WINDOWS_GPS["O4a"]
+    p1 = _o4_with_times(tmp_path / "o4a_only.hdf", 30, lo, lo + 1e6, 5)
+    p2 = _o4_with_times(tmp_path / "o4ab.hdf", 30, lo + 5e5, hi, 6)
+    with pytest.raises(OverlappingCampaignError, match="overlapping time"):
+        build_selection_product([SelectionSet(p1), SelectionSet(p2)],
+                                spin_basis="component")
+    # Disjoint time combines as before.
+    p3 = _o4_with_times(tmp_path / "later.hdf", 30, lo + 2e6, hi, 7)
+    prod = build_selection_product([SelectionSet(p1), SelectionSet(p3)],
+                                   spin_basis="component")
+    assert int(prod.attrs["n_campaigns"]) == 2
+
+
+def test_an_unjudgeable_overlap_warns(tmp_path):
+    from gwcat.export import build_selection_product
+
+    o3 = write_endo3_full(tmp_path / "endo3.hdf", n=20, seed=8)
+    o4 = write_o4_full(tmp_path / "o4.hdf", n=20, seed=9)
+    with pytest.warns(UserWarning, match="cannot rule out a time overlap"):
+        build_selection_product([SelectionSet(o3), SelectionSet(o4)],
+                                spin_basis="component")
+
+
+def _fixture_cosmology():
+    """A radiation-free flat LCDM that is NOT the SelectionSet default, so a
+    scalar stamped from the constructor default cannot pass for it."""
+    from astropy.cosmology import FlatLambdaCDM, Planck15
+    return FlatLambdaCDM(H0=1.02 * Planck15.H0, Om0=Planck15.Om0)
+
+
+def _endo3_cosmology_consistent(path, n, seed, cosmo):
+    """endo3 fixture whose ``distance`` IS ``cosmo``'s dL(z), so the loader's
+    generation-cosmology detection runs (the plain fixture draws dL
+    independently of z and never reaches that path)."""
+    write_endo3_full(path, n=n, max_spin=0.9, seed=seed)
+    with h5py.File(path, "r+") as f:
+        inj = f["injections"]
+        z = inj["redshift"][:]
+        inj["distance"][:] = cosmo.luminosity_distance(z).to("Mpc").value
+    return str(path)
+
+
+def test_scalar_cosmology_is_the_one_pdraw_used(tmp_path):
+    """The scalar used to be set_list[0].H0 -- the constructor default -- even
+    when the campaign's pdraw used its DETECTED generation cosmology, and the
+    validator refused PE files for disagreeing with it."""
+    from gwcat.export import build_selection_product
+
+    cosmo = _fixture_cosmology()
+    e3 = _endo3_cosmology_consistent(tmp_path / "e3.hdf", 300, 12, cosmo)
+    s = SelectionSet(e3)
+    prod = build_selection_product(s, spin_basis="component")
+    a = prod.attrs
+    assert [x.decode() if isinstance(x, bytes) else x
+            for x in a["cosmology_source_per_campaign"]] == ["detected"]
+    assert float(a["cosmology_H0"]) == float(a["cosmology_H0_per_campaign"][0])
+    assert float(a["cosmology_Om0"]) == float(
+        a["cosmology_Om0_per_campaign"][0])
+    assert float(a["cosmology_H0"]) == pytest.approx(cosmo.H0.value, rel=1e-4)
+    assert abs(float(a["cosmology_H0"]) - s.H0) > 0.5     # not the default
+    assert prod.summary["cosmology_H0"] == float(a["cosmology_H0"])
+
+    # An events-format campaign reads ddL/dz from the file: no cosmology.
+    o4 = write_o4_full(tmp_path / "o4.hdf", n=20, seed=13)
+    a4 = build_selection_product(SelectionSet(o4),
+                                 spin_basis="component").attrs
+    assert np.isnan(a4["cosmology_H0"]) and np.isnan(a4["cosmology_Om0"])
+
+    # Campaigns that differ (the production O3 + O4 shape): NaN.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ac = build_selection_product([SelectionSet(e3), SelectionSet(o4)],
+                                     spin_basis="component").attrs
+    assert bool(ac["cosmology_mixed_across_campaigns"]) is True
+    assert np.isnan(ac["cosmology_H0"]) and np.isnan(ac["cosmology_Om0"])
+
+
+def _o4_aligned_hemisphere(path, n, seed):
+    """O4 factored fixture with a ~ U(0, 0.9) and cos(tilt) ~ U(0, 1): the
+    magnitudes cover a_ref = 0.9, the orientations cover half the sphere."""
+    from gwcat.spin import chi_p_from_components
+
+    write_o4_full(path, n=n, amax=(0.9, 0.9), seed=seed)
+    rng = np.random.default_rng(seed + 77)
+    with h5py.File(path, "r+") as f:
+        ev = f["events"]
+        m1, m2 = ev["mass1_source"][:], ev["mass2_source"][:]
+        a1, a2 = ev["spin1_magnitude"][:], ev["spin2_magnitude"][:]
+        ph1, ph2 = ev["spin1_azimuthal_angle"][:], ev["spin2_azimuthal_angle"][:]
+        c1, c2 = rng.uniform(0.0, 1.0, n), rng.uniform(0.0, 1.0, n)
+        th1, th2 = np.arccos(c1), np.arccos(c2)
+        s1, s2 = np.sin(th1), np.sin(th2)
+        ev["spin1_polar_angle"][:] = th1
+        ev["spin2_polar_angle"][:] = th2
+        ev["lnpdraw_spin1_polar_angle"][:] = np.log(s1)    # p(θ) = sin θ
+        ev["lnpdraw_spin2_polar_angle"][:] = np.log(s2)
+        ev["spin1x"][:] = a1 * s1 * np.cos(ph1)
+        ev["spin1y"][:] = a1 * s1 * np.sin(ph1)
+        ev["spin2x"][:] = a2 * s2 * np.cos(ph2)
+        ev["spin2y"][:] = a2 * s2 * np.sin(ph2)
+        ev["spin1z"][:], ev["spin2z"][:] = a1 * c1, a2 * c2
+        ev["chi_eff"][:] = (m1 * a1 * c1 + m2 * a2 * c2) / (m1 + m2)
+        ev["chi_p"][:] = chi_p_from_components(a1, a2, c1, c2, m1, m2)
+    return str(path)
+
+
+def test_reference_tilt_hole_is_refused(tmp_path):
+    """The coverage check compared magnitudes only, so an aligned-hemisphere
+    campaign exported with spin_reference_coverage_ok=True and alpha biased
+    low (a detected fraction of 1/4 of the truth in the review's probe)."""
+    from gwcat.export import build_selection_product
+    from gwcat.export.selection_builder import BlockCampaignMismatch
+
+    hole = _o4_aligned_hemisphere(tmp_path / "hemi.hdf", 2000, 31)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")           # the loader's isotropy check
+        with pytest.raises(BlockCampaignMismatch, match="never drew"):
+            build_selection_product(SelectionSet(hole),
+                                    spin_basis="chieff_reference",
+                                    spin_reference_amax=0.9)
+        with pytest.warns(UserWarning, match="never drew"):
+            prod = build_selection_product(SelectionSet(hole),
+                                           spin_basis="chieff_reference",
+                                           spin_reference_amax=0.9,
+                                           strict=False)
+    a = prod.attrs
+    assert list(a["spin_reference_coverage_per_campaign"]) == [True]
+    assert list(a["spin_reference_tilt_coverage_per_campaign"]) == [False]
+    assert a["spin_reference_coverage_ok"] is False
+    gaps = np.asarray(a["spin_reference_tilt_max_gap_per_campaign"])
+    assert gaps.shape == (1, 2) and (gaps > 0.99).all()     # [-1, 0) undrawn
+
+    # Isotropic control, same size: covered, and nothing is refused.
+    iso = write_o4_full(tmp_path / "iso.hdf", n=2000, amax=(0.9, 0.9), seed=32)
+    ok = build_selection_product(SelectionSet(iso),
+                                 spin_basis="chieff_reference",
+                                 spin_reference_amax=0.9).attrs
+    assert list(ok["spin_reference_tilt_coverage_per_campaign"]) == [True]
+    assert ok["spin_reference_coverage_ok"] is True
+    assert (np.asarray(ok["spin_reference_tilt_max_gap_per_campaign"])
+            < ok["spin_reference_tilt_gap_tolerance_per_campaign"][0]).all()
+
+
+def test_a_sample_maximum_hole_is_refused_once_it_is_not_noise(tmp_path):
+    """A campaign with no detectable magnitude ceiling whose magnitudes stop
+    well below a_ref only warned, even under strict, and the file was written
+    with spin_reference_coverage_ok=False.  On enough rows the shortfall is a
+    hole, not noise, and strict now refuses it; a handful of rows still warns
+    (test_selection_chieff_reference pins that half)."""
+    from gwcat.export import build_selection_product
+    from gwcat.export.selection_builder import BlockCampaignMismatch
+
+    n = 20000          # shortfall 0.04 of a_ref; noise allows ~0.01 here
+    path = write_o4_full(tmp_path / "o4.hdf", n=n, amax=(0.95, 0.95), seed=41)
+    rng = np.random.default_rng(42)
+    with h5py.File(path, "r+") as f:
+        # Non-uniform magnitudes (no detectable ceiling) that stop at 0.95.
+        for k in ("1", "2"):
+            ev = f["events"]
+            ev[f"lnpdraw_spin{k}_magnitude"][:] = rng.normal(0.0, 0.3, n)
+    s = SelectionSet(path)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        assert s.spin_meta["amax_detected"] in (None, (None, None))
+        with pytest.raises(BlockCampaignMismatch, match="sampling noise"):
+            build_selection_product(SelectionSet(path),
+                                    spin_basis="chieff_reference",
+                                    spin_reference_amax=0.99)
+        prod = build_selection_product(SelectionSet(path),
+                                       spin_basis="chieff_reference",
+                                       spin_reference_amax=0.99, strict=False)
+    assert prod.attrs["spin_reference_coverage_ok"] is False
+    assert list(prod.attrs["spin_reference_coverage_per_campaign"]) == [False]
+
+
+@pytest.mark.parametrize("snr", [np.inf, np.nan, 0.0, -5.0])
+def test_non_finite_snr_threshold_is_refused_on_a_mixture(tmp_path, snr):
+    """`--snr-threshold inf` (an attempt to switch the SNR leg off) or a NaN
+    from a config passed every FAR-only guard -- they test only `is None` --
+    and detected no O1/O2 row while the file said 'lvk-cumulative'."""
+    from gwcat.export import build_selection_product
+    from test_selection_cumulative_mixture import (write_cumulative_mixture,
+                                                   _ANCHORS)
+
+    path, _, _ = write_cumulative_mixture(tmp_path / "mix.hdf")
+    with pytest.raises(ValueError, match="snr_threshold"):
+        build_selection_product(SelectionSet(path), spin_basis="component",
+                                snr_threshold=snr, mixture_anchors=_ANCHORS,
+                                sky_marginal=True)
+
+
+@pytest.mark.parametrize("far", [np.nan, np.inf, 0.0, -1.0])
+def test_non_finite_far_threshold_is_refused(tmp_path, far):
+    from gwcat.export import build_selection_product
+
+    path = write_o4_full(tmp_path / "o4.hdf", n=20, seed=14)
+    with pytest.raises(ValueError, match="far_threshold"):
+        build_selection_product(SelectionSet(path), spin_basis="component",
+                                far_threshold=far)
+
+
+def test_endo3_jacobian_matches_astropy_on_a_cosmology_consistent_file(tmp_path):
+    """The computed ddL/dz (the O3 half of the production selection) was only
+    ever checked against gwcat's own _ddL_dz, so dropping its (1+z) factor --
+    a 5-44% error over the O3 range -- passed every test.  Here the fixture's
+    dL IS a flat-LCDM dL(z), the loader detects that cosmology, and pdraw is
+    recomputed from the file with h5py and astropy alone (a central-difference
+    derivative of astropy's luminosity distance), no gwcat function in it."""
+    from astropy.cosmology import FlatLambdaCDM
+    from gwcat.export import build_selection_product
+
+    truth = _fixture_cosmology()
+    path = _endo3_cosmology_consistent(tmp_path / "e3.hdf", 400, 21, truth)
+    prod = build_selection_product(SelectionSet(path), spin_basis="component")
+    a = prod.attrs
+    assert [x.decode() if isinstance(x, bytes) else x
+            for x in a["cosmology_source_per_campaign"]] == ["detected"]
+    H0 = float(a["cosmology_H0_per_campaign"][0])
+    Om0 = float(a["cosmology_Om0_per_campaign"][0])
+    assert H0 == pytest.approx(truth.H0.value, rel=1e-4)
+    assert Om0 == pytest.approx(truth.Om0, rel=1e-3)
+
+    with h5py.File(path, "r") as f:
+        inj = f["injections"]
+        pdf = inj["sampling_pdf"][:]
+        m1det, z = inj["mass1"][:], inj["redshift"][:]
+        a1 = np.sqrt(inj["spin1x"][:] ** 2 + inj["spin1y"][:] ** 2
+                     + inj["spin1z"][:] ** 2)
+        a2 = np.sqrt(inj["spin2x"][:] ** 2 + inj["spin2y"][:] ** 2
+                     + inj["spin2z"][:] ** 2)
+    used = FlatLambdaCDM(H0=H0, Om0=Om0)
+    h = 1e-5
+    ddL = ((used.luminosity_distance(z + h) - used.luminosity_distance(z - h))
+           .to("Mpc").value / (2 * h))
+    # p(m1src, m2src, z, spins) -> p(m1det, q, dL, a, cos t): the spin part
+    # 1/(4 pi a^2) per body (cartesian -> polar) is undone by (2 pi)^2 a^2.
+    expected = (pdf * (2 * np.pi) ** 2 * a1 ** 2 * a2 ** 2
+                * m1det / (1 + z) ** 2 / ddL)
+    np.testing.assert_allclose(prod.columns["pdraw"], expected, rtol=1e-7)
+
+
+def test_input_identity_is_recorded_and_a_byte_copy_is_refused(tmp_path):
+    """No injection name or hash reached the selection HDF5, so a re-clipped
+    file under the same name made a product indistinguishable from the
+    original; and a byte copy under another name combined like a new
+    campaign."""
+    import hashlib
+    import os
+    import shutil
+    from gwcat.export import build_selection_product
+    from gwcat.export.selection_builder import OverlappingCampaignError
+
+    p = write_o4_full(tmp_path / "o4.hdf", n=20, seed=15)
+    with open(p, "rb") as fh:
+        digest = hashlib.sha256(fh.read()).hexdigest()
+    a = build_selection_product(SelectionSet(p), spin_basis="component").attrs
+    dec = [x.decode() if isinstance(x, bytes) else x
+           for x in a["campaign_file_sha256"]]
+    assert dec == [digest]
+    assert [x.decode() if isinstance(x, bytes) else x
+            for x in a["campaign_files"]] == [os.fspath(p)]
+    assert list(a["campaign_file_size_bytes"]) == [os.path.getsize(p)]
+
+    copy = shutil.copy(p, tmp_path / "renamed.hdf")
+    with pytest.raises(OverlappingCampaignError, match="byte-identical"):
+        build_selection_product([SelectionSet(p), SelectionSet(copy)],
+                                spin_basis="component")
+
+
+@pytest.mark.parametrize("basis", ["chieff", "chieff_chip"])
+def test_per_campaign_spin_attrs_keep_empty_campaigns(tmp_path, basis):
+    """A campaign with no detections was left out of the *_per_campaign spin
+    attrs, so they no longer lined up with campaign_ndraws and every other
+    per-campaign array (and the validator's matching check skipped on the
+    shape mismatch)."""
+    from gwcat.export import build_selection_product
+
+    o4a = write_o4_full(tmp_path / "a.hdf", n=30, amax=(0.9, 0.9), seed=16)
+    o4b = write_o4_full(tmp_path / "b.hdf", n=30, amax=(0.8, 0.8), seed=17,
+                        detected=False)
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        a = build_selection_product([SelectionSet(o4a), SelectionSet(o4b)],
+                                    spin_basis=basis).attrs
+    assert any("no detected injections" in str(w.message) for w in rec)
+    if basis == "chieff":
+        pairs = np.asarray(a["chi_eff_amax_per_campaign"])
+        assert pairs.shape == (2, 2)
+        np.testing.assert_allclose(pairs[0], [0.9, 0.9], rtol=1e-9)
+        assert np.isnan(pairs[1]).all()
+        assert [x.decode() if isinstance(x, bytes) else x for x in
+                a["chi_eff_amax_source_per_campaign"]] == ["detected",
+                                                           "no_detections"]
+    else:
+        amax = np.asarray(a["chi_eff_chi_p_amax_detected_per_campaign"])
+        assert amax.shape == (2,)
+        assert amax[0] == pytest.approx(0.9, rel=1e-9) and np.isnan(amax[1])
+    assert float(a["chi_eff_amax"]) == pytest.approx(0.9, rel=1e-9)
+
+
+@pytest.mark.parametrize("sentinel", [1.0, 1e50, np.inf, np.nan, -1e300])
+def test_out_of_reference_sentinel_must_be_negligible(tmp_path, sentinel):
+    """A caller-set out_of_reference_pdraw of 1.0 gave the excluded rows a real
+    weight while the attrs still said they carry none."""
+    from gwcat.export import build_selection_product
+
+    path = write_o4_full(tmp_path / "o4.hdf", n=40, amax=(0.998, 0.998),
+                         seed=18)
+    with pytest.raises(ValueError, match="out_of_reference_pdraw"):
+        build_selection_product(SelectionSet(path),
+                                spin_basis="chieff_reference",
+                                spin_reference_amax=0.99,
+                                out_of_reference_pdraw=sentinel)
+    # The default is accepted.
+    build_selection_product(SelectionSet(path), spin_basis="chieff_reference",
+                            spin_reference_amax=0.99)
+
+
+def test_a_forced_amax_that_contradicts_the_detected_ceiling_warns(tmp_path):
+    """A numeric amax silently overrode each campaign's detected ceiling on the
+    chieff basis; the legacy mode stays, but it is no longer silent."""
+    from gwcat.export import build_selection_product
+
+    path = write_o4_full(tmp_path / "o4.hdf", n=30, amax=(0.9, 0.9), seed=19)
+    with pytest.warns(UserWarning, match="differs from the campaign's own"):
+        build_selection_product(SelectionSet(path), spin_basis="chieff",
+                                amax=0.99)
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        a = build_selection_product(SelectionSet(path), spin_basis="chieff",
+                                    amax=0.9).attrs
+    assert not any("differs from the campaign's own" in str(w.message)
+                   for w in rec)
+    assert [x.decode() if isinstance(x, bytes) else x
+            for x in a["chi_eff_amax_source_per_campaign"]] == ["caller"]
+
+
+@pytest.mark.parametrize("ln_spin", [750.0, -800.0])
+def test_the_finished_pdraw_is_rechecked_for_every_basis(tmp_path, ln_spin):
+    """A finite but huge (or tiny) per-injection spin factor overflowed to an
+    infinite pdraw (or underflowed to zero) with the overflow silenced, and
+    the component basis wrote it -- the loader's positivity check runs before
+    the spin factor, and nothing re-checked the array actually written."""
+    from gwcat.export import build_selection_product
+
+    path = write_o4_full(tmp_path / "o4.hdf", n=20, seed=20)
+    s = SelectionSet(path)
+    s._load()
+    s._ln_spin_component = np.array(s._ln_spin_component, dtype=float)
+    s._ln_spin_component[3] = ln_spin
+    with pytest.raises(ValueError, match="FINISHED selection pdraw"):
+        build_selection_product(s, spin_basis="component")
+
+
+@pytest.mark.parametrize("field", ["_chieff", "_a1", "_a2"])
+def test_reference_basis_refuses_a_nan_spin_on_a_detected_row(tmp_path, field):
+    """A NaN chi_eff or magnitude failed every support comparison, so a
+    detected injection was written with the exclusion sentinel and counted in
+    spin_reference_excluded_rows as if the reference had excluded it."""
+    from gwcat.export import build_selection_product
+
+    path = write_o4_full(tmp_path / "o4.hdf", n=30, amax=(0.9, 0.9), seed=22)
+    s = SelectionSet(path)
+    s._load()
+    arr = np.array(getattr(s, field), dtype=float)
+    arr[5] = np.nan
+    setattr(s, field, arr)
+    with pytest.raises(ValueError, match="detected injections have a non-finite"):
+        build_selection_product(s, spin_basis="chieff_reference",
+                                spin_reference_amax=0.9, strict=False)
+
+
+@pytest.mark.parametrize("field,value", [("_dL", np.nan), ("_dL", -1.0),
+                                         ("_m1det", np.inf), ("_m2src", 0.0),
+                                         ("_z", np.nan)])
+def test_unusable_masses_distance_redshift_are_refused(tmp_path, field, value):
+    """Only sky position and pdraw were checked on written rows (August
+    review, export-sel 4): a NaN distance or an infinite mass on a detected
+    injection was exported."""
+    from gwcat.export import build_selection_product
+
+    path = write_o4_full(tmp_path / "o4.hdf", n=20, seed=23)
+    s = SelectionSet(path)
+    s._load()
+    arr = np.array(getattr(s, field), dtype=float)
+    arr[2] = value
+    setattr(s, field, arr)
+    with pytest.raises(ValueError, match="unusable"):
+        build_selection_product(s, spin_basis="component")
+
+
+def test_p_astro_columns_are_recorded_per_campaign(tmp_path):
+    """Every selection product said p_astro_available=False and the pastro_min
+    refusal read that as 'the campaigns carry no per-injection p_astro', but
+    both production campaigns do.  What each campaign carries is recorded,
+    separately from the (unchanged) statement that none is used."""
+    from gwcat.export import build_selection_product
+
+    o4 = write_o4_full(tmp_path / "o4.hdf", n=20, seed=24)
+    with h5py.File(o4, "r+") as f:
+        f["events"].create_dataset("gstlal_p_astro",
+                                   data=np.full(20, 0.9))
+    e3 = write_endo3_full(tmp_path / "e3.hdf", n=20, seed=25)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        prod = build_selection_product([SelectionSet(e3), SelectionSet(o4)],
+                                       spin_basis="component")
+    assert json.loads(prod.attrs["p_astro_columns_per_campaign"]) == [
+        [], ["gstlal_p_astro"]]
+    assert prod.attrs["p_astro_used_for_detection"] is False
+    assert bool(prod.attrs["p_astro_available"]) is False      # unchanged
+    assert prod.summary["p_astro_columns_per_campaign"] == [
+        [], ["gstlal_p_astro"]]
+
+
+# --------------------------------------------------------------------------
+# August review, test-gaps 5: the combination loop with campaigns that are
+# not 100% detected, one that contributes nothing, and mixed spin content.
+# --------------------------------------------------------------------------
+def test_combination_with_partial_detection_in_both_campaigns(tmp_path):
+    """Per-campaign rows are the detected ones, ndraw and campaign_ndraws are
+    the files' totals (the cut is subsetting), and pdraw is each campaign's
+    from-file component density times N_k/N_total -- with N_k read from the
+    file attrs, not from the builder."""
+    from gwcat.export import build_selection_product
+
+    pa = write_o4_full(tmp_path / "a.hdf", n=40, amax=(0.8, 0.6), seed=26,
+                       total_generated=1500)
+    pb = write_o4_full(tmp_path / "b.hdf", n=30, amax=(0.9, 0.7), seed=27,
+                       total_generated=700)
+    rng = np.random.default_rng(28)
+    fars = {}
+    for p, n in ((pa, 40), (pb, 30)):
+        far = 10 ** rng.uniform(-2.0, 1.0, n)
+        far[rng.uniform(size=n) < 0.2] = np.inf
+        with h5py.File(p, "r+") as f:
+            f["events"]["pycbc_far"][:] = far
+        fars[p] = far
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        prod = build_selection_product([SelectionSet(pa), SelectionSet(pb)],
+                                       spin_basis="component",
+                                       far_threshold=1.0)
+    n_tot = 0
+    expected = []
+    for p in (pa, pb):
+        with h5py.File(p, "r") as f:
+            n_tot += int(f.attrs["total_generated"])
+    for p in (pa, pb):
+        with h5py.File(p, "r") as f:
+            n_k = int(f.attrs["total_generated"])
+        keep = fars[p] < 1.0
+        assert 0 < keep.sum() < keep.size                  # partial, really
+        expected.append(_o4_component_pdraw(p)[keep] * (n_k / n_tot))
+    expected = np.concatenate(expected)
+    np.testing.assert_allclose(prod.columns["pdraw"], expected, rtol=1e-12)
+    assert int(prod.attrs["n_detected"]) == expected.size
+    assert int(prod.attrs["ndraw"]) == n_tot
+    assert list(prod.attrs["campaign_ndraws"]) == [1500, 700]
+
+
+def test_an_empty_campaign_still_counts_in_ndraw(tmp_path):
+    """A campaign with no detections is skipped (and warned about), but its
+    draws stay in N_total: the surviving campaign's fraction is N_a/(N_a+N_b),
+    not 1 -- dropping it would rescale every surviving pdraw."""
+    from gwcat.export import build_selection_product
+
+    pa = write_o4_full(tmp_path / "a.hdf", n=25, seed=29, total_generated=800)
+    pb = write_o4_full(tmp_path / "b.hdf", n=25, seed=30, total_generated=1200,
+                       detected=False)
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        prod = build_selection_product([SelectionSet(pa), SelectionSet(pb)],
+                                       spin_basis="component")
+    assert any("no detected injections" in str(w.message) for w in rec)
+    np.testing.assert_allclose(prod.columns["pdraw"],
+                               _o4_component_pdraw(pa) * (800 / 2000),
+                               rtol=1e-12)
+    assert int(prod.attrs["ndraw"]) == 2000
+    assert int(prod.attrs["n_detected"]) == 25
+
+
+def test_a_spinless_campaign_drops_the_spin_columns_whole(tmp_path):
+    """Combining a campaign with spin columns and one without (a legacy
+    spin-less file) drops a1/a2/cost1/cost2 and chip from the combined file,
+    says so, and writes no partial-length column."""
+    from gwcat.export import build_selection_product
+    from test_selection_cbc import write_o3
+
+    e3 = write_endo3_full(tmp_path / "e3.hdf", n=20, seed=31)
+    o3 = write_o3(tmp_path / "o3.hdf", {"BBH": 6})
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        prod = build_selection_product([SelectionSet(e3), SelectionSet(o3)],
+                                       spin_basis="chieff", strict=False)
+    assert prod.attrs["component_columns_emitted"] is False
+    assert prod.attrs["chip_column_emitted"] is False
+    for c in ("a1", "a2", "cost1", "cost2", "chip"):
+        assert c not in prod.columns
+    lengths = {k: np.asarray(v).shape[0] for k, v in prod.columns.items()}
+    assert len(set(lengths.values())) == 1, lengths
+    assert lengths["pdraw"] == int(prod.attrs["n_detected"])

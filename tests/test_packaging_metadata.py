@@ -131,3 +131,78 @@ def test_the_declared_license_ships_with_its_text():
     # header claiming to be one.
     assert "Permission is hereby granted, free of charge" in text
     assert 'THE SOFTWARE IS PROVIDED "AS IS"' in text
+
+
+# ==========================================================================
+# Review 2026-10-20: every module-scope import of `import gwcat` is declared
+# ==========================================================================
+#: Import name -> distribution name, where they differ.
+_DIST_OF = {"yaml": "pyyaml"}
+
+
+def _is_stdlib(name):
+    """Whether top-level module ``name`` belongs to the standard library.
+
+    ``sys.stdlib_module_names`` where it exists (3.10+).  Before 3.10: a
+    built-in or frozen module, or one whose file lies in the interpreter's
+    standard-library directories and not in site-packages.
+    """
+    import importlib.util
+    import sys
+    import sysconfig
+
+    known = getattr(sys, "stdlib_module_names", None)
+    if known is not None:
+        return name in known
+    if name in sys.builtin_module_names:
+        return True
+    spec = importlib.util.find_spec(name)
+    if spec is None or spec.origin is None:
+        return False
+    if spec.origin in ("built-in", "frozen"):
+        return True
+    origin = Path(spec.origin).resolve()
+    paths = sysconfig.get_paths()
+
+    def under(*keys):
+        return any(Path(paths[k]).resolve() in origin.parents for k in keys)
+
+    return under("stdlib", "platstdlib") and not under("purelib", "platlib")
+
+
+@needs_source_tree
+def test_import_gwcat_needs_only_declared_dependencies():
+    """scipy was a hard import of ``import gwcat`` (gwcat/chi_eff_exact.py)
+    but not a declared dependency, so a plain ``pip install .`` could not
+    import gwcat.  Every third-party package imported at MODULE scope by a
+    module that ``import gwcat`` loads must be in [project].dependencies."""
+    import subprocess
+    import sys
+
+    out = subprocess.run(
+        [sys.executable, "-c",
+         "import sys, gwcat; print('\\n'.join(sorted("
+         "m.__file__ for n, m in sys.modules.items() if n == 'gwcat' or "
+         "n.startswith('gwcat.'))))"],
+        capture_output=True, text=True, check=True, cwd=str(REPO_ROOT))
+    files = [Path(x) for x in out.stdout.split() if x.endswith(".py")]
+    assert files, "import gwcat loaded no gwcat modules?"
+    third = set()
+    for f in files:
+        for node in ast.parse(f.read_text()).body:     # module scope only
+            if isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and not node.level:
+                names = [node.module]
+            else:
+                continue
+            third |= {n.split(".")[0] for n in names} - {"__future__", "gwcat"}
+    third = {n for n in third if not _is_stdlib(n)}
+    declared = {re.split(r"[<>=!~\[ ;]", d, maxsplit=1)[0].lower()
+                for d in _pyproject()["project"]["dependencies"]}
+    missing = sorted(n for n in third
+                     if _DIST_OF.get(n, n).lower() not in declared)
+    assert not missing, (
+        f"`import gwcat` imports {missing} at module scope, but "
+        f"pyproject.toml does not declare them: a plain `pip install .` "
+        f"would fail to import gwcat.")

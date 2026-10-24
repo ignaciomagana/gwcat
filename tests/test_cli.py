@@ -176,7 +176,7 @@ def test_inspect_happy_path(tmp_path, capsys):
 
 def test_inspect_json(tmp_path, capsys):
     store = _build_mixed_store(tmp_path, MIXED_EVENTS)
-    rc = main(["inspect", store, "--json"])
+    rc = main(["inspect", store, "--json", "--parameter-space", "chieff"])
     assert rc == 0
     info = json.loads(capsys.readouterr().out)
     assert info["n_events"] == 4

@@ -41,16 +41,18 @@ would have written to `validation_summary.json`).
 
 ## 2. Export darksirens PE samples (BBH only)
 
-The fake store has one BBH event with no FAR. `--allow-missing-far` keeps it
-(with a warning and explicit provenance); the default would silently drop it,
-and `--require-far` would fail loudly instead.
+The two BBH events are selected by name. A `--source-class bbh` cut would
+classify the events by their posterior-median masses and the injections by
+their true masses, a pair `gwcat validate` refuses; a `--far-max` cut would
+have to drop the BBH event with no FAR (`--allow-missing-far` keeps it, and
+`gwcat validate` then refuses the pair, since the injections cannot model an
+event that was never tested against the cut).
 
 ```bash
+printf 'GW900101_000001\nGW900102_000002\n' > ./fake_data/bbh_events.txt
 gwcat export-darksirens ./fake_data/fake_store.h5 \
     --out ./fake_data/fake_gw_bbh.h5 \
-    --source-class bbh \
-    --far-max 1.0 \
-    --allow-missing-far \
+    --event-list ./fake_data/bbh_events.txt \
     --cosmology 67.66,0.3096 \
     --nsamp 256 --seed 0
 ```
@@ -66,13 +68,13 @@ Writes `fake_gw_bbh.h5` plus, by default, `fake_gw_bbh.h5.validation_summary.jso
 ```bash
 gwcat selection \
     --injections ./fake_data/fake_injections.hdf \
-    --out ./fake_data/fake_selection_bbh.h5 \
-    --source-class bbh \
-    --H0 67.66 --Om0 0.3096
+    --out ./fake_data/fake_selection_bbh.h5
 ```
 
-Uses the SAME cosmology and source-class filter as step 2, which is what lets
-step 4's cross-validation pass.
+No class cut (the population model handles the classes) and no `--H0`/`--Om0`:
+the campaign's Jacobian uses its own cosmology. `gwcat validate` warns that a
+name list meets a selection with no class cut, which is legal when the list's
+membership does not come from the events' measured masses.
 
 ## 4. Validate
 
@@ -83,20 +85,22 @@ gwcat validate ./fake_data/fake_gw_bbh.h5 ./fake_data/fake_selection_bbh.h5
 Runs `gwcat.catalog.validate_export`'s internal checks (array lengths,
 `p_pe`/`pdraw` finite and positive, source masses <= detector masses) plus the
 PE <-> selection cross-validation (spin-prior mode, cosmology, source-class
-agreement). Exits 0 when every check passes; the CLI's exit code is 1 if any
-non-strict internal check fails, and a cross-validation contract mismatch
-always raises (printed to stderr, exit 1) since a "looks valid but wrong
-prior/cosmology/source-class" file is exactly what this step exists to catch.
+agreement). Exits 0 when every check passes and 1 otherwise. Most
+cross-validation contract mismatches raise (printed to stderr, exit 1), since
+a "looks valid but wrong prior/cosmology/source-class" file is exactly what
+this step exists to catch; a few only warn unless `--strict` is given, so use
+`--strict` when the pair gates an analysis.
 
 ## One-liner
 
 ```bash
 python examples/make_fake_store.py --outdir ./fake_data \
   && gwcat inspect ./fake_data/fake_store.h5 \
+  && printf 'GW900101_000001\nGW900102_000002\n' > ./fake_data/bbh_events.txt \
   && gwcat export-darksirens ./fake_data/fake_store.h5 --out ./fake_data/fake_gw_bbh.h5 \
-       --source-class bbh --far-max 1.0 --allow-missing-far \
+       --event-list ./fake_data/bbh_events.txt \
        --cosmology 67.66,0.3096 --nsamp 256 --seed 0 \
   && gwcat selection --injections ./fake_data/fake_injections.hdf \
-       --out ./fake_data/fake_selection_bbh.h5 --source-class bbh --H0 67.66 --Om0 0.3096 \
-  && gwcat validate ./fake_data/fake_gw_bbh.h5 ./fake_data/fake_selection_bbh.h5
+       --out ./fake_data/fake_selection_bbh.h5 \
+  && gwcat validate --strict ./fake_data/fake_gw_bbh.h5 ./fake_data/fake_selection_bbh.h5
 ```

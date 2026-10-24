@@ -28,30 +28,34 @@ gwcat ingest --glob "./GWTC/GWTC2p1/*.h5" --glob "./GWTC/GWTC3/*.h5" \
 #    available.
 gwcat inspect store_cbc.h5
 
-# 4. Export every compact-binary class in one file
-gwcat export-darksirens store_cbc.h5 \
+# 4. Export every compact-binary class in one file (component basis: exact for
+#    any injection campaign). Events with no FAR are dropped by the FAR cut,
+#    with a warning; keeping them (--allow-missing-far) makes the event list
+#    one the injections cannot model, and gwcat validate refuses the pair.
+gwcat export pe store_cbc.h5 \
     --out gw_cbc.h5 \
+    --format gwcat2 --parameter-space component \
     --source-class cbc \
     --far-max 1.0 \
-    --allow-missing-far \
     --waveform-policy mixed-first \
-    --spin-prior-mode include \
-    --cosmology 67.74,0.3089 \
     --nsamp 4096 --seed 0
 
 # 5. Build the matching combined CBC selection export (no --source-class:
-#    keeps every injected class, matching the PE export's "cbc" filter)
-gwcat selection \
-    --injections ./injections/injections-O3-BBH/endo3_bbhpop-LIGO-T2100113-v12.hdf5 \
-                 ./injections/injections-O4ab/mixture-real_o4a_o4b-cartesian_spins.hdf \
+#    keeps every injected class, matching the PE export's "cbc" filter). No
+#    --H0/--Om0: each campaign's Jacobian uses its own cosmology. Check that
+#    every campaign draws the classes you export (endo3_bbhpop is a BBH
+#    population campaign).
+gwcat export selection \
+    ./injections/injections-O3-BBH/endo3_bbhpop-LIGO-T2100113-v12.hdf5 \
+    ./injections/injections-O4ab/samples-rpo4ab-1366933504-55469568-clipped.hdf \
     --out selection_cbc.h5 \
-    --far-threshold 1.0 \
-    --H0 67.74 --Om0 0.3089
+    --format gwcat2 --parameter-space component \
+    --far-threshold 1.0
 
 # 6. Validate: the cross-check confirms the PE and selection files cover the
 #    SAME source-class set (both "cbc" here) as well as matching spin-prior
 #    mode and cosmology.
-gwcat validate gw_cbc.h5 selection_cbc.h5
+gwcat validate --strict gw_cbc.h5 selection_cbc.h5
 ```
 
 To restrict to a specific mix, e.g. NSBH + BNS only, pass

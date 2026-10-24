@@ -228,6 +228,49 @@ def test_component_ppe_constant_per_event(tmp_path):
     assert bool(attrs["component_spin_prior_applied_to_p_pe"]) is True
 
 
+def test_component_samples_bound_widening_value(tmp_path):
+    """The samples_bound ceiling, checked against the SAMPLES, not against the
+    file's own recorded ceiling (review Low 79: a 1.5x widening mutant passed
+    every test).  The declared box is U(0, 0.8) on a_1, the samples reach
+    0.95: the ceiling becomes max|a_1| over the exported rows times
+    (1 + 1e-6), the inflation is max|a_1|/0.8 - 1, and p_pe carries
+    1/(4 amax_1 amax_2) at that widened value."""
+    events = [{"name": "GWsb_000001", "amax1": 0.80, "amax2": 0.99},
+              {"name": "GWsb_000002", "amax1": 0.99, "amax2": 0.99}]
+    store, _ = _build_spin_store(tmp_path, events, name="sb_store.h5")
+    with h5py.File(store, "r+") as f:
+        off = f["index/offsets"][:]
+        a1 = f["samples/a_1"][:]
+        n0 = int(off[1] - off[0])
+        a1[int(off[0]):int(off[1])] = np.linspace(0.0, 0.95, n0)
+        f["samples/a_1"][...] = a1
+    out = tmp_path / "sb.h5"
+    with pytest.warns(UserWarning, match="samples_bound"):
+        GWCatalog(store).export(str(out), format="gwcat2",
+                                spin_basis="component", nsamp=64, seed=0,
+                                cosmology=(67.74, 0.3089))
+    cols, attrs = _read(out)
+    nsamp = int(attrs["nsamp"])
+    sl = slice(0, nsamp)
+    s1 = float(np.max(np.abs(cols["a1"][sl])))
+    assert 0.8 < s1 <= 0.95
+    want_amax1 = s1 * (1.0 + 1e-6)
+    amax1 = np.asarray(attrs["spin_amax_1_per_event"], float)
+    amax2 = np.asarray(attrs["spin_amax_2_per_event"], float)
+    assert amax1[0] == pytest.approx(want_amax1, rel=1e-15)
+    assert amax2[0] == 0.99 and amax1[1] == 0.99
+    infl = np.asarray(attrs["spin_amax_inflation_per_event"], float)
+    assert infl[0] == pytest.approx(s1 / 0.8 - 1.0, rel=1e-12)
+    assert infl[1] == 0.0
+    src = [s.decode() if isinstance(s, bytes) else s
+           for s in attrs["spin_amax_source_1_per_event"]]
+    assert src == ["samples_bound", "analytic"]
+    # p_pe at the widened box, from the samples rather than the attrs.
+    np.testing.assert_allclose(
+        cols["p_pe"][sl] / (cols["m1det"][sl] * _P_DL_CONST),
+        1.0 / (4.0 * want_amax1 * 0.99), rtol=1e-12)
+
+
 # ==========================================================================
 # 2. component shares the chieff scaffold; emits a1/a2/cost1/cost2/chip
 # ==========================================================================
@@ -391,16 +434,33 @@ def test_chieff_chip_ppe_joint_prior(tmp_path):
     store, _ = _build_spin_store(tmp_path, events)
     cat = GWCatalog(store)
     out = tmp_path / "chieffchip.h5"
+    # The mismatched event is refused by default (August export-pe 3; review
+    # 2026-10-20): it used to be evaluated at amax_1 for both bodies, behind a
+    # warning, but the joint prior has one amax.
+    with pytest.raises(ValueError, match="spin_amax_1 != spin_amax_2"):
+        cat.export(str(out), format="gwcat2", spin_basis="chieff_chip",
+                   allow_projection_basis=True, nsamp=32, seed=0,
+                   cosmology=(67.74, 0.3089))
+    # The opt-in keeps the amax_1 evaluation, warned and recorded ...
     with pytest.warns(UserWarning, match="spin_amax_1 != spin_amax_2"):
         cat.export(str(out), format="gwcat2", spin_basis="chieff_chip", allow_projection_basis=True,
-                   nsamp=32, seed=0, cosmology=(67.74, 0.3089))
+                   nsamp=32, seed=0, cosmology=(67.74, 0.3089),
+                   allow_chieff_chip_amax_mismatch=True)
+    _, attrs = _read(out)
+    assert [s.decode() if isinstance(s, bytes) else s
+            for s in attrs["spin_amax_mismatch_events"]] == ["GWc4_000002"]
+    # ... and stating one ceiling explicitly exports it without a mismatch.
+    cat.export(str(out), format="gwcat2", spin_basis="chieff_chip",
+               allow_projection_basis=True, amax=0.99, nsamp=32, seed=0,
+               cosmology=(67.74, 0.3089))
 
     cols, attrs = _read(out)
     assert bool(attrs["chi_eff_chi_p_prior_applied_to_p_pe"]) is True
     amax1 = np.asarray(attrs["chi_eff_chi_p_amax_per_event"], float)
+    assert np.all(amax1 == 0.99)
     mism = [s.decode() if isinstance(s, bytes) else s
             for s in attrs["spin_amax_mismatch_events"]]
-    assert mism == ["GWc4_000002"]
+    assert mism == []
     assert "chip" in cols
 
     nsamp = int(attrs["nsamp"])
@@ -583,10 +643,15 @@ def test_rng_neutrality_chieff_fetches_no_extra_store_columns(tmp_path,
     calls = []
     orig = _SampleReader.read
 
-    def spy(self, e, params, **kw):
-        calls.append((params,) if isinstance(params, str) else tuple(params))
-        return orig(self, e, params, **kw)
+    def spy(self, e, params, rows=None, **kw):
+        if rows is not None:   # the drawn-row fetch; whole-slice reads apart
+            calls.append((params,) if isinstance(params, str)
+                         else tuple(params))
+        else:
+            whole.append(tuple(params))
+        return orig(self, e, params, rows=rows, **kw)
 
+    whole = []
     monkeypatch.setattr(_SampleReader, "read", spy)
     cat.export(str(tmp_path / "c.h5"), format="gwcat2", spin_basis="chieff",
                nsamp=32, seed=0, cosmology=(67.74, 0.3089))
@@ -595,6 +660,9 @@ def test_rng_neutrality_chieff_fetches_no_extra_store_columns(tmp_path,
     assert len(calls) == 1, f"chieff made {len(calls)} store fetches: {calls}"
     assert set(calls[0]) == set(schema.EXPORT_REQUIREMENTS["gwcat2_pe:chieff"])
     assert get_space("chieff").store_params_fetched == ()
+    # The one whole-slice read is the spin-ceiling COUNT (review High 1): the
+    # magnitudes only, before the draw, consuming no random numbers.
+    assert whole == [("a_1", "a_2")]
 
     # ... whereas component DOES fetch extras, which is why it is exempt from
     # the parity contract rather than violating it.
@@ -1092,11 +1160,17 @@ def test_pe_export_reads_only_the_rows_it_emits(tmp_path, monkeypatch):
     nsamp = 32
 
     rows_read = []
+    whole_reads = []
     orig_read = _SampleReader.read
 
     def spy_read(self, e, params, rows=None, **kw):
         out = orig_read(self, e, params, rows=rows, **kw)
-        rows_read.append(sum(np.size(v) for v in out.values()))
+        if rows is None:
+            # The spin-ceiling count (review High 1) reads the magnitudes of
+            # the whole slice before the draw; it emits nothing.
+            whole_reads.append(tuple(params))
+        else:
+            rows_read.append(sum(np.size(v) for v in out.values()))
         return out
 
     got = []
@@ -1129,8 +1203,10 @@ def test_pe_export_reads_only_the_rows_it_emits(tmp_path, monkeypatch):
     # every read is a drawn-row read, and they sum to the emitted rows x columns
     assert len(rows_read) == len(events)
     assert sum(rows_read) == nsamp * len(events) * ncols_read
-    # ... and not one whole-selection posterior fetch happened
+    # ... and not one whole-selection posterior fetch happened; the only
+    # whole-slice reads are the per-event spin-magnitude counts
     assert got == [], f"export still fetched whole slices: {got}"
+    assert whole_reads == [("a_1", "a_2")] * len(events)
 
 
 def test_pe_export_z_max_reads_dL_once_then_only_the_drawn_rows(tmp_path,
@@ -1161,7 +1237,10 @@ def test_pe_export_z_max_reads_dL_once_then_only_the_drawn_rows(tmp_path,
                    cosmology=(67.74, 0.3089))
 
     assert calls[0] == ("luminosity_distance", None)
-    assert all(n == 16 for _params, n in calls[1:])
+    # then the whole-slice spin-magnitude count (review High 1), which emits
+    # nothing, and the drawn rows only
+    assert calls[1] == (["a_1", "a_2"], None)
+    assert all(n == 16 for _params, n in calls[2:])
 
 
 def test_pe_export_emits_the_rows_the_rng_drew_from_the_full_slice(tmp_path):

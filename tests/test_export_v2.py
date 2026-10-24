@@ -28,7 +28,6 @@ import pytest
 from gwcat.catalog import GWCatalog
 from gwcat.export import (export, build_pe_product, get_exporter,
                           register_exporter, list_formats, ExportProduct)
-from gwcat.schema import MissingParameterError
 
 
 # ==========================================================================
@@ -559,19 +558,20 @@ def test_cli_export_list_spaces(capsys):
     assert "projection" in out and "bijective" in out
 
 
-def test_missing_parameter_error_names_the_usable_spaces(tmp_path):
+def test_missing_parameter_error_names_the_usable_spaces(tmp_path, capsys):
     """A chi_eff-only store must say what it CAN export, not only what it lacks.
 
     With `component` the shared default this is the first error such a store
-    produces, so it has to be a signpost rather than a wall.
+    produces, so it has to be a signpost rather than a wall.  The CLI prints it
+    as a one-line error (exit 1) rather than a traceback.
     """
     from gwcat.cli import main
 
     store = _build_store(tmp_path)
-    with pytest.raises(MissingParameterError) as ei:
-        main(["export", "pe", store, "--out", str(tmp_path / "x.h5"),
-              "--cosmology", "67.74,0.3089", "--nsamp", "8"])
-    msg = str(ei.value)
+    rc = main(["export", "pe", store, "--out", str(tmp_path / "x.h5"),
+               "--cosmology", "67.74,0.3089", "--nsamp", "8"])
+    assert rc == 1
+    msg = capsys.readouterr().err
     assert "a_1" in msg                    # what is missing
     assert "chieff" in msg                 # what would work instead
     assert "--parameter-space" in msg      # how to ask for it

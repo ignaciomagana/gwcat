@@ -8,8 +8,10 @@ Three stages:
 Or all at once:
   gwcat.fetch.fetch_and_build(["GWTC-2.1", "GWTC-3", "GWTC-4.1", "GWTC-5"], out="store.h5")
 
-The (m1det, q, dL)-basis mass Jacobian is applied ONLY in
-GWCatalog.to_darksirens; the store stays mass-prior-agnostic.
+The (m1det, q, dL)-basis mass Jacobian is applied at export only: by
+GWCatalog.to_darksirens (v1) and by the gwcat2 PE builder behind
+GWCatalog.export (gwcat.export.build_pe_product). The store stays
+mass-prior-agnostic.
 (_to_darksirens_format is a deprecated alias kept for compatibility.)
 """
 # THE version authority for the package: pyproject.toml declares

@@ -1,31 +1,33 @@
 """Canonical BBH event whitelist for gwcat — O1 through O4b (GWTC-5.0).
 
-Two modes of operation
-----------------------
-1. **Dynamic** (preferred): call `fetch_bbh_list()` at runtime, which queries
-   the GWOSC v2 API for all events with source-frame secondary mass above the
-   selected threshold, restricted to the LVK GWTC catalogs, then applies the
-   explicit non-BBH exclusion guard.  It falls back to the static list when the
-   network fails; `fetch_bbh_list_with_source()` returns which of the two you
-   got, and `require_live=True` turns a failure into an error instead.
+Two lists, which are NOT the same sample
+-----------------------------------------
+1. **Static, curated** (the population sample): `BBH_ALL`, populated from the
+   GWTC-3/GWTC-4.1/GWTC-5.0 population data-release event lists (FAR < 1/yr),
+   with known BNS/NSBH/non-BBH names removed by `NON_BBH_EXCLUSIONS`.  Use it
+   for any population or cosmology analysis; it is reproducible and offline.
 
-2. **Static fallback**: use `BBH_ALL` directly when offline or for
-   reproducibility. The static list is populated from the GWTC-3/GWTC-4.1/
-   GWTC-5.0 population data-release event lists, with known BNS/NSBH/non-BBH
-   names removed by `NON_BBH_EXCLUSIONS`.
+2. **Live, mass threshold**: `fetch_bbh_list()` queries the GWOSC v2 API for
+   every confident event with source-frame secondary mass above the threshold,
+   restricted to the LVK GWTC catalogs, then applies the exclusion guard.  It
+   applies NO FAR cut (14 confident BBH-mass events have FAR >= 1/yr), so it is
+   a candidate list for refreshing the curated one, not a population sample.
+   It falls back to the static list when the network fails;
+   `fetch_bbh_list_with_source()` returns which of the two you got, and
+   `require_live=True` turns a failure into an error instead.
 
 Usage
 -----
     from gwcat.bbh_allowed_names import BBH_ALL, fetch_bbh_list
 
-    # Dynamic — always up to date:
-    bbh_names = fetch_bbh_list()            # queries GWOSC live
-    cat.select(compact_type="BBH", allowed_names=bbh_names)
-
-    # Static — reproducible / offline:
+    # The population sample -- reproducible / offline:
     cat.select(compact_type="BBH", allowed_names=BBH_ALL)
 
-    # Refresh the static list and print it (run once, paste result back):
+    # Live candidates (no FAR cut; NOT a population sample):
+    candidates = fetch_bbh_list()           # queries GWOSC live
+
+    # Print the live list in the data-file format, to update the curated
+    # lists under gwcat/data/event_lists/ by hand:
     refresh_bbh_list()
 
 GWTC-5.0 context (arxiv:2605.27225, submitted 26 May 2026)
@@ -34,7 +36,7 @@ GWTC-5.0 context (arxiv:2605.27225, submitted 26 May 2026)
 - 104 O4b events, the full official Event_list/GWTC5_BBH.txt
 - Combined O1–O4b: 259 BBH events with PE measurements
 - Explicit non-BBH exclusions include BNS/NSBH events such as
-  GW190425_232155, GW200105_162426, GW200115_042309,
+  GW190425_081805, GW200105_162426, GW200115_042309,
   GW230518_125908, and GW230529_181500, plus the GW190814_211039
   lower-mass-gap system (excluded from the BBH population sample)
 """
@@ -79,7 +81,8 @@ def _read_event_list_file(fname: str) -> list[str]:
     if not path.exists():
         path = Path(__file__).parent.joinpath(*_EVENT_LIST_DIRNAME, fname)
     names: list[str] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    # utf-8-sig: a byte-order mark must not become part of the first name.
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
         line = line.split("#", 1)[0].strip()
         if line:
             names.append(line)
@@ -302,6 +305,7 @@ def get_bbh_allowed_names(
     store_path: Optional[Union[str, Path]] = None,
     prefer_gwosc: bool = True,
     expected: int = EXPECTED_BBH_TOTAL,
+    adopt_live_list: bool = False,
 ) -> list[str]:
     """Return the best available BBH allowed-name list for catalog selection.
 
@@ -313,9 +317,18 @@ def get_bbh_allowed_names(
 
     If ``store_path`` is supplied, names in ``index/event_names`` whose matching
     ``meta/catalog`` entry identifies GWTC-5/O4b are also added.  Finally, when
-    ``prefer_gwosc`` is true, the live GWOSC BBH list replaces the curated
-    combination only when it is a strict superset of it -- i.e. it adds events
-    without dropping any curated population member.
+    ``prefer_gwosc`` is true, the live GWOSC BBH list is consulted: the names
+    it adds to the curated combination are reported, and it REPLACES the
+    curated combination only when ``adopt_live_list=True`` and it is a strict
+    superset of it -- i.e. it adds events without dropping any curated
+    population member.
+
+    ``adopt_live_list`` defaults to False (review 2026-10-20).  The live list
+    is a secondary-mass threshold with no FAR cut, while the curated list is
+    the FAR < 1/yr population sample, so the superset rule alone let a live
+    list holding sub-threshold candidates (GW200322_091133 at 140/yr)
+    redefine the sample, and a later ``select(allowed_names=...)`` applies no
+    FAR cut to make up for it.  Apply your own FAR cut before adopting one.
 
     That condition is the point (GW-15).  It used to be ``len(gwosc) >=
     len(combined)``: a live list merely *as long* as the curated one replaced
@@ -352,9 +365,26 @@ def get_bbh_allowed_names(
             if source == "gwosc":
                 gwosc_names = set(live_names) - NON_BBH_EXCLUSIONS
                 dropped = combined - gwosc_names
-                if not dropped:
+                added = sorted(gwosc_names - combined)
+                if not dropped and adopt_live_list:
                     final = set(gwosc_names)
                     gwosc_used = True
+                    if added:
+                        warnings.warn(
+                            "get_bbh_allowed_names: adopted the live GWOSC "
+                            f"list (adopt_live_list=True), adding {len(added)} "
+                            f"name(s) to the curated population list: "
+                            f"{added[:10]}. The live list applies no FAR cut; "
+                            "these events are not checked against FAR < 1/yr.")
+                elif not dropped:
+                    if added:
+                        warnings.warn(
+                            "get_bbh_allowed_names: keeping the curated BBH "
+                            f"list; the live GWOSC list adds {len(added)} "
+                            f"name(s) not in it ({added[:10]}), but it is a "
+                            "secondary-mass threshold with NO FAR cut, so they "
+                            "are not adopted. Apply a FAR cut yourself and pass "
+                            "adopt_live_list=True to adopt them.")
                 else:
                     warnings.warn(
                         "get_bbh_allowed_names: keeping the curated BBH list; "
@@ -431,6 +461,10 @@ def fetch_bbh_list(m2_min: float = 3.0, verbose: bool = True,
     PE measurements present, restricted to the LVK GWTC catalogs. Explicitly
     known non-BBH exclusions are removed from the returned live list.
 
+    This is a mass threshold with NO FAR cut, so it is not the population
+    sample (:data:`BBH_ALL`, FAR < 1/yr): it is the candidate list a refresh
+    of the curated one starts from.
+
     Falls back to the static BBH_ALL (with a warning) if the network is
     unavailable, unless ``require_live=True``.  Callers that must not confuse
     the two should use :func:`fetch_bbh_list_with_source`, which says which one
@@ -445,19 +479,70 @@ def fetch_bbh_list(m2_min: float = 3.0, verbose: bool = True,
     return names
 
 
-def refresh_bbh_list(m2_min: float = 3.0) -> list:
-    """Query GWOSC, print the result as Python code, and return the list.
+#: GPS - UTC, in seconds, from each date on (the leap seconds since 2012).
+_GPS_MINUS_UTC = (("2012-07-01", 16), ("2015-07-01", 17), ("2017-01-01", 18))
 
-    Run this once when online after GWOSC indexes GWTC-5.0 to get the list you
-    can paste back into BBH_O4B above.
+#: Which bundled data file holds each run's BBH names.
+_RUN_LIST_FILE = {"O1": "bbh_o1o2.txt", "O2": "bbh_o1o2.txt",
+                  "O3a": "bbh_o3a.txt", "O3b": "bbh_o3b.txt",
+                  "O4a": "bbh_o4a.txt", "O4b": "bbh_o4b.txt"}
+
+
+def _run_of_event_name(name: str) -> Optional[str]:
+    """The observing run an event name's UTC timestamp falls in, or None.
+
+    Uses the official run windows of :mod:`gwcat.observing_runs`
+    (``EXPOSURE_WINDOWS_GPS``).  A short name (``GWyymmdd``) is placed at the
+    start of its day.  Name prefixes cannot do this: O4a ran until
+    2024-01-16, so ``GW2401xx`` events are O4a while ``GW2404xx`` ones are O4b.
+    """
+    from datetime import datetime, timezone
+    from .observing_runs import EXPOSURE_WINDOWS_GPS
+    m = re.fullmatch(r"GW(\d{2})(\d{2})(\d{2})(?:_(\d{2})(\d{2})(\d{2}))?",
+                     str(name))
+    if not m:
+        return None
+    yy, mo, dd = (int(m.group(i)) for i in (1, 2, 3))
+    hh, mi, ss = (int(m.group(i) or 0) for i in (4, 5, 6))
+    try:
+        t = datetime(2000 + yy, mo, dd, hh, mi, ss, tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    leap = 0
+    for since, n in _GPS_MINUS_UTC:
+        if t >= datetime.fromisoformat(since).replace(tzinfo=timezone.utc):
+            leap = n
+    gps = (t - datetime(1980, 1, 6, tzinfo=timezone.utc)).total_seconds() + leap
+    for run, (lo, hi) in EXPOSURE_WINDOWS_GPS.items():
+        if lo <= gps <= hi:
+            return run
+    return None
+
+
+def refresh_bbh_list(m2_min: float = 3.0) -> list:
+    """Query GWOSC, print the result in the bundled data-file format, and
+    return the list.
+
+    The BBH lists live as plain-text files under ``gwcat/data/event_lists/``
+    (one name per line; see ``provenance.yaml``), not as Python literals.
+    This prints, per observing run, the live names that the run's bundled
+    file does not hold yet, assigning each name to its run by the UTC
+    timestamp in the name against the official run windows (review
+    2026-10-20: a GW24x/GW25x prefix put the three January-2024 O4a events
+    into the O4b block, and the output asked for a paste into a Python
+    literal that no longer exists).  The live list applies no FAR cut, so
+    check every new name against the population Event_list before adding it.
 
     Raises rather than falling back to the static list if the query fails: this
     function exists to replace the static list, so silently printing the static
     list back is the one output that must never happen (GW-15).
 
     Since GW-15 the live query is restricted to the LVK GWTC catalogs, so it
-    returns the LVK-only sample (~244 names) rather than the 286 that
-    third-party catalogs inflated it to.
+    returns the LVK-only sample rather than the 286 names that third-party
+    catalogs inflated it to.  Since the 2026-10-20 review it reads every event
+    version (no ``lastver``), so the LVK versions of the O3a events whose latest
+    GWOSC version is a third-party one count again: about 272 names are
+    expected (the 2026-09-24 cumulative table), not the ~244 measured before.
 
     Example::
 
@@ -465,21 +550,32 @@ def refresh_bbh_list(m2_min: float = 3.0) -> list:
     """
     names = fetch_bbh_list(m2_min=m2_min, verbose=True, require_live=True)
     names = sorted(set(names) - NON_BBH_EXCLUSIONS)
-    # Separate out O4b events (GW24* and GW25*)
-    o4b = sorted(n for n in names if n.startswith(("GW240", "GW241", "GW242", "GW250", "GW251")))
-    known = set(BBH_O1O2 + BBH_O3A + BBH_O3B + BBH_O4A) - NON_BBH_EXCLUSIONS
-    new_other = sorted(n for n in names if n not in known and n not in o4b)
+    bundled = {"bbh_o1o2.txt": set(BBH_O1O2), "bbh_o3a.txt": set(BBH_O3A),
+               "bbh_o3b.txt": set(BBH_O3B), "bbh_o4a.txt": set(BBH_O4A),
+               "bbh_o4b.txt": set(BBH_O4B)}
+    by_file: dict = {}
+    unplaced = []
+    for n in names:
+        run = _run_of_event_name(n)
+        if run is None:
+            unplaced.append(n)
+            continue
+        by_file.setdefault(_RUN_LIST_FILE[run], []).append(n)
 
-    print(f"\n# Total BBH from GWOSC: {len(names)}")
-    print(f"# O4b (GW24x/GW25x): {len(o4b)}")
-    if new_other:
-        print(f"# Other new events not in static list: {new_other}")
-    print("\n# Paste this into BBH_O4B:")
-    print("BBH_O4B = [")
-    for i, n in enumerate(o4b):
-        comma = "," if i < len(o4b) - 1 else ""
-        print(f'    "{n}"{comma}')
-    print("]")
+    print(f"\n# Total BBH from GWOSC: {len(names)} (no FAR cut: check every "
+          f"new name against the population Event_list before adding it)")
+    for fname in ("bbh_o1o2.txt", "bbh_o3a.txt", "bbh_o3b.txt",
+                  "bbh_o4a.txt", "bbh_o4b.txt"):
+        live = by_file.get(fname, [])
+        new = [n for n in live if n not in bundled[fname]]
+        print(f"\n# gwcat/data/event_lists/{fname}: {len(live)} live, "
+              f"{len(new)} not in the file yet"
+              + ("; append these lines:" if new else "."))
+        for n in new:
+            print(n)
+    if unplaced:
+        print(f"\n# Outside every official run window (not placed): "
+              f"{unplaced}")
     return names
 
 
