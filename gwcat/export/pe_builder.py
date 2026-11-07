@@ -96,6 +96,7 @@ import numpy as np
 # from one place (SelectionSpec.check_pairable raises it).
 from ..catalog import UnpairableSelectionCut  # noqa: F401
 from ..cosmology import make_cosmology, z_of_dL
+from ..mixed_spin_prior import PER_SAMPLE_AMAX_PARAMS, PER_SAMPLE_META_FIELD
 from ..release_cosmology import identify_bundled_tables
 from ..params import (DEFAULT_PARAMETER_SPACE, PEContext,
                       block_prior_factor_pe, get_space)
@@ -519,12 +520,26 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     cmix_avail = (sub.param_available("p_mass_dL_pe") if has_cmix_col
                   else np.zeros(sub.n_events, dtype=bool))
 
+    # Per-sample spin ceilings of a combined set's own analyses (owner,
+    # 7 Nov 2026; gwcat.mixed_spin_prior): a C01:Mixed row's IMRPhenomXPHM
+    # samples were drawn under U(0, 0.99), its SEOBNRv4PHM samples under
+    # U(0, 1).  The component basis divides each sample by its own box; the
+    # projection bases keep the event's declared ceiling, as before.  Read
+    # after the draw, like every column, so the rng stream is untouched.
+    has_ps_amax = all(p in sub._param_index for p in PER_SAMPLE_AMAX_PARAMS)
+    ps_amax_avail = ((sub.param_available(PER_SAMPLE_AMAX_PARAMS[0])
+                      & sub.param_available(PER_SAMPLE_AMAX_PARAMS[1]))
+                     if has_ps_amax else np.zeros(sub.n_events, dtype=bool))
+    use_ps_amax = spin_basis == "component" and forced_amax is None
+
     def _read_plan(e):
         """The columns event ``e`` will actually be asked for."""
         plan = need + [p for p in extra_params
                        if p not in need and extra_avail[p][e]]
         if _mass_kind(e) == CONSTITUENT_MIXTURE:
             plan = plan + ["p_mass_dL_pe"]
+        if use_ps_amax and ps_amax_avail[e]:
+            plan = plan + list(PER_SAMPLE_AMAX_PARAMS)
         return plan
 
     # ── Resolve cosmology: per-event (default) or a single override ─────────
@@ -676,6 +691,10 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                     else None)
 
         kept_amax1, kept_amax2 = [], []
+        #: Per-sample ceilings of each kept event's drawn rows (None where the
+        #: event's one box applies), and their provenance.
+        kept_ps_amax1, kept_ps_amax2, kept_ps_prov = [], [], []
+        ps_amax_events = []
         amax_src1_list, amax_src2_list, amax_infl_list = [], [], []
         samples_bound_events = []
         fallback_events, unrecognized_events, mismatch_events = [], [], []
@@ -733,6 +752,9 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
     sel_cfg_amax = (_meta_str_sel("spin_amax_config_per_constituent")
                     or [""] * sub.n_events)
     kept_cfg_amax = []
+    # The store's provenance of each row's per-sample spin ceilings.
+    sel_ps_prov = ((_meta_str_sel(PER_SAMPLE_META_FIELD) if has_ps_amax
+                    else None) or [""] * sub.n_events)
     # Which implementation evaluated each event's p_dL_pe AT INGEST (GW-40i:
     # "exact" by default; "bilby"/"astropy"/"analytic" in older stores or under
     # --legacy-grid-priors).  A meta read, like the provenance above.
@@ -1054,6 +1076,40 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                 src1 = src2 = ("caller" if forced_amax is not None
                                else "fallback" if used_fallback else "analytic")
                 infl1 = infl2 = 0.0
+                # ── Each sample's own analysis's ceiling (owner, 7 Nov 2026) ──
+                # A combined set annotated with per-sample ceilings
+                # (gwcat.mixed_spin_prior) needs no widened box: every row
+                # lies inside its own analysis's prior, and a row that does
+                # not is out of support (the GW-03 gate refuses it).  The
+                # event-level ceiling recorded is their envelope.
+                ps1_e = ps2_e = None
+                if use_ps_amax and ps_amax_avail[e]:
+                    ps1_e = np.asarray(drawn[PER_SAMPLE_AMAX_PARAMS[0]],
+                                       dtype=float)
+                    ps2_e = np.asarray(drawn[PER_SAMPLE_AMAX_PARAMS[1]],
+                                       dtype=float)
+                    if not (np.all(np.isfinite(ps1_e))
+                            and np.all(np.isfinite(ps2_e))
+                            and np.all(ps1_e > 0) and np.all(ps2_e > 0)):
+                        raise ValueError(
+                            f"{name}: the store marks per-sample spin "
+                            f"ceilings available but a drawn row's is not a "
+                            f"positive number.")
+                    a1max, a2max = float(ps1_e.max()), float(ps2_e.max())
+                    src1 = src2 = "per_sample_constituent"
+                    ps_amax_events.append(str(name))
+                kept_ps_amax1.append(ps1_e)
+                kept_ps_amax2.append(ps2_e)
+                if ps1_e is None:
+                    kept_ps_prov.append("")
+                else:
+                    _pv = json.loads(sel_ps_prov[e] or "{}")
+                    _u, _c = np.unique(np.stack([ps1_e, ps2_e], 1), axis=0,
+                                       return_counts=True)
+                    _pv["drawn_rows_per_ceiling"] = [
+                        [float(a), float(b), int(c)]
+                        for (a, b), c in zip(_u, _c)]
+                    kept_ps_prov.append(json.dumps(_pv, sort_keys=True))
                 # ONLY for a flat-box (bijection-like) prior.  Widening the box
                 # changes just the per-event constant 1/(4*amax_1*amax_2), which
                 # cancels in the consumer's per-event normalisation -- so it is
@@ -1066,13 +1122,15 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                 # GW-03 support gate instead, which is the honest outcome: a
                 # projection cannot be built against a prior whose support does not
                 # contain the samples.
-                if spin_basis == "component" and a1_e is not None and np.size(a1_e):
+                if (spin_basis == "component" and ps1_e is None
+                        and a1_e is not None and np.size(a1_e)):
                     s1 = float(np.nanmax(np.abs(np.asarray(a1_e, float))))
                     if np.isfinite(s1) and s1 > a1max:
                         infl1 = s1 / a1max - 1.0
                         a1max = s1 * (1.0 + 1e-6)
                         src1 = "samples_bound"
-                if spin_basis == "component" and a2_e is not None and np.size(a2_e):
+                if (spin_basis == "component" and ps2_e is None
+                        and a2_e is not None and np.size(a2_e)):
                     s2 = float(np.nanmax(np.abs(np.asarray(a2_e, float))))
                     if np.isfinite(s2) and s2 > a2max:
                         infl2 = s2 / a2max - 1.0
@@ -1200,6 +1258,17 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
                          context=f"gwcat-pe-2.0 export (spin_basis="
                                  f"{spin_basis!r})")
 
+    if (need_amax and has_ps_amax and not use_ps_amax
+            and bool(np.any(ps_amax_avail))):
+        warnings.warn(
+            f"spin_basis={spin_basis!r}"
+            f"{' with a forced amax' if forced_amax is not None else ''}: "
+            f"{int(np.sum(ps_amax_avail))} selected event(s) carry per-sample "
+            f"spin ceilings of their constituent analyses (combined sets whose "
+            f"constituents were sampled under different spin priors); only "
+            f"the component basis applies them, so this export divides each "
+            f"of those events by one ceiling, as before.")
+
     # ── Spin-basis-specific step (columns + p_pe spin factor) ───────────────
     spin_attrs: dict = {}
     # Per-event ceilings, resolved above, broadcast to one value per sample.
@@ -1212,6 +1281,15 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         amax2_arr = np.asarray(kept_amax2, dtype=float)
         amax1_ps = (np.repeat(amax1_arr, nsamp) if nobs else np.array([]))
         amax2_ps = (np.repeat(amax2_arr, nsamp) if nobs else np.array([]))
+        if ps_amax_events:
+            # Annotated events carry each drawn row's own ceiling; the rest
+            # keep their one box, bit for bit the broadcast above.
+            amax1_ps = np.concatenate([
+                np.full(nsamp, a) if p is None else p
+                for p, a in zip(kept_ps_amax1, amax1_arr)])
+            amax2_ps = np.concatenate([
+                np.full(nsamp, a) if p is None else p
+                for p, a in zip(kept_ps_amax2, amax2_arr)])
         #: The file-level chi_eff support bound: max(amax_1, amax_2) over events.
         amax_bound = (float(max(amax1_arr.max(), amax2_arr.max()))
                       if nobs else float(forced_amax if forced_amax is not None
@@ -1360,6 +1438,14 @@ def build_pe_product(cat, *, spin_basis=DEFAULT_PARAMETER_SPACE,
         }
         if spin_basis == "component":
             spin_attrs["component_spin_prior_applied_to_p_pe"] = True
+            if has_ps_amax:
+                # Which events divide each sample by its own analysis's box
+                # (gwcat.mixed_spin_prior), with the store's attribution and
+                # the drawn rows per ceiling ("" for a one-box event).
+                spin_attrs["spin_prior_per_sample_events"] = np.array(
+                    ps_amax_events, dtype=_str)
+                spin_attrs["spin_prior_per_sample_per_event"] = np.array(
+                    kept_ps_prov, dtype=_str)
         else:  # chieff_chip
             spin_attrs["chi_eff_chi_p_prior_applied_to_p_pe"] = True
             spin_attrs["chi_eff_chi_p_amax_per_event"] = amax1_arr

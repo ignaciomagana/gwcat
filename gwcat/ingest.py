@@ -255,6 +255,10 @@ META_FLOAT_FIELDS += ["dL_prior_ks_threshold", "dL_prior_n_prior_samples",
                       "dL_prior_frac_samples_outside",
                       "dL_prior_bounds_pvalue"]
 META_STR_FIELDS += ["spin_sample_max_per_constituent"]
+# How each sample of a combined set was given its own analysis's spin prior
+# (owner, 7 Nov 2026; gwcat.mixed_spin_prior): JSON per row, "" for a row that
+# is not a combined set.
+META_STR_FIELDS += ["spin_prior_per_sample"]
 # How observing_run was assigned: "gps_exposure_windows" (median GPS time in
 # gwcat's official run table), "gps_outside_exposure_windows" (observing_run
 # ""), or "event_name" (no GPS time; the name's date).  Review 2026-10-20,
@@ -300,6 +304,14 @@ class IngestConfig:
     #: each row by its own constituent's prior.  An owner decision: recorded
     #: in every mixture row's mass/dL prior source, default unchanged.
     constituent_mixture_convention: str = "equal_weight"
+    #: Give each sample of a combined (``Mixed``) set the spin-magnitude
+    #: ceiling of the analysis it came from, as the store columns
+    #: ``spin_prior_amax_1/2`` (owner, 7 Nov 2026; :mod:`gwcat.mixed_spin_prior`).
+    #: Written only for a row whose constituents' ceilings differ (GWTC-2.1/3
+    #: C01:Mixed: IMRPhenomXPHM U(0, 0.99), SEOBNRv4PHM U(0, 1)); the
+    #: component-basis export reads them.  A row that cannot be attributed is
+    #: warned about and keeps the one ceiling, as before.
+    per_sample_spin_prior: bool = True
     validate_prior: bool = True
     compression: str = "gzip"
     #: Which UniformSourceFrame implementation evaluates p_dL_pe (GW-01).
@@ -1662,6 +1674,74 @@ def constituent_spin_amax_config(data, analysis, analyses, constituents=()):
     return _json.dumps(out, sort_keys=True)
 
 
+def _own_config_spin_amax(data, analysis):
+    """``(a1_max, a2_max)`` ``analysis``'s OWN config declares, or None (no
+    sibling search: a constituent's prior is its own)."""
+    cfg_all = getattr(data, "config", None)
+    if not isinstance(cfg_all, dict):
+        return None
+    try:
+        cfgd = cfg_all.get(analysis)
+    except Exception:
+        return None
+    eng = cfgd.get("engine") if isinstance(cfgd, dict) else None
+    if not isinstance(eng, dict):
+        return None
+    vals = [_config_float(eng.get(k)) for k in _CONFIG_SPIN_KEYS]
+    if any(v is None for v in vals):
+        return None
+    return float(vals[0]), float(vals[1])
+
+
+def _per_sample_spin_prior(name, analysis, analyses, samples_dict, priors,
+                           data, constituents, mixed_samples, rec):
+    """Add a combined row's per-sample spin ceilings to ``rec`` (see
+    :mod:`gwcat.mixed_spin_prior`); return the row's provenance JSON."""
+    from .mixed_spin_prior import (MixedSpinPriorError,
+                                   PER_SAMPLE_AMAX_PARAMS, SPIN_KEYS, TIME_KEY,
+                                   resolve_mixed_spin_prior)
+    from .constituent_mixture import MATCH_KEYS
+    prefix = _label_parts(analysis)[0]
+    labs = list(constituents) or [
+        an for an in analyses if an != analysis
+        and _label_parts(an)[0] == prefix
+        and not _is_combined_base(_label_parts(an)[1])]
+    cols = MATCH_KEYS + (TIME_KEY,) + SPIN_KEYS
+
+    def _cols(smp):
+        if smp is None:
+            return None
+        return {c: np.asarray(smp[c], dtype=np.float64) for c in cols
+                if c in smp}
+
+    an_pri = (priors.get("analytic", {}) if isinstance(priors, dict) else {})
+    analytic, config, cons = {}, {}, {}
+    for lab in labs:
+        smp = samples_dict.get(lab) if hasattr(samples_dict, "get") else None
+        cons[lab] = _cols(smp)
+        node = an_pri.get(lab) if isinstance(an_pri, dict) else None
+        got = []
+        for k in SPIN_KEYS:
+            p = (_parse_analytic_spin(node[k]) if isinstance(node, dict)
+                 and k in node else None)
+            got.append(p[2] if p is not None and p[0] == "Uniform" else None)
+        analytic[lab] = (None if any(g is None for g in got)
+                         else (float(got[0]), float(got[1])))
+        config[lab] = _own_config_spin_amax(data, lab)
+    try:
+        msp = resolve_mixed_spin_prior(_cols(mixed_samples), cons, analytic,
+                                       config)
+    except MixedSpinPriorError as exc:
+        warnings.warn(f"{name} [{analysis}]: its samples keep one spin "
+                      f"ceiling: {exc}")
+        return json.dumps({"status": "unresolved", "reason": str(exc)})
+    if msp is None:
+        return json.dumps({"status": "single_ceiling"})
+    rec[PER_SAMPLE_AMAX_PARAMS[0]] = msp.amax_1
+    rec[PER_SAMPLE_AMAX_PARAMS[1]] = msp.amax_2
+    return msp.to_json()
+
+
 def constituent_spin_sample_max(analysis, analyses, samples_dict,
                                 constituents=()):
     """JSON ``{constituent: [max|a_1|, max|a_2|] | null}`` for a Mixed label.
@@ -2940,6 +3020,13 @@ def build_store(paths, out_path, params=None, extra_params=None,
                         msg + " Refused (mixed_prior_mismatch='raise'); use "
                         "constituent_mixture_prior=True or exclude the row.")
                 warnings.warn(msg)
+            # ── Each sample's own analysis's spin prior (owner, 7 Nov 2026) ──
+            ps_prov = ""
+            if (cfg.per_sample_spin_prior
+                    and _is_combined_base(_label_parts(analysis)[1])):
+                ps_prov = _per_sample_spin_prior(
+                    name, analysis, analyses, samples_dict, priors, data,
+                    constituents, s, rec)
             records.append((name, n, rec))
 
             # metadata
@@ -3018,6 +3105,7 @@ def build_store(paths, out_path, params=None, extra_params=None,
             meta["mixed_constituent_priors"].append(mixed_priors)
             meta["spin_sample_max_1"].append(float(sp.sample_max_1))
             meta["spin_sample_max_2"].append(float(sp.sample_max_2))
+            meta["spin_prior_per_sample"].append(ps_prov)
             meta["spin_sample_max_per_constituent"].append(
                 constituent_spin_sample_max(analysis, analyses, samples_dict,
                                             constituents))
@@ -3193,6 +3281,9 @@ def build_store(paths, out_path, params=None, extra_params=None,
     # ``params`` that omitted them (a column absent from every rec is dropped by
     # _assemble_union, so this is harmless when nothing was derived).
     candidate_params = list(params) + ["p_dL_pe", "p_mass_dL_pe"]
+    from .mixed_spin_prior import PER_SAMPLE_AMAX_PARAMS
+    candidate_params += [p for p in PER_SAMPLE_AMAX_PARAMS
+                         if p not in candidate_params]
     for p in ("cos_tilt_1", "cos_tilt_2", "chi_p"):
         if p not in candidate_params:
             candidate_params.append(p)
