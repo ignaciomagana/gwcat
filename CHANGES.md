@@ -1,5 +1,43 @@
 # Changes
 
+## Each O3 Mixed sample divided by its own analysis's spin prior (2026-11-07)
+
+Owner's decision of 7 Nov 2026. GWTC-2.1/3 `C01:Mixed` concatenates
+`C01:IMRPhenomXPHM` samples, drawn under `a_i ~ U(0, 0.99)`, and
+`C01:SEOBNRv4PHM` (RIFT) samples, whose magnitudes run to 1: every one of the
+72 releases with that constituent has samples above 0.99, and their pooled
+density is flat through the configured 0.99 (the samples show that upper edge;
+a uniform-magnitude, isotropic prior below it is assumed, as for XPHM). The
+component-basis export gave the whole set one box per spin, 0.99 widened to
+the largest drawn magnitude of that spin where it exceeds 0.99
+(`spin_amax_source = samples_bound`). On a widened spin every XPHM row carried
+the wrong box; on a spin left at 0.99 every SEOBNRv4PHM row did, by the same
+ratio the other way: 0.99 / 1, about 1% of a row's weight per misdescribed
+spin (of the 48 such events among the 249 the population analyses use, spin 1
+was widened in 34 and spin 2 in 46). This is the Mixed-set half of option 2 of
+the review's open decisions below.
+
+- `gwcat/mixed_spin_prior.py`: attributes every Mixed row to its constituent
+  (exact row match; RIFT's fixed `geocent_time`; the remainder to the only
+  other constituent; a combined set whose release holds one analysis is that
+  analysis) with the rules cross-checked, resolves each constituent's
+  ceiling (analytic prior, else config, else the Kerr bound when its samples
+  exceed the configured ceiling), and refuses what it cannot verify.
+- Ingest writes the per-sample ceilings as the store columns
+  `spin_prior_amax_1/2` for a combined row whose constituents' ceilings
+  differ, with `meta/spin_prior_per_sample` (default on:
+  `IngestConfig.per_sample_spin_prior`).
+- `gwcat annotate-spin-priors STORE --out NEW --pe-dir DIR` adds them to an
+  existing store from its release files; every other dataset is copied
+  unchanged. It exits 2 (the store still written) when a requested combined
+  row is left unresolved.
+- The component-basis PE export divides each such sample by its own box
+  (`spin_amax_source = per_sample_constituent`, the event-level ceiling their
+  envelope; new attrs `spin_prior_per_sample_events` and
+  `spin_prior_per_sample_per_event`). A store without the columns exports
+  exactly as before. The projection bases (chieff, chieff_chip) keep one
+  ceiling per event, as before, and warn.
+
 ## Review fixes (2026-10-20)
 
 A review of gwcat at 3ba1dbf on 2026-10-20 confirmed 144 findings. They were

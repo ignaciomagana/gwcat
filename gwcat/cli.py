@@ -150,6 +150,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="Ingest raw PESummary cosmo files into a store.h5 "
              "(see `%s ingest --help`)." % PROG)
 
+    # -- annotate-spin-priors ---------------------------------------------
+    p_ann = sub.add_parser(
+        "annotate-spin-priors",
+        help="Copy a store with each combined (Mixed) row's per-sample spin "
+             "ceilings added from its release file: every sample is divided "
+             "by its own analysis's spin prior in a component-basis export. "
+             "Exits 2 (the new store still written) when a requested combined "
+             "row is left unresolved.")
+    p_ann.add_argument("store", help="The store.h5 to read (never modified).")
+    p_ann.add_argument("--out", required=True,
+                       help="The new store.h5 (must not exist).")
+    p_ann.add_argument("--pe-dir", action="append", required=True,
+                       help="Directory searched (recursively) for the release "
+                            "files named in meta/file_name; repeatable.")
+    p_ann.add_argument("--event", action="append", default=None,
+                       help="Annotate only these events (repeatable); default "
+                            "every combined row.")
+    p_ann.add_argument("--summary", default=None,
+                       help="Write the per-row result as JSON here.")
+
     # -- inspect --------------------------------------------------------
     p_inspect = sub.add_parser(
         "inspect",
@@ -581,6 +601,31 @@ def _selection_cosmology_kwargs(args) -> dict:
     return kwargs
 
 
+def _cmd_annotate_spin_priors(args) -> int:
+    import json as _json
+    from .mixed_spin_prior import annotate_store
+    summ = annotate_store(args.store, args.out, args.pe_dir, names=args.event)
+    if args.summary:
+        with open(args.summary, "w") as fh:
+            _json.dump(summ, fh, indent=1, sort_keys=True)
+    rows = summ["rows"]
+    stat = {}
+    for v in rows.values():
+        stat[v.get("status", "?")] = stat.get(v.get("status", "?"), 0) + 1
+    print(f"{args.out}: {summ['n_rows_annotated']} combined row(s) carry "
+          f"per-sample spin ceilings; statuses {stat}")
+    bad = [k for k, v in rows.items() if v.get("status") == "unresolved"]
+    for k in bad:
+        print(f"  unresolved: {k}: {rows[k].get('reason')}")
+    if bad:
+        # The store is written (an unresolved row keeps its one box, as
+        # before), but the caller asked for every row's own spin prior.
+        print(f"{PROG} annotate-spin-priors: {len(bad)} combined row(s) "
+              f"unresolved", file=sys.stderr)
+        return 2
+    return 0
+
+
 def _cmd_inspect(args) -> int:
     from .catalog import GWCatalog
     from .validation_summary import (summarize_catalog, _json_default,
@@ -943,6 +988,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         if args.command == "inspect":
             return _cmd_inspect(args)
+        if args.command == "annotate-spin-priors":
+            return _cmd_annotate_spin_priors(args)
         if args.command == "export-darksirens":
             return _cmd_export_darksirens(args)
         if args.command == "export":
