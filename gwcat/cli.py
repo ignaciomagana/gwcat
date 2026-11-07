@@ -155,7 +155,9 @@ def build_parser() -> argparse.ArgumentParser:
         "annotate-spin-priors",
         help="Copy a store with each combined (Mixed) row's per-sample spin "
              "ceilings added from its release file: every sample is divided "
-             "by its own analysis's spin prior in a component-basis export.")
+             "by its own analysis's spin prior in a component-basis export. "
+             "Exits 2 (the new store still written) when a requested combined "
+             "row is left unresolved.")
     p_ann.add_argument("store", help="The store.h5 to read (never modified).")
     p_ann.add_argument("--out", required=True,
                        help="The new store.h5 (must not exist).")
@@ -612,9 +614,15 @@ def _cmd_annotate_spin_priors(args) -> int:
         stat[v.get("status", "?")] = stat.get(v.get("status", "?"), 0) + 1
     print(f"{args.out}: {summ['n_rows_annotated']} combined row(s) carry "
           f"per-sample spin ceilings; statuses {stat}")
-    for k, v in rows.items():
-        if v.get("status") == "unresolved":
-            print(f"  unresolved: {k}: {v.get('reason')}")
+    bad = [k for k, v in rows.items() if v.get("status") == "unresolved"]
+    for k in bad:
+        print(f"  unresolved: {k}: {rows[k].get('reason')}")
+    if bad:
+        # The store is written (an unresolved row keeps its one box, as
+        # before), but the caller asked for every row's own spin prior.
+        print(f"{PROG} annotate-spin-priors: {len(bad)} combined row(s) "
+              f"unresolved", file=sys.stderr)
+        return 2
     return 0
 
 

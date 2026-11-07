@@ -6,21 +6,28 @@ tilts, declared in its ``priors/analytic`` group) and ``C01:SEOBNRv4PHM``
 (RIFT; no analytic group, and a config that declares
 ``a_spin{1,2}-max = 0.99``).  The SEOBNRv4PHM samples do not stop at 0.99:
 over the 72 releases that carry this constituent every set has samples above
-0.99 (the lowest maximum is 0.9936, the median 0.9998), and the pooled
-magnitude density is flat through the declared edge (1.03 and 1.01 times its
-value in [0.97, 0.975) in the two 0.005-wide bins above 0.99) with the same
-near-uniform shape below it as the IMRPhenomXPHM half.  Its prior is uniform in
-magnitude to the Kerr bound, 1, and isotropic.
+0.99 on at least one spin (the lowest maximum is 0.9936, the median 0.9998),
+and the pooled magnitude density is flat through the declared edge (1.03 and
+1.01 times its value in [0.97, 0.975) in the two 0.005-wide bins above 0.99).
+Its prior is taken as uniform in magnitude to the Kerr bound, 1, and
+isotropic.  The samples show the upper edge only; the uniform shape below it
+is the standard LVK spin prior, assumed (the pooled posterior magnitude
+densities fall across [0, 1], about 2x for SEOBNRv4PHM and 1.3x for
+IMRPhenomXPHM, as the data inform them; they do not show the prior's shape).
 
-The store used to give the whole Mixed set ONE box -- XPHM's 0.99, widened to
-the largest drawn magnitude (``spin_amax_source = samples_bound``) -- which
-describes the SEOBNRv4PHM half and misdescribes the XPHM half by the ratio of
-the two boxes, ``(0.99 / 1)^2``: about 2% in each XPHM row's weight, most of it
-a per-event constant (review 2026-10-20, Low 77 / high-2).  This module gives
-each row the ceiling of the analysis it came from, so the component-basis
-``p_pe`` divides out ``1 / (4 amax_1 amax_2)`` of that analysis (the
-``own_prior`` reading of :mod:`gwcat.constituent_mixture`, applied to the spin
-prior only; the shapes are the same, uniform magnitude and isotropic tilt).
+The store used to give the whole Mixed set ONE box per spin: 0.99, widened to
+the largest drawn magnitude of that spin where it exceeds 0.99
+(``spin_amax_source = samples_bound``).  On a widened spin the box describes
+the SEOBNRv4PHM half and misdescribes the XPHM half by 0.99 / 1; on a spin
+left at 0.99 it misdescribes the SEOBNRv4PHM half by the same ratio the other
+way (in the 249-event population set, of the 48 C01:Mixed events with an
+SEOBNRv4PHM half, spin 1 was widened in 34 and spin 2 in 46).  That is about
+1% per misdescribed spin in a row's weight, most of it a per-event constant
+(review 2026-10-20, Low 77 / high-2).  This module gives each row the ceiling
+of the analysis it came from, so the component-basis ``p_pe`` divides out
+``1 / (4 amax_1 amax_2)`` of that analysis (the ``own_prior`` reading of
+:mod:`gwcat.constituent_mixture`, applied to the spin prior only; both are
+taken as uniform in magnitude and isotropic in tilt).
 
 Which analysis a Mixed row came from is not recorded in the release, so it is
 established row by row and verified (:func:`attribute_mixed_rows`):
@@ -31,7 +38,12 @@ established row by row and verified (:func:`attribute_mixed_rows`):
    ``geocent_time`` (RIFT fixes the event time; every one of the 72
    SEOBNRv4PHM sets does) owns every Mixed row with that time;
 3. **remainder** -- the rows left belong to the only other constituent that
-   contributes exactly matched rows.
+   contributes exactly matched rows;
+4. **sole constituent** -- where the release holds ONE analysis besides the
+   combined set, no time signature, and that analysis contributes exactly
+   matched rows, the combined set is that analysis: every row is its.  Some
+   GWTC-2.1 ``C01:Mixed`` sets hold only ``C01:IMRPhenomXPHM`` and most of
+   their rows equal no released row; their single 0.99 box is exact.
 
 and refused (:class:`MixedSpinPriorError`) where the rules disagree: an
 exactly matched row carrying another constituent's time signature, a row
@@ -202,6 +214,18 @@ def attribute_mixed_rows(mixed: dict, constituents: Dict[str, dict]):
     if np.any(left):
         exact_owners = {int(j) for j in np.unique(owner[method == 1])}
         cand = sorted(exact_owners - set(tsig))
+        present = [j for j, lab in enumerate(names)
+                   if constituents[lab] is not None
+                   and all(k in constituents[lab] for k in MATCH_KEYS)]
+        if not tsig and len(present) == 1 and cand == present:
+            # Rule 4: the release has ONE analysis besides the combined set
+            # and the combined set contains its rows, so the combined set is
+            # that analysis (some GWTC-2.1 C01:Mixed sets hold only
+            # IMRPhenomXPHM, most rows not bitwise equal to its released set).
+            owner[left] = cand[0]
+            method[left] = 4
+            left = owner < 0
+    if np.any(left):
         if not tsig or len(cand) != 1:
             raise MixedSpinPriorError(
                 f"{int(left.sum())} of {n} Mixed row(s) equal no released "
@@ -218,7 +242,8 @@ def attribute_mixed_rows(mixed: dict, constituents: Dict[str, dict]):
     labels = [names[j] for j in used]
     methods = {"exact": int(np.sum(method == 1)),
                "time_signature": int(np.sum(method == 2)),
-               "remainder": int(np.sum(method == 3))}
+               "remainder": int(np.sum(method == 3)),
+               "sole_constituent": int(np.sum(method == 4))}
     return labels, rows, methods, {names[j]: t for j, t in tsig.items()}
 
 

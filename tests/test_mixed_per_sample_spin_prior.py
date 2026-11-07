@@ -122,9 +122,23 @@ def _write_release(path, sd, priors, config):
                     ge.create_dataset(k, data=np.array([v.encode()]))
 
 
+def _xphm_only_mixed(seed=5, n=300):
+    """A C01:Mixed set of ONE analysis (as in some GWTC-2.1 releases): the
+    release holds C01:IMRPhenomXPHM and C01:Mixed only, and most Mixed rows
+    equal no released XPHM row; no constituent has a fixed time."""
+    rng = np.random.default_rng(seed)
+    xp = _samples(rng, n, 0.99)
+    xp_hidden = _samples(rng, 3 * n // 4, 0.99)
+    k = n // 4
+    mixed = _concat(_take(xp, np.arange(k)), xp_hidden)
+    truth = np.zeros(k + 3 * n // 4, int)
+    _sd, priors, _cfg, _t = _o3_mixed()
+    return {XP: xp, MX: mixed}, priors, {XP: {}, MX: {}}, truth
+
+
 def _ingest(tmp_path, *, per_sample=True, name="store.h5", seed=3,
-            write_release=True, monkeypatch=None):
-    sd, priors, config, truth = _o3_mixed(seed)
+            write_release=True, monkeypatch=None, fixture=None):
+    sd, priors, config, truth = (fixture or _o3_mixed)(seed)
     extra = {MX: {"meta_data": {"combined": "Prod5, Prod6_extended"}}}
     data = _Data(sd, extra=extra, config=config)
     monkeypatch.setattr(ing, "_read_event_pesummary",
@@ -170,7 +184,7 @@ def test_rows_are_attributed_by_exact_match_time_signature_and_remainder():
     np.testing.assert_array_equal(rows, truth)
     n = 300
     assert methods == {"exact": n, "time_signature": n // 3,
-                       "remainder": n // 3}
+                       "remainder": n // 3, "sole_constituent": 0}
     assert tsig == {SE: T_RIFT}
 
 
@@ -372,3 +386,65 @@ def test_annotation_refuses_a_release_whose_rows_are_not_the_stores(
     _co, ao = _export(out, tmp_path / "pe.h5")
     assert [_s(x) for x in ao["spin_amax_source_1_per_event"]] == [
         "samples_bound"]
+
+
+# --------------------------------------------------------------------------
+# A combined set of one analysis (GWTC-2.1 C01:Mixed of IMRPhenomXPHM only)
+# --------------------------------------------------------------------------
+def test_a_mixed_set_of_one_analysis_is_that_analysis():
+    sd, _p, _c, truth = _xphm_only_mixed()
+    labels, rows, methods, tsig = attribute_mixed_rows(sd[MX], {XP: sd[XP]})
+    assert labels == [XP]
+    np.testing.assert_array_equal(rows, truth)
+    assert methods == {"exact": 75, "time_signature": 0, "remainder": 0,
+                       "sole_constituent": 225}
+    assert tsig == {}
+    # one analysis, one ceiling: the event's single box is exact
+    analytic = {XP: (0.99, 0.99)}
+    assert resolve_mixed_spin_prior(sd[MX], {XP: sd[XP]}, analytic,
+                                    {XP: None}) is None
+
+
+def test_a_sole_analysis_that_contributes_no_row_is_refused():
+    sd, _p, _c, _t = _xphm_only_mixed()
+    rng = np.random.default_rng(11)
+    other = _samples(rng, 300, 0.99)              # equals no Mixed row
+    with pytest.raises(MixedSpinPriorError, match="no single"):
+        attribute_mixed_rows(sd[MX], {XP: other})
+
+
+def test_annotating_a_one_analysis_mixed_set_keeps_its_single_box(
+        tmp_path, monkeypatch):
+    old, _sd, _t = _ingest(tmp_path, per_sample=False, name="old.h5",
+                           monkeypatch=monkeypatch, fixture=_xphm_only_mixed)
+    out = str(tmp_path / "annotated.h5")
+    summ = annotate_store(old, out, [str(tmp_path)])
+    assert summ["rows"] == {f"GW951109_010717 [{MX}]":
+                            {"status": "single_ceiling"}}
+    assert summ["n_rows_annotated"] == 0
+    co, ao = _export(old, tmp_path / "pe_old.h5")
+    ca, aa = _export(out, tmp_path / "pe_new.h5")
+    for k in co:
+        np.testing.assert_array_equal(co[k], ca[k], err_msg=k)
+
+
+def test_cli_annotate_exits_nonzero_when_a_row_is_unresolved(
+        tmp_path, monkeypatch, capsys):
+    from gwcat.cli import main
+    old, _sd, _t = _ingest(tmp_path, per_sample=False, name="old.h5",
+                           monkeypatch=monkeypatch)
+    ok = tmp_path / "ok.h5"
+    summ = tmp_path / "ok.json"
+    assert main(["annotate-spin-priors", old, "--out", str(ok), "--pe-dir",
+                 str(tmp_path), "--summary", str(summ)]) == 0
+    assert json.loads(summ.read_text())["n_rows_annotated"] == 1
+    with h5py.File(tmp_path / NAME, "r+") as f:   # the release no longer
+        ps = f[MX]["posterior_samples"]           # equals the store's rows
+        arr = ps[:]
+        arr["luminosity_distance"][3] += 1.0
+        ps[...] = arr
+    bad = tmp_path / "bad.h5"
+    assert main(["annotate-spin-priors", old, "--out", str(bad), "--pe-dir",
+                 str(tmp_path)]) == 2
+    assert bad.exists()
+    assert "unresolved" in capsys.readouterr().out
